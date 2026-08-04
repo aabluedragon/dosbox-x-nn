@@ -86,6 +86,9 @@ SHELL_Cmd cmd_list[]={
 {	"ERASE",		1,		&DOS_Shell::CMD_DELETE,		"SHELL_CMD_DELETE_HELP"},
 #endif
 {	"EXIT",			0,		&DOS_Shell::CMD_EXIT,		"SHELL_CMD_EXIT_HELP"},
+#if !defined(OSFREE)
+{	"FILEMOUNT",	1,		&DOS_Shell::CMD_FILEMOUNT,	"SHELL_CMD_FILEMOUNT_HELP"},
+#endif
 {	"FOR",			1,		&DOS_Shell::CMD_FOR,		"SHELL_CMD_FOR_HELP"},
 {	"GOTO",			1,		&DOS_Shell::CMD_GOTO,		"SHELL_CMD_GOTO_HELP"},
 #if !defined(OSFREE)
@@ -3535,6 +3538,110 @@ void DOS_Shell::CMD_SUBST(char * args) {
 	}
 
 	return;
+}
+#endif
+
+#if !defined(OSFREE)
+void DOS_Shell::CMD_FILEMOUNT(char * args) {
+	HELP("FILEMOUNT");
+	StripSpaces(args);
+	CommandLine command(nullptr, args);
+	std::string arg1, arg2;
+	unsigned int count = (unsigned int)command.GetCount();
+
+	if (!count) {
+		/* no arguments: list all mounted files on all drives */
+		bool none = true;
+		for (int d = 0;d < DOS_DRIVES;d++) {
+			if (!Drives[d]) continue;
+			localDrive * const ldp = dynamic_cast<localDrive*>(Drives[d]);
+			if (!ldp || strncmp(Drives[d]->GetInfo(),"local directory",15)) continue;
+			for (const auto &m : ldp->GetMountedFiles()) {
+				WriteOut("%c:\\%s <= %s\n",'A'+d,m.first.c_str(),m.second.c_str());
+				none = false;
+			}
+		}
+		if (none) WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_NONE"));
+		return;
+	}
+
+	command.FindCommand(1,arg1);
+	bool unmount = (arg1 == "/D" || arg1 == "/d" || arg1 == "-u" || arg1 == "-U");
+	if (unmount) {
+		if (count != 2) {
+			WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_USAGE"));
+			return;
+		}
+		command.FindCommand(2,arg1);
+	} else if (count != 2) {
+		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_USAGE"));
+		return;
+	}
+
+	uint8_t drive;char fullname[DOS_PATHLENGTH];
+	if (!DOS_MakeName(arg1.c_str(),fullname,&drive)) {
+		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_INVALID_PATH"),arg1.c_str());
+		return;
+	}
+
+	localDrive * const ldp = dynamic_cast<localDrive*>(Drives[drive]);
+	if (!ldp || strncmp(Drives[drive]->GetInfo(),"local directory",15)) {
+		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_NOT_LOCAL"),(char)('A'+drive));
+		return;
+	}
+
+	if (unmount) {
+		if (ldp->RemoveMountedFile(fullname))
+			WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_REMOVED"),(char)('A'+drive),fullname);
+		else
+			WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_NOT_MOUNTED"),(char)('A'+drive),fullname);
+		return;
+	}
+
+	command.FindCommand(2,arg2);
+	struct stat st;
+	if (stat(arg2.c_str(),&st) != 0 || (st.st_mode & S_IFDIR)) {
+		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_HOST_NOT_FOUND"),arg2.c_str());
+		return;
+	}
+
+	const bool already = ldp->GetMountedFiles().count(localDrive::MountedFileKey(fullname)) != 0;
+
+	/* refuse to shadow a file or directory that really exists at the target */
+	uint16_t chk_attr;
+	if (!already && ldp->GetFileAttr(fullname,&chk_attr)) {
+		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_EXISTS"),(char)('A'+drive),fullname);
+		return;
+	}
+
+	/* the directory the file goes into must exist for real */
+	{
+		char parent[DOS_PATHLENGTH];
+		strcpy(parent,fullname);
+		char *sep = strrchr(parent,'\\');
+		if (sep != NULL) {
+			*sep = 0;
+			if (!ldp->TestDir(parent)) {
+				WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_DIR_NOT_FOUND"),(char)('A'+drive),parent);
+				return;
+			}
+		}
+	}
+
+	/* store an absolute host path so the mapping survives host cwd changes */
+	std::string hostpath = arg2;
+#if defined (WIN32)
+	char *abshost = _fullpath(NULL,arg2.c_str(),0);
+#else
+	char *abshost = realpath(arg2.c_str(),NULL);
+#endif
+	if (abshost != NULL) {
+		hostpath = abshost;
+		free(abshost);
+	}
+
+	ldp->AddMountedFile(fullname,hostpath.c_str());
+	WriteOut(MSG_Get(already?"SHELL_CMD_FILEMOUNT_UPDATED":"SHELL_CMD_FILEMOUNT_SUCCESS"),(char)('A'+drive),fullname,hostpath.c_str());
 }
 #endif
 

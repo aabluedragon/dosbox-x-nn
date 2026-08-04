@@ -21,6 +21,9 @@
 #define _DRIVES_H__
 
 #include <vector>
+#include <map>
+#include <string>
+#include <utility>
 #include <sys/types.h>
 #include "dos_system.h"
 #include "cdrom.h"
@@ -105,6 +108,13 @@ public:
 	void EmptyCache(void) override { dirCache.EmptyCache(); };
 	void MediaChange() override {};
 	const char* getBasedir() const {return basedir;};
+	/* FILEMOUNT support: map individual host files into this drive's directory tree.
+	 * The key is the uppercased DOS path relative to the drive root (e.g. "GAMES\\DATA.DAT"),
+	 * the value is the host filesystem path backing it. */
+	bool AddMountedFile(const char* dosPath, const char* hostPath);
+	bool RemoveMountedFile(const char* dosPath);
+	const std::map<std::string,std::string>& GetMountedFiles() const { return mounted_files; }
+	static std::string MountedFileKey(const char* dosPath);
 	struct {
 		uint16_t bytes_sector;
 		uint8_t sectors_cluster;
@@ -121,10 +131,14 @@ private:
 protected:
 	DOS_Drive_Cache dirCache;
 	char basedir[CROSS_LEN];
-	friend void DOS_Shell::CMD_SUBST(char* args); 	
+	friend void DOS_Shell::CMD_SUBST(char* args);
 	struct {
 		char srch_dir[CROSS_LEN];
     } srchInfo[MAX_OPENDIRS] = {};
+	std::map<std::string,std::string> mounted_files;
+	std::map<uint16_t,std::pair<std::string,size_t> > mounted_file_search; /* dirCache search id -> (DOS dir key, next entry index) */
+	const char* GetMountedFileHost(const char* dosPath);
+	bool MountedFileFindNext(DOS_DTA &dta,uint16_t id);
 };
 
 #if !defined(OSFREE)

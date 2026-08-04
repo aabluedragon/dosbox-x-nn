@@ -1343,6 +1343,101 @@ void drivezRegister(std::string const& path, std::string const& target_dir, bool
     dos.loaded_codepage = cp;
 }
 
+/* FILEMOUNT support: individual host files mapped into the drive's directory tree.
+ * The mapped file is presented to the guest as if it existed at the DOS path even
+ * though the host directory backing that location does not contain it. */
+std::string localDrive::MountedFileKey(const char* dosPath) {
+	std::string key;
+	const char* p = dosPath;
+	while (*p == '\\' || *p == '/') p++;
+	for (;*p != 0;p++) {
+		char c = *p;
+		if (c == '/') c = '\\';
+		key += (char)toupper((unsigned char)c);
+	}
+	while (!key.empty() && key.back() == '\\') key.pop_back();
+	return key;
+}
+
+bool localDrive::AddMountedFile(const char* dosPath, const char* hostPath) {
+	std::string key = MountedFileKey(dosPath);
+	if (key.empty()) return false;
+	mounted_files[key] = hostPath;
+	return true;
+}
+
+bool localDrive::RemoveMountedFile(const char* dosPath) {
+	return mounted_files.erase(MountedFileKey(dosPath)) != 0;
+}
+
+const char* localDrive::GetMountedFileHost(const char* dosPath) {
+	if (mounted_files.empty()) return NULL;
+	const auto it = mounted_files.find(MountedFileKey(dosPath));
+	return (it != mounted_files.end()) ? it->second.c_str() : NULL;
+}
+
+bool localDrive::MountedFileFindNext(DOS_DTA &dta,uint16_t id) {
+	if (mounted_files.empty()) return false;
+	const auto sit = mounted_file_search.find(id);
+	if (sit == mounted_file_search.end()) return false;
+	const std::string &srch_dir = sit->second.first;
+
+	uint8_t srch_attr;char srch_pattern[LFN_NAMELENGTH+1];
+	dta.GetSearchParams(srch_attr,srch_pattern,false);
+	(void)srch_attr;/* mounted entries are always plain files, never excluded by attribute */
+
+	size_t index = 0;
+	for (auto it = mounted_files.begin();it != mounted_files.end();++it,++index) {
+		if (index < sit->second.second) continue;
+		sit->second.second = index + 1;
+
+		/* entry must live directly inside the directory being searched */
+		const std::string &key = it->first;
+		const size_t slash = key.rfind('\\');
+		const std::string entry_dir = (slash == std::string::npos) ? "" : key.substr(0,slash);
+		if (entry_dir != srch_dir) continue;
+		const std::string entry_name = (slash == std::string::npos) ? key : key.substr(slash+1);
+		if (entry_name.length() >= DOS_NAMELENGTH_ASCII) continue;
+		if (!WildFileCmp(entry_name.c_str(),srch_pattern) && !LWildFileCmp(entry_name.c_str(),srch_pattern)) continue;
+
+		/* if the host file vanished, the mapping vanishes from view as well */
+		struct stat st;
+		if (stat(it->second.c_str(),&st) != 0 || (st.st_mode & S_IFDIR)) continue;
+
+		uint8_t find_attr = DOS_ATTR_ARCHIVE;
+#if defined (WIN32)
+		if (!(st.st_mode & _S_IWRITE)) find_attr |= DOS_ATTR_READ_ONLY;
+#else
+		if (!(st.st_mode & S_IWUSR)) find_attr |= DOS_ATTR_READ_ONLY;
+#endif
+
+		uint16_t find_date,find_time;
+		const struct tm* time;
+		if((time=
+#if defined(__MINGW32__) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
+			_localtime64
+#else
+			localtime
+#endif
+			(&st.st_mtime))!=nullptr){
+			find_date=DOS_PackDate((uint16_t)(time->tm_year+1900),(uint16_t)(time->tm_mon+1),(uint16_t)time->tm_mday);
+			find_time=DOS_PackTime((uint16_t)time->tm_hour,(uint16_t)time->tm_min,(uint16_t)time->tm_sec);
+		} else {
+			find_time=6;
+			find_date=4;
+		}
+
+		char find_name[DOS_NAMELENGTH_ASCII];
+		strcpy(find_name,entry_name.c_str());
+		dta.SetResult(find_name,find_name,
+			(uint32_t)((uint64_t)st.st_size % 0x100000000ull),
+			(uint32_t)((uint64_t)st.st_size / 0x100000000ull),
+			find_date,find_time,find_attr);
+		return true;
+	}
+	return false;
+}
+
 bool localDrive::FileCreate(DOS_File * * file,const char * name,uint16_t attributes) {
     if (nocachedir) EmptyCache();
 
@@ -1375,6 +1470,21 @@ bool localDrive::FileCreate(DOS_File * * file,const char * name,uint16_t attribu
     }
 
     assert(file != NULL);
+
+	{
+		const char* mounted_host = GetMountedFileHost(name);
+		if (mounted_host != NULL) {
+			/* creating over a mounted file truncates the host file it maps to */
+			FILE* hand = fopen(mounted_host,"wb+");
+			if (hand == NULL) {
+				DOS_SetError(DOSERR_ACCESS_DENIED);
+				return false;
+			}
+			*file = new LocalFile(name,hand);
+			(*file)->flags = OPEN_READWRITE;
+			return true;
+		}
+	}
 
 //TODO Maybe care for attributes but not likely
 	char newname[CROSS_LEN];
@@ -1586,6 +1696,21 @@ bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
 		DOS_SetError(DOSERR_ACCESS_CODE_INVALID);
 		return false;
 	}
+
+	{
+		const char* mounted_host = GetMountedFileHost(name);
+		if (mounted_host != NULL) {
+			FILE* hand = fopen(mounted_host,((flags&0xf)==OPEN_WRITE||(flags&0xf)==OPEN_READWRITE)?"rb+":"rb");
+			if (hand == NULL) {
+				DOS_SetError(((flags&0xf)==OPEN_READ||(flags&0xf)==OPEN_READ_NO_MOD)?DOSERR_FILE_NOT_FOUND:DOSERR_ACCESS_DENIED);
+				return false;
+			}
+			*file = new LocalFile(name,hand);
+			(*file)->flags = flags;
+			return true;
+		}
+	}
+
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	strcat(newname,name);
@@ -1673,6 +1798,9 @@ bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
 
 FILE * localDrive::GetSystemFilePtr(char const * const name, char const * const type) {
 
+	const char* mounted_host = GetMountedFileHost(name);
+	if (mounted_host != NULL) return fopen(mounted_host,type);
+
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	strcat(newname,name);
@@ -1703,6 +1831,12 @@ FILE * localDrive::GetSystemFilePtr(char const * const name, char const * const 
 
 bool localDrive::GetSystemFilename(char *sysName, char const * const dosName) {
 
+	const char* mounted_host = GetMountedFileHost(dosName);
+	if (mounted_host != NULL) {
+		strcpy(sysName,mounted_host);
+		return true;
+	}
+
 	strcpy(sysName, basedir);
 	strcat(sysName, dosName);
 	CROSS_FILENAME(sysName);
@@ -1729,6 +1863,12 @@ bool localDrive::FileUnlink(const char * name) {
         DOS_SetError(DOSERR_WRITE_PROTECTED);
         return false;
     }
+
+	if (GetMountedFileHost(name) != NULL) {
+		/* deleting a mounted file only removes the mapping; the host file is left untouched */
+		RemoveMountedFile(name);
+		return true;
+	}
 
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
@@ -1826,6 +1966,10 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		ldir[lfn_filefind_handle]=tempDir;
 	}
 
+	/* remember which DOS directory this search id refers to, so mounted files can be listed */
+	if (!mounted_files.empty()) mounted_file_search[id] = std::make_pair(MountedFileKey(_dir),(size_t)0);
+	else mounted_file_search.erase(id);
+
 	uint8_t sAttr;
 	dta.GetSearchParams(sAttr,tempDir,false);
 
@@ -1875,6 +2019,9 @@ bool localDrive::FindNext(DOS_DTA & dta) {
 
 again:
 	if (!dirCache.FindNext(id,dir_ent,ldir_ent)) {
+		/* real directory exhausted; list any mounted files that live in this directory */
+		if (MountedFileFindNext(dta,id)) return true;
+		mounted_file_search.erase(id);
 		if (lfn_filefind_handle<LFN_FILEFIND_MAX) {
 			ldid[lfn_filefind_handle]=0;
 			ldir[lfn_filefind_handle]="";
@@ -2022,6 +2169,11 @@ bool localDrive::add_special_file_to_disk(const char* dosname, const char* opera
 }
 
 bool localDrive::SetFileAttr(const char * name,uint16_t attr) {
+	if (GetMountedFileHost(name) != NULL) {
+		/* attribute changes on mounted files are accepted but not persisted */
+		return true;
+	}
+
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	strcat(newname,name);
@@ -2070,6 +2222,25 @@ bool localDrive::SetFileAttr(const char * name,uint16_t attr) {
 
 bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
     if (nocachedir) EmptyCache();
+
+	{
+		const char* mounted_host = GetMountedFileHost(name);
+		if (mounted_host != NULL) {
+			struct stat st;
+			if (stat(mounted_host,&st) == 0 && !(st.st_mode & S_IFDIR)) {
+				*attr = DOS_ATTR_ARCHIVE;
+#if defined (WIN32)
+				if (!(st.st_mode & _S_IWRITE)) *attr |= DOS_ATTR_READ_ONLY;
+#else
+				if (!(st.st_mode & S_IWUSR)) *attr |= DOS_ATTR_READ_ONLY;
+#endif
+				return true;
+			}
+			*attr = 0;
+			DOS_SetError(DOSERR_FILE_NOT_FOUND);
+			return false;
+		}
+	}
 
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
@@ -2121,6 +2292,9 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
 }
 
 bool localDrive::GetFileAttrEx(char* name, struct stat *status) {
+	const char* mounted_host = GetMountedFileHost(name);
+	if (mounted_host != NULL) return !stat(mounted_host,status);
+
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	strcat(newname,name);
@@ -2130,6 +2304,14 @@ bool localDrive::GetFileAttrEx(char* name, struct stat *status) {
 }
 
 std::string localDrive::GetHostName(const char * name) {
+	const char* mounted_host = GetMountedFileHost(name);
+	if (mounted_host != NULL) {
+		struct stat mst;
+		static std::string mounted_hostname;
+		mounted_hostname = (stat(mounted_host,&mst) == 0) ? mounted_host : "";
+		return mounted_hostname;
+	}
+
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	strcat(newname,name);
@@ -2293,6 +2475,11 @@ bool localDrive::TestDir(const char * dir) {
 }
 
 bool localDrive::Rename(const char * oldname,const char * newname) {
+	if (GetMountedFileHost(oldname) != NULL || GetMountedFileHost(newname) != NULL) {
+		/* renaming mounted files (or over them) is not supported */
+		DOS_SetError(DOSERR_ACCESS_DENIED);
+		return false;
+	}
     if (readonly) {
         DOS_SetError(DOSERR_WRITE_PROTECTED);
         return false;
@@ -2581,6 +2768,14 @@ bool localDrive::AllocationInfo64(uint32_t* _bytes_sector, uint32_t* _sectors_cl
 bool localDrive::FileExists(const char* name) {
     if (nocachedir) EmptyCache();
 
+	{
+		const char* mounted_host = GetMountedFileHost(name);
+		if (mounted_host != NULL) {
+			struct stat st;
+			return stat(mounted_host,&st) == 0 && !(st.st_mode & S_IFDIR);
+		}
+	}
+
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	strcat(newname,name);
@@ -2602,6 +2797,27 @@ bool localDrive::FileExists(const char* name) {
 
 bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
     if (nocachedir) EmptyCache();
+
+	{
+		const char* mounted_host = GetMountedFileHost(name);
+		if (mounted_host != NULL) {
+			struct stat st;
+			if (stat(mounted_host,&st) != 0) return false;
+			const struct tm* mtime;
+			if((mtime=
+#if defined(__MINGW32__) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
+			_localtime64
+#else
+			localtime
+#endif
+			(&st.st_mtime))!=nullptr) {
+				stat_block->time=DOS_PackTime((uint16_t)mtime->tm_hour,(uint16_t)mtime->tm_min,(uint16_t)mtime->tm_sec);
+				stat_block->date=DOS_PackDate((uint16_t)(mtime->tm_year+1900),(uint16_t)(mtime->tm_mon+1),(uint16_t)mtime->tm_mday);
+			}
+			stat_block->size=(uint32_t)st.st_size;
+			return true;
+		}
+	}
 
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);

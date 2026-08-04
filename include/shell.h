@@ -262,6 +262,10 @@ public:
      */
 	void CMD_SUBST(char* args);
 
+    /*! \brief      Map a host file into a mounted drive's directory (FILEMOUNT)
+     */
+	void CMD_FILEMOUNT(char* args);
+
     /*! \brief      Load a program into high memory if possible
      */
 	void CMD_LOADHIGH(char* args);

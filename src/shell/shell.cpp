@@ -1888,6 +1888,27 @@ void SHELL_MessagesInit() {
 			"  [drive2:]path Specifies a mounted local drive and path you want to assign to.\n"
 			"  /D            Deletes a mounted or substituted drive.\n\n"
 			"Type SUBST with no parameters to display a list of mounted local drives.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_HELP","Maps a host file into a mounted drive's directory tree.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_HELP_LONG","FILEMOUNT [drive:][path]filename hostfile\nFILEMOUNT /D [drive:][path]filename\nFILEMOUNT\n\n"
+			"  [drive:][path]filename  The DOS path where the host file should appear.\n"
+			"                          The drive must be a mounted local directory and\n"
+			"                          the directory must already exist.\n"
+			"  hostfile                The file on the host system to map there.\n"
+			"  /D                      Removes a mapping (the host file is not touched).\n\n"
+			"The file appears in the DOS directory as if it were there, even though it\n"
+			"does not exist at that location on the host file system.\n\n"
+			"Type FILEMOUNT with no parameters to list the current file mappings.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_NONE","No files are currently mounted.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_USAGE","Wrong number of parameters.\nUsage: FILEMOUNT [/D] [drive:][path]filename [hostfile]\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_INVALID_PATH","Invalid DOS path: %s\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_NOT_LOCAL","Drive %c: is not a mounted local directory.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_REMOVED","Unmounted file %c:\\%s.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_NOT_MOUNTED","No file is mounted at %c:\\%s.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_HOST_NOT_FOUND","Host file not found or not a file: %s\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_EXISTS","%c:\\%s already exists; refusing to shadow it.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_DIR_NOT_FOUND","Directory %c:\\%s does not exist.\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_SUCCESS","Mounted file %c:\\%s <= %s\n");
+	MSG_Add("SHELL_CMD_FILEMOUNT_UPDATED","Updated file %c:\\%s <= %s\n");
 	MSG_Add("SHELL_CMD_LOADHIGH_HELP","Loads a program into upper memory (requires XMS and UMB memory).\n");
 	MSG_Add("SHELL_CMD_LOADHIGH_HELP_LONG","LH              [drive:][path]filename [parameters]\n"
 			"LOADHIGH        [drive:][path]filename [parameters]\n");
