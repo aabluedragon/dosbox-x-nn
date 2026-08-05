@@ -1113,7 +1113,7 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total) {
         }
 
         if (advanced) {
-            while ((have / INPUTNET_STATE_CHUNK) < nchunks && got[have / INPUTNET_STATE_CHUNK])
+            while (have < total && got[have / INPUTNET_STATE_CHUNK])
                 have = std::min(total,have + INPUTNET_STATE_CHUNK);
             lastprogress = GetTicks();
         }
@@ -1874,8 +1874,13 @@ static void INPUTNET_TickHandler(void) {
     if (inputnet_busy) return;
     inputnet_busy = true;
 
-    /* Deferred start from the config file or the command line. */
-    if (!inputnet_autostart_done) {
+    /* Deferred start from the config file or the command line. Wait until the
+     * shell sits idle at its prompt: joining swaps in the server's emulator
+     * state, which only unwinds safely when this machine is parked in the
+     * same quiescent input wait instead of midway through a booting program
+     * (e.g. the welcome screen). */
+    extern bool dos_shell_reading_input;
+    if (!inputnet_autostart_done && dos_shell_reading_input) {
         inputnet_autostart_done = true;
 
         if (inputnet_auto_server >= 0) {
@@ -1900,8 +1905,9 @@ static void INPUTNET_TickHandler(void) {
     if (!inputnet_link_up) { inputnet_busy = false; return; }
 
     if (inputnet_pending_stateload) {
-        /* Wait until INPUTNET.COM has returned before replacing the machine. */
-        if (!inputnet_in_program) INPUTNET_FinishJoin();
+        /* Wait until INPUTNET.COM has returned and the shell is parked at its
+         * prompt before replacing the machine. */
+        if (!inputnet_in_program && dos_shell_reading_input) INPUTNET_FinishJoin();
         inputnet_busy = false;
         return;
     }
@@ -1937,6 +1943,9 @@ static void INPUTNET_TickHandler(void) {
 
     inputnet_busy = false;
 }
+
+//save state support
+void *INPUTNET_TickHandler_PIC_Timer = (void*)((uintptr_t)INPUTNET_TickHandler);
 
 /* ------------------------------------------------------------------------- */
 /* Public status                                                              */

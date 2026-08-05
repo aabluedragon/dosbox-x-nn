@@ -456,8 +456,19 @@ extern bool isDBCSCP();
 void ReadCharAttr(uint16_t col, uint16_t row, uint8_t page, uint16_t* result);
 bool read_lead_byte = false;
 uint8_t temp_lead_byte;
+
+/* True while the shell sits at its prompt waiting for a command. The shared
+ * input feature (inputnet) uses this as a quiescent point where the emulator
+ * state can safely be replaced. */
+bool dos_shell_reading_input = false;
+namespace { struct ShellInputScope {
+	ShellInputScope() { dos_shell_reading_input = true; }
+	~ShellInputScope() { dos_shell_reading_input = false; }
+}; }
+
 /* NTS: buffer pointed to by "line" must be at least CMD_MAXLINE+1 large */
 void DOS_Shell::InputCommand(char * line) {
+	ShellInputScope at_prompt_scope;
 	Bitu size=CMD_MAXLINE-2; //lastcharacter+0
 	uint8_t c;uint16_t n=1;
 	uint16_t str_len=0;uint16_t str_index=0;

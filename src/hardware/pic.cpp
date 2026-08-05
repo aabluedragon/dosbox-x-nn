@@ -808,6 +808,9 @@ struct TickerBlock {
 };
 
 static TickerBlock * firstticker = nullptr;
+/* bumped whenever a ticker is removed, so that TIMER_AddTick can tell its
+ * saved next pointer may have been freed by the handler it just called */
+static unsigned int ticker_generation = 0;
 
 void TIMER_ShutdownTickHandlers() {
     unsigned int leftovers = 0;
@@ -831,6 +834,7 @@ void TIMER_DelTickHandler(TIMER_TickHandler handler) {
         if (ticker->handler==handler) {
             *tick_where=ticker->next;
             delete ticker;
+            ticker_generation++;
             return;
         }
         tick_where=&ticker->next;
@@ -879,7 +883,11 @@ void TIMER_AddTick(void) {
     TickerBlock * ticker=firstticker;
     while (ticker) {
         TickerBlock * nextticker=ticker->next;
+        const unsigned int gen=ticker_generation;
         ticker->handler();
+        /* the handler may have removed tickers (e.g. a save state load
+         * re-registering modules), leaving nextticker dangling */
+        if (gen!=ticker_generation) break;
         ticker=nextticker;
     }
 }
@@ -1183,16 +1191,19 @@ const void *pic_state_event_table[] = {
 };
 
 
+extern void *INPUTNET_TickHandler_PIC_Timer;
+
 const void *pic_state_timer_table[] = {
 	NULL,
-#if C_IPX	
+#if C_IPX
 //	IPX_ClientLoop_PIC_Timer,
 //	IPX_ServerLoop_PIC_Timer,
-#endif	
+#endif
 	KEYBOARD_TickHandler_PIC_Timer,
 	KEYBOARD_TickHandler_PIC_Timer,
 	//MIXER_Mix_NoSound_PIC_Timer,
 	MIXER_Mix_PIC_Timer,
+	INPUTNET_TickHandler_PIC_Timer,
 
 	//NE2000_Poller_PIC_Event,
 };
@@ -1441,6 +1452,9 @@ private:
 
 					delete ticker_ptr;
 				}
+				/* a state load can happen from inside a tick handler (shared
+				 * input session join); tell TIMER_AddTick its iteration died */
+				ticker_generation++;
 
 
 				// - reloc ptr
@@ -1448,27 +1462,27 @@ private:
 
 				firstticker = NULL;
 				if( ticker_size ) {
-					TickerBlock *ticker_ptr;
+					TickerBlock *ticker_tail = NULL;
 
 					for( int lcv = 0; lcv<ticker_size; lcv++ ) {
 						uint16_t ticker_idx;
 
-						if( lcv == 0 ) {
-							ticker_ptr = new TickerBlock;
-							firstticker = ticker_ptr;
-						}
-						else {
-							ticker_ptr->next = new TickerBlock;
-							ticker_ptr = ticker_ptr->next;
-						}
-
-
 						// - function ptr
 						stream.read(reinterpret_cast<char*>(&ticker_idx), sizeof(ticker_idx) );
-						ticker_ptr->handler = (TIMER_TickHandler) PIC_State_IndexTimer( ticker_idx );
+						TIMER_TickHandler handler = (TIMER_TickHandler) PIC_State_IndexTimer( ticker_idx );
 
-						// - reloc new ptr (linked list)
+						/* a handler missing from pic_state_timer_table saves as
+						 * 0xffff and resolves to NULL here; a NULL node would
+						 * crash TIMER_AddTick, so drop it instead */
+						if( handler == NULL ) continue;
+
+						TickerBlock *ticker_ptr = new TickerBlock;
+						ticker_ptr->handler = handler;
 						ticker_ptr->next = NULL;
+
+						if( ticker_tail != NULL ) ticker_tail->next = ticker_ptr;
+						else firstticker = ticker_ptr;
+						ticker_tail = ticker_ptr;
 					}
 				}
 
