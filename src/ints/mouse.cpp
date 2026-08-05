@@ -32,6 +32,7 @@
 #include "regs.h"
 #include "cpu.h"
 #include "mouse.h"
+#include "inputnet.h"
 #include "pic.h"
 #include "inout.h"
 #include "int10.h"
@@ -863,8 +864,39 @@ static bool AllowINT33RMAccess() {
 bool IsDebuggerActive(void);
 #endif
 
-/* FIXME: Re-test this code */
+/* While a shared input session is running the movement is not applied here. It
+ * is handed to the other DOSBox-X instances instead and every instance
+ * (including this one) applies it at the same emulated time. */
 void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
+    if (inputnet_capture_active && INPUTNET_InterceptMouseMotion(xrel,yrel,x,y,emulate))
+        return;
+
+    Mouse_CursorMovedRaw(xrel,yrel,x,y,emulate);
+}
+
+void Mouse_ButtonPressed(uint8_t button) {
+    if (inputnet_capture_active && INPUTNET_InterceptMouseButton(button,true))
+        return;
+
+    Mouse_ButtonPressedRaw(button);
+}
+
+void Mouse_ButtonReleased(uint8_t button) {
+    if (inputnet_capture_active && INPUTNET_InterceptMouseButton(button,false))
+        return;
+
+    Mouse_ButtonReleasedRaw(button);
+}
+
+void Mouse_WheelMoved(int32_t scroll) {
+    if (inputnet_capture_active && INPUTNET_InterceptMouseWheel(scroll))
+        return;
+
+    Mouse_WheelMovedRaw(scroll);
+}
+
+/* FIXME: Re-test this code */
+void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
     extern bool Mouse_Vertical;
     float dx = xrel * mouse.pixelPerMickey_x;
     float dy = (Mouse_Vertical?-yrel:yrel) * mouse.pixelPerMickey_y;
@@ -1238,7 +1270,7 @@ void Mouse_Select(int x1, int y1, int x2, int y2, int w, int h, bool select) {
 }
 #endif
 
-void Mouse_ButtonPressed(uint8_t button) {
+void Mouse_ButtonPressedRaw(uint8_t button) {
     if (!IS_PC98_ARCH && KEYBOARD_AUX_Active()) {
         switch (button) {
             case 0:
@@ -1295,7 +1327,7 @@ void Mouse_ButtonPressed(uint8_t button) {
     on_mouse_event_for_serial(0,0,mouse.buttons);
 }
 
-void Mouse_ButtonReleased(uint8_t button) {
+void Mouse_ButtonReleasedRaw(uint8_t button) {
     if (!IS_PC98_ARCH && KEYBOARD_AUX_Active()) {
         switch (button) {
             case 0:
@@ -1358,7 +1390,7 @@ void Mouse_ButtonReleased(uint8_t button) {
     on_mouse_event_for_serial(0,0,mouse.buttons);
 }
 
-void Mouse_WheelMoved(int32_t scroll) {
+void Mouse_WheelMovedRaw(int32_t scroll) {
 	mouse.wheel = clamp(scroll + mouse.wheel, -0x7FFF, 0x7FFF); /* limit is -0x8000,0x7FFF, but let's keep it symmetric */
 	Mouse_AddEvent(MOUSE_WHEEL_MOVED);
 	mouse.last_scrolled_x=POS_X;

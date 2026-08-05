@@ -420,6 +420,9 @@
     <ClCompile Include="..\src\hardware\iohandler.cpp">
       <Filter>Sources\hardware</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\hardware\inputnet.cpp">
+      <Filter>Sources\hardware</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\hardware\ipx.cpp">
       <Filter>Sources\hardware</Filter>
     </ClCompile>
@@ -2172,6 +2175,9 @@
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\iowin32.h">
+      <Filter>Includes</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\inputnet.h">
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\ipx.h">

@@ -20,6 +20,7 @@
 
 #include "dosbox.h"
 #include "keyboard.h"
+#include "inputnet.h"
 #include "logging.h"
 #include "support.h"
 #include "setup.h"
@@ -1889,12 +1890,14 @@ static void KEYBOARD_TickHandler(void) {
 
     if (keyb.active && keyb.scanning) {
         if (keyb.pending_key >= 0) {
-            KEYBOARD_AddKey((KBD_KEYS)keyb.pending_key,keyb.pending_key_state);
+            /* Internally generated, not user input: never routed through the
+             * shared input layer or it would be duplicated on every instance. */
+            KEYBOARD_AddKeyRaw((KBD_KEYS)keyb.pending_key,keyb.pending_key_state);
             keyb.pending_key = -1;
         }
         else if (keyb.repeat.wait) {
             keyb.repeat.wait--;
-            if (!keyb.repeat.wait) KEYBOARD_AddKey(keyb.repeat.key,true);
+            if (!keyb.repeat.wait) KEYBOARD_AddKeyRaw(keyb.repeat.key,true);
         }
     }
 }
@@ -1902,6 +1905,16 @@ static void KEYBOARD_TickHandler(void) {
 void APM_Suspend_Wakeup_Key(void);
 
 void KEYBOARD_AddKey(KBD_KEYS keytype,bool pressed) {
+    /* While a shared input session is running the key is not applied here.
+     * It is handed to the other DOSBox-X instances instead and every instance
+     * (including this one) applies it at the same emulated time. */
+    if (inputnet_capture_active && INPUTNET_InterceptKey(keytype,pressed))
+        return;
+
+    KEYBOARD_AddKeyRaw(keytype,pressed);
+}
+
+void KEYBOARD_AddKeyRaw(KBD_KEYS keytype,bool pressed) {
     /* If the BIOS has put the system into APM suspend, let certain keys wake it up again.
      * Send on RELEASE so that the key isn't also typed into the guest OS. */
     if (!pressed && (keytype == KBD_space))

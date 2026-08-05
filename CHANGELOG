@@ -1,4 +1,20 @@
 NEXT VERSION:
+  - Added shared input ("inputnet") emulation and the INPUTNET command, so that
+    DOS games which only ever supported two players on one PC sharing one
+    keyboard can be played over a network. One DOSBox-X session hosts
+    (INPUTNET STARTSERVER) and the others join (INPUTNET CONNECT address); the
+    host hands its complete emulator state to each joining session, after which
+    the sessions run in lockstep and every session receives the keyboard and
+    mouse input of every player. Only emulator state and input are exchanged,
+    never video. The command structure deliberately matches the IPXNET command
+    used to set up an IPX tunnel. The emulated CPU speed is synchronized
+    across the participants as well, so "cycles=max" and "cycles=auto" work:
+    the host owns the cycle count and publishes every adjustment, and because
+    the sessions run in lockstep it settles on a speed the slowest machine can
+    sustain. A periodic machine checksum reports a loss of synchronization
+    instead of letting it silently ruin the game. Enabled with
+    "inputnet=true" in the new [inputnet] section, or with the
+    -inputnet-server / -inputnet-connect command line options.
   - 
 
 2026.08.02

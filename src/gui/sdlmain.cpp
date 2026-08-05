@@ -7420,6 +7420,8 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -showcycles                             Show cycles count (FPS) in the title\n");
             fprintf(stderr,"  -showrt                                 Show emulation speed relative to realtime in the title\n");
             fprintf(stderr,"  -socket <socketnum>                     Specify the socket number for null-modem emulation\n");
+            fprintf(stderr,"  -inputnet-server <port>                 Host a shared keyboard/mouse session on this UDP port\n");
+            fprintf(stderr,"  -inputnet-connect <address[:port]>      Join the shared keyboard/mouse session hosted there\n");
             fprintf(stderr,"  -savedir <path>                         Set path for the save slots\n");
             fprintf(stderr,"  -defaultdir <path>                      Set the default working path for DOSBox-X\n");
             fprintf(stderr,"  -defaultconf                            Use the default config settings for DOSBox-X\n");
@@ -7509,6 +7511,14 @@ bool DOSBOX_parse_argv() {
         }
         else if (optname == "machine") {
             if (!control->cmdline->NextOptArgv(control->opt_machine)) return false;
+        }
+        else if (optname == "inputnet-server") {
+            if (!control->cmdline->NextOptArgv(tmp)) return false;
+            control->opt_inputnet_server = atoi(tmp.c_str());
+            if (control->opt_inputnet_server < 0 || control->opt_inputnet_server > 65535) control->opt_inputnet_server = 0;
+        }
+        else if (optname == "inputnet-connect") {
+            if (!control->cmdline->NextOptArgv(control->opt_inputnet_connect)) return false;
         }
         else if (optname == "time-limit") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
@@ -7837,6 +7847,7 @@ void CDROM_Image_Init();
 void MSCDEX_Init();
 void DRIVES_Init();
 void IPX_Init();
+void INPUTNET_Init();
 void IDE_Init();
 void NE2K_Init();
 void FDC_Primary_Init();
@@ -9768,6 +9779,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 #if C_IPX
         IPX_Init();
 #endif
+        INPUTNET_Init();
         MSCDEX_Init();
         CDROM_Image_Init();
 
