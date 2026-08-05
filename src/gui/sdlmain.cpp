@@ -250,6 +250,71 @@ typedef enum PROCESS_DPI_AWARENESS {
 
 #if C_EMSCRIPTEN
 # include <emscripten.h>
+# include "SDL.h"
+# include <string.h>
+
+/* This build runs single-threaded inside a hand-rolled Web Worker (js-dos
+ * style): the page thread only composites the transferred OffscreenCanvas,
+ * plays audio and forwards input, so the emulator needs to yield its worker
+ * event loop just often enough for onmessage handlers to run. A MessageChannel
+ * message is a macrotask without the ~4ms setTimeout clamp, so these yields
+ * cost almost nothing; a real setTimeout is still taken a few times a second
+ * so timers and housekeeping never starve. */
+EM_ASYNC_JS(void, emscripten_fast_yield, (), {
+  if (!Module.__yieldChannel) Module.__yieldChannel = new MessageChannel();
+  const ch = Module.__yieldChannel;
+  await new Promise(resolve => {
+    ch.port1.onmessage = resolve;
+    ch.port2.postMessage(0);
+  });
+});
+
+void EMSCRIPTEN_Yield_Throttled(void) {
+    static double last_yield = 0;
+    static double last_timer_yield = 0;
+    const double now = emscripten_get_now();
+    /* 16ms cadence (~60fps): js-dos ships 24ms; suspending less often keeps
+     * more time in the emulator while input latency stays a frame or less */
+    if ((now - last_yield) >= 16.0) {
+        last_yield = now;
+        if ((now - last_timer_yield) >= 100.0) {
+            last_timer_yield = now;
+            emscripten_sleep(0);
+        }
+        else {
+            emscripten_fast_yield();
+        }
+    }
+}
+
+/* Input arrives from the page thread as postMessage events; the worker glue
+ * injects them into the normal SDL event queue through these exports. */
+extern "C" {
+EMSCRIPTEN_KEEPALIVE void EMWORKER_PushKey(int scancode, int down) {
+    SDL_Event ev; memset(&ev,0,sizeof(ev));
+    ev.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+    ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+    ev.key.keysym.scancode = (SDL_Scancode)scancode;
+    ev.key.keysym.sym = SDL_GetKeyFromScancode((SDL_Scancode)scancode);
+    SDL_PushEvent(&ev);
+}
+EMSCRIPTEN_KEEPALIVE void EMWORKER_PushMouseMotion(int x,int y,int xrel,int yrel) {
+    SDL_Event ev; memset(&ev,0,sizeof(ev));
+    ev.type = SDL_MOUSEMOTION;
+    ev.motion.x = x; ev.motion.y = y;
+    ev.motion.xrel = xrel; ev.motion.yrel = yrel;
+    SDL_PushEvent(&ev);
+}
+EMSCRIPTEN_KEEPALIVE void EMWORKER_PushMouseButton(int button,int down,int x,int y) {
+    SDL_Event ev; memset(&ev,0,sizeof(ev));
+    ev.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+    ev.button.button = (button == 2) ? SDL_BUTTON_RIGHT :
+                       (button == 1) ? SDL_BUTTON_MIDDLE : SDL_BUTTON_LEFT;
+    ev.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+    ev.button.x = x; ev.button.y = y;
+    SDL_PushEvent(&ev);
+}
+}
 #endif
 
 #include "../src/libs/gui_tk/gui_tk.h"
@@ -3300,7 +3365,7 @@ void GFX_OpenGLRedrawScreen(void) {
 
 void GFX_EndUpdate(const uint16_t *changedLines) {
 #if C_EMSCRIPTEN
-    emscripten_sleep(0);
+    EMSCRIPTEN_Yield_Throttled();
 #endif
 #if C_OPENGL
     bool actually_updating = false;
@@ -5936,7 +6001,7 @@ void GFX_Events() {
     GFX_EventsMouse();
 
 #if C_EMSCRIPTEN
-    emscripten_sleep(0);
+    EMSCRIPTEN_Yield_Throttled();
 #endif
 
     while (SDL_PollEvent(&event)) {
@@ -6364,7 +6429,7 @@ void GFX_Events() {
     GFX_EventsMouse();
 
 #if C_EMSCRIPTEN
-    emscripten_sleep(0);
+    EMSCRIPTEN_Yield_Throttled();
 #endif
 
     while (SDL_PollEvent(&event)) {
@@ -9476,7 +9541,14 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 	LOG_MSG("Prevent capture: %u",preventcap);
 
         /* -- SDL init */
+#if C_EMSCRIPTEN
+        /* Worker build: no AudioContext exists in a Web Worker, so the SDL
+         * audio subsystem cannot initialize. Leave audio to the mixer, which
+         * falls back to nosound mode and the page-side audio pump. */
+        if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER|SDL_INIT_NOPARACHUTE) >= 0)
+#else
         if (SDL_Init(SDL_INIT_AUDIO|SDL_INIT_VIDEO|SDL_INIT_TIMER|SDL_INIT_NOPARACHUTE) >= 0)
+#endif
             sdl.inited = true;
         else
             E_Exit("Can't init SDL %s",SDL_GetError());

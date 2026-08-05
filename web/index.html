@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DOSBox-X (WebAssembly)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #ddd; font: 14px/1.5 -apple-system, system-ui, sans-serif; }
+  header { padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0 12px 0 0; font-weight: 600; }
+  button { background: #2a6df4; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #444; color: #888; cursor: default; }
+  #status { color: #9ab; }
+  #screen { display: block; margin: 0 auto; background: #000; image-rendering: pixelated; outline: none; }
+  #stage { padding: 8px; text-align: center; }
+  /* GPU upscale: emulator renders native-res frames, CSS doubles them */
+  #canvas { image-rendering: pixelated; min-width: 640px; }
+  .note { padding: 4px 16px 12px; color: #778; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DOSBox-X <small>wasm</small></h1>
+  <button id="pickBtn" disabled>Choose folder &amp; start (mounts as C:)</button>
+  <button id="startEmptyBtn" disabled>Start without a folder</button>
+  <button id="syncBtn" disabled hidden>Sync changes back to disk</button>
+  <span id="status">Loading engine…</span>
+  <input id="dirFallback" type="file" webkitdirectory multiple hidden>
+</header>
+<details id="confBox" style="padding:0 16px 8px">
+  <summary style="cursor:pointer;color:#9ab">DOSBox-X configuration (applied at launch)</summary>
+  <textarea id="confText" spellcheck="false"
+    style="width:100%;max-width:720px;height:180px;margin-top:8px;background:#1a1a1a;color:#cde;
+           border:1px solid #333;border-radius:6px;font:12px/1.4 ui-monospace,monospace;padding:8px"></textarea>
+  <div><button id="confReset" style="margin-top:6px;background:#444">Reset to defaults</button></div>
+</details>
+<div id="stage"><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas></div>
+<div class="note">
+  The emulator runs in a Web Worker; this page only draws frames, plays audio and forwards input.
+  The chosen folder is copied into the emulator's filesystem and mounted as C:. In Chromium browsers
+  "Sync changes back to disk" writes the emulator's C: contents back to the real folder. Serve this
+  page over http(s) — file:// will not work.
+</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const pickBtn = document.getElementById('pickBtn');
+const startEmptyBtn = document.getElementById('startEmptyBtn');
+const syncBtn = document.getElementById('syncBtn');
+const dirFallback = document.getElementById('dirFallback');
+const canvas = document.getElementById('canvas');
+const setStatus = t => { statusEl.textContent = t; };
+
+let dirHandle = null;
+let started = false;
+const SKIP_FILE_LIMIT = 256 * 1024 * 1024;
+
+/* ---- editable dosbox-x.conf, persisted across reloads ---- */
+const confText = document.getElementById('confText');
+const DEFAULT_CONF = `[dosbox]
+memsize=63
+
+[cpu]
+core=normal
+# fixed cycles: "max" mis-calibrates in the browser and settles far below
+# what the machine can do. ~120-140k is sustained in real time here; raise it
+# until audio starts to stutter, then back off.
+cycles=100000
+
+[sdl]
+autolock=false
+# the SDL-drawn menu bar costs per-frame work; all settings live in this panel
+showmenu=false
+
+[render]
+# CSS scales the canvas on the GPU for free; the software scaler would
+# quadruple the pixels pushed every frame
+scaler=none
+
+[log]
+sb=false
+`;
+let storedConf = localStorage.getItem('dosbox-x.conf') || DEFAULT_CONF;
+if (!storedConf.includes('[log]')) storedConf += '\n[log]\nsb=false\n';
+if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n/, '[sdl]\nshowmenu=false\n');
+if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
+/* migrate away from cycles=max: its auto-calibration is unreliable under
+ * browser timing and costs a large fraction of attainable speed */
+if (/cycles\s*=\s*max/.test(storedConf)) storedConf = storedConf.replace(/cycles\s*=\s*max.*/g, 'cycles=100000');
+/* 70000 was this page's earlier default before the menu/scaler/yield tuning */
+storedConf = storedConf.replace(/^cycles=70000$/m, 'cycles=100000');
+confText.value = storedConf;
+confText.addEventListener('input', () => localStorage.setItem('dosbox-x.conf', confText.value));
+document.getElementById('confReset').addEventListener('click', () => {
+  confText.value = DEFAULT_CONF;
+  localStorage.setItem('dosbox-x.conf', DEFAULT_CONF);
+});
+
+/* ---- log ring (filled from worker batches); dosboxLog() to inspect ---- */
+const logRing = [];
+window.dosboxLog = (n = 50) => logRing.slice(-n).join('\n');
+
+/* ---- worker ---- */
+const worker = new Worker('worker.js');
+const offscreen = canvas.transferControlToOffscreen();
+worker.postMessage({ type: 'init', canvas: offscreen }, [offscreen]);
+
+let exportResolve = null;
+worker.onmessage = (e) => {
+  const m = e.data;
+  switch (m.type) {
+    case 'ready':
+      setStatus('Engine ready. Pick a folder to mount as C:, or start empty.');
+      pickBtn.disabled = false;
+      startEmptyBtn.disabled = false;
+      break;
+    case 'started': setStatus('Running.'); canvas.focus(); break;
+    case 'status': setStatus(m.text); break;
+    case 'critical': console.warn(m.line); break;
+    case 'log':
+      logRing.push(...m.lines);
+      if (logRing.length > 3000) logRing.splice(0, logRing.length - 2000);
+      break;
+    case 'audioinfo': audioInit(m.freq); break;
+    case 'audio': audioEnqueue(m.buf); break;
+    case 'exported': if (exportResolve) { exportResolve(m.files); exportResolve = null; } break;
+  }
+};
+worker.onerror = (e) => { console.error(e); setStatus('Worker error: ' + (e.message || e)); };
+
+/* ---- audio: AudioWorklet fed by S16 stereo chunks from the worker ---- */
+let audioCtx = null, audioNode = null;
+async function audioInit(freq) {
+  try {
+    audioCtx = new AudioContext({ sampleRate: freq });
+    const src = `
+      class DosboxPlayer extends AudioWorkletProcessor {
+        constructor() { super(); this.queue = []; this.offset = 0; this.port.onmessage = e => {
+          this.queue.push(new Int16Array(e.data));
+          /* cap latency: drop backlog beyond ~150ms */
+          const maxChunks = Math.ceil(sampleRate * 0.15 / 1024);
+          while (this.queue.length > maxChunks) { this.queue.shift(); this.offset = 0; }
+        }; }
+        process(inputs, outputs) {
+          const L = outputs[0][0], R = outputs[0][1] || outputs[0][0];
+          let i = 0;
+          while (i < L.length && this.queue.length) {
+            const q = this.queue[0];
+            const frames = q.length >> 1;
+            while (i < L.length && this.offset < frames) {
+              L[i] = q[this.offset*2] / 32768;
+              R[i] = q[this.offset*2+1] / 32768;
+              i++; this.offset++;
+            }
+            if (this.offset >= frames) { this.queue.shift(); this.offset = 0; }
+          }
+          for (; i < L.length; i++) { L[i] = 0; R[i] = 0; }
+          return true;
+        }
+      }
+      registerProcessor('dosbox-player', DosboxPlayer);`;
+    await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+    audioNode = new AudioWorkletNode(audioCtx, 'dosbox-player', { outputChannelCount: [2] });
+    audioNode.connect(audioCtx.destination);
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (err) { console.warn('audio init failed', err); }
+}
+function audioEnqueue(buf) {
+  if (audioNode) audioNode.port.postMessage(buf, [buf]);
+}
+/* browsers require a gesture before audio can play */
+document.addEventListener('click', () => { if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+
+/* ---- input capture -> worker ---- */
+/* KeyboardEvent.code -> SDL/USB-HID scancode */
+const KEYCODES = { Enter:40, Escape:41, Backspace:42, Tab:43, Space:44, Minus:45, Equal:46,
+  BracketLeft:47, BracketRight:48, Backslash:49, Semicolon:51, Quote:52, Backquote:53, Comma:54,
+  Period:55, Slash:56, CapsLock:57, PrintScreen:70, ScrollLock:71, Pause:72, Insert:73, Home:74,
+  PageUp:75, Delete:76, End:77, PageDown:78, ArrowRight:79, ArrowLeft:80, ArrowDown:81, ArrowUp:82,
+  NumLock:83, NumpadDivide:84, NumpadMultiply:85, NumpadSubtract:86, NumpadAdd:87, NumpadEnter:88,
+  Numpad0:98, NumpadDecimal:99, IntlBackslash:100, ContextMenu:101,
+  ControlLeft:224, ShiftLeft:225, AltLeft:226, MetaLeft:227,
+  ControlRight:228, ShiftRight:229, AltRight:230, MetaRight:231 };
+for (let i = 0; i < 26; i++) KEYCODES['Key' + String.fromCharCode(65 + i)] = 4 + i;
+for (let i = 1; i <= 9; i++) KEYCODES['Digit' + i] = 29 + i;
+KEYCODES['Digit0'] = 39;
+for (let i = 1; i <= 12; i++) KEYCODES['F' + i] = 57 + i;
+for (let i = 1; i <= 9; i++) KEYCODES['Numpad' + i] = 88 + i;
+
+function onKey(e, down) {
+  if (!started) return;
+  const code = KEYCODES[e.code];
+  if (code === undefined) return;
+  e.preventDefault();
+  worker.postMessage({ type: 'key', code, down });
+}
+window.addEventListener('keydown', e => onKey(e, true));
+window.addEventListener('keyup', e => onKey(e, false));
+
+function canvasCoords(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: Math.round((e.clientX - r.left) * (canvas.clientWidth ? (offscreenSize.w / r.width) : 1)),
+    y: Math.round((e.clientY - r.top) * (canvas.clientHeight ? (offscreenSize.h / r.height) : 1)),
+  };
+}
+const offscreenSize = { w: 640, h: 400 };
+canvas.addEventListener('mousemove', e => {
+  if (!started) return;
+  const c = canvasCoords(e);
+  worker.postMessage({ type: 'mousemove', x: c.x, y: c.y, xrel: e.movementX, yrel: e.movementY });
+});
+canvas.addEventListener('mousedown', e => {
+  if (!started) return;
+  canvas.focus();
+  const c = canvasCoords(e);
+  worker.postMessage({ type: 'mousebtn', btn: e.button, down: true, x: c.x, y: c.y });
+});
+canvas.addEventListener('mouseup', e => {
+  if (!started) return;
+  const c = canvasCoords(e);
+  worker.postMessage({ type: 'mousebtn', btn: e.button, down: false, x: c.x, y: c.y });
+});
+
+/* ---- folder import (page side; files are transferred to the worker) ---- */
+async function collectDirHandle(handle, prefix, out, stats) {
+  for await (const [name, entry] of handle.entries()) {
+    const p = prefix + '/' + name;
+    if (entry.kind === 'directory') await collectDirHandle(entry, p, out, stats);
+    else {
+      const file = await entry.getFile();
+      if (file.size > SKIP_FILE_LIMIT) { stats.skipped++; continue; }
+      out.push({ path: p, data: await file.arrayBuffer() });
+      stats.files++; stats.bytes += file.size;
+      if (stats.files % 50 === 0) setStatus(`Importing… ${stats.files} files (${(stats.bytes/1048576).toFixed(1)} MB)`);
+    }
+  }
+}
+
+function startDOSBox(files) {
+  started = true;
+  pickBtn.disabled = true;
+  startEmptyBtn.disabled = true;
+  confText.readOnly = true;
+  const transfers = files ? files.map(f => f.data) : [];
+  worker.postMessage({ type: 'start', conf: confText.value, mount: !!files, files }, transfers);
+}
+
+pickBtn.addEventListener('click', async () => {
+  if (started) return;
+  const stats = { files: 0, bytes: 0, skipped: 0 };
+  try {
+    if (window.showDirectoryPicker) {
+      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' }).catch(async err => {
+        if (err && err.name === 'AbortError') throw err;
+        return window.showDirectoryPicker({ mode: 'read' });
+      });
+      setStatus('Importing folder…');
+      const files = [];
+      await collectDirHandle(dirHandle, '/c', files, stats);
+      setStatus(`Imported ${stats.files} files (${(stats.bytes/1048576).toFixed(1)} MB)` + (stats.skipped ? `, skipped ${stats.skipped} large` : ''));
+      syncBtn.hidden = false;
+      syncBtn.disabled = false;
+      startDOSBox(files);
+      return;
+    }
+    dirFallback.click();
+  } catch (err) {
+    if (err && err.name === 'AbortError') { setStatus('Folder pick cancelled.'); return; }
+    console.error(err);
+    setStatus('Import failed: ' + err);
+  }
+});
+
+dirFallback.addEventListener('change', async () => {
+  if (started || dirFallback.files.length === 0) return;
+  const stats = { files: 0, bytes: 0, skipped: 0 };
+  const files = [];
+  setStatus('Importing folder…');
+  for (const file of dirFallback.files) {
+    const rel = (file.webkitRelativePath || file.name).split('/').slice(1).join('/');
+    if (!rel || file.size > SKIP_FILE_LIMIT) continue;
+    files.push({ path: '/c/' + rel, data: await file.arrayBuffer() });
+    stats.files++; stats.bytes += file.size;
+  }
+  setStatus(`Imported ${stats.files} files (${(stats.bytes/1048576).toFixed(1)} MB)`);
+  startDOSBox(files);
+});
+
+startEmptyBtn.addEventListener('click', () => { if (!started) startDOSBox(null); });
+
+/* ---- sync back to the real folder ---- */
+syncBtn.addEventListener('click', async () => {
+  if (!dirHandle) return;
+  syncBtn.disabled = true;
+  setStatus('Syncing back to disk…');
+  try {
+    const files = await new Promise(res => { exportResolve = res; worker.postMessage({ type: 'export' }); });
+    let count = 0;
+    for (const f of files) {
+      const parts = f.path.replace(/^\/c\//, '').split('/');
+      let dh = dirHandle;
+      for (let i = 0; i < parts.length - 1; i++) dh = await dh.getDirectoryHandle(parts[i], { create: true });
+      const fh = await dh.getFileHandle(parts[parts.length - 1], { create: true });
+      const w = await fh.createWritable();
+      await w.write(f.data);
+      await w.close();
+      count++;
+    }
+    setStatus(`Synced ${count} files back to the real folder.`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Sync failed: ' + err);
+  }
+  syncBtn.disabled = false;
+});
+</script>
+</body>
+</html>

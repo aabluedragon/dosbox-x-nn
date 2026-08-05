@@ -879,6 +879,29 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
     }
 }
 
+#if C_EMSCRIPTEN
+#include <emscripten.h>
+/* Worker build: there is no AudioContext in a Web Worker, so SDL audio is
+ * unavailable and the mixer runs in nosound mode (MIXER_Mix keeps rendering
+ * into the circular buffer). The page thread plays audio instead: the worker
+ * glue pulls interleaved S16 stereo frames here and posts them to an
+ * AudioWorklet. Pulling through MIXER_CallBack drains the buffer exactly the
+ * way the SDL callback would. */
+extern "C" {
+EMSCRIPTEN_KEEPALIVE int EMWORKER_PullAudio(int16_t *out, int frames) {
+    MIXER_CallBack(NULL, (Uint8*)out, frames * (int)MIXER_SSIZE);
+    return frames;
+}
+EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioFreq(void) {
+    return (int)mixer.freq;
+}
+EMSCRIPTEN_KEEPALIVE int16_t* EMWORKER_AudioBuffer(void) {
+    static int16_t buf[8192]; /* up to 4096 stereo frames per pull */
+    return buf;
+}
+}
+#endif
+
 std::string mixerinfo() {
     std::string info="Channel  Main    Main(dB)\n";
     char str[100];
