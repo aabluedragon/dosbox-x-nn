@@ -78,6 +78,7 @@
 #include "pci_bus.h"
 #include "parport.h"
 #include "keyboard.h"
+#include "inputnet.h"
 #include "clockdomain.h"
 
 #if __APPLE__ && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
@@ -563,6 +564,28 @@ static Bitu Normal_Loop(void) {
 	return 0;
 }
 
+/* Apply a new emulated CPU speed right now. */
+void DOSBOX_ApplyCycleMax(cpu_cycles_count_t newmax,bool reset_counters) {
+    RDTSC_rebase();
+    CPU_CycleMax = newmax;
+    if (reset_counters) { CPU_CycleLeft = 0; CPU_Cycles = 0; }
+}
+
+/* The single place the automatic cycle guessing changes the emulated CPU speed.
+ *
+ * While a shared input session is running the speed is not ours alone to
+ * change: every participant has to execute the same number of cycles per
+ * emulated millisecond, or the emulated machines drift apart even though they
+ * are fed identical input. The shared input layer therefore takes the value,
+ * distributes it, and applies it on every participant at the same emulated
+ * time. Returns true if the new speed was applied here and now. */
+bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters) {
+    if (INPUTNET_ProposeCycleMax((uint32_t)newmax,reset_counters)) return false;
+
+    DOSBOX_ApplyCycleMax(newmax,reset_counters);
+    return true;
+}
+
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;
@@ -690,12 +713,12 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
                has taken place are most likely caused by heavy load through a
                different application, the cycles adjusting is skipped as well */
             if ((ratio > 120) || (ticksDone < 700)) {
-                RDTSC_rebase();
-                CPU_CycleMax = new_cmax;
+                cpu_cycles_count_t want = (cpu_cycles_count_t)new_cmax;
                 if (CPU_CycleLimit > 0) {
-                    if (CPU_CycleMax > CPU_CycleLimit) CPU_CycleMax = CPU_CycleLimit;
+                    if (want > CPU_CycleLimit) want = CPU_CycleLimit;
                 }
-                else if (CPU_CycleMax > 2000000) CPU_CycleMax = 2000000; //Hardcoded limit, if no limit was specified.
+                else if (want > 2000000) want = 2000000; //Hardcoded limit, if no limit was specified.
+                DOSBOX_SetCycleMax(want,false);
             }
         }
 
@@ -710,10 +733,10 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         /* ticksAdded > 15 but ticksScheduled < 5, lower the cycles
            but do not reset the scheduled/done ticks to take them into
            account during the next auto cycle adjustment */
-        RDTSC_rebase();
-        CPU_CycleMax /= 3;
-        if (CPU_CycleMax < CPU_CYCLES_LOWER_LIMIT)
-            CPU_CycleMax = CPU_CYCLES_LOWER_LIMIT;
+        cpu_cycles_count_t want = CPU_CycleMax / 3;
+        if (want < CPU_CYCLES_LOWER_LIMIT)
+            want = CPU_CYCLES_LOWER_LIMIT;
+        DOSBOX_SetCycleMax(want,false);
     }
 }
 
@@ -5147,6 +5170,83 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool = secprop->Add_bool("ipx",Property::Changeable::WhenIdle, false);
     Pbool->Set_help("Enable ipx over UDP/IP emulation.");
     Pbool->SetBasic(true);
+
+    const char* inputnetcyclesync[] = { "auto", "freeze", "off", 0 };
+
+    secprop=control->AddSection_prop("inputnet",&Null_Init,true);
+    Pbool = secprop->Add_bool("inputnet",Property::Changeable::WhenIdle, false);
+    Pbool->Set_help("Enable shared keyboard/mouse input over UDP between DOSBox-X sessions.\n"
+                    "This makes DOS games that only support two players on one PC (two sets of keys on the\n"
+                    "same keyboard, no IPX or serial multiplayer) playable over a network: the participating\n"
+                    "DOSBox-X sessions run the same machine in lockstep and every session receives the input\n"
+                    "of every player. Only emulator state and input are exchanged, never video.\n"
+                    "Once enabled, use the INPUTNET command to host or join a session.\n"
+                    "All participating sessions must run the same DOSBox-X version and the same configuration.\n"
+                    "The emulated CPU speed is synchronized as well, so \"cycles=max\" and \"cycles=auto\" can be\n"
+                    "used; see the \"cycle sync\" option below.");
+    Pbool->SetBasic(true);
+
+    Pint = secprop->Add_int("port",Property::Changeable::WhenIdle, 2130);
+    Pint->Set_help("Default UDP port used by the INPUTNET command.");
+
+    Pstring = secprop->Add_string("startserver",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("If set to a port number, host a shared input session on that port when DOSBox-X starts.\n"
+                      "The command line option -inputnet-server takes precedence over this setting.");
+
+    Pstring = secprop->Add_string("connect",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("If set to \"address\" or \"address:port\", join the shared input session hosted there when\n"
+                      "DOSBox-X starts. The command line option -inputnet-connect takes precedence over this setting.");
+
+    Pint = secprop->Add_int("frame",Property::Changeable::WhenIdle, 10);
+    Pint->Set_help("Length in emulated milliseconds of one shared input frame. Input is exchanged, and the\n"
+                   "sessions synchronize with each other, once per frame. Smaller values synchronize more\n"
+                   "tightly at the cost of more network packets. Valid range is 1 to 100.");
+
+    Pint = secprop->Add_int("delay",Property::Changeable::WhenIdle, 3);
+    Pint->Set_help("Number of frames local input is delayed by before it is applied, so that it can reach the\n"
+                   "other sessions in time. This must cover the network latency between the sessions or the\n"
+                   "emulation will stutter: frame*delay milliseconds should exceed the round trip time.\n"
+                   "Valid range is 1 to 64.");
+
+    Pint = secprop->Add_int("redundancy",Property::Changeable::WhenIdle, 4);
+    Pint->Set_help("Number of past input frames repeated in every packet, so that a lost UDP datagram does not\n"
+                   "stall the session. Valid range is 1 to 32.");
+
+    Pint = secprop->Add_int("timeout",Property::Changeable::WhenIdle, 10000);
+    Pint->Set_help("How long in milliseconds to wait for an unresponsive participant before ending the session.");
+
+    Pbool = secprop->Add_bool("share keyboard",Property::Changeable::WhenIdle, true);
+    Pbool->Set_help("Share keyboard input between the participating DOSBox-X sessions.");
+
+    Pbool = secprop->Add_bool("share mouse",Property::Changeable::WhenIdle, true);
+    Pbool->Set_help("Share mouse input between the participating DOSBox-X sessions. Turn this off for games\n"
+                    "where only the keyboard is used, so that each player keeps their own mouse pointer.");
+
+    Pstring = secprop->Add_string("cycle sync",Property::Changeable::WhenIdle, "auto");
+    Pstring->Set_values(inputnetcyclesync);
+    Pstring->Set_help("How the emulated CPU speed is kept identical across the participating sessions, which is\n"
+                      "required for them to stay in sync.\n"
+                      "  auto:   the server owns the cycle count and publishes every change to the others, which\n"
+                      "          they apply at the same emulated time. This is what makes \"cycles=max\" and\n"
+                      "          \"cycles=auto\" usable: the automatic guessing keeps working, and because the\n"
+                      "          sessions run in lockstep it settles on a speed the slowest participant can\n"
+                      "          keep up with.\n"
+                      "  freeze: the cycle count is locked to the server's value for the whole session and is\n"
+                      "          never adjusted. The most predictable option, but the emulated speed will not\n"
+                      "          adapt to the host machines.\n"
+                      "  off:    do not manage the cycle count at all. Only safe with a fixed \"cycles\" value\n"
+                      "          that is identical in every session.");
+
+    Pint = secprop->Add_int("desync check",Property::Changeable::WhenIdle, 100);
+    Pint->Set_help("How often, in shared input frames, to compare a checksum of the emulated machine with the\n"
+                   "other participants, so that a loss of synchronization is reported instead of silently\n"
+                   "ruining the game. Set to 0 to disable the check. Each check hashes the CPU registers and\n"
+                   "conventional memory, which costs about a millisecond.");
+
+    Pbool = secprop->Add_bool("sync state",Property::Changeable::WhenIdle, true);
+    Pbool->Set_help("Hand the complete emulator state of the server over to a session when it joins, so that\n"
+                    "both machines start out identical. Turn this off only if the sessions are already known\n"
+                    "to be in exactly the same state.");
 
     secprop=control->AddSection_prop("ne2000",&Null_Init,true);
     Pbool = secprop->Add_bool("ne2000", Property::Changeable::WhenIdle, false);

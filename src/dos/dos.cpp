@@ -4126,6 +4126,7 @@ static Bitu DOS_29Handler(void)
 
 void AddBPINT3(void);
 void IPX_Setup(Section*);
+void INPUTNET_Setup(Section*);
 void DOS_SetupIHSEG(void);
 void DOS_CreateDummyDeviceMCB(void);
 void DOS_MemStartChange(uint16_t adjto);
@@ -4772,6 +4773,8 @@ public:
 #if C_IPX
 		IPX_Setup(NULL);
 #endif
+
+		INPUTNET_Setup(NULL);
 
 		DOS_SetupPrograms();
 		DOS_SetupMisc();							/* Some additional dos interrupts */

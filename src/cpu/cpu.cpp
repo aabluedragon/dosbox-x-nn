@@ -24,6 +24,7 @@
 #include "cpu.h"
 #include "debug.h"
 #include "mapper.h"
+#include "inputnet.h"
 #include "paging.h"
 #include "callback.h"
 #include "lazyflags.h"
@@ -3330,8 +3331,19 @@ void CPU_SyncCycleMaxToProp(void) {
     prop->SetValue(tmp);
 }
 
+/* Changing the emulated CPU speed by hand would only change it here, on this
+ * one machine, and the participants of a shared input session must all run at
+ * the same speed. Leave the session first (the state is picked up again on
+ * reconnect) if the speed needs adjusting. */
+static bool CPU_CycleChangeBlocked(void) {
+	if (!inputnet_capture_active) return false;
+	LOG_MSG("CPU: the cycle count cannot be changed while a shared input session is running.");
+	return true;
+}
+
 void CPU_CycleIncrease(bool pressed) {
 	if (!pressed) return;
+	if (CPU_CycleChangeBlocked()) return;
 
 	if (CPU_CycleAutoAdjust) {
 		CPU_CyclePercUsed+=5;
@@ -3368,6 +3380,7 @@ void CPU_CycleIncrease(bool pressed) {
 
 void CPU_CycleDecrease(bool pressed) {
 	if (!pressed) return;
+	if (CPU_CycleChangeBlocked()) return;
 	if (CPU_CycleAutoAdjust) {
 		CPU_CyclePercUsed-=5;
 		if (CPU_CyclePercUsed<=0) CPU_CyclePercUsed=1;
@@ -3397,6 +3410,7 @@ void CPU_CycleDecrease(bool pressed) {
 }
 
 static void CPU_ToggleAutoCycles(bool pressed) {
+    if (pressed && CPU_CycleChangeBlocked()) return;
     if (!pressed)
         return;
 
@@ -3462,10 +3476,14 @@ static void CPU_ToggleDynamicCore(bool pressed) {
 
 void CPU_Enable_SkipAutoAdjust(void) {
 	if (CPU_CycleAutoAdjust) {
-		RDTSC_rebase();
-		CPU_CycleMax /= 2;
-		if (CPU_CycleMax < CPU_CYCLES_LOWER_LIMIT)
-			CPU_CycleMax = CPU_CYCLES_LOWER_LIMIT;
+		/* Losing the window focus is a local event: without routing this through
+		 * DOSBOX_SetCycleMax(), one participant of a shared input session
+		 * alt-tabbing away would halve only its own emulated CPU speed and the
+		 * machines would immediately drift apart. */
+		cpu_cycles_count_t want = CPU_CycleMax / 2;
+		if (want < CPU_CYCLES_LOWER_LIMIT)
+			want = CPU_CYCLES_LOWER_LIMIT;
+		DOSBOX_SetCycleMax(want,false);
 	}
 	CPU_SkipCycleAutoAdjust=true;
 }
