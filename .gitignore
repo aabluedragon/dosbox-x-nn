@@ -141,3 +141,8 @@ contrib/macos/dosbox-x.plist
 # ignore default dosbox config files (used for manual testing)
 /dosbox-x.conf
 /src/dosbox-x.conf
+web/duke/
+web/dosbox-x.js
+web/dosbox-x.wasm
+web/bench-*.html
+web/*-backup/

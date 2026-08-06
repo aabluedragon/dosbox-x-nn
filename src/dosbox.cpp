@@ -681,7 +681,15 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > TICKS_GAP_PANIC && ticksScheduled >= 5)) {
         if (ticksDone < 1) ticksDone = 1; // Protect against div by zero
         /* ratio we are aiming for is around 90% usage*/
+#if C_EMSCRIPTEN
+        /* Aim closer to full host utilisation than the stock 90%: in a worker
+         * there is no other work competing for this thread, and profiling a
+         * game showed ~14% of the host sitting idle that the emulated machine
+         * could have used. */
+        int32_t ratio = (int32_t)((ticksScheduled * (CPU_CyclePercUsed * 97 * 1024 / 100 / 100)) / ticksDone);
+#else
         int32_t ratio = (int32_t)((ticksScheduled * (CPU_CyclePercUsed * 90 * 1024 / 100 / 100)) / ticksDone);
+#endif
         int32_t new_cmax = (int32_t)CPU_CycleMax;
         int64_t cproc = (int64_t)CPU_CycleMax * (int64_t)ticksScheduled;
         if (cproc > 0) {
@@ -755,8 +763,10 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
                     if (want > CPU_CycleLimit) want = CPU_CycleLimit;
                 }
 #if C_EMSCRIPTEN
-                /* keep one slice short enough to stay inside a frame */
-                else if (want > 400000) want = 400000;
+                /* Slices stay short because long string ops now chunk
+                 * themselves; this ceiling only guards against the guess
+                 * running away entirely. */
+                else if (want > 1500000) want = 1500000;
 #else
                 else if (want > 2000000) want = 2000000; //Hardcoded limit, if no limit was specified.
 #endif
