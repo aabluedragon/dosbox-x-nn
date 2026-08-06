@@ -162,6 +162,29 @@ bool DRC_CALL_CONV mem_readd_checked_drc(PhysPt address) DRC_FC;
 bool DRC_CALL_CONV mem_writeb_checked_drc(PhysPt address,uint8_t val) DRC_FC;
 bool DRC_CALL_CONV mem_writew_checked_drc(PhysPt address,uint16_t val) DRC_FC;
 bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,uint32_t val) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_cf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_ncf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_zf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_nzf(void) DRC_FC;
+
+/* Width mask per lazy flag type for the zero flag: get_ZF() returns
+ * lf_res<width>==0 for exactly these types, so a zero entry means "not ours,
+ * call the helper". Transcribed from the case lists in flags.cpp - the word
+ * and dword groups include the double shifts, the byte group does not. */
+static const uint32_t drc_zf_mask[t_LASTFLAG] = {
+    [t_ADDb]=0xFFu,[t_ORb]=0xFFu,[t_ADCb]=0xFFu,[t_SBBb]=0xFFu,[t_ANDb]=0xFFu,
+    [t_XORb]=0xFFu,[t_SUBb]=0xFFu,[t_CMPb]=0xFFu,[t_INCb]=0xFFu,[t_DECb]=0xFFu,
+    [t_TESTb]=0xFFu,[t_SHLb]=0xFFu,[t_SHRb]=0xFFu,[t_SARb]=0xFFu,[t_NEGb]=0xFFu,
+    [t_ADDw]=0xFFFFu,[t_ORw]=0xFFFFu,[t_ADCw]=0xFFFFu,[t_SBBw]=0xFFFFu,[t_ANDw]=0xFFFFu,
+    [t_XORw]=0xFFFFu,[t_SUBw]=0xFFFFu,[t_CMPw]=0xFFFFu,[t_INCw]=0xFFFFu,[t_DECw]=0xFFFFu,
+    [t_TESTw]=0xFFFFu,[t_SHLw]=0xFFFFu,[t_SHRw]=0xFFFFu,[t_SARw]=0xFFFFu,
+    [t_DSHLw]=0xFFFFu,[t_DSHRw]=0xFFFFu,[t_NEGw]=0xFFFFu,
+    [t_ADDd]=0xFFFFFFFFu,[t_ORd]=0xFFFFFFFFu,[t_ADCd]=0xFFFFFFFFu,[t_SBBd]=0xFFFFFFFFu,
+    [t_ANDd]=0xFFFFFFFFu,[t_XORd]=0xFFFFFFFFu,[t_SUBd]=0xFFFFFFFFu,[t_CMPd]=0xFFFFFFFFu,
+    [t_INCd]=0xFFFFFFFFu,[t_DECd]=0xFFFFFFFFu,[t_TESTd]=0xFFFFFFFFu,[t_SHLd]=0xFFFFFFFFu,
+    [t_SHRd]=0xFFFFFFFFu,[t_SARd]=0xFFFFFFFFu,[t_DSHLd]=0xFFFFFFFFu,[t_DSHRd]=0xFFFFFFFFu,
+    [t_NEGd]=0xFFFFFFFFu,
+};
 
 /* ------------------------------------------------------------------ */
 /* gen_* emitter interface                                             */
@@ -502,6 +525,74 @@ static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
     return true;
 }
 
+/* Inline the carry-flag read. For a compare or subtract - what a branch is
+ * almost always testing - flags.cpp computes carry as an unsigned comparison
+ * of the two operands, so that is what we emit; every other flag type still
+ * calls the helper. */
+static bool drc_emit_cf_inline(uint32_t target, unsigned import_slot) {
+    bool negate;
+    if      (target == (uint32_t)(uintptr_t)dynrec_get_cf)  negate = false;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_ncf) negate = true;
+    else return false;
+
+    const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
+    const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
+    const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
+    struct { int type; uint32_t mask; } const cases[] = {
+        { t_CMPd, 0xFFFFFFFFu }, { t_SUBd, 0xFFFFFFFFu },
+        { t_CMPw, 0x0000FFFFu }, { t_SUBw, 0x0000FFFFu },
+        { t_CMPb, 0x000000FFu }, { t_SUBb, 0x000000FFu },
+    };
+    drc_iconst(a_type); drc_load32(); drc_setl(DRC_LOCAL_SCRATCH);
+    for (unsigned i = 0; i < 6; i++) {
+        drc_getl(DRC_LOCAL_SCRATCH);
+        drc_iconst((uint32_t)cases[i].type); drc_b(0x46);
+        drc_b(0x04); drc_b(0x7F);
+        drc_iconst(a_var1); drc_load32();
+        if (cases[i].mask != 0xFFFFFFFFu) { drc_iconst(cases[i].mask); drc_b(0x71); }
+        drc_iconst(a_var2); drc_load32();
+        if (cases[i].mask != 0xFFFFFFFFu) { drc_iconst(cases[i].mask); drc_b(0x71); }
+        drc_b(0x49);
+        if (negate) drc_b(0x45);
+        drc_b(0x05);
+    }
+    drc_b(0x10); drc_uleb(import_slot);
+    for (unsigned i = 0; i < 6; i++) drc_b(0x0B);
+    drc_setl(FC_RETOP);
+    return true;
+}
+
+/* Inline the zero-flag read the conditional branches use: get_ZF() is just
+ * "the result was zero" at the operand width for every type in drc_zf_mask.
+ * A zero entry (t_UNKNOWN, rotates, mul/div) falls back to the helper. */
+static bool drc_emit_zf_inline(uint32_t target, unsigned import_slot) {
+    bool negate;
+    if      (target == (uint32_t)(uintptr_t)dynrec_get_zf)  negate = false;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_nzf) negate = true;
+    else return false;
+
+    const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
+    const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
+    const uint32_t a_mask = (uint32_t)(uintptr_t)&drc_zf_mask[0];
+
+    drc_iconst(a_type); drc_load32();
+    drc_iconst(2); drc_b(0x74);
+    drc_iconst(a_mask); drc_b(0x6A);
+    drc_load32();
+    drc_teel(DRC_LOCAL_SCRATCH);
+    drc_b(0x04); drc_b(0x40);
+    drc_iconst(a_res); drc_load32();
+    drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71);
+    drc_b(0x45);
+    if (negate) drc_b(0x45);
+    drc_setl(FC_RETOP);
+    drc_b(0x05);
+    drc_b(0x10); drc_uleb(import_slot);
+    drc_setl(FC_RETOP);
+    drc_b(0x0B);
+    return true;
+}
+
 /* translate the IR in [start,end) and hand it to the JS compiler.
  * returns the tagged xstart value (DRC_XSTART_TAG on failure keeps idx 0). */
 static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
@@ -707,6 +798,8 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     for (unsigned i = 0; i < ncalls; i++) if (calls[i] == r->x) { slot = i; found = true; break; }
                     if (!found) { drc_note_bail(5); return DRC_XSTART_TAG; }
                     if (drc_emit_mem_inline(r->x, slot)) { DRC_FORGET_ALL(); break; }
+                    if (drc_emit_zf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
