@@ -2,6 +2,15 @@
  * worker; the page thread owns input capture, audio playback and displays the
  * transferred OffscreenCanvas that SDL draws into. */
 
+/* heartbeat: if these timestamps show a gap, the worker's event loop was
+ * blocked; if they are even while frames are late, the emulator simply did
+ * not present. */
+self.__beats = [];
+setInterval(() => {
+  self.__beats.push(performance.now());
+  if (self.__beats.length > 4000) self.__beats.splice(0, 2000);
+}, 5);
+
 let logBatch = [];
 function ringLog(t) {
   logBatch.push(t);
@@ -136,7 +145,8 @@ onmessage = (e) => {
       postMessage({ type: 'stats', compiled: Module.__drcCount || 0,
                     failed: Module.__drcFail || 0, bail: Module.__drcBail || {}, ms: Module.__drcTime || 0,
                     frames: (self.__frameTimes || []).slice(),
-                    events: (Module.__drcEvents || []).slice() });
+                    events: (Module.__drcEvents || []).slice(),
+                    beats: (self.__beats || []).slice() });
       break;
 
     case 'export': {
