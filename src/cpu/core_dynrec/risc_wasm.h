@@ -555,6 +555,94 @@ static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
     return true;
 }
 
+static uint8_t DRC_CALL_CONV dynrec_add_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_add_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_add_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t DRC_CALL_CONV dynrec_sub_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_sub_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_sub_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t DRC_CALL_CONV dynrec_and_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_and_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_and_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t DRC_CALL_CONV dynrec_or_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_or_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_or_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t DRC_CALL_CONV dynrec_xor_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_xor_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_xor_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_cmp_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_cmp_word(uint16_t op1,uint16_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_cmp_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_test_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_test_word(uint16_t op1,uint16_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_test_dword(uint32_t op1,uint32_t op2) DRC_FC;
+
+/* The flag-setting arithmetic helpers all have one shape:
+ *     lf_var1 = op1;  lf_var2 = op2;
+ *     lf_res  = op1 <operator> op2;  lflags.type = <type>;
+ * (returning the result, except compare and test). That is four stores, so
+ * calling out for it costs more than doing it. Operands are masked to the
+ * operand width first because the C reads the truncated values back out of
+ * the union before computing. */
+struct DrcFlagOp { uint32_t fn; uint32_t mask; uint8_t wasmop; int type; bool hasret; };
+static const DrcFlagOp drc_flag_ops[] = {
+  { (uint32_t)(uintptr_t)dynrec_add_byte, 0xFFu, 0x6A, t_ADDb, true },
+  { (uint32_t)(uintptr_t)dynrec_add_word, 0xFFFFu, 0x6A, t_ADDw, true },
+  { (uint32_t)(uintptr_t)dynrec_add_dword, 0xFFFFFFFFu, 0x6A, t_ADDd, true },
+  { (uint32_t)(uintptr_t)dynrec_sub_byte, 0xFFu, 0x6B, t_SUBb, true },
+  { (uint32_t)(uintptr_t)dynrec_sub_word, 0xFFFFu, 0x6B, t_SUBw, true },
+  { (uint32_t)(uintptr_t)dynrec_sub_dword, 0xFFFFFFFFu, 0x6B, t_SUBd, true },
+  { (uint32_t)(uintptr_t)dynrec_and_byte, 0xFFu, 0x71, t_ANDb, true },
+  { (uint32_t)(uintptr_t)dynrec_and_word, 0xFFFFu, 0x71, t_ANDw, true },
+  { (uint32_t)(uintptr_t)dynrec_and_dword, 0xFFFFFFFFu, 0x71, t_ANDd, true },
+  { (uint32_t)(uintptr_t)dynrec_or_byte, 0xFFu, 0x72, t_ORb, true },
+  { (uint32_t)(uintptr_t)dynrec_or_word, 0xFFFFu, 0x72, t_ORw, true },
+  { (uint32_t)(uintptr_t)dynrec_or_dword, 0xFFFFFFFFu, 0x72, t_ORd, true },
+  { (uint32_t)(uintptr_t)dynrec_xor_byte, 0xFFu, 0x73, t_XORb, true },
+  { (uint32_t)(uintptr_t)dynrec_xor_word, 0xFFFFu, 0x73, t_XORw, true },
+  { (uint32_t)(uintptr_t)dynrec_xor_dword, 0xFFFFFFFFu, 0x73, t_XORd, true },
+  { (uint32_t)(uintptr_t)dynrec_cmp_byte, 0xFFu, 0x6B, t_CMPb, false },
+  { (uint32_t)(uintptr_t)dynrec_cmp_word, 0xFFFFu, 0x6B, t_CMPw, false },
+  { (uint32_t)(uintptr_t)dynrec_cmp_dword, 0xFFFFFFFFu, 0x6B, t_CMPd, false },
+  { (uint32_t)(uintptr_t)dynrec_test_byte, 0xFFu, 0x71, t_TESTb, false },
+  { (uint32_t)(uintptr_t)dynrec_test_word, 0xFFFFu, 0x71, t_TESTw, false },
+  { (uint32_t)(uintptr_t)dynrec_test_dword, 0xFFFFFFFFu, 0x71, t_TESTd, false },
+};
+
+static bool drc_emit_flagop_inline(uint32_t target, unsigned import_slot) {
+    const DrcFlagOp* f = NULL;
+    for (unsigned i = 0; i < sizeof(drc_flag_ops)/sizeof(drc_flag_ops[0]); i++)
+        if (drc_flag_ops[i].fn == target) { f = &drc_flag_ops[i]; break; }
+    if (f == NULL) return false;
+    (void)import_slot;   /* fully inlined, the helper is never needed */
+
+    drc_used_extra_locals = true;
+    const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
+    const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
+    const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
+    const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
+    const bool narrow = (f->mask != 0xFFFFFFFFu);
+
+    /* v1 = op1 & mask, v2 = op2 & mask */
+    drc_getl(FC_OP1); if (narrow) { drc_iconst(f->mask); drc_b(0x71); } drc_setl(DRC_LOCAL_V1);
+    drc_getl(FC_OP2); if (narrow) { drc_iconst(f->mask); drc_b(0x71); } drc_setl(DRC_LOCAL_V2);
+    /* res = (v1 op v2) & mask */
+    drc_getl(DRC_LOCAL_V1); drc_getl(DRC_LOCAL_V2); drc_b(f->wasmop);
+    if (narrow) { drc_iconst(f->mask); drc_b(0x71); }
+    drc_setl(DRC_LOCAL_RES);
+
+    drc_iconst(a_var1); drc_getl(DRC_LOCAL_V1);
+    if (f->mask == 0xFFu) drc_store8(); else if (f->mask == 0xFFFFu) drc_store16(); else drc_store32();
+    drc_iconst(a_var2); drc_getl(DRC_LOCAL_V2);
+    if (f->mask == 0xFFu) drc_store8(); else if (f->mask == 0xFFFFu) drc_store16(); else drc_store32();
+    drc_iconst(a_res);  drc_getl(DRC_LOCAL_RES);
+    if (f->mask == 0xFFu) drc_store8(); else if (f->mask == 0xFFFFu) drc_store16(); else drc_store32();
+    drc_iconst(a_type); drc_iconst((uint32_t)f->type); drc_store32();
+
+    if (f->hasret) { drc_getl(DRC_LOCAL_RES); drc_setl(FC_RETOP); }
+    return true;
+}
+
 /* Inline add-with-carry and subtract-with-borrow. These are only a sum plus
  * the carry flag - "op1 + op2 + CF" and "op1 - (op2 + CF)" - and they were the
  * single largest consumer of get_CF in a game profile. The carry comes from
@@ -966,6 +1054,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_adcsbb_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_flagop_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
