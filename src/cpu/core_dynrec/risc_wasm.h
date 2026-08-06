@@ -118,7 +118,11 @@ EM_JS(int, drc_wasm_compile, (const uint8_t* bytes, int len), {
         }
         wasmTable.set(idx, inst.exports.f);
         Module.__drcCount = (Module.__drcCount || 0) + 1;
-        Module.__drcTime = (Module.__drcTime || 0) + (performance.now() - t0);
+        const dt = performance.now() - t0;
+        Module.__drcTime = (Module.__drcTime || 0) + dt;
+        if (!Module.__drcEvents) Module.__drcEvents = [];
+        Module.__drcEvents.push(t0, dt);
+        if (Module.__drcEvents.length > 4000) Module.__drcEvents.splice(0, 2000);
         return idx;
     } catch (e) {
         Module.__drcFail = (Module.__drcFail || 0) + 1;

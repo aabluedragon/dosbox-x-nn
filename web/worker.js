@@ -67,6 +67,18 @@ onmessage = (e) => {
   switch (m.type) {
     case 'init':
       Module.canvas = m.canvas; /* OffscreenCanvas transferred from the page */
+      /* frame-pacing probe: record when the emulator actually presents a frame */
+      try {
+        const proto = self.OffscreenCanvasRenderingContext2D.prototype;
+        const orig = proto.putImageData;
+        self.__frameTimes = [];
+        proto.putImageData = function (...a) {
+          const t = performance.now();
+          self.__frameTimes.push(t);
+          if (self.__frameTimes.length > 600) self.__frameTimes.shift();
+          return orig.apply(this, a);
+        };
+      } catch (e) { /* probe is optional */ }
       /* html5 library helpers expect an HTMLCanvasElement */
       m.canvas.getBoundingClientRect = () => ({ x: 0, y: 0, left: 0, top: 0,
         width: m.canvas.width, height: m.canvas.height,
@@ -122,7 +134,9 @@ onmessage = (e) => {
 
     case 'stats':
       postMessage({ type: 'stats', compiled: Module.__drcCount || 0,
-                    failed: Module.__drcFail || 0, bail: Module.__drcBail || {}, ms: Module.__drcTime || 0 });
+                    failed: Module.__drcFail || 0, bail: Module.__drcBail || {}, ms: Module.__drcTime || 0,
+                    frames: (self.__frameTimes || []).slice(),
+                    events: (Module.__drcEvents || []).slice() });
       break;
 
     case 'export': {

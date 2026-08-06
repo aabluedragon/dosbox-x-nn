@@ -659,9 +659,19 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
     ticksLast = ticksNew;
     ticksDone += (int32_t)ticksRemain;
+#if C_EMSCRIPTEN
+    /* Browser: catching up several milliseconds in one uninterrupted slice
+     * means that many milliseconds with no frame presented and no chance to
+     * yield, which is visible as stutter. The faster the core, the worse it
+     * gets, so keep the catch-up window short. */
+    if (ticksRemain > 4) {
+        ticksRemain = 4;
+    }
+#else
     if (ticksRemain > 20) {
         ticksRemain = 20;
     }
+#endif
     ticksAdded = ticksRemain;
 
     // Is the system in auto cycle mode guessing? If not just exit. (It can be temporarily disabled)
@@ -707,6 +717,21 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
             }
         }
 
+#if C_EMSCRIPTEN
+        /* Browser: the guessed speed is allowed to move only a fraction per
+         * adjustment. Host timing here is noisy enough (and the recompiling
+         * core fast enough) that the unclamped guess swings widely between
+         * adjustments, and a machine that keeps changing speed reads as
+         * stutter even when the average throughput is high. Ramping instead
+         * keeps the emulated speed steady. */
+        {
+            const int32_t cur = (int32_t)CPU_CycleMax;
+            const int32_t step = (cur >> 3) + 1000;      /* ~12.5% per 250ms */
+            if (new_cmax > cur + step) new_cmax = cur + step;
+            if (new_cmax < cur - step) new_cmax = cur - step;
+        }
+#endif
+
         if (new_cmax < CPU_CYCLES_LOWER_LIMIT)
             new_cmax = CPU_CYCLES_LOWER_LIMIT;
 
@@ -729,7 +754,12 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
                 if (CPU_CycleLimit > 0) {
                     if (want > CPU_CycleLimit) want = CPU_CycleLimit;
                 }
+#if C_EMSCRIPTEN
+                /* keep one slice short enough to stay inside a frame */
+                else if (want > 400000) want = 400000;
+#else
                 else if (want > 2000000) want = 2000000; //Hardcoded limit, if no limit was specified.
+#endif
                 DOSBOX_SetCycleMax(want,false);
             }
         }

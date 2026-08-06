@@ -273,9 +273,10 @@ void EMSCRIPTEN_Yield_Throttled(void) {
     static double last_yield = 0;
     static double last_timer_yield = 0;
     const double now = emscripten_get_now();
-    /* 16ms cadence (~60fps): js-dos ships 24ms; suspending less often keeps
-     * more time in the emulator while input latency stays a frame or less */
-    if ((now - last_yield) >= 16.0) {
+    /* 5ms cadence: fine-grained yielding keeps frame production even (coarse
+     * chunks beat against the compositor and read as stutter). The recompiling
+     * core has the throughput headroom to pay for the extra suspensions. */
+    if ((now - last_yield) >= 5.0) {
         last_yield = now;
         if ((now - last_timer_yield) >= 100.0) {
             last_timer_yield = now;

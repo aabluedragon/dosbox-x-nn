@@ -61,11 +61,9 @@ const DEFAULT_CONF = `[dosbox]
 memsize=63
 
 [cpu]
-# core=dynamic enables the experimental WebAssembly recompiler. It is about
-# 2x the raw speed of the interpreter, but the emulated speed then swings more
-# under cycles=max, which can feel like jitter in games. Pair it with a fixed
-# cycles value (e.g. cycles=150000) rather than max.
-core=normal
+# WebAssembly recompiler (~2x the interpreter). core=normal falls back to the
+# plain interpreter if a game misbehaves.
+core=dynamic
 # "max" adapts the emulated CPU speed to the host. If a game feels uneven,
 # a fixed value (e.g. cycles=100000) is the predictable alternative.
 cycles=max
@@ -89,7 +87,7 @@ if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n
 if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
 /* earlier page defaults; cycles=max works now that the emulator's gap-panic
  * paths are disabled for the browser build */
-storedConf = storedConf.replace(/^core=(auto|dynamic)$/m, 'core=normal'); /* JIT is opt-in while its pacing is tuned */
+storedConf = storedConf.replace(/^core=(auto|normal)$/m, 'core=dynamic');
 storedConf = storedConf.replace(/^cycles=(70000|100000)$/m, 'cycles=max');
 confText.value = storedConf;
 confText.addEventListener('input', () => localStorage.setItem('dosbox-x.conf', confText.value));
