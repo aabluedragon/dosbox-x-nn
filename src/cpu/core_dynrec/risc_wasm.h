@@ -57,6 +57,9 @@ typedef uint8_t HostReg;
 #define DRC_LOCAL_V2      10
 #define DRC_LOCAL_RES     11
 #define DRC_LOCAL_SIGN    12
+/* wasm zero-initialises every local on entry, so a block that never uses the
+ * extra four should not declare them */
+static bool drc_used_extra_locals = false;
 
 #define DRC_XSTART_TAG 0x80000000u
 
@@ -166,6 +169,12 @@ bool DRC_CALL_CONV mem_readd_checked_drc(PhysPt address) DRC_FC;
 bool DRC_CALL_CONV mem_writeb_checked_drc(PhysPt address,uint8_t val) DRC_FC;
 bool DRC_CALL_CONV mem_writew_checked_drc(PhysPt address,uint16_t val) DRC_FC;
 bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,uint32_t val) DRC_FC;
+static uint8_t  DRC_CALL_CONV dynrec_adc_byte_simple(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_adc_word_simple(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_adc_dword_simple(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t  DRC_CALL_CONV dynrec_sbb_byte_simple(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_sbb_word_simple(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_sbb_dword_simple(uint32_t op1,uint32_t op2) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_sf(void) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_nsf(void) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_cf_or_zf(void) DRC_FC;
@@ -546,6 +555,59 @@ static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
     return true;
 }
 
+/* Inline add-with-carry and subtract-with-borrow. These are only a sum plus
+ * the carry flag - "op1 + op2 + CF" and "op1 - (op2 + CF)" - and they were the
+ * single largest consumer of get_CF in a game profile. The carry comes from
+ * the same compare/subtract fast path used by the branches; any other flag
+ * type calls the helper, which computes it the long way. */
+static bool drc_emit_adcsbb_inline(uint32_t target, unsigned import_slot) {
+    uint32_t opmask; bool is_sbb;
+    if      (target == (uint32_t)(uintptr_t)dynrec_adc_byte_simple)  { opmask = 0xFFu;       is_sbb = false; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_adc_word_simple)  { opmask = 0xFFFFu;     is_sbb = false; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_adc_dword_simple) { opmask = 0xFFFFFFFFu; is_sbb = false; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_sbb_byte_simple)  { opmask = 0xFFu;       is_sbb = true;  }
+    else if (target == (uint32_t)(uintptr_t)dynrec_sbb_word_simple)  { opmask = 0xFFFFu;     is_sbb = true;  }
+    else if (target == (uint32_t)(uintptr_t)dynrec_sbb_dword_simple) { opmask = 0xFFFFFFFFu; is_sbb = true;  }
+    else return false;
+
+    drc_used_extra_locals = true;
+    const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
+    const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
+    const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
+    const uint32_t a_mask = (uint32_t)(uintptr_t)&drc_subcmp_mask[0];
+
+    drc_iconst(a_type); drc_load32();
+    drc_iconst(2); drc_b(0x74);
+    drc_iconst(a_mask); drc_b(0x6A);
+    drc_load32();
+    drc_teel(DRC_LOCAL_SCRATCH);
+    drc_b(0x04); drc_b(0x40);                       /* if (flag type is a compare/subtract) */
+
+    /* carry = (var1 & m) < (var2 & m) */
+    drc_iconst(a_var1); drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71);
+    drc_iconst(a_var2); drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71);
+    drc_b(0x49);
+    drc_setl(DRC_LOCAL_V1);                          /* V1 holds the carry */
+
+    if (is_sbb) {                                    /* op1 - (op2 + carry) */
+        drc_getl(FC_OP1);
+        drc_getl(FC_OP2); drc_getl(DRC_LOCAL_V1); drc_b(0x6A);
+        drc_b(0x6B);
+    } else {                                         /* op1 + op2 + carry */
+        drc_getl(FC_OP1); drc_getl(FC_OP2); drc_b(0x6A);
+        drc_getl(DRC_LOCAL_V1); drc_b(0x6A);
+    }
+    if (opmask != 0xFFFFFFFFu) { drc_iconst(opmask); drc_b(0x71); }
+    drc_setl(FC_RETOP);
+
+    drc_b(0x05);                                     /* else: call the helper */
+    drc_getl(FC_OP1); drc_getl(FC_OP2);
+    drc_b(0x10); drc_uleb(import_slot);
+    drc_setl(FC_RETOP);
+    drc_b(0x0B);
+    return true;
+}
+
 /* Inline the branch conditions that need the sign and overflow flags - the
  * signed compares (jl/jge/jle/jg) and the unsigned pair (jbe/ja). After a
  * compare or subtract, which is what a branch is testing, flags.cpp computes
@@ -570,6 +632,8 @@ static bool drc_emit_cond_inline(uint32_t target, unsigned import_slot) {
     else if (target == (uint32_t)(uintptr_t)dynrec_get_nzf_and_sf_eq_of)  cond = DRC_C_NZF_AND_SF_EQ_OF;
     else return false;
 
+    drc_used_extra_locals = true;
+    drc_used_extra_locals = true;
     const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
     const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
     const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
@@ -811,9 +875,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
         std::vector<uint8_t> saveMain; saveMain.swap(drc_buf);
         /* emit body into drc_buf then move to body */
         drc_buf.clear();
-
-        /* locals: DRC_NUM_LOCALS i32 */
-        drc_b(1); drc_uleb(DRC_NUM_LOCALS); drc_b(0x7F);
+        drc_used_extra_locals = false;
 
         /* open one wasm block per branch target, outermost = latest target */
         for (unsigned i = ntargets; i-- > 0;) { (void)i; drc_b(0x02); drc_b(0x40); }
@@ -903,6 +965,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (drc_emit_zf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_adcsbb_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
@@ -953,6 +1016,16 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
         drc_iconst(0); drc_b(0x0F);
         drc_b(0x0B);    /* end of function body */
 
+        /* now that the body is known, declare only the locals it used */
+        {
+            std::vector<uint8_t> withLocals;
+            withLocals.push_back(1);
+            const uint32_t n = drc_used_extra_locals ? DRC_NUM_LOCALS : (DRC_LOCAL_SCRATCH + 1);
+            uint32_t v = n; do { uint8_t b7 = v & 0x7f; v >>= 7; if (v) b7 |= 0x80; withLocals.push_back(b7); } while (v);
+            withLocals.push_back(0x7F);
+            withLocals.insert(withLocals.end(), drc_buf.begin(), drc_buf.end());
+            drc_buf.swap(withLocals);
+        }
         body.swap(drc_buf);
         drc_buf.swap(saveMain);
     }
