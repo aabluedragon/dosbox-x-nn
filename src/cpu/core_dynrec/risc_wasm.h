@@ -51,8 +51,12 @@ typedef uint8_t HostReg;
 #define FC_TMP_BA1    5
 #define FC_TMP_BA2    6
 #define TEMP_REG_DRC  7
-#define DRC_NUM_LOCALS 9   /* one scratch local (8) used by the translator */
+#define DRC_NUM_LOCALS 13  /* 0..7 are the decoder's registers, 8..12 are ours */
 #define DRC_LOCAL_SCRATCH 8
+#define DRC_LOCAL_V1      9
+#define DRC_LOCAL_V2      10
+#define DRC_LOCAL_RES     11
+#define DRC_LOCAL_SIGN    12
 
 #define DRC_XSTART_TAG 0x80000000u
 
@@ -162,6 +166,23 @@ bool DRC_CALL_CONV mem_readd_checked_drc(PhysPt address) DRC_FC;
 bool DRC_CALL_CONV mem_writeb_checked_drc(PhysPt address,uint8_t val) DRC_FC;
 bool DRC_CALL_CONV mem_writew_checked_drc(PhysPt address,uint16_t val) DRC_FC;
 bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,uint32_t val) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_sf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_nsf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_cf_or_zf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_ncf_and_nzf(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_sf_eq_of(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_sf_neq_of(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_zf_or_sf_neq_of(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_get_nzf_and_sf_eq_of(void) DRC_FC;
+
+/* Width mask for the types where a branch condition is computable from the
+ * compare/subtract operands alone; zero means "call the helper". */
+static const uint32_t drc_subcmp_mask[t_LASTFLAG] = {
+    [t_SUBb]=0xFFu,[t_CMPb]=0xFFu,
+    [t_SUBw]=0xFFFFu,[t_CMPw]=0xFFFFu,
+    [t_SUBd]=0xFFFFFFFFu,[t_CMPd]=0xFFFFFFFFu,
+};
+
 static uint32_t DRC_CALL_CONV dynrec_get_cf(void) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_ncf(void) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_zf(void) DRC_FC;
@@ -525,6 +546,87 @@ static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
     return true;
 }
 
+/* Inline the branch conditions that need the sign and overflow flags - the
+ * signed compares (jl/jge/jle/jg) and the unsigned pair (jbe/ja). After a
+ * compare or subtract, which is what a branch is testing, flags.cpp computes
+ * all four flags from the two operands and the result:
+ *     ZF = res == 0                SF = res & sign
+ *     CF = var1 < var2 (unsigned)  OF = ((v1^v2) & (v1^res)) & sign
+ * so the whole condition folds into a few instructions. Any other flag type
+ * falls back to the helper. */
+enum DrcCond { DRC_C_SF, DRC_C_NSF, DRC_C_CF_OR_ZF, DRC_C_NCF_AND_NZF,
+               DRC_C_SF_EQ_OF, DRC_C_SF_NEQ_OF, DRC_C_ZF_OR_SF_NEQ_OF,
+               DRC_C_NZF_AND_SF_EQ_OF, DRC_C_NONE };
+
+static bool drc_emit_cond_inline(uint32_t target, unsigned import_slot) {
+    DrcCond cond;
+    if      (target == (uint32_t)(uintptr_t)dynrec_get_sf)                cond = DRC_C_SF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_nsf)               cond = DRC_C_NSF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_cf_or_zf)          cond = DRC_C_CF_OR_ZF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_ncf_and_nzf)       cond = DRC_C_NCF_AND_NZF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_sf_eq_of)          cond = DRC_C_SF_EQ_OF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_sf_neq_of)         cond = DRC_C_SF_NEQ_OF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_zf_or_sf_neq_of)   cond = DRC_C_ZF_OR_SF_NEQ_OF;
+    else if (target == (uint32_t)(uintptr_t)dynrec_get_nzf_and_sf_eq_of)  cond = DRC_C_NZF_AND_SF_EQ_OF;
+    else return false;
+
+    const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
+    const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
+    const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
+    const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
+    const uint32_t a_mask = (uint32_t)(uintptr_t)&drc_subcmp_mask[0];
+
+    /* mask = drc_subcmp_mask[lflags.type] */
+    drc_iconst(a_type); drc_load32();
+    drc_iconst(2); drc_b(0x74);
+    drc_iconst(a_mask); drc_b(0x6A);
+    drc_load32();
+    drc_teel(DRC_LOCAL_SCRATCH);
+    drc_b(0x04); drc_b(0x40);                       /* if (mask != 0) */
+
+    /* sign = (mask >>> 1) + 1 */
+    drc_getl(DRC_LOCAL_SCRATCH); drc_iconst(1); drc_b(0x76);
+    drc_iconst(1); drc_b(0x6A); drc_setl(DRC_LOCAL_SIGN);
+    /* operands, masked to width */
+    drc_iconst(a_var1); drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71); drc_setl(DRC_LOCAL_V1);
+    drc_iconst(a_var2); drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71); drc_setl(DRC_LOCAL_V2);
+    drc_iconst(a_res);  drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71); drc_setl(DRC_LOCAL_RES);
+
+    /* the pieces each condition may need */
+    #define DRC_PUSH_ZF() do { drc_getl(DRC_LOCAL_RES); drc_b(0x45); } while (0)          /* res == 0 */
+    #define DRC_PUSH_SF() do { drc_getl(DRC_LOCAL_RES); drc_getl(DRC_LOCAL_SIGN); \
+                               drc_b(0x71); drc_iconst(0); drc_b(0x47); } while (0)       /* (res & sign) != 0 */
+    #define DRC_PUSH_CF() do { drc_getl(DRC_LOCAL_V1); drc_getl(DRC_LOCAL_V2); drc_b(0x49); } while (0)
+    #define DRC_PUSH_OF() do { drc_getl(DRC_LOCAL_V1); drc_getl(DRC_LOCAL_V2); drc_b(0x73); \
+                               drc_getl(DRC_LOCAL_V1); drc_getl(DRC_LOCAL_RES); drc_b(0x73); \
+                               drc_b(0x71); drc_getl(DRC_LOCAL_SIGN); drc_b(0x71); \
+                               drc_iconst(0); drc_b(0x47); } while (0)
+
+    switch (cond) {
+        case DRC_C_SF:  DRC_PUSH_SF(); break;
+        case DRC_C_NSF: DRC_PUSH_SF(); drc_b(0x45); break;
+        case DRC_C_CF_OR_ZF:      DRC_PUSH_CF(); DRC_PUSH_ZF(); drc_b(0x72); break;
+        case DRC_C_NCF_AND_NZF:   DRC_PUSH_CF(); DRC_PUSH_ZF(); drc_b(0x72); drc_b(0x45); break;
+        case DRC_C_SF_EQ_OF:      DRC_PUSH_SF(); DRC_PUSH_OF(); drc_b(0x46); break;
+        case DRC_C_SF_NEQ_OF:     DRC_PUSH_SF(); DRC_PUSH_OF(); drc_b(0x47); break;
+        case DRC_C_ZF_OR_SF_NEQ_OF:
+            DRC_PUSH_ZF(); DRC_PUSH_SF(); DRC_PUSH_OF(); drc_b(0x47); drc_b(0x72); break;
+        case DRC_C_NZF_AND_SF_EQ_OF:
+            DRC_PUSH_ZF(); DRC_PUSH_SF(); DRC_PUSH_OF(); drc_b(0x47); drc_b(0x72); drc_b(0x45); break;
+        default: break;
+    }
+    #undef DRC_PUSH_ZF
+    #undef DRC_PUSH_SF
+    #undef DRC_PUSH_CF
+    #undef DRC_PUSH_OF
+    drc_setl(FC_RETOP);
+    drc_b(0x05);                                    /* else: call the helper */
+    drc_b(0x10); drc_uleb(import_slot);
+    drc_setl(FC_RETOP);
+    drc_b(0x0B);
+    return true;
+}
+
 /* Inline the carry-flag read. For a compare or subtract - what a branch is
  * almost always testing - flags.cpp computes carry as an unsigned comparison
  * of the two operands, so that is what we emit; every other flag type still
@@ -800,6 +902,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (drc_emit_mem_inline(r->x, slot)) { DRC_FORGET_ALL(); break; }
                     if (drc_emit_zf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
