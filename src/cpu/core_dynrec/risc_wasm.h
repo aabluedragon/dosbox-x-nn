@@ -1372,6 +1372,25 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
         drc_used_extra_locals = false;
         drc_flag_type = -1;
 
+        /* Interrupt responsiveness: linked blocks chain without returning to
+         * the dispatcher, so a pending IRQ otherwise waits for the cycle
+         * budget to run out - up to a full emulated millisecond, which is
+         * enough to unsettle timer-paced real-mode games. The interpreter
+         * checks between instructions; checking at block entry gets within
+         * one block of that for two loads per block. */
+        {
+            const uint32_t a_flags = (uint32_t)(uintptr_t)DRCD_REG_FLAGS;
+            const uint32_t a_pic   = (uint32_t)(uintptr_t)&PIC_IRQCheck;
+            drc_iconst(a_flags); drc_load32();
+            drc_iconst(0x200u); drc_b(0x71);
+            drc_b(0x04); drc_b(0x40);            /* if (IF set) */
+            drc_iconst(a_pic); drc_load32();
+            drc_b(0x04); drc_b(0x40);            /* if (an IRQ is pending) */
+            drc_iconst(1);                        /* BR_Cycles */
+            drc_b(0x0F);                          /* return: let it deliver */
+            drc_b(0x0B); drc_b(0x0B);
+        }
+
         /* open one wasm block per branch target, outermost = latest target */
         for (unsigned i = ntargets; i-- > 0;) { (void)i; drc_b(0x02); drc_b(0x40); }
 

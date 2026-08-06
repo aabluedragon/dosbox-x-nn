@@ -1663,7 +1663,6 @@ static uint16_t DRC_CALL_CONV dynrec_movsb_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1673,9 +1672,12 @@ static uint16_t DRC_CALL_CONV dynrec_movsb_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	for (;count>0;count--) {
 		mem_writeb(di_base+reg_di,mem_readb(si_base+reg_si));
 		reg_si+=add_index;
@@ -1692,7 +1694,6 @@ static uint32_t DRC_CALL_CONV dynrec_movsb_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count-CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1702,9 +1703,12 @@ static uint32_t DRC_CALL_CONV dynrec_movsb_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	for (;count>0;count--) {
 		mem_writeb(di_base+reg_edi,mem_readb(si_base+reg_esi));
 		reg_esi+=add_index;
@@ -1721,7 +1725,6 @@ static uint16_t DRC_CALL_CONV dynrec_movsw_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1731,9 +1734,12 @@ static uint16_t DRC_CALL_CONV dynrec_movsw_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=1;
 	for (;count>0;count--) {
 		mem_writew(di_base+reg_di,mem_readw(si_base+reg_si));
@@ -1751,7 +1757,6 @@ static uint32_t DRC_CALL_CONV dynrec_movsw_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count-CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1761,9 +1766,12 @@ static uint32_t DRC_CALL_CONV dynrec_movsw_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=1;
 	for (;count>0;count--) {
 		mem_writew(di_base+reg_edi,mem_readw(si_base+reg_esi));
@@ -1781,7 +1789,6 @@ static uint16_t DRC_CALL_CONV dynrec_movsd_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1791,9 +1798,12 @@ static uint16_t DRC_CALL_CONV dynrec_movsd_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=2;
 	for (;count>0;count--) {
 		mem_writed(di_base+reg_di,mem_readd(si_base+reg_si));
@@ -1811,7 +1821,6 @@ static uint32_t DRC_CALL_CONV dynrec_movsd_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1821,9 +1830,12 @@ static uint32_t DRC_CALL_CONV dynrec_movsd_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=2;
 	for (;count>0;count--) {
 		mem_writed(di_base+reg_edi,mem_readd(si_base+reg_esi));
@@ -1842,7 +1854,6 @@ static uint16_t DRC_CALL_CONV dynrec_lodsb_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1852,9 +1863,12 @@ static uint16_t DRC_CALL_CONV dynrec_lodsb_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	for (;count>0;count--) {
 		reg_al=mem_readb(si_base+reg_si);
 		reg_si+=add_index;
@@ -1870,7 +1884,6 @@ static uint32_t DRC_CALL_CONV dynrec_lodsb_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1880,9 +1893,12 @@ static uint32_t DRC_CALL_CONV dynrec_lodsb_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	for (;count>0;count--) {
 		reg_al=mem_readb(si_base+reg_esi);
 		reg_esi+=add_index;
@@ -1898,7 +1914,6 @@ static uint16_t DRC_CALL_CONV dynrec_lodsw_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1908,9 +1923,12 @@ static uint16_t DRC_CALL_CONV dynrec_lodsw_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=1;
 	for (;count>0;count--) {
 		reg_ax=mem_readw(si_base+reg_si);
@@ -1927,7 +1945,6 @@ static uint32_t DRC_CALL_CONV dynrec_lodsw_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1937,9 +1954,12 @@ static uint32_t DRC_CALL_CONV dynrec_lodsw_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=1;
 	for (;count>0;count--) {
 		reg_ax=mem_readw(si_base+reg_esi);
@@ -1956,7 +1976,6 @@ static uint16_t DRC_CALL_CONV dynrec_lodsd_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1966,9 +1985,12 @@ static uint16_t DRC_CALL_CONV dynrec_lodsd_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=2;
 	for (;count>0;count--) {
 		reg_eax=mem_readd(si_base+reg_si);
@@ -1985,7 +2007,6 @@ static uint32_t DRC_CALL_CONV dynrec_lodsd_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -1995,9 +2016,12 @@ static uint32_t DRC_CALL_CONV dynrec_lodsd_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=2;
 	for (;count>0;count--) {
 		reg_eax=mem_readd(si_base+reg_esi);
@@ -2015,7 +2039,6 @@ static uint16_t DRC_CALL_CONV dynrec_stosb_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -2025,9 +2048,12 @@ static uint16_t DRC_CALL_CONV dynrec_stosb_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	for (;count>0;count--) {
 		mem_writeb(di_base+reg_di,reg_al);
 		reg_di+=add_index;
@@ -2043,7 +2069,6 @@ static uint32_t DRC_CALL_CONV dynrec_stosb_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count= (uint32_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -2053,9 +2078,12 @@ static uint32_t DRC_CALL_CONV dynrec_stosb_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	for (;count>0;count--) {
 		mem_writeb(di_base+reg_edi,reg_al);
 		reg_edi+=add_index;
@@ -2071,7 +2099,6 @@ static uint16_t DRC_CALL_CONV dynrec_stosw_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -2081,9 +2108,12 @@ static uint16_t DRC_CALL_CONV dynrec_stosw_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=1;
 	for (;count>0;count--) {
 		mem_writew(di_base+reg_di,reg_ax);
@@ -2100,7 +2130,6 @@ static uint32_t DRC_CALL_CONV dynrec_stosw_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count=(uint32_t) CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -2110,9 +2139,12 @@ static uint32_t DRC_CALL_CONV dynrec_stosw_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=1;
 	for (;count>0;count--) {
 		mem_writew(di_base+reg_edi,reg_ax);
@@ -2129,7 +2161,6 @@ static uint16_t DRC_CALL_CONV dynrec_stosd_word(uint16_t count,int16_t add_index
 	} else {
 		count_left=(uint16_t)(count-CPU_Cycles);
 		count=(uint16_t)CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -2139,9 +2170,12 @@ static uint16_t DRC_CALL_CONV dynrec_stosd_word(uint16_t count,int16_t add_index
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=2;
 	for (;count>0;count--) {
 		mem_writed(di_base+reg_di,reg_eax);
@@ -2158,7 +2192,6 @@ static uint32_t DRC_CALL_CONV dynrec_stosd_dword(uint32_t count,int32_t add_inde
 	} else {
 		count_left= (uint32_t)(count - CPU_Cycles);
 		count=(uint32_t) CPU_Cycles;
-		CPU_Cycles=0;
 	}
 #if C_EMSCRIPTEN
 	/* Browser: one call must stay short enough that the core loop can yield
@@ -2168,9 +2201,12 @@ static uint32_t DRC_CALL_CONV dynrec_stosd_dword(uint32_t count,int32_t add_inde
 	if (count > DRC_STRING_CHUNK) {
 		count_left += count - DRC_STRING_CHUNK;
 		count = DRC_STRING_CHUNK;
-		if (CPU_Cycles > (Bits)count) CPU_Cycles -= (Bits)count; else CPU_Cycles = 0;
 	}
 #endif
+	/* charge the iterations actually run, like the interpreter does - an
+	 * uncharged rep makes the guest effectively faster than its cycle
+	 * setting, which speed-sensitive real-mode games notice */
+	CPU_Cycles -= (Bits)count;
 	add_index<<=2;
 	for (;count>0;count--) {
 		mem_writed(di_base+reg_edi,reg_eax);
