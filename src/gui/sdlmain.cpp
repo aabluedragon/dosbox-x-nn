@@ -252,6 +252,7 @@ typedef enum PROCESS_DPI_AWARENESS {
 # include <emscripten.h>
 # include "SDL.h"
 # include <string.h>
+# include "keyboard.h"
 
 /* This build runs single-threaded inside a hand-rolled Web Worker (js-dos
  * style): the page thread only composites the transferred OffscreenCanvas,
@@ -291,13 +292,64 @@ void EMSCRIPTEN_Yield_Throttled(void) {
 /* Input arrives from the page thread as postMessage events; the worker glue
  * injects them into the normal SDL event queue through these exports. */
 extern "C" {
+/* USB HID usage id (what KeyboardEvent.code maps to) -> KBD_KEYS.
+ * Feeding KEYBOARD_AddKey directly puts the make/break code into the emulated
+ * 8042 and raises IRQ1, which is what games that install their own INT 9
+ * handler read. Pushing an SDL event instead only reliably reached the BIOS
+ * keyboard buffer, so DOS typing worked while such games saw nothing. */
+static KBD_KEYS EMWORKER_MapKey(int hid) {
+    switch (hid) {
+        case 4: return KBD_a;  case 5: return KBD_b;  case 6: return KBD_c;
+        case 7: return KBD_d;  case 8: return KBD_e;  case 9: return KBD_f;
+        case 10: return KBD_g; case 11: return KBD_h; case 12: return KBD_i;
+        case 13: return KBD_j; case 14: return KBD_k; case 15: return KBD_l;
+        case 16: return KBD_m; case 17: return KBD_n; case 18: return KBD_o;
+        case 19: return KBD_p; case 20: return KBD_q; case 21: return KBD_r;
+        case 22: return KBD_s; case 23: return KBD_t; case 24: return KBD_u;
+        case 25: return KBD_v; case 26: return KBD_w; case 27: return KBD_x;
+        case 28: return KBD_y; case 29: return KBD_z;
+        case 30: return KBD_1; case 31: return KBD_2; case 32: return KBD_3;
+        case 33: return KBD_4; case 34: return KBD_5; case 35: return KBD_6;
+        case 36: return KBD_7; case 37: return KBD_8; case 38: return KBD_9;
+        case 39: return KBD_0;
+        case 40: return KBD_enter;      case 41: return KBD_esc;
+        case 42: return KBD_backspace;  case 43: return KBD_tab;
+        case 44: return KBD_space;      case 45: return KBD_minus;
+        case 46: return KBD_equals;     case 47: return KBD_leftbracket;
+        case 48: return KBD_rightbracket; case 49: return KBD_backslash;
+        case 51: return KBD_semicolon;  case 52: return KBD_quote;
+        case 53: return KBD_grave;      case 54: return KBD_comma;
+        case 55: return KBD_period;     case 56: return KBD_slash;
+        case 57: return KBD_capslock;
+        case 58: return KBD_f1;  case 59: return KBD_f2;  case 60: return KBD_f3;
+        case 61: return KBD_f4;  case 62: return KBD_f5;  case 63: return KBD_f6;
+        case 64: return KBD_f7;  case 65: return KBD_f8;  case 66: return KBD_f9;
+        case 67: return KBD_f10; case 68: return KBD_f11; case 69: return KBD_f12;
+        case 70: return KBD_printscreen; case 71: return KBD_scrolllock;
+        case 72: return KBD_pause;       case 73: return KBD_insert;
+        case 74: return KBD_home;        case 75: return KBD_pageup;
+        case 76: return KBD_delete;      case 77: return KBD_end;
+        case 78: return KBD_pagedown;
+        case 79: return KBD_right; case 80: return KBD_left;
+        case 81: return KBD_down;  case 82: return KBD_up;
+        case 83: return KBD_numlock;     case 84: return KBD_kpdivide;
+        case 85: return KBD_kpmultiply;  case 86: return KBD_kpminus;
+        case 87: return KBD_kpplus;      case 88: return KBD_kpenter;
+        case 89: return KBD_kp1; case 90: return KBD_kp2; case 91: return KBD_kp3;
+        case 92: return KBD_kp4; case 93: return KBD_kp5; case 94: return KBD_kp6;
+        case 95: return KBD_kp7; case 96: return KBD_kp8; case 97: return KBD_kp9;
+        case 98: return KBD_kp0; case 99: return KBD_kpperiod;
+        case 224: return KBD_leftctrl;  case 225: return KBD_leftshift;
+        case 226: return KBD_leftalt;   case 228: return KBD_rightctrl;
+        case 229: return KBD_rightshift; case 230: return KBD_rightalt;
+        default: return KBD_NONE;
+    }
+}
+
 EMSCRIPTEN_KEEPALIVE void EMWORKER_PushKey(int scancode, int down) {
-    SDL_Event ev; memset(&ev,0,sizeof(ev));
-    ev.type = down ? SDL_KEYDOWN : SDL_KEYUP;
-    ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
-    ev.key.keysym.scancode = (SDL_Scancode)scancode;
-    ev.key.keysym.sym = SDL_GetKeyFromScancode((SDL_Scancode)scancode);
-    SDL_PushEvent(&ev);
+    const KBD_KEYS k = EMWORKER_MapKey(scancode);
+    if (k == KBD_NONE) return;
+    KEYBOARD_AddKey(k, down ? true : false);
 }
 EMSCRIPTEN_KEEPALIVE void EMWORKER_PushMouseMotion(int x,int y,int xrel,int yrel) {
     SDL_Event ev; memset(&ev,0,sizeof(ev));

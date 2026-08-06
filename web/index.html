@@ -117,7 +117,7 @@ worker.onmessage = (e) => {
       pickBtn.disabled = false;
       startEmptyBtn.disabled = false;
       break;
-    case 'started': setStatus('Running.'); canvas.focus(); break;
+    case 'started': started = true; setStatus('Running.'); canvas.focus(); break;
     case 'status': setStatus(m.text); break;
     case 'critical': console.warn(m.line); break;
     case 'log':
@@ -191,15 +191,28 @@ KEYCODES['Digit0'] = 39;
 for (let i = 1; i <= 12; i++) KEYCODES['F' + i] = 57 + i;
 for (let i = 1; i <= 9; i++) KEYCODES['Numpad' + i] = 88 + i;
 
+/* keys are injected straight into the emulated keyboard, so a keyup that the
+ * browser never delivers (alt-tab, focus loss, a swallowed event) would leave
+ * the key held down forever - in a game that reads held keys this looks like
+ * the character walking into a wall and getting stuck. Track what is down and
+ * release it whenever this page stops receiving events. */
+const keysDown = new Set();
 function onKey(e, down) {
   if (!started) return;
   const code = KEYCODES[e.code];
   if (code === undefined) return;
   e.preventDefault();
+  if (down) keysDown.add(code); else keysDown.delete(code);
   worker.postMessage({ type: 'key', code, down });
+}
+function releaseAllKeys() {
+  for (const code of keysDown) worker.postMessage({ type: 'key', code, down: false });
+  keysDown.clear();
 }
 window.addEventListener('keydown', e => onKey(e, true));
 window.addEventListener('keyup', e => onKey(e, false));
+window.addEventListener('blur', releaseAllKeys);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAllKeys(); });
 
 function canvasCoords(e) {
   const r = canvas.getBoundingClientRect();

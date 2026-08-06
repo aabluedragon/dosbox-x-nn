@@ -129,7 +129,7 @@ onmessage = (e) => {
         const args = ['-conf', '/dosbox-x.conf'];
         if (m.mount) args.push('-c', 'MOUNT C /c', '-c', 'C:');
         postMessage({ type: 'started' });
-        startAudioPump();
+        if (!m.noAudio) startAudioPump();
         (typeof callMain === 'function' ? callMain : Module.callMain)(args); /* JSPI: returns a promise-like, runs on */
       } catch (err) {
         postMessage({ type: 'status', text: 'Start failed: ' + err });
