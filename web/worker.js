@@ -120,6 +120,11 @@ onmessage = (e) => {
     case 'mousemove': Module._EMWORKER_PushMouseMotion(m.x, m.y, m.xrel, m.yrel); break;
     case 'mousebtn': Module._EMWORKER_PushMouseButton(m.btn, m.down ? 1 : 0, m.x, m.y); break;
 
+    case 'stats':
+      postMessage({ type: 'stats', compiled: Module.__drcCount || 0,
+                    failed: Module.__drcFail || 0, bail: Module.__drcBail || {}, ms: Module.__drcTime || 0 });
+      break;
+
     case 'export': {
       const out = [];
       try { exportTree('/c', out); } catch (err) {}

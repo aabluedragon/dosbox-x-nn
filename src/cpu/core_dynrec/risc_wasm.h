@@ -100,24 +100,37 @@ static INLINE DRCIRRec* drcir_emit(uint8_t op) {
 /* ------------------------------------------------------------------ */
 
 EM_JS(int, drc_wasm_compile, (const uint8_t* bytes, int len), {
+    const t0 = performance.now();
     try {
-        const buf = HEAPU8.slice(bytes, bytes + len);
+        const buf = HEAPU8.subarray(bytes, bytes + len);
         const mod = new WebAssembly.Module(buf);
         const inst = new WebAssembly.Instance(mod, { e: { t: wasmTable, m: wasmMemory } });
         let idx;
         if (Module.__drcFree && Module.__drcFree.length) idx = Module.__drcFree.pop();
-        else idx = wasmTable.grow(1);
+        else {
+            /* grow the table in chunks: growing one slot at a time is O(n) per call */
+            if (!Module.__drcSpare || Module.__drcSpare.length === 0) {
+                const base = wasmTable.grow(256);
+                Module.__drcSpare = [];
+                for (let i = 255; i >= 0; i--) Module.__drcSpare.push(base + i);
+            }
+            idx = Module.__drcSpare.pop();
+        }
         wasmTable.set(idx, inst.exports.f);
-        if (Module.__drcCount === undefined) Module.__drcCount = 0;
-        Module.__drcCount++;
+        Module.__drcCount = (Module.__drcCount || 0) + 1;
+        Module.__drcTime = (Module.__drcTime || 0) + (performance.now() - t0);
         return idx;
     } catch (e) {
-        if (!Module.__drcErrLogged) {
-            Module.__drcErrLogged = true;
-            console.warn('dynrec: wasm block compile failed:', e);
-        }
+        Module.__drcFail = (Module.__drcFail || 0) + 1;
+        if (Module.__drcFail <= 3) console.warn('dynrec: block compile failed:', e.message || e);
         return 0;
     }
+});
+
+/* how many blocks were rejected before we even tried to compile them */
+EM_JS(void, drc_note_bail, (int reason), {
+    if (!Module.__drcBail) Module.__drcBail = {};
+    Module.__drcBail[reason] = (Module.__drcBail[reason] || 0) + 1;
 });
 
 /* debug aid: Module.__drcLimit caps how many blocks may be JIT compiled, so a
@@ -427,11 +440,11 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
     for (const DRCIRRec* r = first; r < last; r++) {
         if (r->op != DRCIR_BR) continue;
         if (r->x == 0 || r->x <= (uint32_t)(uintptr_t)r || r->x > (uint32_t)(uintptr_t)end)
-            return DRC_XSTART_TAG;      /* unfilled or non-forward: bail out */
+            { drc_note_bail(1); return DRC_XSTART_TAG; }   /* unfilled or non-forward */
         bool seen = false;
         for (unsigned i = 0; i < ntargets; i++) if (targets[i] == r->x) { seen = true; break; }
         if (!seen) {
-            if (ntargets >= 512) return DRC_XSTART_TAG;
+            if (ntargets >= 512) { drc_note_bail(2); return DRC_XSTART_TAG; }
             targets[ntargets++] = r->x;
         }
     }
@@ -555,6 +568,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (r->b) drc_store32(); else drc_store16();
                     break;
                 case DRCIR_CALL: {
+                    if (r->b > 4) { drc_note_bail(5); return DRC_XSTART_TAG; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_iconst(r->x);
                     drc_b(0x11); drc_uleb(drc_calltype(r->b, r->c)); drc_b(0x00);
@@ -584,7 +598,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                         if (targets[i] == r->x) { found = true; break; }
                         depth++;
                     }
-                    if (!found) return DRC_XSTART_TAG;
+                    if (!found) { drc_note_bail(3); return DRC_XSTART_TAG; }
                     drc_getl(r->b);
                     if (r->c == 8)  { drc_iconst(0xFF); drc_b(0x71); }
                     else if (r->c == 16) { drc_iconst(0xFFFF); drc_b(0x71); }
@@ -597,7 +611,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     drc_getl(FC_RETOP); drc_b(0x0F);
                     break;
                 default:
-                    return DRC_XSTART_TAG;
+                    drc_note_bail(4); return DRC_XSTART_TAG;
             }
         }
         while (closed < ntargets) { drc_b(0x0B); closed++; }
