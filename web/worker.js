@@ -146,7 +146,9 @@ onmessage = (e) => {
                     failed: Module.__drcFail || 0, bail: Module.__drcBail || {}, ms: Module.__drcTime || 0,
                     frames: (self.__frameTimes || []).slice(),
                     events: (Module.__drcEvents || []).slice(),
-                    beats: (self.__beats || []).slice() });
+                    beats: (self.__beats || []).slice(),
+                    cyclesRun: Module._EMWORKER_CyclesRun ? Module._EMWORKER_CyclesRun() : 0,
+                    cycleMax: Module._EMWORKER_CycleMax ? Module._EMWORKER_CycleMax() : 0 });
       break;
 
     case 'export': {

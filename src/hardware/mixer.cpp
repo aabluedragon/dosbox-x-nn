@@ -901,6 +901,10 @@ EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioFreq(void) {
 EMSCRIPTEN_KEEPALIVE int EMWORKER_EmuMs(void) {
     return (int)PIC_Ticks;      /* declared in pic.h */
 }
+EMSCRIPTEN_KEEPALIVE double EMWORKER_CyclesRun(void) {
+    extern uint64_t emu_cycles_run;
+    return (double)emu_cycles_run;
+}
 EMSCRIPTEN_KEEPALIVE int EMWORKER_CycleMax(void) {
     return (int)CPU_CycleMax;   /* declared in cpu.h */
 }

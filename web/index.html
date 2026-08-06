@@ -64,9 +64,11 @@ memsize=63
 # WebAssembly recompiler (~2x the interpreter). core=normal falls back to the
 # plain interpreter if a game misbehaves.
 core=dynamic
-# "max" adapts the emulated CPU speed to the host. If a game feels uneven,
-# a fixed value (e.g. cycles=100000) is the predictable alternative.
-cycles=max
+# "auto" runs old real-mode games at the speed they were written for and
+# switches to "max" for protected-mode (DOS4GW) games, which want everything
+# the host can give. Games from the early 90s misbehave when the CPU is much
+# faster than they expect, so "max" everywhere is not the fast choice.
+cycles=auto
 
 [sdl]
 autolock=false
@@ -88,7 +90,7 @@ if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
 /* earlier page defaults; cycles=max works now that the emulator's gap-panic
  * paths are disabled for the browser build */
 storedConf = storedConf.replace(/^core=(auto|normal)$/m, 'core=dynamic');
-storedConf = storedConf.replace(/^cycles=(70000|100000)$/m, 'cycles=max');
+storedConf = storedConf.replace(/^cycles=(70000|100000|max)$/m, 'cycles=auto');
 confText.value = storedConf;
 confText.addEventListener('input', () => localStorage.setItem('dosbox-x.conf', confText.value));
 document.getElementById('confReset').addEventListener('click', () => {

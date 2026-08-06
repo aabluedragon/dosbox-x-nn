@@ -430,6 +430,12 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
+#if C_EMSCRIPTEN
+/* cycles the guest has actually executed; lets a test tell a game that is
+ * compute bound apart from one that is sitting in a wait */
+uint64_t emu_cycles_run = 0;
+#endif
+
 static Bitu Normal_Loop(void) {
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
@@ -473,7 +479,13 @@ static Bitu Normal_Loop(void) {
 
                 saved_allow = dosbox_allow_nonrecursive_page_fault;
                 dosbox_allow_nonrecursive_page_fault = true;
-                ret = (*cpudecoder)();
+    #if C_EMSCRIPTEN
+            { const cpu_cycles_count_t before = CPU_Cycles;
+              ret = (*cpudecoder)();
+              if (before > CPU_Cycles) emu_cycles_run += (uint64_t)(before - CPU_Cycles); }
+#else
+            ret = (*cpudecoder)();
+#endif
                 dosbox_allow_nonrecursive_page_fault = saved_allow;
 
                 if (GCC_UNLIKELY(ret<0))
