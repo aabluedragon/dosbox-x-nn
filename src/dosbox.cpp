@@ -659,19 +659,15 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
     ticksLast = ticksNew;
     ticksDone += (int32_t)ticksRemain;
-#if C_EMSCRIPTEN
-    /* Browser: catching up several milliseconds in one uninterrupted slice
-     * means that many milliseconds with no frame presented and no chance to
-     * yield, which is visible as stutter. The faster the core, the worse it
-     * gets, so keep the catch-up window short. */
-    if (ticksRemain > 4) {
-        ticksRemain = 4;
-    }
-#else
+    /* Time past this point is discarded (ticksLast has already advanced), so
+     * the window must stay comfortably above the host's sleep granularity.
+     * In a browser SDL_Delay(1) really takes 4-15ms because timers are
+     * clamped, so a short window here makes a game that waits on the timer
+     * lose most of its elapsed time and crawl. Long slices are kept in check
+     * by chunking string operations instead. */
     if (ticksRemain > 20) {
         ticksRemain = 20;
     }
-#endif
     ticksAdded = ticksRemain;
 
     // Is the system in auto cycle mode guessing? If not just exit. (It can be temporarily disabled)

@@ -146,3 +146,4 @@ web/dosbox-x.js
 web/dosbox-x.wasm
 web/bench-*.html
 web/*-backup/
+web/nk/

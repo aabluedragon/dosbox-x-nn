@@ -48,6 +48,7 @@
 #include "SDL.h"
 #include "mem.h"
 #include "pic.h"
+#include "cpu.h"
 #include "dosbox.h"
 #include "logging.h"
 #include "mixer.h"
@@ -894,6 +895,14 @@ EMSCRIPTEN_KEEPALIVE int EMWORKER_PullAudio(int16_t *out, int frames) {
 }
 EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioFreq(void) {
     return (int)mixer.freq;
+}
+/* emulated milliseconds elapsed and the current guessed cpu speed: together
+ * these say whether the machine is keeping up with real time */
+EMSCRIPTEN_KEEPALIVE int EMWORKER_EmuMs(void) {
+    return (int)PIC_Ticks;      /* declared in pic.h */
+}
+EMSCRIPTEN_KEEPALIVE int EMWORKER_CycleMax(void) {
+    return (int)CPU_CycleMax;   /* declared in cpu.h */
 }
 EMSCRIPTEN_KEEPALIVE int16_t* EMWORKER_AudioBuffer(void) {
     static int16_t buf[8192]; /* up to 4096 stereo frames per pull */
