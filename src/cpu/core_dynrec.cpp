@@ -47,7 +47,11 @@
 
 extern bool do_lds_wraparound;
 
+#if defined(__EMSCRIPTEN__)
+#define CACHE_MAXSIZE	(4096*8)	/* fixed-size IR records are larger than native code */
+#else
 #define CACHE_MAXSIZE	(4096*2)
+#endif
 #define CACHE_TOTAL		(1024*1024*8)
 #define CACHE_PAGES		(512)
 #define CACHE_BLOCKS	(128*1024)
@@ -148,7 +152,10 @@ static struct {
 # endif
 #endif
 
-#if C_TARGETCPU == X86_64
+#if defined(__EMSCRIPTEN__)
+/* runtime-generated WebAssembly modules; see risc_wasm.h */
+#include "core_dynrec/risc_wasm.h"
+#elif C_TARGETCPU == X86_64
 #include "core_dynrec/risc_x64.h"
 #elif C_TARGETCPU == X86
 #include "core_dynrec/risc_x86.h"

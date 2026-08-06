@@ -212,7 +212,7 @@ static void cache_dynamic_common_alloc(Bitu allocsz) {
     if (cache_exec_ptr == NULL)
         cache_exec_ptr = cache_code;
 
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !defined(__EMSCRIPTEN__) /* wasm has no icache and no llvm.clear_cache */
     /* make sure dual mapping works */
     if (cache_exec_ptr != cache_code) {
         *cache_code = 0xAA;

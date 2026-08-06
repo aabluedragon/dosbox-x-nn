@@ -95,6 +95,7 @@ onmessage = (e) => {
 
     case 'start': {
       try {
+        if (typeof m.drcLimit === 'number') Module.__drcLimit = m.drcLimit;
         FS.writeFile('/dosbox-x.conf', m.conf || '');
         if (m.files) {
           fsMkdirs('/c');

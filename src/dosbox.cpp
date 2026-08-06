@@ -586,6 +586,18 @@ bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters) {
     return true;
 }
 
+/* A gap of more than this many ms between loop iterations is treated as
+ * "the host cannot keep up" and triggers aggressive cycle reduction. In a
+ * browser such gaps are routine (clamped timers, event loop yields, GC,
+ * compositor work), so the panic paths would slash cycles=max to a third
+ * over and over and it would settle far below what the host sustains.
+ * Disable them there and let the 250ms averaging window do the adjusting. */
+#if C_EMSCRIPTEN
+# define TICKS_GAP_PANIC 1000000
+#else
+# define TICKS_GAP_PANIC 15
+#endif
+
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;
@@ -656,7 +668,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
     if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust)
         return;
 
-    if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > 15 && ticksScheduled >= 5)) {
+    if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > TICKS_GAP_PANIC && ticksScheduled >= 5)) {
         if (ticksDone < 1) ticksDone = 1; // Protect against div by zero
         /* ratio we are aiming for is around 90% usage*/
         int32_t ratio = (int32_t)((ticksScheduled * (CPU_CyclePercUsed * 90 * 1024 / 100 / 100)) / ticksDone);
@@ -679,7 +691,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
                     ratio = 5120;
 
                 // When downscaling multiple times in a row, ensure a minimum amount of downscaling
-                if (ticksAdded > 15 && ticksScheduled >= 5 && ticksScheduled <= 20 && ratio > 800)
+                if (ticksAdded > TICKS_GAP_PANIC && ticksScheduled >= 5 && ticksScheduled <= 20 && ratio > 800)
                     ratio = 800;
 
                 if (ratio <= 1024) {
@@ -729,8 +741,8 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         lastsleepDone = -1;
         sleep1count = 0;
     }
-    else if (ticksAdded > 15) {
-        /* ticksAdded > 15 but ticksScheduled < 5, lower the cycles
+    else if (ticksAdded > TICKS_GAP_PANIC) {
+        /* ticksAdded > TICKS_GAP_PANIC but ticksScheduled < 5, lower the cycles
            but do not reset the scheduled/done ticks to take them into
            account during the next auto cycle adjustment */
         cpu_cycles_count_t want = CPU_CycleMax / 3;

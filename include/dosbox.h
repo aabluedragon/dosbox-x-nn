@@ -104,6 +104,11 @@
 #elif defined(__arm__) || defined(__aarch64__)
 // ARMv7 (Raspberry Pi) does not have long double, sizeof(long double) == sizeof(double)
 // ARM 64 has a quadruple-precision float instead of the 80-bit extended precision one used by x87
+#elif defined(__EMSCRIPTEN__)
+// WebAssembly has no extended precision type: long double is quad precision
+// emulated in software (__multf3 and friends), which profiling shows eating
+// several percent of total runtime through the PIC tick index and FPU core.
+// Treat it like ARM and use double.
 #else
 // GCC, other compilers, have sizeof(long double) == 10 80-bit IEEE
 #define HAS_LONG_DOUBLE		1

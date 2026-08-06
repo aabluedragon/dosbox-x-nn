@@ -22,6 +22,14 @@
 
 class CodePageHandlerDynRec;	// forward
 
+#if defined(__EMSCRIPTEN__)
+/* wasm backend hooks (risc_wasm.h, included after this header) */
+class CacheBlockDynRec;
+static void drc_release_block_code(CacheBlockDynRec* block);
+static uint8_t* drc_compile_range(uint8_t* start, uint8_t* end);
+static BlockReturnDynRec WASM_RunCode(uint8_t* xstart);
+#endif
+
 // basic cache block representation
 class CacheBlockDynRec {
 public:
@@ -446,6 +454,10 @@ static CacheBlockDynRec * cache_getblock(void) {
 }
 
 void CacheBlockDynRec::Clear(void) {
+#if defined(__EMSCRIPTEN__)
+	// recycle the wasm table slot held by this block's compiled code
+	drc_release_block_code(this);
+#endif
 	// check if this is not a cross page block
 	if (hash.index) for (Bitu ind=0;ind<2;ind++) {
 		CacheBlockDynRec * fromlink=link[ind].from;
@@ -658,10 +670,16 @@ static void cache_reset(void) {
 		link_blocks[0].cache.start=cache.pos;
 		link_blocks[0].cache.xstart=(uint8_t*)cache_rwtox(link_blocks[0].cache.start);
 		dyn_return(BR_Link1,false);
+#if defined(__EMSCRIPTEN__)
+		link_blocks[0].cache.xstart=drc_compile_range(link_blocks[0].cache.start,cache.pos);
+#endif
 		cache.pos=&cache_code_link_blocks[32];
 		link_blocks[1].cache.start=cache.pos;
 		link_blocks[1].cache.xstart=(uint8_t*)cache_rwtox(link_blocks[1].cache.start);
 		dyn_return(BR_Link2,false);
+#if defined(__EMSCRIPTEN__)
+		link_blocks[1].cache.xstart=drc_compile_range(link_blocks[1].cache.start,cache.pos);
+#endif
 		cache.free_pages=nullptr;
 		cache.last_page=nullptr;
 		cache.used_pages=nullptr;
@@ -718,16 +736,27 @@ static void cache_init(bool enable) {
 		link_blocks[0].cache.xstart=(uint8_t*)cache_rwtox(link_blocks[0].cache.start);
 		// link code that returns with a special return code
 		dyn_return(BR_Link1,false);
+#if defined(__EMSCRIPTEN__)
+		link_blocks[0].cache.xstart=drc_compile_range(link_blocks[0].cache.start,cache.pos);
+#endif
 		cache.pos=&cache_code_link_blocks[32];
 		link_blocks[1].cache.start=cache.pos;
 		link_blocks[1].cache.xstart=(uint8_t*)cache_rwtox(link_blocks[1].cache.start);
 		// link code that returns with a special return code
 		dyn_return(BR_Link2,false);
+#if defined(__EMSCRIPTEN__)
+		link_blocks[1].cache.xstart=drc_compile_range(link_blocks[1].cache.start,cache.pos);
+#endif
 
 		cache.pos=&cache_code_link_blocks[64];
+#if defined(__EMSCRIPTEN__)
+		/* the entry trampoline is a plain C function for the wasm backend */
+		core_dynrec.runcode = WASM_RunCode;
+#else
 		*(void**)(&core_dynrec.runcode) = (void*)cache_rwtox(cache.pos);
 //		link_blocks[1].cache.start=cache.pos;
 		dyn_run_code();
+#endif
 
 		cache.free_pages=nullptr;
 		cache.last_page=nullptr;

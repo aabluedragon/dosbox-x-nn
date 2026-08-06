@@ -61,11 +61,10 @@ const DEFAULT_CONF = `[dosbox]
 memsize=63
 
 [cpu]
-core=normal
-# fixed cycles: "max" mis-calibrates in the browser and settles far below
-# what the machine can do. ~120-140k is sustained in real time here; raise it
-# until audio starts to stutter, then back off.
-cycles=100000
+core=auto
+# "max" adapts the emulated CPU speed to the host. If a game feels uneven,
+# a fixed value (e.g. cycles=100000) is the predictable alternative.
+cycles=max
 
 [sdl]
 autolock=false
@@ -84,11 +83,10 @@ let storedConf = localStorage.getItem('dosbox-x.conf') || DEFAULT_CONF;
 if (!storedConf.includes('[log]')) storedConf += '\n[log]\nsb=false\n';
 if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n/, '[sdl]\nshowmenu=false\n');
 if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
-/* migrate away from cycles=max: its auto-calibration is unreliable under
- * browser timing and costs a large fraction of attainable speed */
-if (/cycles\s*=\s*max/.test(storedConf)) storedConf = storedConf.replace(/cycles\s*=\s*max.*/g, 'cycles=100000');
-/* 70000 was this page's earlier default before the menu/scaler/yield tuning */
-storedConf = storedConf.replace(/^cycles=70000$/m, 'cycles=100000');
+/* earlier page defaults; cycles=max works now that the emulator's gap-panic
+ * paths are disabled for the browser build */
+storedConf = storedConf.replace(/^core=normal$/m, 'core=auto');
+storedConf = storedConf.replace(/^cycles=(70000|100000)$/m, 'cycles=max');
 confText.value = storedConf;
 confText.addEventListener('input', () => localStorage.setItem('dosbox-x.conf', confText.value));
 document.getElementById('confReset').addEventListener('click', () => {
