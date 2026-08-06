@@ -577,6 +577,106 @@ static void DRC_CALL_CONV dynrec_test_byte(uint8_t op1,uint8_t op2) DRC_FC;
 static void DRC_CALL_CONV dynrec_test_word(uint16_t op1,uint16_t op2) DRC_FC;
 static void DRC_CALL_CONV dynrec_test_dword(uint32_t op1,uint32_t op2) DRC_FC;
 
+static uint8_t DRC_CALL_CONV dynrec_inc_byte(uint8_t op) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_inc_word(uint16_t op) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_inc_dword(uint32_t op) DRC_FC;
+static uint8_t DRC_CALL_CONV dynrec_dec_byte(uint8_t op) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_dec_word(uint16_t op) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_dec_dword(uint32_t op) DRC_FC;
+static uint8_t DRC_CALL_CONV dynrec_neg_byte(uint8_t op) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_neg_word(uint16_t op) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_neg_dword(uint32_t op) DRC_FC;
+
+/* increment, decrement and negate. neg is three stores; inc and dec are the
+ * same but must first materialise the carry flag into the flags word, because
+ * they leave carry alone while replacing the lazy state that would have
+ * produced it. The carry comes from the compare/subtract fast path, and if
+ * the current flag type is not one of those the helper is called instead. */
+/* Types where get_CF() just returns the flags word's carry bit, so the
+ * LoadCF that inc and dec begin with writes back what is already there and
+ * can be skipped. Everything else needs carry computed before the lazy state
+ * is replaced. */
+static const uint8_t drc_cf_is_noop[t_LASTFLAG] = {
+    [t_UNKNOWN]=1, [t_INCb]=1, [t_INCw]=1, [t_INCd]=1,
+    [t_DECb]=1, [t_DECw]=1, [t_DECd]=1, [t_MUL]=1,
+};
+
+struct DrcUnOp { uint32_t fn; uint32_t mask; int kind; int type; };  /* 0 inc, 1 dec, 2 neg */
+static const DrcUnOp drc_un_ops[] = {
+  { (uint32_t)(uintptr_t)dynrec_inc_byte, 0xFFu, 0, t_INCb },
+  { (uint32_t)(uintptr_t)dynrec_inc_word, 0xFFFFu, 0, t_INCw },
+  { (uint32_t)(uintptr_t)dynrec_inc_dword, 0xFFFFFFFFu, 0, t_INCd },
+  { (uint32_t)(uintptr_t)dynrec_dec_byte, 0xFFu, 1, t_DECb },
+  { (uint32_t)(uintptr_t)dynrec_dec_word, 0xFFFFu, 1, t_DECw },
+  { (uint32_t)(uintptr_t)dynrec_dec_dword, 0xFFFFFFFFu, 1, t_DECd },
+  { (uint32_t)(uintptr_t)dynrec_neg_byte, 0xFFu, 2, t_NEGb },
+  { (uint32_t)(uintptr_t)dynrec_neg_word, 0xFFFFu, 2, t_NEGw },
+  { (uint32_t)(uintptr_t)dynrec_neg_dword, 0xFFFFFFFFu, 2, t_NEGd },
+};
+
+static bool drc_emit_unop_inline(uint32_t target, unsigned import_slot) {
+    const DrcUnOp* f = NULL;
+    for (unsigned i = 0; i < sizeof(drc_un_ops)/sizeof(drc_un_ops[0]); i++)
+        if (drc_un_ops[i].fn == target) { f = &drc_un_ops[i]; break; }
+    if (f == NULL) return false;
+
+    drc_used_extra_locals = true;
+    const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
+    const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
+    const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
+    const uint32_t a_flag = (uint32_t)(uintptr_t)DRCD_REG_FLAGS;
+    const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
+    const uint32_t a_mask = (uint32_t)(uintptr_t)&drc_subcmp_mask[0];
+    const bool narrow = (f->mask != 0xFFFFFFFFu);
+
+    if (f->kind != 2) {
+        const uint32_t a_noop = (uint32_t)(uintptr_t)&drc_cf_is_noop[0];
+        /* mask != 0 -> carry is computable here; noop -> carry needs no work */
+        drc_iconst(a_type); drc_load32(); drc_setl(DRC_LOCAL_V2);
+        drc_getl(DRC_LOCAL_V2); drc_iconst(2); drc_b(0x74);
+        drc_iconst(a_mask); drc_b(0x6A); drc_load32();
+        drc_teel(DRC_LOCAL_SCRATCH);
+        drc_b(0x04); drc_b(0x40);                  /* if (compare/subtract) */
+        /* reg_flags = (reg_flags & ~1) | (var1 < var2) */
+        drc_iconst(a_flag);
+        drc_iconst(a_flag); drc_load32(); drc_iconst(0xFFFFFFFEu); drc_b(0x71);
+        drc_iconst(a_var1); drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71);
+        drc_iconst(a_var2); drc_load32(); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x71);
+        drc_b(0x49);
+        drc_b(0x72);
+        drc_store32();
+        drc_b(0x0B);                               /* end if */
+        /* inline when carry was computed, or when it needed nothing */
+        drc_getl(DRC_LOCAL_SCRATCH); drc_iconst(0); drc_b(0x47);   /* mask != 0 */
+        drc_getl(DRC_LOCAL_V2); drc_iconst(a_noop); drc_b(0x6A); drc_load8u();
+        drc_b(0x72);                                               /* or */
+        drc_b(0x04); drc_b(0x40);
+    }
+
+    /* v1 = op & mask; res = (v1 +/- 1 or 0 - v1) & mask */
+    drc_getl(FC_OP1); if (narrow) { drc_iconst(f->mask); drc_b(0x71); } drc_setl(DRC_LOCAL_V1);
+    if (f->kind == 2) { drc_iconst(0); drc_getl(DRC_LOCAL_V1); drc_b(0x6B); }
+    else { drc_getl(DRC_LOCAL_V1); drc_iconst(1); drc_b(f->kind == 0 ? 0x6A : 0x6B); }
+    if (narrow) { drc_iconst(f->mask); drc_b(0x71); }
+    drc_setl(DRC_LOCAL_RES);
+
+    drc_iconst(a_var1); drc_getl(DRC_LOCAL_V1);
+    if (f->mask == 0xFFu) drc_store8(); else if (f->mask == 0xFFFFu) drc_store16(); else drc_store32();
+    drc_iconst(a_res); drc_getl(DRC_LOCAL_RES);
+    if (f->mask == 0xFFu) drc_store8(); else if (f->mask == 0xFFFFu) drc_store16(); else drc_store32();
+    drc_iconst(a_type); drc_iconst((uint32_t)f->type); drc_store32();
+    drc_getl(DRC_LOCAL_RES); drc_setl(FC_RETOP);
+
+    if (f->kind != 2) {
+        drc_b(0x05);                               /* else: let the helper do it */
+        drc_getl(FC_OP1);
+        drc_b(0x10); drc_uleb(import_slot);
+        drc_setl(FC_RETOP);
+        drc_b(0x0B);
+    }
+    return true;
+}
+
 /* The flag-setting arithmetic helpers all have one shape:
  *     lf_var1 = op1;  lf_var2 = op2;
  *     lf_res  = op1 <operator> op2;  lflags.type = <type>;
@@ -1055,6 +1155,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_adcsbb_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_flagop_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_unop_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
