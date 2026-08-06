@@ -16,6 +16,12 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+#if defined(__EMSCRIPTEN__)
+/* diagnostic counters shared with the wasm backend (Module.__drcBail):
+ * 50 = cache arena wrapped, 51 = a block was cleared by self-modifying code */
+extern "C" void drc_note_bail(int reason);
+#endif
+
 #include <assert.h>
 
 #include "logging.h"
@@ -141,6 +147,9 @@ public:
 				// test if this block is in the range
 				if (start<=block->page.end && end>=block->page.start) {
 					if (ip_point<=block->page.end && ip_point>=block->page.start) is_current_block=true;
+#if defined(__EMSCRIPTEN__)
+					drc_note_bail(51);	/* diagnostic: SMC invalidation */
+#endif
 					block->Clear();		// clear the block, decrements the write_map accordingly
 				}
 				block=nextblock;
@@ -565,6 +574,9 @@ static void cache_closeblock(void) {
 	// advance the active block pointer
 	if (!block->cache.next || (block->cache.next->cache.start>(cache_code_start_ptr + CACHE_TOTAL - CACHE_MAXSIZE))) {
 //		LOG_MSG("Cache full restarting");
+#if defined(__EMSCRIPTEN__)
+		drc_note_bail(50);	/* diagnostic: cache arena wrapped */
+#endif
 		cache.block.active=cache.block.first;
 	} else {
 		cache.block.active=block->cache.next;

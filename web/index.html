@@ -61,14 +61,15 @@ const DEFAULT_CONF = `[dosbox]
 memsize=63
 
 [cpu]
-# WebAssembly recompiler (~2x the interpreter). core=normal falls back to the
-# plain interpreter if a game misbehaves.
-core=dynamic
-# "auto" runs old real-mode games at the speed they were written for and
-# switches to "max" for protected-mode (DOS4GW) games, which want everything
-# the host can give. Games from the early 90s misbehave when the CPU is much
-# faster than they expect, so "max" everywhere is not the fast choice.
-cycles=auto
+# "auto" picks the plain interpreter for real-mode games and the WebAssembly
+# recompiler for protected-mode (DOS4GW) games. Retrace-synced real-mode
+# engines (Keen and friends) pace measurably better on the interpreter, and
+# at their small cycle counts the recompiler has nothing to win anyway.
+core=auto
+# "auto N" runs real-mode games at N cycles - enough for smooth EGA scrolling,
+# not so fast that speed-sensitive engines misbehave - and switches to "max"
+# for protected-mode games, which want everything the host can give.
+cycles=auto 6000
 
 [sdl]
 autolock=false
@@ -87,10 +88,10 @@ let storedConf = localStorage.getItem('dosbox-x.conf') || DEFAULT_CONF;
 if (!storedConf.includes('[log]')) storedConf += '\n[log]\nsb=false\n';
 if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n/, '[sdl]\nshowmenu=false\n');
 if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
-/* earlier page defaults; cycles=max works now that the emulator's gap-panic
- * paths are disabled for the browser build */
-storedConf = storedConf.replace(/^core=(auto|normal)$/m, 'core=dynamic');
-storedConf = storedConf.replace(/^cycles=(70000|100000|max)$/m, 'cycles=auto');
+/* earlier page defaults: real-mode games pace better on the interpreter with
+ * a bit more than the stock 3000 cycles, so core/cycles both moved to auto */
+storedConf = storedConf.replace(/^core=(dynamic|normal)$/m, 'core=auto');
+storedConf = storedConf.replace(/^cycles=(70000|100000|max|auto)$/m, 'cycles=auto 6000');
 confText.value = storedConf;
 confText.addEventListener('input', () => localStorage.setItem('dosbox-x.conf', confText.value));
 document.getElementById('confReset').addEventListener('click', () => {
