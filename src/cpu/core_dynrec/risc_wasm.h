@@ -1386,6 +1386,15 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
         for (unsigned i = 0; i < DRC_NUM_LOCALS; i++) { held_addr[i] = 0; held_kind[i] = 0; }
         #define DRC_FORGET_ALL() do { for (unsigned i_ = 0; i_ < DRC_NUM_LOCALS; i_++) held_kind[i_] = 0; } while (0)
         #define DRC_FORGET(l)    do { if ((l) < DRC_NUM_LOCALS) held_kind[l] = 0; } while (0)
+        /* forget only what a store to [ad, ad+w) can alias - store addresses
+         * in the IR are compile-time constants, so this is exact */
+        #define DRC_FORGET_RANGE(ad, w) do { \
+            for (unsigned i_ = 0; i_ < DRC_NUM_LOCALS; i_++) \
+                if (held_kind[i_] && held_addr[i_] < (ad) + (w) && (ad) < held_addr[i_] + held_kind[i_]) \
+                    held_kind[i_] = 0; \
+        } while (0)
+        const uint32_t a_lflags = (uint32_t)(uintptr_t)&lflags;
+        const uint32_t a_rflags = (uint32_t)(uintptr_t)DRCD_REG_FLAGS;
 
         unsigned closed = 0;    /* targets already closed (label emitted) */
         for (const DRCIRRec* r = first; r < last; r++) {
@@ -1399,39 +1408,59 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                 case DRCIR_LOADW: {
                     const uint8_t kind = r->b ? 4 : 2;
                     if (held_kind[r->a] == kind && held_addr[r->a] == r->x) break;  /* already there */
-                    drc_iconst(r->x);
-                    if (r->b) drc_load32(); else drc_load16u();
-                    drc_setl(r->a);
+                    int fwd = -1;   /* another local already holds this value */
+                    for (unsigned i = 0; i < DRC_NUM_LOCALS; i++)
+                        if (held_kind[i] == kind && held_addr[i] == r->x) { fwd = (int)i; break; }
+                    if (fwd >= 0) { drc_getl((uint32_t)fwd); drc_setl(r->a); }
+                    else {
+                        drc_iconst(r->x);
+                        if (r->b) drc_load32(); else drc_load16u();
+                        drc_setl(r->a);
+                    }
                     held_addr[r->a] = r->x; held_kind[r->a] = kind;
                     break;
                 }
-                case DRCIR_LOADB:
+                case DRCIR_LOADB: {
                     if (held_kind[r->a] == 1 && held_addr[r->a] == r->x) break;
-                    drc_iconst(r->x); drc_load8u(); drc_setl(r->a);
+                    int fwd = -1;
+                    for (unsigned i = 0; i < DRC_NUM_LOCALS; i++)
+                        if (held_kind[i] == 1 && held_addr[i] == r->x) { fwd = (int)i; break; }
+                    if (fwd >= 0) { drc_getl((uint32_t)fwd); drc_setl(r->a); }
+                    else { drc_iconst(r->x); drc_load8u(); drc_setl(r->a); }
                     held_addr[r->a] = r->x; held_kind[r->a] = 1;
                     break;
+                }
                 case DRCIR_STOREW:
                     drc_iconst(r->x); drc_getl(r->a);
                     if (r->b) drc_store32(); else drc_store16();
                     if (drc_touches_lflags(r->x, r->b ? 4 : 2)) drc_flag_type = -1;
-                    DRC_FORGET_ALL(); break;
+                    DRC_FORGET_RANGE(r->x, r->b ? 4u : 2u);
+                    /* the source local now mirrors the stored dword (narrow
+                     * stores may truncate bits the local still carries) */
+                    if (r->b && r->a < DRC_NUM_LOCALS) { held_addr[r->a] = r->x; held_kind[r->a] = 4; }
+                    break;
                 case DRCIR_STOREB:
                     drc_iconst(r->x); drc_getl(r->a); drc_store8();
                     if (drc_touches_lflags(r->x, 1)) drc_flag_type = -1;
-                    DRC_FORGET_ALL(); break;
+                    DRC_FORGET_RANGE(r->x, 1u);
+                    break;
                 case DRCIR_EXT:
                     drc_getl(r->a);
                     if (r->b) { drc_b(r->c == 8 ? 0xC0 : 0xC1); }             /* extend8_s/16_s */
                     else { drc_iconst(r->c == 8 ? 0xFF : 0xFFFF); drc_b(0x71); }
                     drc_setl(r->a); DRC_FORGET(r->a); break;
                 case DRCIR_ADDMEM:
-                    drc_getl(r->a); drc_iconst(r->x); drc_load32(); drc_b(0x6A); drc_setl(r->a); break;
+                    drc_getl(r->a); drc_iconst(r->x); drc_load32(); drc_b(0x6A); drc_setl(r->a);
+                    DRC_FORGET(r->a); break;
                 case DRCIR_ADDI:
-                    drc_getl(r->a); drc_iconst(r->x); drc_b(0x6A); drc_setl(r->a); break;
+                    drc_getl(r->a); drc_iconst(r->x); drc_b(0x6A); drc_setl(r->a);
+                    DRC_FORGET(r->a); break;
                 case DRCIR_ANDI:
-                    drc_getl(r->a); drc_iconst(r->x); drc_b(0x71); drc_setl(r->a); break;
+                    drc_getl(r->a); drc_iconst(r->x); drc_b(0x71); drc_setl(r->a);
+                    DRC_FORGET(r->a); break;
                 case DRCIR_SHRI:
-                    drc_getl(r->a); drc_iconst(r->b); drc_b(0x76); drc_setl(r->a); break;
+                    drc_getl(r->a); drc_iconst(r->b); drc_b(0x76); drc_setl(r->a);
+                    DRC_FORGET(r->a); break;
                 case DRCIR_LEA2:
                     drc_getl(r->a); drc_getl(r->b);
                     if (r->c) { drc_iconst(r->c); drc_b(0x74); }
@@ -1442,13 +1471,13 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     drc_getl(r->a);
                     if (r->c) { drc_iconst(r->c); drc_b(0x74); }
                     if (r->x) { drc_iconst(r->x); drc_b(0x6A); }
-                    drc_setl(r->a); break;
+                    drc_setl(r->a); DRC_FORGET(r->a); break;
                 case DRCIR_STOREI:
                     drc_iconst(r->x); drc_iconst(r->y); drc_store32();
                     if (r->x == (uint32_t)(uintptr_t)&lflags.type)
                         drc_flag_type = (r->y < (uint32_t)t_LASTFLAG) ? (int)r->y : -1;
                     else if (drc_touches_lflags(r->x, 4)) drc_flag_type = -1;
-                    DRC_FORGET_ALL(); break;
+                    DRC_FORGET_RANGE(r->x, 4u); break;
                 case DRCIR_ADDDIR:
                     drc_iconst(r->x);
                     drc_iconst(r->x);
@@ -1456,7 +1485,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     drc_iconst(r->y); drc_b(0x6A);
                     if (r->b) drc_store32(); else drc_store16();
                     if (drc_touches_lflags(r->x, r->b ? 4 : 2)) drc_flag_type = -1;
-                    DRC_FORGET_ALL();
+                    DRC_FORGET_RANGE(r->x, r->b ? 4u : 2u);
                     break;
                 case DRCIR_CALL: {
                     unsigned slot = 0; bool found = false;
@@ -1467,8 +1496,17 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_adcsbb_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
-                    if (drc_emit_flagop_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
-                    if (drc_emit_unop_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_flagop_inline(r->x, slot)) {
+                        DRC_FORGET(FC_RETOP);
+                        DRC_FORGET_RANGE(a_lflags, (uint32_t)sizeof(lflags));
+                        break;
+                    }
+                    if (drc_emit_unop_inline(r->x, slot)) {
+                        DRC_FORGET(FC_RETOP);
+                        DRC_FORGET_RANGE(a_lflags, (uint32_t)sizeof(lflags));
+                        DRC_FORGET_RANGE(a_rflags, 4u);
+                        break;
+                    }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
