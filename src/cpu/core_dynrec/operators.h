@@ -1,5 +1,5 @@
 #if C_EMSCRIPTEN
-#define DRC_STRING_CHUNK 512u
+#define DRC_STRING_CHUNK 2048u
 #endif
 /*
  *  Copyright (C) 2002-2021  The DOSBox Team
