@@ -154,6 +154,15 @@ EM_JS(void, drc_wasm_release, (int idx), {
     Module.__drcFree.push(idx);
 });
 
+/* the checked memory accessors, declared here so generated code can inline
+ * their fast path; they are defined later in decoder_basic.h */
+bool DRC_CALL_CONV mem_readb_checked_drc(PhysPt address) DRC_FC;
+bool DRC_CALL_CONV mem_readw_checked_drc(PhysPt address) DRC_FC;
+bool DRC_CALL_CONV mem_readd_checked_drc(PhysPt address) DRC_FC;
+bool DRC_CALL_CONV mem_writeb_checked_drc(PhysPt address,uint8_t val) DRC_FC;
+bool DRC_CALL_CONV mem_writew_checked_drc(PhysPt address,uint16_t val) DRC_FC;
+bool DRC_CALL_CONV mem_writed_checked_drc(PhysPt address,uint32_t val) DRC_FC;
+
 /* ------------------------------------------------------------------ */
 /* gen_* emitter interface                                             */
 /* ------------------------------------------------------------------ */
@@ -433,6 +442,66 @@ static void drc_emit_simple(uint32_t t) {
     drc_getl(FC_OP1); drc_getl(FC_OP2); drc_b(op); drc_setl(FC_RETOP);
 }
 
+/* Inline the fast path of a checked memory accessor instead of calling it.
+ * Each accessor looks up paging.tlb.read/write[address>>12]; a non-null entry
+ * means the access is plain memory and becomes a single load or store, with
+ * the helper called only on a miss. The wider accesses keep their guard
+ * against straddling a page boundary, where the helper does more work.
+ * Returns false if this call is not one of them. */
+static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
+    const uint32_t tlb_read  = (uint32_t)(uintptr_t)&paging.tlb.read[0];
+    const uint32_t tlb_write = (uint32_t)(uintptr_t)&paging.tlb.write[0];
+    const uint32_t readdata  = (uint32_t)(uintptr_t)&core_dynrec.readdata;
+
+    unsigned width;             /* 1, 2 or 4 bytes */
+    bool is_write;
+    if      (target == (uint32_t)(uintptr_t)mem_readb_checked_drc)  { width = 1; is_write = false; }
+    else if (target == (uint32_t)(uintptr_t)mem_readw_checked_drc)  { width = 2; is_write = false; }
+    else if (target == (uint32_t)(uintptr_t)mem_readd_checked_drc)  { width = 4; is_write = false; }
+    else if (target == (uint32_t)(uintptr_t)mem_writeb_checked_drc) { width = 1; is_write = true; }
+    else if (target == (uint32_t)(uintptr_t)mem_writew_checked_drc) { width = 2; is_write = true; }
+    else if (target == (uint32_t)(uintptr_t)mem_writed_checked_drc) { width = 4; is_write = true; }
+    else return false;
+
+    /* tlb entry, or 0 when the access straddles a page and the helper must
+     * handle it: (addr & 0xfff) < limit ? tlb[addr>>12] : 0 */
+    const uint32_t limit = (width == 1) ? 0 : (width == 2 ? 0xfffu : 0xffdu);
+    if (limit) {
+        drc_getl(FC_OP1); drc_iconst(0xfff); drc_b(0x71);        /* and  */
+        drc_iconst(limit); drc_b(0x49);                          /* lt_u */
+        drc_b(0x04); drc_b(0x7F);                                /* if (result i32) */
+    }
+    drc_getl(FC_OP1); drc_iconst(12); drc_b(0x76);               /* shr_u */
+    drc_iconst(2); drc_b(0x74);                                  /* shl   */
+    drc_iconst(is_write ? tlb_write : tlb_read); drc_b(0x6A);    /* add   */
+    drc_load32();
+    if (limit) {
+        drc_b(0x05); drc_iconst(0); drc_b(0x0B);                 /* else 0; end */
+    }
+    drc_teel(DRC_LOCAL_SCRATCH);
+    drc_b(0x04); drc_b(0x40);                                    /* if (non-null) */
+
+    if (is_write) {
+        drc_getl(DRC_LOCAL_SCRATCH); drc_getl(FC_OP1); drc_b(0x6A);
+        drc_getl(FC_OP2);
+        if (width == 1) drc_store8(); else if (width == 2) drc_store16(); else drc_store32();
+    } else {
+        drc_iconst(readdata);
+        drc_getl(DRC_LOCAL_SCRATCH); drc_getl(FC_OP1); drc_b(0x6A);
+        if (width == 1) drc_load8u(); else if (width == 2) drc_load16u(); else drc_load32();
+        if (width == 1) drc_store8(); else if (width == 2) drc_store16(); else drc_store32();
+    }
+    drc_iconst(0); drc_setl(FC_RETOP);                           /* no fault */
+
+    drc_b(0x05);                                                 /* else: call it */
+    drc_getl(FC_OP1);
+    if (is_write) drc_getl(FC_OP2);
+    drc_b(0x10); drc_uleb(import_slot);
+    drc_setl(FC_RETOP);
+    drc_b(0x0B);                                                 /* end */
+    return true;
+}
+
 /* translate the IR in [start,end) and hand it to the JS compiler.
  * returns the tagged xstart value (DRC_XSTART_TAG on failure keeps idx 0). */
 static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
@@ -613,6 +682,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     unsigned slot = 0; bool found = false;
                     for (unsigned i = 0; i < ncalls; i++) if (calls[i] == r->x) { slot = i; found = true; break; }
                     if (!found) { drc_note_bail(5); return DRC_XSTART_TAG; }
+                    if (drc_emit_mem_inline(r->x, slot)) break;
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
