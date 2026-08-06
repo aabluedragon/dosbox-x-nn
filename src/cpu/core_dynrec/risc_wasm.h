@@ -61,6 +61,15 @@ typedef uint8_t HostReg;
  * extra four should not declare them */
 static bool drc_used_extra_locals = false;
 
+/* The value lflags.type will hold at the record being translated, or -1 when
+ * it cannot be known. The flag producer is nearly always in the same block as
+ * its consumer - blocks end at branches, so a cmp travels with its jcc and an
+ * add with its adc - which lets the consumers emit the one formula flags.cpp
+ * would have picked instead of dispatching on the type at runtime. Set by the
+ * inlined flag writers, forgotten at branch targets and at any call that may
+ * clobber the lazy state. */
+static int drc_flag_type = -1;
+
 #define DRC_XSTART_TAG 0x80000000u
 
 /* ------------------------------------------------------------------ */
@@ -555,6 +564,181 @@ static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
     return true;
 }
 
+/* the memory accessors never touch the lazy flag state, so a call to one
+ * does not invalidate the tracked flag type */
+static INLINE bool drc_call_is_mem(uint32_t target) {
+    return target == (uint32_t)(uintptr_t)mem_readb_checked_drc
+        || target == (uint32_t)(uintptr_t)mem_readw_checked_drc
+        || target == (uint32_t)(uintptr_t)mem_readd_checked_drc
+        || target == (uint32_t)(uintptr_t)mem_writeb_checked_drc
+        || target == (uint32_t)(uintptr_t)mem_writew_checked_drc
+        || target == (uint32_t)(uintptr_t)mem_writed_checked_drc;
+}
+
+static INLINE bool drc_touches_lflags(uint32_t addr, uint32_t width) {
+    const uint32_t lo = (uint32_t)(uintptr_t)&lflags;
+    return addr + width > lo && addr < lo + (uint32_t)sizeof(lflags);
+}
+
+/* operand width of a lazy flag type */
+static uint32_t drc_type_mask(int t) {
+    switch (t) {
+    case t_ADDb: case t_ORb: case t_ADCb: case t_SBBb: case t_ANDb:
+    case t_XORb: case t_SUBb: case t_CMPb: case t_INCb: case t_DECb:
+    case t_TESTb: case t_SHLb: case t_SHRb: case t_SARb: case t_NEGb:
+        return 0xFFu;
+    case t_ADDw: case t_ORw: case t_ADCw: case t_SBBw: case t_ANDw:
+    case t_XORw: case t_SUBw: case t_CMPw: case t_INCw: case t_DECw:
+    case t_TESTw: case t_SHLw: case t_SHRw: case t_SARw: case t_NEGw:
+    case t_DSHLw: case t_DSHRw:
+        return 0xFFFFu;
+    default:
+        return 0xFFFFFFFFu;
+    }
+}
+
+enum { DRC_F_CF, DRC_F_ZF, DRC_F_SF, DRC_F_OF };
+
+/* With the flag type known, push the given flag as an i32 0/1 - the exact
+ * formula the matching case in flags.cpp computes. With emit=false, only
+ * answer whether the type/flag pair is statically computable; a false return
+ * means the caller must call the helper. ADC and SBB are left out (their
+ * carry also depends on lflags.oldcf), as are the shift counts carry needs. */
+static bool drc_flag_emit(int t, int which, bool emit) {
+    if (t < 0 || t >= t_LASTFLAG) return false;
+    const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
+    const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
+    const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
+    const uint32_t a_flag = (uint32_t)(uintptr_t)DRCD_REG_FLAGS;
+    const uint32_t m = drc_type_mask(t);
+    const uint32_t sign = (m >> 1) + 1;
+
+    /* a lazy operand, masked to the operand width: narrow helpers store into
+     * the low bytes of the union, the rest is leftover from wider ops */
+    #define DRC_LOADM(a) do { drc_iconst(a); drc_load32(); \
+        if (m != 0xFFFFFFFFu) { drc_iconst(m); drc_b(0x71); } } while (0)
+    /* one bit of the flags word as 0/1 */
+    #define DRC_FLAGBIT(bit) do { drc_iconst(a_flag); drc_load32(); \
+        drc_iconst(bit); drc_b(0x71); drc_iconst(0); drc_b(0x47); } while (0)
+
+    switch (which) {
+    case DRC_F_ZF:
+        if (t == t_UNKNOWN) { if (emit) DRC_FLAGBIT(0x40u); return true; }
+        if (t == t_MUL || t == t_DIV) { if (emit) drc_iconst(0); return true; }
+        if (!drc_zf_mask[t]) return false;
+        if (emit) { DRC_LOADM(a_res); drc_b(0x45); }
+        return true;
+    case DRC_F_SF:
+        /* same case list as the zero flag; the sign bit is always within the
+         * valid low bytes, so no width mask is needed */
+        if (t == t_UNKNOWN) { if (emit) DRC_FLAGBIT(0x80u); return true; }
+        if (t == t_MUL || t == t_DIV) { if (emit) drc_iconst(0); return true; }
+        if (!drc_zf_mask[t]) return false;
+        if (emit) { drc_iconst(a_res); drc_load32(); drc_iconst(sign); drc_b(0x71);
+                    drc_iconst(0); drc_b(0x47); }
+        return true;
+    case DRC_F_CF:
+        switch (t) {
+        case t_ADDb: case t_ADDw: case t_ADDd:
+            if (emit) { DRC_LOADM(a_res); DRC_LOADM(a_var1); drc_b(0x49); }
+            return true;
+        case t_SUBb: case t_SUBw: case t_SUBd:
+        case t_CMPb: case t_CMPw: case t_CMPd:
+            if (emit) { DRC_LOADM(a_var1); DRC_LOADM(a_var2); drc_b(0x49); }
+            return true;
+        case t_ANDb: case t_ANDw: case t_ANDd:
+        case t_ORb:  case t_ORw:  case t_ORd:
+        case t_XORb: case t_XORw: case t_XORd:
+        case t_TESTb: case t_TESTw: case t_TESTd:
+        case t_DIV:
+            if (emit) drc_iconst(0);
+            return true;
+        case t_NEGb: case t_NEGw: case t_NEGd:
+            if (emit) { DRC_LOADM(a_var1); drc_iconst(0); drc_b(0x47); }
+            return true;
+        case t_INCb: case t_INCw: case t_INCd:
+        case t_DECb: case t_DECw: case t_DECd:
+        case t_UNKNOWN: case t_MUL:
+            if (emit) DRC_FLAGBIT(1u);
+            return true;
+        default:
+            return false;
+        }
+    case DRC_F_OF:
+        switch (t) {
+        case t_ADDb: case t_ADDw: case t_ADDd:
+            /* ((v1 ^ v2 ^ sign) & (res ^ v2)) & sign */
+            if (emit) {
+                drc_iconst(a_var1); drc_load32();
+                drc_iconst(a_var2); drc_load32(); drc_b(0x73);
+                drc_iconst(sign); drc_b(0x73);
+                drc_iconst(a_res); drc_load32();
+                drc_iconst(a_var2); drc_load32(); drc_b(0x73);
+                drc_b(0x71); drc_iconst(sign); drc_b(0x71);
+                drc_iconst(0); drc_b(0x47);
+            }
+            return true;
+        case t_SUBb: case t_SUBw: case t_SUBd:
+        case t_CMPb: case t_CMPw: case t_CMPd:
+            /* ((v1 ^ v2) & (v1 ^ res)) & sign */
+            if (emit) {
+                drc_iconst(a_var1); drc_load32();
+                drc_iconst(a_var2); drc_load32(); drc_b(0x73);
+                drc_iconst(a_var1); drc_load32();
+                drc_iconst(a_res); drc_load32(); drc_b(0x73);
+                drc_b(0x71); drc_iconst(sign); drc_b(0x71);
+                drc_iconst(0); drc_b(0x47);
+            }
+            return true;
+        case t_ANDb: case t_ANDw: case t_ANDd:
+        case t_ORb:  case t_ORw:  case t_ORd:
+        case t_XORb: case t_XORw: case t_XORd:
+        case t_TESTb: case t_TESTw: case t_TESTd:
+        case t_SARb: case t_SARw: case t_SARd:
+            if (emit) drc_iconst(0);
+            return true;
+        case t_INCb: case t_INCw: case t_INCd:
+            if (emit) { DRC_LOADM(a_res); drc_iconst(sign); drc_b(0x46); }
+            return true;
+        case t_DECb: case t_DECw: case t_DECd:
+            if (emit) { DRC_LOADM(a_res); drc_iconst(sign - 1); drc_b(0x46); }
+            return true;
+        case t_NEGb: case t_NEGw: case t_NEGd:
+            if (emit) { DRC_LOADM(a_var1); drc_iconst(sign); drc_b(0x46); }
+            return true;
+        case t_SHLb: case t_SHLw: case t_SHLd:
+            /* (res ^ v1) & sign */
+            if (emit) {
+                drc_iconst(a_res); drc_load32();
+                drc_iconst(a_var1); drc_load32(); drc_b(0x73);
+                drc_iconst(sign); drc_b(0x71);
+                drc_iconst(0); drc_b(0x47);
+            }
+            return true;
+        case t_UNKNOWN: case t_MUL:
+            if (emit) DRC_FLAGBIT(0x800u);
+            return true;
+        default:
+            return false;
+        }
+    }
+    #undef DRC_LOADM
+    #undef DRC_FLAGBIT
+    return false;
+}
+
+static INLINE bool drc_flag_supported(int t, int which) { return drc_flag_emit(t, which, false); }
+static INLINE void drc_push_flag(int t, int which) { (void)drc_flag_emit(t, which, true); }
+
+/* diagnostic twin of drc_note_bail: which path each flag consumer took at
+ * translate time (1/2/3 adc-sbb static/helper/dynamic, 4/5/6 inc-dec helper/
+ * static/dynamic, 7/8/9 carry read, 10/11/12 zero read, 13/14/15 branch
+ * condition). Read via Module.__drcPath / the worker's stats message. */
+EM_JS(void, drc_note_path, (int reason), {
+    if (!Module.__drcPath) Module.__drcPath = {};
+    Module.__drcPath[reason] = (Module.__drcPath[reason] || 0) + 1;
+});
+
 static uint8_t DRC_CALL_CONV dynrec_add_byte(uint8_t op1,uint8_t op2) DRC_FC;
 static uint16_t DRC_CALL_CONV dynrec_add_word(uint16_t op1,uint16_t op2) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_add_dword(uint32_t op1,uint32_t op2) DRC_FC;
@@ -620,6 +804,19 @@ static bool drc_emit_unop_inline(uint32_t target, unsigned import_slot) {
         if (drc_un_ops[i].fn == target) { f = &drc_un_ops[i]; break; }
     if (f == NULL) return false;
 
+    const bool dynamic = (drc_flag_type < 0);
+    if (!dynamic && f->kind != 2 && !drc_cf_is_noop[drc_flag_type]
+        && !drc_flag_supported(drc_flag_type, DRC_F_CF)) {
+        /* carry not statically computable: the helper does the whole thing
+         * (and sets the type itself, so tracking survives) */
+        drc_note_path(4);
+        drc_getl(FC_OP1);
+        drc_b(0x10); drc_uleb(import_slot);
+        drc_setl(FC_RETOP);
+        drc_flag_type = f->type;
+        return true;
+    }
+
     drc_used_extra_locals = true;
     const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
     const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
@@ -629,7 +826,17 @@ static bool drc_emit_unop_inline(uint32_t target, unsigned import_slot) {
     const uint32_t a_mask = (uint32_t)(uintptr_t)&drc_subcmp_mask[0];
     const bool narrow = (f->mask != 0xFFFFFFFFu);
 
-    if (f->kind != 2) {
+    if (!dynamic) drc_note_path(5); else drc_note_path(6);
+    if (!dynamic && f->kind != 2 && !drc_cf_is_noop[drc_flag_type]) {
+        /* reg_flags = (reg_flags & ~1) | CF, with CF known statically */
+        drc_iconst(a_flag);
+        drc_iconst(a_flag); drc_load32(); drc_iconst(0xFFFFFFFEu); drc_b(0x71);
+        drc_push_flag(drc_flag_type, DRC_F_CF);
+        drc_b(0x72);
+        drc_store32();
+    }
+
+    if (dynamic && f->kind != 2) {
         const uint32_t a_noop = (uint32_t)(uintptr_t)&drc_cf_is_noop[0];
         /* mask != 0 -> carry is computable here; noop -> carry needs no work */
         drc_iconst(a_type); drc_load32(); drc_setl(DRC_LOCAL_V2);
@@ -667,13 +874,14 @@ static bool drc_emit_unop_inline(uint32_t target, unsigned import_slot) {
     drc_iconst(a_type); drc_iconst((uint32_t)f->type); drc_store32();
     drc_getl(DRC_LOCAL_RES); drc_setl(FC_RETOP);
 
-    if (f->kind != 2) {
+    if (dynamic && f->kind != 2) {
         drc_b(0x05);                               /* else: let the helper do it */
         drc_getl(FC_OP1);
         drc_b(0x10); drc_uleb(import_slot);
         drc_setl(FC_RETOP);
         drc_b(0x0B);
     }
+    drc_flag_type = f->type;
     return true;
 }
 
@@ -740,6 +948,7 @@ static bool drc_emit_flagop_inline(uint32_t target, unsigned import_slot) {
     drc_iconst(a_type); drc_iconst((uint32_t)f->type); drc_store32();
 
     if (f->hasret) { drc_getl(DRC_LOCAL_RES); drc_setl(FC_RETOP); }
+    drc_flag_type = f->type;
     return true;
 }
 
@@ -757,6 +966,30 @@ static bool drc_emit_adcsbb_inline(uint32_t target, unsigned import_slot) {
     else if (target == (uint32_t)(uintptr_t)dynrec_sbb_word_simple)  { opmask = 0xFFFFu;     is_sbb = true;  }
     else if (target == (uint32_t)(uintptr_t)dynrec_sbb_dword_simple) { opmask = 0xFFFFFFFFu; is_sbb = true;  }
     else return false;
+
+    /* the _simple helpers only read the lazy state, so the tracked type
+     * survives either path */
+    if (drc_flag_type >= 0) {
+        if (drc_flag_supported(drc_flag_type, DRC_F_CF)) {
+            drc_note_path(1);
+            if (is_sbb) {   /* op1 - (op2 + carry) */
+                drc_getl(FC_OP1);
+                drc_getl(FC_OP2); drc_push_flag(drc_flag_type, DRC_F_CF); drc_b(0x6A);
+                drc_b(0x6B);
+            } else {        /* op1 + op2 + carry */
+                drc_getl(FC_OP1); drc_getl(FC_OP2); drc_b(0x6A);
+                drc_push_flag(drc_flag_type, DRC_F_CF); drc_b(0x6A);
+            }
+            if (opmask != 0xFFFFFFFFu) { drc_iconst(opmask); drc_b(0x71); }
+        } else {
+            drc_note_path(2);
+            drc_getl(FC_OP1); drc_getl(FC_OP2);
+            drc_b(0x10); drc_uleb(import_slot);
+        }
+        drc_setl(FC_RETOP);
+        return true;
+    }
+    drc_note_path(3);
 
     drc_used_extra_locals = true;
     const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
@@ -820,7 +1053,52 @@ static bool drc_emit_cond_inline(uint32_t target, unsigned import_slot) {
     else if (target == (uint32_t)(uintptr_t)dynrec_get_nzf_and_sf_eq_of)  cond = DRC_C_NZF_AND_SF_EQ_OF;
     else return false;
 
-    drc_used_extra_locals = true;
+    if (drc_flag_type >= 0) {
+        const int K = drc_flag_type;
+        bool ok;
+        switch (cond) {
+        case DRC_C_SF: case DRC_C_NSF:
+            ok = drc_flag_supported(K, DRC_F_SF); break;
+        case DRC_C_CF_OR_ZF: case DRC_C_NCF_AND_NZF:
+            ok = drc_flag_supported(K, DRC_F_CF) && drc_flag_supported(K, DRC_F_ZF); break;
+        case DRC_C_SF_EQ_OF: case DRC_C_SF_NEQ_OF:
+            ok = drc_flag_supported(K, DRC_F_SF) && drc_flag_supported(K, DRC_F_OF); break;
+        default:
+            ok = drc_flag_supported(K, DRC_F_ZF) && drc_flag_supported(K, DRC_F_SF)
+              && drc_flag_supported(K, DRC_F_OF); break;
+        }
+        if (ok) {
+            drc_note_path(13);
+            switch (cond) {
+            case DRC_C_SF:  drc_push_flag(K, DRC_F_SF); break;
+            case DRC_C_NSF: drc_push_flag(K, DRC_F_SF); drc_b(0x45); break;
+            case DRC_C_CF_OR_ZF:
+                drc_push_flag(K, DRC_F_CF); drc_push_flag(K, DRC_F_ZF); drc_b(0x72); break;
+            case DRC_C_NCF_AND_NZF:
+                drc_push_flag(K, DRC_F_CF); drc_push_flag(K, DRC_F_ZF); drc_b(0x72); drc_b(0x45); break;
+            case DRC_C_SF_EQ_OF:
+                drc_push_flag(K, DRC_F_SF); drc_push_flag(K, DRC_F_OF); drc_b(0x46); break;
+            case DRC_C_SF_NEQ_OF:
+                drc_push_flag(K, DRC_F_SF); drc_push_flag(K, DRC_F_OF); drc_b(0x47); break;
+            case DRC_C_ZF_OR_SF_NEQ_OF:
+                drc_push_flag(K, DRC_F_ZF);
+                drc_push_flag(K, DRC_F_SF); drc_push_flag(K, DRC_F_OF); drc_b(0x47);
+                drc_b(0x72); break;
+            case DRC_C_NZF_AND_SF_EQ_OF:
+                drc_push_flag(K, DRC_F_ZF);
+                drc_push_flag(K, DRC_F_SF); drc_push_flag(K, DRC_F_OF); drc_b(0x47);
+                drc_b(0x72); drc_b(0x45); break;
+            default: break;
+            }
+        } else {
+            drc_note_path(14);
+            drc_b(0x10); drc_uleb(import_slot);
+        }
+        drc_setl(FC_RETOP);
+        return true;
+    }
+    drc_note_path(15);
+
     drc_used_extra_locals = true;
     const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
     const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
@@ -889,6 +1167,20 @@ static bool drc_emit_cf_inline(uint32_t target, unsigned import_slot) {
     else if (target == (uint32_t)(uintptr_t)dynrec_get_ncf) negate = true;
     else return false;
 
+    if (drc_flag_type >= 0) {
+        if (drc_flag_supported(drc_flag_type, DRC_F_CF)) {
+            drc_note_path(7);
+            drc_push_flag(drc_flag_type, DRC_F_CF);
+            if (negate) drc_b(0x45);
+        } else {
+            drc_note_path(8);
+            drc_b(0x10); drc_uleb(import_slot);
+        }
+        drc_setl(FC_RETOP);
+        return true;
+    }
+    drc_note_path(9);
+
     const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
     const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
     const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
@@ -924,6 +1216,20 @@ static bool drc_emit_zf_inline(uint32_t target, unsigned import_slot) {
     if      (target == (uint32_t)(uintptr_t)dynrec_get_zf)  negate = false;
     else if (target == (uint32_t)(uintptr_t)dynrec_get_nzf) negate = true;
     else return false;
+
+    if (drc_flag_type >= 0) {
+        if (drc_flag_supported(drc_flag_type, DRC_F_ZF)) {
+            drc_note_path(10);
+            drc_push_flag(drc_flag_type, DRC_F_ZF);
+            if (negate) drc_b(0x45);
+        } else {
+            drc_note_path(11);
+            drc_b(0x10); drc_uleb(import_slot);
+        }
+        drc_setl(FC_RETOP);
+        return true;
+    }
+    drc_note_path(12);
 
     const uint32_t a_type = (uint32_t)(uintptr_t)&lflags.type;
     const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
@@ -1064,6 +1370,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
         /* emit body into drc_buf then move to body */
         drc_buf.clear();
         drc_used_extra_locals = false;
+        drc_flag_type = -1;
 
         /* open one wasm block per branch target, outermost = latest target */
         for (unsigned i = ntargets; i-- > 0;) { (void)i; drc_b(0x02); drc_b(0x40); }
@@ -1084,7 +1391,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
         for (const DRCIRRec* r = first; r < last; r++) {
             /* close blocks whose target is this record */
             while (closed < ntargets && targets[closed] == (uint32_t)(uintptr_t)r)
-                { drc_b(0x0B); closed++; DRC_FORGET_ALL(); }
+                { drc_b(0x0B); closed++; DRC_FORGET_ALL(); drc_flag_type = -1; }
 
             switch (r->op) {
                 case DRCIR_MOVRR: drc_getl(r->b); drc_setl(r->a); DRC_FORGET(r->a); break;
@@ -1106,9 +1413,11 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                 case DRCIR_STOREW:
                     drc_iconst(r->x); drc_getl(r->a);
                     if (r->b) drc_store32(); else drc_store16();
+                    if (drc_touches_lflags(r->x, r->b ? 4 : 2)) drc_flag_type = -1;
                     DRC_FORGET_ALL(); break;
                 case DRCIR_STOREB:
                     drc_iconst(r->x); drc_getl(r->a); drc_store8();
+                    if (drc_touches_lflags(r->x, 1)) drc_flag_type = -1;
                     DRC_FORGET_ALL(); break;
                 case DRCIR_EXT:
                     drc_getl(r->a);
@@ -1136,6 +1445,9 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     drc_setl(r->a); break;
                 case DRCIR_STOREI:
                     drc_iconst(r->x); drc_iconst(r->y); drc_store32();
+                    if (r->x == (uint32_t)(uintptr_t)&lflags.type)
+                        drc_flag_type = (r->y < (uint32_t)t_LASTFLAG) ? (int)r->y : -1;
+                    else if (drc_touches_lflags(r->x, 4)) drc_flag_type = -1;
                     DRC_FORGET_ALL(); break;
                 case DRCIR_ADDDIR:
                     drc_iconst(r->x);
@@ -1143,6 +1455,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (r->b) drc_load32(); else drc_load16u();
                     drc_iconst(r->y); drc_b(0x6A);
                     if (r->b) drc_store32(); else drc_store16();
+                    if (drc_touches_lflags(r->x, r->b ? 4 : 2)) drc_flag_type = -1;
                     DRC_FORGET_ALL();
                     break;
                 case DRCIR_CALL: {
@@ -1159,6 +1472,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
                     drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
+                    if (!drc_call_is_mem(r->x)) drc_flag_type = -1;
                     DRC_FORGET_ALL();
                     break;
                 }

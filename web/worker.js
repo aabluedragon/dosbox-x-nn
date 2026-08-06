@@ -144,6 +144,7 @@ onmessage = (e) => {
     case 'stats':
       postMessage({ type: 'stats', compiled: Module.__drcCount || 0,
                     failed: Module.__drcFail || 0, bail: Module.__drcBail || {}, ms: Module.__drcTime || 0,
+                    path: Module.__drcPath || {},
                     frames: (self.__frameTimes || []).slice(),
                     events: (Module.__drcEvents || []).slice(),
                     beats: (self.__beats || []).slice(),
