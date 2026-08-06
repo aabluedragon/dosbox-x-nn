@@ -30,6 +30,7 @@
 #include <emscripten.h>
 #include <type_traits>
 #include <vector>
+#include <cstdio>
 
 // configuring defines
 #define DRC_FLAGS_INVALIDATION
@@ -104,7 +105,11 @@ EM_JS(int, drc_wasm_compile, (const uint8_t* bytes, int len), {
     try {
         const buf = HEAPU8.subarray(bytes, bytes + len);
         const mod = new WebAssembly.Module(buf);
-        const inst = new WebAssembly.Instance(mod, { e: { t: wasmTable, m: wasmMemory } });
+        const imports = { e: { t: wasmTable, m: wasmMemory }, f: {} };
+        for (const im of WebAssembly.Module.imports(mod)) {
+            if (im.module === 'f') imports.f[im.name] = wasmTable.get(parseInt(im.name, 10));
+        }
+        const inst = new WebAssembly.Instance(mod, imports);
         let idx;
         if (Module.__drcFree && Module.__drcFree.length) idx = Module.__drcFree.pop();
         else {
@@ -458,6 +463,22 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
             uint32_t t = targets[j]; targets[j] = targets[j-1]; targets[j-1] = t;
         }
 
+    /* Helpers are imported so the generated code can use a direct call
+     * instead of call_indirect: no runtime type check, no table bounds check,
+     * and the callee is a known function to the engine. */
+    uint32_t calls[128]; uint8_t call_nargs[128], call_hasret[128];
+    unsigned ncalls = 0;
+    for (const DRCIRRec* r = first; r < last; r++) {
+        if (r->op != DRCIR_CALL) continue;
+        if (r->b > 4 || r->x == 0) { drc_note_bail(5); return DRC_XSTART_TAG; }
+        bool seen = false;
+        for (unsigned i = 0; i < ncalls; i++) if (calls[i] == r->x) { seen = true; break; }
+        if (seen) continue;
+        if (ncalls >= 128) { drc_note_bail(6); return DRC_XSTART_TAG; }
+        calls[ncalls] = r->x; call_nargs[ncalls] = r->b; call_hasret[ncalls] = r->c;
+        ncalls++;
+    }
+
     drc_buf.clear();
 
     /* ---- module header ---- */
@@ -488,13 +509,24 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
     /* import section: table + memory */
     {
         std::vector<uint8_t> s;
-        s.push_back(2);
+        s.push_back(2);     /* patched below once helper imports are counted */
         /* "e" "t" table funcref min 0 */
         s.push_back(1); s.push_back('e'); s.push_back(1); s.push_back('t');
         s.push_back(0x01); s.push_back(0x70); s.push_back(0x00); s.push_back(0x00);
         /* "e" "m" memory min 0 */
         s.push_back(1); s.push_back('e'); s.push_back(1); s.push_back('m');
         s.push_back(0x02); s.push_back(0x00); s.push_back(0x00);
+        /* one function import per distinct helper, named by its table index */
+        for (unsigned i = 0; i < ncalls; i++) {
+            char name[16];
+            const int n = snprintf(name, sizeof(name), "%u", (unsigned)calls[i]);
+            s.push_back(1); s.push_back('f');
+            s.push_back((uint8_t)n);
+            for (int j = 0; j < n; j++) s.push_back((uint8_t)name[j]);
+            s.push_back(0x00);  /* func */
+            s.push_back((uint8_t)drc_calltype(call_nargs[i], call_hasret[i]));
+        }
+        s[0] = (uint8_t)(2 + ncalls);
         drc_b(0x02); drc_uleb((uint32_t)s.size());
         drc_buf.insert(drc_buf.end(), s.begin(), s.end());
     }
@@ -502,8 +534,14 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
     /* function section: one function of type 0 */
     drc_b(0x03); drc_uleb(2); drc_b(1); drc_b(DRC_TYPE_BLOCK);
 
-    /* export section: "f" -> func 0 */
-    drc_b(0x07); drc_uleb(5); drc_b(1); drc_b(1); drc_b('f'); drc_b(0x00); drc_b(0);
+    /* export section: "f" -> our function, which follows the imports */
+    {
+        std::vector<uint8_t> s;
+        s.push_back(1); s.push_back(1); s.push_back('f'); s.push_back(0x00);
+        uint32_t fi = ncalls; do { uint8_t b7 = fi & 0x7f; fi >>= 7; if (fi) b7 |= 0x80; s.push_back(b7); } while (fi);
+        drc_b(0x07); drc_uleb((uint32_t)s.size());
+        drc_buf.insert(drc_buf.end(), s.begin(), s.end());
+    }
 
     /* code section */
     std::vector<uint8_t> body;
@@ -572,10 +610,11 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (r->b) drc_store32(); else drc_store16();
                     break;
                 case DRCIR_CALL: {
-                    if (r->b > 4) { drc_note_bail(5); return DRC_XSTART_TAG; }
+                    unsigned slot = 0; bool found = false;
+                    for (unsigned i = 0; i < ncalls; i++) if (calls[i] == r->x) { slot = i; found = true; break; }
+                    if (!found) { drc_note_bail(5); return DRC_XSTART_TAG; }
                     for (unsigned i = 0; i < r->b; i++) drc_getl(FC_OP1 + i);
-                    drc_iconst(r->x);
-                    drc_b(0x11); drc_uleb(drc_calltype(r->b, r->c)); drc_b(0x00);
+                    drc_b(0x10); drc_uleb(slot);        /* call <imported helper> */
                     if (r->c) drc_setl(FC_RETOP);
                     break;
                 }
