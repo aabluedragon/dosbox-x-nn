@@ -6034,6 +6034,12 @@ __attribute__((used)) unsigned int EMWORKER_FrameDiag(int which) {
         case 5: return emw_latch_count;
         case 6: return emw_line_sum;
         case 7: return emw_flip_count;
+        case 8: {
+            /* cycles charged to emulated port I/O delay; with fixed cycles
+             * nothing resets it, so deltas give the I/O time share */
+            extern cpu_cycles_count_t CPU_IODelayRemoved;
+            return (unsigned int)(uint64_t)CPU_IODelayRemoved;
+        }
     }
     return 0;
 }

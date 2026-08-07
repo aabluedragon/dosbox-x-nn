@@ -408,7 +408,26 @@ int io_delay_ns[3] = {-1,-1,-1};
 /* nonzero if we're in a callback */
 extern unsigned int last_callback;
 
-inline void IO_USEC_read_delay(const unsigned int szidx) {
+#if defined(__EMSCRIPTEN__)
+/* The web build emulates a mid-90s machine with an S3 SVGA card. On real
+ * hardware of that class the video card sat on VLB/PCI, not the ISA bus, so
+ * video register I/O was several times faster than the ISA delay emulated
+ * here. Charging the ISA delay on VGA ports made EGA tile renderers
+ * (Commander Keen and friends) spend >50% of emulated time on OUT
+ * instructions, dropping them from a locked 35fps to a juddery ~27fps.
+ * Peripheral ports (Sound Blaster, PIT, ...) keep the ISA delay - the SB DSP
+ * reset handshake genuinely depends on it. */
+static inline bool IO_port_is_fast_video(const Bitu port) {
+	return port >= 0x3B0 && port <= 0x3DF;
+}
+#endif
+
+inline void IO_USEC_read_delay(const unsigned int szidx, const Bitu port) {
+#if defined(__EMSCRIPTEN__)
+	if (IO_port_is_fast_video(port)) return;
+#else
+	(void)port;
+#endif
 	if (io_delay_ns[szidx] > 0 && last_callback == 0/*NOT running within a callback function*/) {
 		Bits delaycyc = (CPU_CycleMax * io_delay_ns[szidx]) / 1000000;
 		CPU_Cycles -= delaycyc;
@@ -416,7 +435,12 @@ inline void IO_USEC_read_delay(const unsigned int szidx) {
 	}
 }
 
-inline void IO_USEC_write_delay(const unsigned int szidx) {
+inline void IO_USEC_write_delay(const unsigned int szidx, const Bitu port) {
+#if defined(__EMSCRIPTEN__)
+	if (IO_port_is_fast_video(port)) return;
+#else
+	(void)port;
+#endif
 	if (io_delay_ns[szidx] > 0 && last_callback == 0/*NOT running within a callback function*/) {
 		Bits delaycyc = (CPU_CycleMax * io_delay_ns[szidx] * 3) / (1000000 * 4);
 		CPU_Cycles -= delaycyc;
@@ -496,7 +520,7 @@ void IO_WriteB(Bitu port,uint8_t val) {
 		CPU_ForceV86FakeIO_Out(port,val,1);
 	}
 	else {
-		IO_USEC_write_delay(0);
+		IO_USEC_write_delay(0,port);
 		io_writehandlers[0][port](port,val,1);
 	}
 }
@@ -507,7 +531,7 @@ void IO_WriteW(Bitu port,uint16_t val) {
 		CPU_ForceV86FakeIO_Out(port,val,2);
 	}
 	else {
-		IO_USEC_write_delay(1);
+		IO_USEC_write_delay(1,port);
 		io_writehandlers[1][port](port,val,2);
 	}
 }
@@ -518,7 +542,7 @@ void IO_WriteD(Bitu port,uint32_t val) {
 		CPU_ForceV86FakeIO_Out(port,val,4);
 	}
 	else {
-		IO_USEC_write_delay(2);
+		IO_USEC_write_delay(2,port);
 		io_writehandlers[2][port](port,val,4);
 	}
 }
@@ -529,7 +553,7 @@ uint8_t IO_ReadB(Bitu port) {
 		return (uint8_t)CPU_ForceV86FakeIO_In(port,1);
 	}
 	else {
-		IO_USEC_read_delay(0);
+		IO_USEC_read_delay(0,port);
 		retval = (uint8_t)io_readhandlers[0][port](port,1);
 	}
 	log_io(0, false, port, retval);
@@ -542,7 +566,7 @@ uint16_t IO_ReadW(Bitu port) {
 		return (uint16_t)CPU_ForceV86FakeIO_In(port,2);
 	}
 	else {
-		IO_USEC_read_delay(1);
+		IO_USEC_read_delay(1,port);
 		retval = (uint16_t)io_readhandlers[1][port](port,2);
 	}
 	log_io(1, false, port, retval);
@@ -555,7 +579,7 @@ uint32_t IO_ReadD(Bitu port) {
 		return (uint32_t)CPU_ForceV86FakeIO_In(port,4);
 	}
 	else {
-		IO_USEC_read_delay(2);
+		IO_USEC_read_delay(2,port);
 		retval = (uint32_t)io_readhandlers[2][port](port,4);
 	}
 	log_io(2, false, port, retval);
