@@ -148,4 +148,5 @@ web/bench-*.html
 web/*-backup/
 web/nk/
 web/sw/
+web/abuse/
 build-wasm/

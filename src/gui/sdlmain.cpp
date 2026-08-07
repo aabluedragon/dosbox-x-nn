@@ -4877,8 +4877,21 @@ void UpdateUserCursorScreenDimensions(void) {
 	}
 }
 
+#if defined(__EMSCRIPTEN__)
+/* mouse-path diagnostics: entries / gate results / final feed calls */
+extern "C" {
+unsigned int emw_mouse_diag[8] = {0};
+__attribute__((used)) unsigned int EMWORKER_MouseDiag(int i) {
+    return (i >= 0 && i < 8) ? emw_mouse_diag[i] : 0;
+}
+}
+#endif
+
 static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
     bool inputToScreen = false;
+#if defined(__EMSCRIPTEN__)
+    emw_mouse_diag[0]++;
+#endif
 
     /* limit mouse input to whenever the cursor is on the screen, or near the edge of the screen. */
     if (is_paused)
@@ -4944,6 +4957,9 @@ static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
 #endif
 
     if (!inputToScreen) {
+#if defined(__EMSCRIPTEN__)
+        emw_mouse_diag[1]++;
+#endif
 #if defined(C_SDL2)
         if (!sdl.mouse.locked)
 #else
@@ -5004,6 +5020,13 @@ static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
 #endif
             SDL_ShowCursor(((!inside) || ((MOUSE_IsHidden()) && !(MOUSE_IsBeingPolled() || MOUSE_HasInterruptSub()))) ? SDL_ENABLE : SDL_DISABLE);
     }
+#if defined(__EMSCRIPTEN__)
+    emw_mouse_diag[2]++;
+    emw_mouse_diag[3] = (unsigned int)(int)(x * 1000.0f);
+    emw_mouse_diag[4] = (unsigned int)(int)(xrel * 10.0f);
+    emw_mouse_diag[5] = (unsigned int)sdl.clip.w;
+    emw_mouse_diag[6] = (unsigned int)sdl.clip.x;
+#endif
     Mouse_CursorMoved(xrel, yrel, x, y, emu);
     VMWARE_MousePosition(motion->x, motion->y);
 }

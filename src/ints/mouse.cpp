@@ -85,6 +85,9 @@ extern bool usesystemcursor, dbcs_sbcs, showdbcs, del_flag;
 
 bool en_int33=false;
 bool en_vmware=false;
+#if defined(__EMSCRIPTEN__)
+static unsigned int emw_mouse_fed = 0;
+#endif
 bool en_bios_ps2mouse=false;
 bool cell_granularity_disable=false;
 bool en_int33_hide_if_polling=false;
@@ -944,6 +947,32 @@ void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
         if (mouse.mickey_y >= 32768) mouse.mickey_y -= 65536;
         else if (mouse.mickey_y <= -32769) mouse.mickey_y += 65536;
     }
+#if defined(__EMSCRIPTEN__)
+    else {
+        /* Web worker build: there is no pointer capture, so the cursor is
+         * never "locked" - but the page's synthetic events still carry true
+         * relative deltas (movementX/Y). Feed the motion counters anyway:
+         * games that aim by reading INT 33h mickeys (Abuse) see a frozen
+         * mouse otherwise, while absolute-position readers are unaffected. */
+        emw_mouse_fed += (unsigned int)(fabs(dx) + fabs(dy));
+        mouse.mickey_accum_x += (dx * mouse.mickeysPerPixel_x);
+        mouse.mickey_accum_y += (dy * mouse.mickeysPerPixel_y);
+
+        if (fabs(mouse.mickey_accum_x) >= mickey_threshold) {
+            mouse.mickey_x += truncf(mouse.mickey_accum_x);
+            mouse.mickey_accum_x -= truncf(mouse.mickey_accum_x);
+        }
+        if (fabs(mouse.mickey_accum_y) >= mickey_threshold) {
+            mouse.mickey_y += truncf(mouse.mickey_accum_y);
+            mouse.mickey_accum_y -= truncf(mouse.mickey_accum_y);
+        }
+
+        if (mouse.mickey_x >= 32768) mouse.mickey_x -= 65536;
+        else if (mouse.mickey_x <= -32769) mouse.mickey_x += 65536;
+        if (mouse.mickey_y >= 32768) mouse.mickey_y -= 65536;
+        else if (mouse.mickey_y <= -32769) mouse.mickey_y += 65536;
+    }
+#endif
 
     if (emulate) {
         mouse.x += dx;
@@ -1045,6 +1074,23 @@ void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
 uint8_t Mouse_GetButtonState(void) {
     return mouse.buttons;
 }
+
+#if defined(__EMSCRIPTEN__)
+/* mouse-core state probe for diagnosing dead mouse input from a live session */
+extern "C" __attribute__((used)) int EMWORKER_MouseState(int i) {
+    switch (i) {
+        case 0: return (int)mouse.x;
+        case 1: return (int)mouse.y;
+        case 2: return KEYBOARD_AUX_Active() ? 1 : 0;
+        case 3: return (int)mouse.hidden;
+        case 4: return useps2callback ? 1 : 0;
+        case 5: return (int)mouse.max_x;
+        case 6: return (int)mouse.max_screen_x;
+        case 7: return (int)emw_mouse_fed;
+    }
+    return 0;
+}
+#endif
 
 char text[5000];
 extern std::list<uint16_t> bdlist;
@@ -1640,7 +1686,14 @@ void Mouse_Used(void) {
 }
 
 void Mouse_Read_Motion_Data() {
+#if defined(__EMSCRIPTEN__)
+    /* Web worker build: pointer capture does not exist, but the motion
+     * counters are fed from the page's true relative deltas, so return
+     * them - games that aim by mickeys (Abuse) read zero otherwise. */
+    const auto locked = true;
+#else
     const auto locked = MOUSE_IsLocked();
+#endif
     reg_cx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_x : 0);
     reg_dx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_y : 0);
     mouse.mickey_x = 0;
@@ -1649,7 +1702,15 @@ void Mouse_Read_Motion_Data() {
 }
 
 // Reference: http://www.ctyme.com/intr/int-33.htm
+#if defined(__EMSCRIPTEN__)
+extern "C" { unsigned int emw_int33_calls[64] = {0};
+__attribute__((used)) unsigned int EMWORKER_Int33Calls(int i) { return (i>=0&&i<64)?emw_int33_calls[i]:0; } }
+#endif
+
 static Bitu INT33_Handler(void) {
+#if defined(__EMSCRIPTEN__)
+    emw_int33_calls[reg_ax < 63 ? reg_ax : 63]++;
+#endif
 //  LOG(LOG_MOUSE,LOG_NORMAL)("MOUSE: %04X %X %X %d %d",reg_ax,reg_bx,reg_cx,POS_X,POS_Y);
     switch (reg_ax) {
     case 0x00:  /* MS MOUSE - RESET DRIVER AND READ STATUS */
