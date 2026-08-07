@@ -58,7 +58,20 @@ typedef double pic_tickindex_t;
 pic_tickindex_t PIC_GetCurrentEventTime(void);
 
 static INLINE pic_tickindex_t PIC_TickIndex(void) {
+#if defined(__EMSCRIPTEN__)
+	/* called on every VGA status poll among much else; CPU_CycleMax only
+	 * changes a few times a second, so trade the division for a multiply
+	 * by a cached reciprocal */
+	static cpu_cycles_count_t cached_max = 0;
+	static pic_tickindex_t recip = 0;
+	if (GCC_UNLIKELY(CPU_CycleMax != cached_max)) {
+		cached_max = CPU_CycleMax;
+		recip = (pic_tickindex_t)1.0 / (pic_tickindex_t)CPU_CycleMax;
+	}
+	return ((pic_tickindex_t)(CPU_CycleMax-CPU_CycleLeft-CPU_Cycles)) * recip;
+#else
 	return ((pic_tickindex_t)(CPU_CycleMax-CPU_CycleLeft-CPU_Cycles)) / ((pic_tickindex_t)CPU_CycleMax);
+#endif
 }
 
 static INLINE Bits PIC_TickIndexND(void) {
