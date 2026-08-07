@@ -741,10 +741,25 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
          * stutter even when the average throughput is high. Ramping instead
          * keeps the emulated speed steady. */
         {
+            static int32_t cyc_hiwater = 0;
             const int32_t cur = (int32_t)CPU_CycleMax;
-            const int32_t step = (cur >> 3) + 1000;      /* ~12.5% per 250ms */
-            if (new_cmax > cur + step) new_cmax = cur + step;
-            if (new_cmax < cur - step) new_cmax = cur - step;
+            /* asymmetric: menus, level loads and disk I/O legitimately push
+             * the guess way down, and a symmetric ramp then starves the game
+             * for seconds after every scene change (a ~1s first-frame freeze
+             * plus echo hiccups while cycles crawl back up). Recover fast;
+             * keep downward moves gentle because a machine that keeps
+             * slowing down reads as stutter. */
+            const int32_t up   = (cur >> 2) + 2000;      /* ~25% per 250ms */
+            const int32_t down = (cur >> 3) + 1000;      /* ~12.5% per 250ms */
+            int32_t limit_up = cur + up;
+            /* when the guest turns CPU-hungry again after a dip, climb
+             * straight back toward the recent sustained speed instead of
+             * rediscovering it a quarter at a time */
+            if (cyc_hiwater > limit_up) limit_up = cyc_hiwater;
+            if (new_cmax > limit_up) new_cmax = limit_up;
+            if (new_cmax < cur - down) new_cmax = cur - down;
+            if (new_cmax > cyc_hiwater) cyc_hiwater = new_cmax;
+            else cyc_hiwater -= cyc_hiwater >> 6;        /* forget slowly */
         }
 #endif
 
