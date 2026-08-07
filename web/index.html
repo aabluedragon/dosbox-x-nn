@@ -173,6 +173,9 @@ async function audioInit(freq) {
           this.drops = 0; this.underruns = 0; this.rebuffers = 0;
           this.minQ = 1e9; this.maxQ = 0;
           this.statTick = 0;
+          /* rolling per-quantum trace, frozen at the moment a dry spell
+           * begins so the delivery hole that caused it can be examined */
+          this.trace = []; this.rebufTrace = null; this.arrived = 0;
           /* clock-skew servo: the mixer produces on the emulator's clock,
            * this processor consumes on the audio device's clock, and the two
            * drift (measured ~0.3%/s here) - any fixed cushion drains on a
@@ -185,9 +188,10 @@ async function audioInit(freq) {
             const q = new Int16Array(e.data);
             this.queue.push(q);
             this.frames += q.length >> 1;
-            /* last-resort latency cap (frame-accurate), above the adaptive
-             * cushion's ceiling so the two never fight */
-            const maxFrames = sampleRate * 0.2;
+            this.arrived += q.length >> 1;
+            /* last-resort latency cap (frame-accurate): must clear the
+             * cushion plus the pump's catch-up burst peaks */
+            const maxFrames = sampleRate * 0.3;
             while (this.frames > maxFrames && this.queue.length > 1) {
               const d = this.queue.shift();
               this.frames -= d.length >> 1;
@@ -201,11 +205,14 @@ async function audioInit(freq) {
           let i = 0;
           if (this.frames < this.minQ) this.minQ = this.frames;
           if (this.frames > this.maxQ) this.maxQ = this.frames;
+          this.trace.push(currentTime, this.frames, this.arrived);
+          if (this.trace.length > 2100) this.trace.splice(0, 900);
           if (this.rebuffer) {
             if (this.frames >= this.rebuildFrames) this.rebuffer = false;
           } else if (this.started && this.frames === 0) {
             this.rebuffer = true;
             this.rebuffers++;
+            if (!this.rebufTrace) this.rebufTrace = this.trace.slice();
             this.rebuildFrames = Math.min(this.rebuildFrames + Math.round(sampleRate * 0.025), this.rebuildMax);
             this.calmQuanta = 0;
           } else if (++this.calmQuanta >= Math.round(sampleRate * 30 / 128)) {
@@ -243,8 +250,9 @@ async function audioInit(freq) {
           if (++this.statTick >= Math.round(sampleRate / 128)) {
             this.statTick = 0;
             this.port.postMessage({ drops: this.drops, underruns: this.underruns,
-                                    rebuffers: this.rebuffers,
+                                    rebuffers: this.rebuffers, rebufTrace: this.rebufTrace,
                                     q: this.frames, minQ: this.minQ, maxQ: this.maxQ });
+            this.rebufTrace = null;
             this.minQ = 1e9; this.maxQ = 0;
           }
           return true;

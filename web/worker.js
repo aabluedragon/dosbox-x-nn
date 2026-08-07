@@ -52,18 +52,21 @@ function startAudioPump() {
     audioPtr = Module._EMWORKER_AudioBuffer();
     postMessage({ type: 'audioinfo', freq });
     /* let this much accumulate before the first drain; it becomes the
-     * standing cushion in the page-side queue that rides out worker stalls */
-    const cushion = Math.round(freq * 0.06);
+     * standing cushion in the page-side queue that rides out worker stalls
+     * and production shortfalls - it must exceed the burst amplitude */
+    const cushion = Math.round(freq * 0.10);
     let started = false;
-    /* after a long stall the ring holds the whole freeze's worth of audio;
-     * shipping it all would blow the page-side latency cap. That audio is
-     * stale (it played "during" the freeze) - discard down to this much and
-     * ship the rest. */
-    const shipMax = Math.round(freq * 0.10);
-    /* diagnostic: pump ticks that arrived late enough to threaten the
-     * page-side cushion, with what the ring held when they finally ran */
-    self.__audioGaps = [];
+    /* Ship everything the ring holds, every tick. The emulator produces in
+     * bursts (with cycles=max a chunk of emulated time runs quickly, then a
+     * catch-up idle) and falls briefly behind during translation storms;
+     * shipping it all lets every shortfall heal itself from the following
+     * catch-up burst - any cap or pacing here makes dips permanent, and the
+     * queue ratchets down to dropouts. The page-side jitter buffer absorbs
+     * the peaks; audio is discarded only if the ring nears overflow after a
+     * genuine multi-hundred-ms stall. */
+    const ringPanic = Math.round(freq * 0.35);
     let lastTick = 0;
+    self.__audioGaps = [];
     setInterval(() => {
       const tickNow = performance.now();
       if (lastTick && tickNow - lastTick > 40) {
@@ -75,14 +78,14 @@ function startAudioPump() {
       if (!started) { if (avail < cushion) return; started = true; }
       const heap = Module.HEAP16 || (typeof HEAP16 !== 'undefined' ? HEAP16 : null);
       if (!heap) return;
-      for (let guard = 0; guard < 8 && avail > shipMax; guard++) {
-        const n = Math.min(avail - shipMax, 4096);
-        Module._EMWORKER_PullAudio(audioPtr, n);   /* pull and discard */
+      for (let guard = 0; guard < 8 && avail > ringPanic; guard++) {
+        const n = Math.min(avail - ringPanic, 4096);
+        Module._EMWORKER_PullAudio(audioPtr, n); /* stall recovery: discard stale audio */
         avail -= n;
       }
       /* bounded: the mixer pads pulls it cannot fill instead of consuming,
        * so never loop on AudioAvail alone */
-      for (let burst = 0; burst < 3 && avail > 0; burst++) {
+      for (let burst = 0; burst < 4 && avail > 0; burst++) {
         const n = Math.min(avail, 4096);
         Module._EMWORKER_PullAudio(audioPtr, n);
         const copy = new Int16Array(new Int16Array(heap.buffer, audioPtr, n * 2));
