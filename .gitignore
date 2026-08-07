@@ -147,4 +147,5 @@ web/dosbox-x.wasm
 web/bench-*.html
 web/*-backup/
 web/nk/
+web/sw/
 build-wasm/

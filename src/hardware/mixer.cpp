@@ -51,6 +51,7 @@
 #include "cpu.h"
 #ifdef __EMSCRIPTEN__
 #include "vga.h"
+#include "paging.h"
 #endif
 #include "dosbox.h"
 #include "logging.h"
@@ -937,6 +938,24 @@ EMSCRIPTEN_KEEPALIVE int EMWORKER_CycleMax(void) {
  * probe can tell "screen is static by content" from "frames were dropped" */
 EMSCRIPTEN_KEEPALIVE int EMWORKER_VgaStart(void) {
     return (int)vga.config.display_start;
+}
+/* video-state probe for diagnosing blank screens: mode, paging, and coarse
+ * checksums of VRAM regions show where (or whether) a guest is drawing */
+EMSCRIPTEN_KEEPALIVE int EMWORKER_VgaProbe(int which) {
+    switch (which) {
+        case 0: return (int)vga.mode;
+        case 1: return (int)vga.config.display_start;
+        case 2: case 3: case 4: case 5: {
+            if (!vga.mem.linear) return -1;
+            const uint32_t base = (uint32_t)(which - 2) * 0x80000u; /* 512KB regions */
+            uint32_t sum = 0;
+            const uint8_t* p = vga.mem.linear + base;
+            for (uint32_t i = 0; i < 0x80000u; i += 64) sum = sum * 31u + p[i];
+            return (int)sum;
+        }
+        case 6: return paging.enabled ? 1 : 0;
+    }
+    return 0;
 }
 EMSCRIPTEN_KEEPALIVE int16_t* EMWORKER_AudioBuffer(void) {
     static int16_t buf[8192]; /* up to 4096 stereo frames per pull */
