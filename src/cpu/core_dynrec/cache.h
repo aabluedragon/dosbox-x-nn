@@ -21,6 +21,10 @@
  * 50 = cache arena wrapped, 51 = a block was cleared by self-modifying code */
 extern "C" void drc_note_bail(int reason);
 extern "C" void drc_note_smc(int page, int addr, int bstart, int hostptr);
+#if defined(__EMSCRIPTEN__)
+/* bumped on every block clear; see the dispatcher's lookup cache */
+static uint32_t drc_dispatch_gen = 1;
+#endif
 #endif
 
 #include <assert.h>
@@ -468,6 +472,9 @@ void CacheBlockDynRec::Clear(void) {
 #if defined(__EMSCRIPTEN__)
 	// recycle the wasm table slot held by this block's compiled code
 	drc_release_block_code(this);
+	// invalidate the dispatcher's block-lookup cache: stale entries become
+	// structurally unmatchable the moment any block is cleared
+	drc_dispatch_gen++;
 #endif
 	// check if this is not a cross page block
 	if (hash.index) for (Bitu ind=0;ind<2;ind++) {

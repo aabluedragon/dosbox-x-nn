@@ -242,6 +242,27 @@ extern int dynamic_core_cache_block_size;
 
 static bool paging_warning = true;
 
+#if defined(__EMSCRIPTEN__)
+/* Return sites and computed jumps re-enter the dispatcher constantly (a
+ * block only carries two direct links), and every entry pays a page walk
+ * (MakeCodePage) plus a hash-chain search - together ~9% of a Duke3D
+ * profile. This direct-mapped cache short-circuits repeat entries.
+ * drc_dispatch_gen is bumped on every block clear, so a stale entry can
+ * never match; the cache is only consulted with paging off, where the
+ * linear address alone identifies the code. */
+#define DRC_DISPATCH_CACHE_SIZE 1024
+static struct DrcDispatchEnt {
+	PhysPt ip;
+	CacheBlockDynRec* block;
+	uint32_t gen;
+} drc_dispatch_cache[DRC_DISPATCH_CACHE_SIZE];
+static INLINE unsigned drc_dispatch_hash(PhysPt ip) {
+	return (unsigned)((ip ^ (ip >> 8)) & (DRC_DISPATCH_CACHE_SIZE - 1));
+}
+extern "C" uint32_t emw_disp_hit, emw_disp_miss;
+uint32_t emw_disp_hit = 0, emw_disp_miss = 0;
+#endif
+
 Bits CPU_Core_Dynrec_Run(void) {
     if (CPU_Cycles <= 0)
 	    return CBRET_NONE;
@@ -283,6 +304,18 @@ Bits CPU_Core_Dynrec_Run(void) {
 		#endif
 
 		CodePageHandlerDynRec * chandler=nullptr;
+		CacheBlockDynRec * block=nullptr;
+#if defined(__EMSCRIPTEN__)
+		if (!paging.enabled) {
+			const DrcDispatchEnt &e = drc_dispatch_cache[drc_dispatch_hash(ip_point)];
+			if (e.gen == drc_dispatch_gen && e.ip == ip_point) {
+				emw_disp_hit++;
+				block = e.block;
+				goto run_block;
+			}
+			emw_disp_miss++;
+		}
+#endif
 		// see if the current page is present and contains code
 		if (GCC_UNLIKELY(MakeCodePage(ip_point,chandler))) {
 			// page not present, throw the exception
@@ -297,7 +330,7 @@ Bits CPU_Core_Dynrec_Run(void) {
 		}
 
 		// find correct Dynamic Block to run
-		CacheBlockDynRec * block=chandler->FindCacheBlock(ip_point&4095);
+		block=chandler->FindCacheBlock(ip_point&4095);
 		if (!block) {
 			// no block found, thus translate the instruction stream
 			// unless the instruction is known to be modified
@@ -333,6 +366,12 @@ Bits CPU_Core_Dynrec_Run(void) {
 			}
 		}
 
+#if defined(__EMSCRIPTEN__)
+		if (block && !paging.enabled) {
+			DrcDispatchEnt &e = drc_dispatch_cache[drc_dispatch_hash(ip_point)];
+			e.ip = ip_point; e.block = block; e.gen = drc_dispatch_gen;
+		}
+#endif
 run_block:
 		cache.block.running=nullptr;
 		// now we're ready to run the dynamic code block

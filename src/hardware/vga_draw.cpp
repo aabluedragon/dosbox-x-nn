@@ -6040,6 +6040,8 @@ __attribute__((used)) unsigned int EMWORKER_FrameDiag(int which) {
             extern cpu_cycles_count_t CPU_IODelayRemoved;
             return (unsigned int)(uint64_t)CPU_IODelayRemoved;
         }
+        case 9: { extern uint32_t emw_disp_hit;  return emw_disp_hit; }
+        case 10: { extern uint32_t emw_disp_miss; return emw_disp_miss; }
     }
     return 0;
 }
