@@ -904,6 +904,16 @@ EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioFreq(void) {
 EMSCRIPTEN_KEEPALIVE int EMWORKER_EmuMs(void) {
     return (int)PIC_Ticks;      /* declared in pic.h */
 }
+/* stereo frames currently buffered in the mixer ring. The audio pump pulls
+ * exactly what is available: pulling more than this engages the mixer's
+ * prebuffer pause (an audible gap), pulling too little for too long trips
+ * its catch-up sample dropping - both read as audio stutter. */
+EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioAvail(void) {
+    int remains = (int)mixer.work_in - (int)mixer.work_out;
+    if (remains < 0) remains += (int)mixer.work_wrap;
+    if (remains < 0) remains = 0;
+    return remains;
+}
 EMSCRIPTEN_KEEPALIVE double EMWORKER_CyclesRun(void) {
     extern uint64_t emu_cycles_run;
     return (double)emu_cycles_run;

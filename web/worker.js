@@ -37,8 +37,13 @@ function fsMkdirs(path) {
   }
 }
 
-/* ---- audio: pull S16 stereo from the mixer, post to the page ---- */
-const AUDIO_FRAMES = 1024;
+/* ---- audio: pull S16 stereo from the mixer, post to the page ----
+ * Closed loop: pull exactly what the mixer ring holds. A fixed-size pull on a
+ * fixed timer can neither match the mixer's production rate nor its phase -
+ * over-pulling engages the mixer's prebuffer pause (an audible gap) and pads
+ * the shortfall with cloned samples, and the resulting surplus perpetually
+ * overflowed the page-side latency cap, which dropped ~5 chunks of audio per
+ * second (the "stutter" in music and sound effects). */
 let audioPtr = 0;
 function startAudioPump() {
   const tryStart = () => {
@@ -46,14 +51,35 @@ function startAudioPump() {
     if (!freq) { setTimeout(tryStart, 500); return; }
     audioPtr = Module._EMWORKER_AudioBuffer();
     postMessage({ type: 'audioinfo', freq });
+    /* let this much accumulate before the first drain; it becomes the
+     * standing cushion in the page-side queue that rides out worker stalls */
+    const cushion = Math.round(freq * 0.06);
+    let started = false;
+    /* after a long stall the ring holds the whole freeze's worth of audio;
+     * shipping it all would blow the page-side latency cap. That audio is
+     * stale (it played "during" the freeze) - discard down to this much and
+     * ship the rest. */
+    const shipMax = Math.round(freq * 0.10);
     setInterval(() => {
-      Module._EMWORKER_PullAudio(audioPtr, AUDIO_FRAMES);
+      let avail = Module._EMWORKER_AudioAvail();
+      if (!started) { if (avail < cushion) return; started = true; }
       const heap = Module.HEAP16 || (typeof HEAP16 !== 'undefined' ? HEAP16 : null);
       if (!heap) return;
-      const view = new Int16Array(heap.buffer, audioPtr, AUDIO_FRAMES * 2);
-      const copy = new Int16Array(view);
-      postMessage({ type: 'audio', buf: copy.buffer }, [copy.buffer]);
-    }, Math.floor(AUDIO_FRAMES / freq * 1000));
+      for (let guard = 0; guard < 8 && avail > shipMax; guard++) {
+        const n = Math.min(avail - shipMax, 4096);
+        Module._EMWORKER_PullAudio(audioPtr, n);   /* pull and discard */
+        avail -= n;
+      }
+      /* bounded: the mixer pads pulls it cannot fill instead of consuming,
+       * so never loop on AudioAvail alone */
+      for (let burst = 0; burst < 3 && avail > 0; burst++) {
+        const n = Math.min(avail, 4096);
+        Module._EMWORKER_PullAudio(audioPtr, n);
+        const copy = new Int16Array(new Int16Array(heap.buffer, audioPtr, n * 2));
+        postMessage({ type: 'audio', buf: copy.buffer }, [copy.buffer]);
+        avail -= n;
+      }
+    }, 20);
   };
   tryStart();
 }
