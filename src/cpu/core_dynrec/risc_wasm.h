@@ -212,6 +212,10 @@ static uint32_t DRC_CALL_CONV dynrec_adc_dword_simple(uint32_t op1,uint32_t op2)
 static uint8_t  DRC_CALL_CONV dynrec_sbb_byte_simple(uint8_t op1,uint8_t op2) DRC_FC;
 static uint16_t DRC_CALL_CONV dynrec_sbb_word_simple(uint16_t op1,uint16_t op2) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_sbb_dword_simple(uint32_t op1,uint32_t op2) DRC_FC;
+static void DRC_CALL_CONV dynrec_push_word(uint16_t value) DRC_FC;
+static void DRC_CALL_CONV dynrec_push_dword(uint32_t value) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_pop_word(void) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_pop_dword(void) DRC_FC;
 static uint8_t  DRC_CALL_CONV dynrec_adc_byte(uint8_t op1,uint8_t op2) DRC_FC;
 static uint16_t DRC_CALL_CONV dynrec_adc_word(uint16_t op1,uint16_t op2) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_adc_dword(uint32_t op1,uint32_t op2) DRC_FC;
@@ -601,6 +605,84 @@ static bool drc_emit_mem_inline(uint32_t target, unsigned import_slot) {
     drc_b(0x10); drc_uleb(import_slot);
     drc_setl(FC_RETOP);
     drc_b(0x0B);                                                 /* end */
+    return true;
+}
+
+/* Inline the near stack helpers. CALL/RET-heavy protected mode code pushes
+ * and pops at the dispatcher's rate - the stack helpers' self time was ~10%
+ * of a Duke3D profile. The fast path is the same TLB probe the memory inline
+ * uses, with the ESP update fused; a page-straddling or unmapped access
+ * falls back to the original helper, which also preserves fault ordering
+ * (memory access first, ESP update after). */
+static bool drc_emit_pushpop_inline(uint32_t target, unsigned import_slot) {
+    unsigned width; bool is_push;
+    if      (target == (uint32_t)(uintptr_t)dynrec_push_dword) { width = 4; is_push = true;  }
+    else if (target == (uint32_t)(uintptr_t)dynrec_push_word)  { width = 2; is_push = true;  }
+    else if (target == (uint32_t)(uintptr_t)dynrec_pop_dword)  { width = 4; is_push = false; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_pop_word)   { width = 2; is_push = false; }
+    else return false;
+
+    const uint32_t a_esp     = (uint32_t)(uintptr_t)&reg_esp;
+    const uint32_t a_mask    = (uint32_t)(uintptr_t)&cpu.stack.mask;
+    const uint32_t a_notmask = (uint32_t)(uintptr_t)&cpu.stack.notmask;
+    const uint32_t a_ssphys  = (uint32_t)(uintptr_t)&Segs.phys[ss];
+    const uint32_t tlb_read  = (uint32_t)(uintptr_t)&paging.tlb.read[0];
+    const uint32_t tlb_write = (uint32_t)(uintptr_t)&paging.tlb.write[0];
+    const uint32_t limit = (width == 2) ? 0xfffu : 0xffdu;
+
+    drc_used_extra_locals = true;
+
+    if (is_push) {
+        /* V1 = new_esp = (esp & notmask) | ((esp - width) & mask) */
+        drc_iconst(a_esp); drc_load32(); drc_iconst(a_notmask); drc_load32(); drc_b(0x71);
+        drc_iconst(a_esp); drc_load32(); drc_iconst(width); drc_b(0x6B);
+        drc_iconst(a_mask); drc_load32(); drc_b(0x71);
+        drc_b(0x72); drc_setl(DRC_LOCAL_V1);
+        /* V2 = linear = ssphys + (new_esp & mask) */
+        drc_getl(DRC_LOCAL_V1); drc_iconst(a_mask); drc_load32(); drc_b(0x71);
+        drc_iconst(a_ssphys); drc_load32(); drc_b(0x6A);
+        drc_setl(DRC_LOCAL_V2);
+    } else {
+        /* V2 = linear = ssphys + (esp & mask) */
+        drc_iconst(a_esp); drc_load32(); drc_iconst(a_mask); drc_load32(); drc_b(0x71);
+        drc_iconst(a_ssphys); drc_load32(); drc_b(0x6A);
+        drc_setl(DRC_LOCAL_V2);
+    }
+
+    /* tlb entry, or 0 when the access straddles a page */
+    drc_getl(DRC_LOCAL_V2); drc_iconst(0xfff); drc_b(0x71);
+    drc_iconst(limit); drc_b(0x49);
+    drc_b(0x04); drc_b(0x7F);                                    /* if (result i32) */
+    drc_getl(DRC_LOCAL_V2); drc_iconst(12); drc_b(0x76);
+    drc_iconst(2); drc_b(0x74);
+    drc_iconst(is_push ? tlb_write : tlb_read); drc_b(0x6A);
+    drc_load32();
+    drc_b(0x05); drc_iconst(0); drc_b(0x0B);
+    drc_teel(DRC_LOCAL_SCRATCH);
+    drc_b(0x04); drc_b(0x40);                                    /* if (mapped) */
+
+    if (is_push) {
+        drc_getl(DRC_LOCAL_SCRATCH); drc_getl(DRC_LOCAL_V2); drc_b(0x6A);
+        drc_getl(FC_OP1);
+        if (width == 2) drc_store16(); else drc_store32();
+        drc_iconst(a_esp); drc_getl(DRC_LOCAL_V1); drc_store32();
+    } else {
+        drc_getl(DRC_LOCAL_SCRATCH); drc_getl(DRC_LOCAL_V2); drc_b(0x6A);
+        if (width == 2) drc_load16u(); else drc_load32();
+        drc_setl(FC_RETOP);
+        /* esp = (esp & notmask) | ((esp + width) & mask) */
+        drc_iconst(a_esp);
+        drc_iconst(a_esp); drc_load32(); drc_iconst(a_notmask); drc_load32(); drc_b(0x71);
+        drc_iconst(a_esp); drc_load32(); drc_iconst(width); drc_b(0x6A);
+        drc_iconst(a_mask); drc_load32(); drc_b(0x71);
+        drc_b(0x72);
+        drc_store32();
+    }
+
+    drc_b(0x05);                                                 /* else: helper */
+    if (is_push) { drc_getl(FC_OP1); drc_b(0x10); drc_uleb(import_slot); }
+    else { drc_b(0x10); drc_uleb(import_slot); drc_setl(FC_RETOP); }
+    drc_b(0x0B);
     return true;
 }
 
@@ -1626,6 +1708,7 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     for (unsigned i = 0; i < ncalls; i++) if (calls[i] == r->x) { slot = i; found = true; break; }
                     if (!found) { drc_note_bail(5); return DRC_XSTART_TAG; }
                     if (drc_emit_mem_inline(r->x, slot)) { DRC_FORGET_ALL(); break; }
+                    if (drc_emit_pushpop_inline(r->x, slot)) { DRC_FORGET_ALL(); break; }
                     if (drc_emit_zf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
