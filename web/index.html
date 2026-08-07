@@ -81,6 +81,14 @@ showmenu=false
 # quadruple the pixels pushed every frame
 scaler=none
 
+[video]
+# DOS video runs at 70Hz but browsers composite at the display rate,
+# typically 60Hz - the mismatch drops ~10 frames a second in a beat
+# pattern that reads as judder. Locking the emulated refresh to 60
+# aligns every frame with the display; game speed is unaffected (DOS
+# games time off the PIT, not the vertical retrace count).
+forcerate=60
+
 [log]
 sb=false
 `;
@@ -88,6 +96,7 @@ let storedConf = localStorage.getItem('dosbox-x.conf') || DEFAULT_CONF;
 if (!storedConf.includes('[log]')) storedConf += '\n[log]\nsb=false\n';
 if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n/, '[sdl]\nshowmenu=false\n');
 if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
+if (!storedConf.includes('[video]')) storedConf += '\n[video]\nforcerate=60\n';
 /* migrate stored configs from earlier page defaults: the recompiler now
  * paces real-mode games as well as the interpreter, with far more headroom */
 storedConf = storedConf.replace(/^core=(auto|normal)$/m, 'core=dynamic');
