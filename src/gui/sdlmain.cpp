@@ -6009,6 +6009,23 @@ bool gfx_in_mapper = false;
 #endif
 
 void GFX_Events() {
+#if C_EMSCRIPTEN
+    /* CALLBACK_Idle calls this for every guest idle poll - over a million
+     * times a second at cycles=max - and everything below (SDL_GetTicks,
+     * SDL_PollEvent, the yield throttle) reads the host clock through the JS
+     * boundary, which profiled at ~16% of total runtime. Input arrives from
+     * the page thread via postMessage, so pumping once per emulated
+     * millisecond is plenty; the counter keeps a trickle of pumps alive even
+     * if emulated time ever stops advancing. */
+    {
+        extern Bitu PIC_Ticks;
+        static Bitu last_pump_tick = 0;
+        static unsigned int forced = 0;
+        if (PIC_Ticks == last_pump_tick && (++forced & 4095u) != 0) return;
+        forced = 0;
+        last_pump_tick = PIC_Ticks;
+    }
+#endif
     CheckMapperKeyboardLayout();
 #if defined(C_SDL2) /* SDL 2.x---------------------------------- */
     //Don't poll too often. This can be heavy on the OS, especially Macs.
