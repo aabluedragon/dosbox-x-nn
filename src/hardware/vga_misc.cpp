@@ -75,7 +75,16 @@ Bitu vga_read_p3da(Bitu port,Bitu iolen) {
 	if (timeInFrame >= vga.draw.delay.vdend) {
 		retval |= 1; // vertical blanking
 	} else {
-		const double timeInLine = fmod(timeInFrame,vga.draw.delay.htotal);
+		/* fmod() is a costly libm call and games sit in polling loops on this
+		 * register; a multiply by the cached reciprocal computes the same
+		 * "time within the scanline" (timeInFrame stays small, well within
+		 * integer range) */
+		static double htotal_cached = 0.0, htotal_inv = 0.0;
+		if (vga.draw.delay.htotal != htotal_cached) {
+			htotal_cached = vga.draw.delay.htotal;
+			htotal_inv = (htotal_cached > 0.0) ? (1.0 / htotal_cached) : 0.0;
+		}
+		const double timeInLine = timeInFrame - htotal_cached * (double)(int32_t)(timeInFrame * htotal_inv);
 		if (timeInLine >= vga.draw.delay.hblkstart && timeInLine <= vga.draw.delay.hblkend)
 			retval |= 1; // horizontal blanking
 	}
