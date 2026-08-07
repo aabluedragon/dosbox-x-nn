@@ -61,11 +61,11 @@ const DEFAULT_CONF = `[dosbox]
 memsize=63
 
 [cpu]
-# "auto" picks the plain interpreter for real-mode games and the WebAssembly
-# recompiler for protected-mode (DOS4GW) games. Retrace-synced real-mode
-# engines (Keen and friends) pace measurably better on the interpreter, and
-# at their small cycle counts the recompiler has nothing to win anyway.
-core=auto
+# The WebAssembly recompiler runs everything. Real-mode games once paced
+# better on the interpreter, but the causes (ISA delay on VGA ports, IRQ
+# delivery latency in linked blocks) are fixed, and measured pacing is now
+# equal or better on the recompiler with several times the CPU headroom.
+core=dynamic
 # "auto N" runs real-mode games at N cycles - enough for smooth EGA scrolling,
 # not so fast that speed-sensitive engines misbehave - and switches to "max"
 # for protected-mode games, which want everything the host can give.
@@ -88,9 +88,9 @@ let storedConf = localStorage.getItem('dosbox-x.conf') || DEFAULT_CONF;
 if (!storedConf.includes('[log]')) storedConf += '\n[log]\nsb=false\n';
 if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n/, '[sdl]\nshowmenu=false\n');
 if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
-/* earlier page defaults: real-mode games pace better on the interpreter with
- * a bit more than the stock 3000 cycles, so core/cycles both moved to auto */
-storedConf = storedConf.replace(/^core=(dynamic|normal)$/m, 'core=auto');
+/* migrate stored configs from earlier page defaults: the recompiler now
+ * paces real-mode games as well as the interpreter, with far more headroom */
+storedConf = storedConf.replace(/^core=(auto|normal)$/m, 'core=dynamic');
 storedConf = storedConf.replace(/^cycles=(70000|100000|max|auto)$/m, 'cycles=auto 6000');
 confText.value = storedConf;
 confText.addEventListener('input', () => localStorage.setItem('dosbox-x.conf', confText.value));
