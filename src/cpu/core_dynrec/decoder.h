@@ -73,6 +73,13 @@ restart_prefix:
 		Bitu opcode;
 		if (!decode.page.invmap) opcode=decode_fetchb();
 		else {
+#if defined(__EMSCRIPTEN__)
+				/* this backend reads patched operands indirectly and
+				 * retranslates cheaply, so heavily-modified bytes do not
+				 * end the block - a cached BR_Opcode stub here would
+				 * single-step the patched loop through the normal core */
+				opcode=decode_fetchb();
+#else
 			// some entries in the invalidation map, see if the next
 			// instruction is known to be modified a lot
 			if (decode.page.index<4096) {
@@ -84,6 +91,7 @@ restart_prefix:
 				if (GCC_UNLIKELY(decode.page.invmap && 
 					(decode.page.invmap[decode.page.index-1]>=4))) goto illegalopcode;
 			}
+#endif
 		}
 		switch (opcode) {
 		// instructions 'op reg8,reg8' and 'op [],reg8'
@@ -182,6 +190,16 @@ restart_prefix:
 				case 0x01:
 					if (dyn_grp7()) goto finish_block;
 					break;
+#if defined(__EMSCRIPTEN__)
+				case 0x02:
+					if ((reg_flags & FLAG_VM) || (!cpu.pmode)) goto illegalopcode;
+					dyn_larlsl(true);
+					break;
+				case 0x03:
+					if ((reg_flags & FLAG_VM) || (!cpu.pmode)) goto illegalopcode;
+					dyn_larlsl(false);
+					break;
+#else
 /*				case 0x02:
 					if ((reg_flags & FLAG_VM) || (!cpu.pmode)) goto illegalopcode;
 					dyn_larlsl(true);
@@ -190,6 +208,7 @@ restart_prefix:
 					if ((reg_flags & FLAG_VM) || (!cpu.pmode)) goto illegalopcode;
 					dyn_larlsl(false);
 					break; */
+#endif
 
 				// hinting NOPs
 				case 0x19:case 0x1a:case 0x1b:case 0x1c:case 0x1d:case 0x1e:case 0x1f:
@@ -253,6 +272,12 @@ restart_prefix:
 				// zero-extending moves
 				case 0xb6:dyn_movx_ev_gb(false);break;
 				case 0xb7:dyn_movx_ev_gw(false);break;
+#if defined(__EMSCRIPTEN__)
+				// bit test/modify with immediate index
+				case 0xba:
+					if (!dyn_grp8_imm()) goto illegalopcode;
+					break;
+#endif
 
 				// sign-extending moves
 				case 0xbe:dyn_movx_ev_gb(true);break;

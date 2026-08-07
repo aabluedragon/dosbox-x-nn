@@ -1172,6 +1172,55 @@ static void dyn_set_byte_on_condition(BranchTypes btype) {
 		MOV_REG_BYTE_FROM_HOST_REG_LOW(FC_RETOP,decode.modrm.rm&3,(decode.modrm.rm>>2)&1);
 	}
 }
+
+/* GRP8 Ev,Ib - DOS4GW-era code tests protection bits with these constantly
+ * (a Duke3D profile saw ~95K/s falling to the interpreter). Returns false
+ * for the undefined sub-ops so the caller can raise the illegal opcode. */
+static bool dyn_grp8_imm(void) {
+	dyn_get_modrm();
+	if (decode.modrm.reg < 4) return false;
+	/* the helper FillFlags()s the pending lazy state */
+	AcquireFlags(FMASK_TEST);
+	const bool wb = decode.modrm.reg != 4;
+	if (decode.modrm.mod<3) {
+		dyn_fill_ea(FC_ADDR);
+		gen_protect_addr_reg();
+		dyn_read_word(FC_ADDR,FC_OP1,decode.big_op);
+		const Bitu imm = decode_fetchb() & (decode.big_op ? 31 : 15);
+		gen_mov_dword_to_reg_imm(FC_OP2,(uint32_t)((decode.modrm.reg << 8) | imm));
+		gen_call_function_raw(dynrec_grp8_imm);
+		if (wb) {
+			gen_restore_addr_reg();
+			dyn_write_word(FC_ADDR,FC_RETOP,decode.big_op);
+		}
+	} else {
+		MOV_REG_WORD_TO_HOST_REG(FC_OP1,decode.modrm.rm,decode.big_op);
+		const Bitu imm = decode_fetchb() & (decode.big_op ? 31 : 15);
+		gen_mov_dword_to_reg_imm(FC_OP2,(uint32_t)((decode.modrm.reg << 8) | imm));
+		gen_call_function_raw(dynrec_grp8_imm);
+		if (wb) MOV_REG_WORD_FROM_HOST_REG(FC_RETOP,decode.modrm.rm,decode.big_op);
+	}
+	return true;
+}
+
+/* LAR/LSL Gv,Ew - DOS4GW segment validation, ~120K/s in the same profile */
+static void dyn_larlsl(bool is_lar) {
+	dyn_get_modrm();
+	AcquireFlags(FMASK_TEST);
+	/* stage the current destination; the helper changes it only on success */
+	MOV_REG_WORD_TO_HOST_REG(FC_OP2,decode.modrm.reg,decode.big_op);
+	gen_mov_word_from_reg(FC_OP2,&core_dynrec.readdata,true);
+	if (decode.modrm.mod<3) {
+		dyn_fill_ea(FC_ADDR);
+		dyn_read_word(FC_ADDR,FC_OP1,false);
+	} else {
+		MOV_REG_WORD16_TO_HOST_REG(FC_OP1,decode.modrm.rm);
+	}
+	if (is_lar) gen_call_function_raw(dynrec_lar);
+	else gen_call_function_raw(dynrec_lsl);
+	gen_mov_word_to_reg(FC_OP2,&core_dynrec.readdata,true);
+	MOV_REG_WORD_FROM_HOST_REG(FC_OP2,decode.modrm.reg,decode.big_op);
+}
 #endif
 
 static void dyn_loop(LoopTypes type) {

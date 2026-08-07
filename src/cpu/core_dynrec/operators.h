@@ -2285,3 +2285,37 @@ static bool DRC_CALL_CONV dynrec_io_readD(Bitu port) {
 	if (!ex) reg_eax = (uint32_t)IO_ReadD(port);
 	return ex;
 }
+
+#if defined(__EMSCRIPTEN__)
+/* GRP8 Ev,Ib (BT/BTS/BTR/BTC with an immediate bit index): carry from the
+ * chosen bit, the possibly-modified value returned for write-back. op_bit
+ * packs the modrm reg field (bits 8+) with the pre-masked bit index. */
+static uint32_t DRC_CALL_CONV dynrec_grp8_imm(uint32_t val,uint32_t op_bit) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_grp8_imm(uint32_t val,uint32_t op_bit) {
+	const uint32_t mask = 1u << (op_bit & 31u);
+	FillFlags();
+	SETFLAGBIT(CF,(val & mask) != 0);
+	switch (op_bit >> 8) {
+		case 5: return val | mask;   /* BTS */
+		case 6: return val & ~mask;  /* BTR */
+		case 7: return val ^ mask;   /* BTC */
+	}
+	return val;                      /* BT */
+}
+
+/* LAR/LSL Gv,Ew: CPU_LAR/CPU_LSL update their out-parameter only when the
+ * selector passes its checks (ZF set), so the current destination value is
+ * staged in readdata and written back unconditionally. */
+static void DRC_CALL_CONV dynrec_lar(uint32_t selector) DRC_FC;
+static void DRC_CALL_CONV dynrec_lar(uint32_t selector) {
+	Bitu ar = core_dynrec.readdata;
+	CPU_LAR((Bitu)(uint16_t)selector,ar);
+	core_dynrec.readdata = (uint32_t)ar;
+}
+static void DRC_CALL_CONV dynrec_lsl(uint32_t selector) DRC_FC;
+static void DRC_CALL_CONV dynrec_lsl(uint32_t selector) {
+	Bitu limit = core_dynrec.readdata;
+	CPU_LSL((Bitu)(uint16_t)selector,limit);
+	core_dynrec.readdata = (uint32_t)limit;
+}
+#endif
