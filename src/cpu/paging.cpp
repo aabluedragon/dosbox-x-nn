@@ -1421,7 +1421,16 @@ void PAGING_SetWP(bool wp) {
 
 int CPU_IsDynamicCore(void);
 
+#if defined(__EMSCRIPTEN__)
+extern "C" uint32_t drc_dispatch_gen;
+#endif
+
 void PAGING_Enable(bool enabled) {
+#if defined(__EMSCRIPTEN__)
+	/* the dynrec dispatch cache resolves by linear address and is only
+	 * valid while paging is off; toggling paging retires every entry */
+	drc_dispatch_gen++;
+#endif
 	/* If paging is disabled, we work from a default paging table */
 	if (paging.enabled==enabled) return;
 	paging.enabled=enabled;

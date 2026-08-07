@@ -22,8 +22,22 @@
 extern "C" void drc_note_bail(int reason);
 extern "C" void drc_note_smc(int page, int addr, int bstart, int hostptr);
 #if defined(__EMSCRIPTEN__)
-/* bumped on every block clear; see the dispatcher's lookup cache */
-static uint32_t drc_dispatch_gen = 1;
+/* The dispatcher's ip -> block lookup cache. Bumping drc_dispatch_gen (on
+ * every block clear, and when paging is toggled) makes all entries
+ * structurally unmatchable. Generated code consults it too - the RET/JMP
+ * dispatch stub tail-calls xstart directly - so the layout is fixed:
+ * 16 bytes, ip @0, gen @4, xstart @8 (tagged wasm table index). */
+extern "C" { uint32_t drc_dispatch_gen = 1; }
+#define DRC_DISPATCH_CACHE_SIZE 1024
+static struct DrcDispatchEnt {
+	uint32_t ip;
+	uint32_t gen;
+	uint32_t xstart;
+	void*    block;
+} drc_dispatch_cache[DRC_DISPATCH_CACHE_SIZE];
+static INLINE unsigned drc_dispatch_hash(uint32_t ip) {
+	return (unsigned)((ip ^ (ip >> 8)) & (DRC_DISPATCH_CACHE_SIZE - 1));
+}
 #endif
 #endif
 

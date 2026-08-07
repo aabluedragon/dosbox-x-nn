@@ -243,22 +243,8 @@ extern int dynamic_core_cache_block_size;
 static bool paging_warning = true;
 
 #if defined(__EMSCRIPTEN__)
-/* Return sites and computed jumps re-enter the dispatcher constantly (a
- * block only carries two direct links), and every entry pays a page walk
- * (MakeCodePage) plus a hash-chain search - together ~9% of a Duke3D
- * profile. This direct-mapped cache short-circuits repeat entries.
- * drc_dispatch_gen is bumped on every block clear, so a stale entry can
- * never match; the cache is only consulted with paging off, where the
- * linear address alone identifies the code. */
-#define DRC_DISPATCH_CACHE_SIZE 1024
-static struct DrcDispatchEnt {
-	PhysPt ip;
-	CacheBlockDynRec* block;
-	uint32_t gen;
-} drc_dispatch_cache[DRC_DISPATCH_CACHE_SIZE];
-static INLINE unsigned drc_dispatch_hash(PhysPt ip) {
-	return (unsigned)((ip ^ (ip >> 8)) & (DRC_DISPATCH_CACHE_SIZE - 1));
-}
+/* the cache itself lives in cache.h so the wasm backend can emit lookups
+ * against its layout; see the dispatch stub in risc_wasm.h */
 extern "C" uint32_t emw_disp_hit, emw_disp_miss;
 uint32_t emw_disp_hit = 0, emw_disp_miss = 0;
 #endif
@@ -310,7 +296,7 @@ Bits CPU_Core_Dynrec_Run(void) {
 			const DrcDispatchEnt &e = drc_dispatch_cache[drc_dispatch_hash(ip_point)];
 			if (e.gen == drc_dispatch_gen && e.ip == ip_point) {
 				emw_disp_hit++;
-				block = e.block;
+				block = (CacheBlockDynRec*)e.block;
 				goto run_block;
 			}
 			emw_disp_miss++;
@@ -369,7 +355,9 @@ Bits CPU_Core_Dynrec_Run(void) {
 #if defined(__EMSCRIPTEN__)
 		if (block && !paging.enabled) {
 			DrcDispatchEnt &e = drc_dispatch_cache[drc_dispatch_hash(ip_point)];
-			e.ip = ip_point; e.block = block; e.gen = drc_dispatch_gen;
+			e.ip = ip_point; e.block = block;
+			e.xstart = (uint32_t)(uintptr_t)block->cache.xstart;
+			e.gen = drc_dispatch_gen;
 		}
 #endif
 run_block:

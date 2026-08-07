@@ -1284,7 +1284,11 @@ static void dyn_ret_near(uint16_t bytes) {
 	gen_mov_word_from_reg(FC_RETOP,decode.big_op?(void*)(&reg_eip):(void*)(&reg_ip),true);
 
 	if (bytes) gen_add_direct_word(&reg_esp,bytes,true);
+#if defined(__EMSCRIPTEN__)
+	gen_ret_dispatch();
+#else
 	dyn_return(BR_Normal);
+#endif
 	dyn_closeblock();
 }
 

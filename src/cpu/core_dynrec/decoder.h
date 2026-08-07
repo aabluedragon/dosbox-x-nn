@@ -644,7 +644,13 @@ restart_prefix:
     goto finish_block;
 core_close_block:
 	dyn_reduce_cycles();
+#if defined(__EMSCRIPTEN__)
+	/* eip (and cs, for the far forms) is already set: chain through the
+	 * dispatch cache instead of exiting to the C dispatcher */
+	gen_ret_dispatch();
+#else
 	dyn_return(BR_Normal);
+#endif
 	dyn_closeblock();
 	goto finish_block;
 illegalopcode:

@@ -88,6 +88,7 @@ enum {
     DRCIR_ADDI,        // a=reg x=imm
     DRCIR_ANDI,        // a=reg x=imm
     DRCIR_BOOL,        // a=reg: reg = (reg != 0) ? 1 : 0
+    DRCIR_RETDISP,     // dispatch-cache lookup of cs:eip; tail-call on hit
     DRCIR_SHRI,        // a=reg b=imm
     DRCIR_LEA2,        // a=dst b=scale_reg c=scale x=imm
     DRCIR_LEA1,        // a=dst c=scale x=imm
@@ -333,6 +334,15 @@ static void gen_and_imm(HostReg reg,uint32_t imm) {
  * booleans, so consumers that need a strict 0/1 (SETcc) normalize this way */
 static void gen_bool_reg(HostReg reg) {
     DRCIRRec* r = drcir_emit(DRCIR_BOOL); r->a = reg;
+}
+
+/* End the block with a dispatch-cache lookup of the new cs:eip and a tail
+ * call straight into the target block on a hit; a miss returns BR_Normal to
+ * the C dispatcher, which performs the full lookup and refills the cache.
+ * This keeps RET and computed-jump chains inside generated code - the C
+ * dispatcher ran 13 million times a second in Duke3D without it. */
+static void INLINE gen_ret_dispatch(void) {
+    drcir_emit(DRCIR_RETDISP);
 }
 
 static void gen_shr_imm(HostReg reg,uint8_t imm) {
@@ -1674,6 +1684,43 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                 case DRCIR_BOOL:
                     drc_getl(r->a); drc_b(0x45); drc_b(0x45); drc_setl(r->a);
                     DRC_FORGET(r->a); break;
+                case DRCIR_RETDISP: {
+                    const uint32_t a_csphys = (uint32_t)(uintptr_t)&Segs.phys[cs];
+                    const uint32_t a_eip    = (uint32_t)(uintptr_t)&reg_eip;
+                    const uint32_t a_cache  = (uint32_t)(uintptr_t)&drc_dispatch_cache[0];
+                    const uint32_t a_gen    = (uint32_t)(uintptr_t)&drc_dispatch_gen;
+                    drc_used_extra_locals = true;
+                    /* ip = Segs.phys[cs] + reg_eip */
+                    drc_iconst(a_csphys); drc_load32();
+                    drc_iconst(a_eip); drc_load32();
+                    drc_b(0x6A); drc_teel(DRC_LOCAL_SCRATCH);
+                    /* entry = &cache[(ip ^ ip>>8) & (N-1)]; 16-byte entries */
+                    drc_iconst(8); drc_b(0x76);
+                    drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x73);
+                    drc_iconst(DRC_DISPATCH_CACHE_SIZE - 1); drc_b(0x71);
+                    drc_iconst(4); drc_b(0x74);
+                    drc_iconst(a_cache); drc_b(0x6A);
+                    drc_setl(DRC_LOCAL_V1);
+                    /* miss if entry.ip != ip or entry.gen != current gen */
+                    drc_getl(DRC_LOCAL_V1); drc_b(0x28); drc_uleb(0); drc_uleb(0);
+                    drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x47);
+                    drc_getl(DRC_LOCAL_V1); drc_b(0x28); drc_uleb(0); drc_uleb(4);
+                    drc_iconst(a_gen); drc_load32(); drc_b(0x47);
+                    drc_b(0x72);
+                    drc_b(0x04); drc_b(0x40);
+                    drc_iconst(0); drc_b(0x0F);         /* BR_Normal */
+                    drc_b(0x0B);
+                    /* tagged table index; 0 means the code was recycled */
+                    drc_getl(DRC_LOCAL_V1); drc_b(0x28); drc_uleb(0); drc_uleb(8);
+                    drc_iconst(0x7FFFFFFF); drc_b(0x71);
+                    drc_teel(DRC_LOCAL_SCRATCH);
+                    drc_b(0x45);
+                    drc_b(0x04); drc_b(0x40);
+                    drc_iconst(0); drc_b(0x0F);
+                    drc_b(0x0B);
+                    drc_getl(DRC_LOCAL_SCRATCH);
+                    drc_b(0x13); drc_uleb(DRC_TYPE_BLOCK); drc_b(0x00);
+                    break; }
                 case DRCIR_SHRI:
                     drc_getl(r->a); drc_iconst(r->b); drc_b(0x76); drc_setl(r->a);
                     DRC_FORGET(r->a); break;
