@@ -557,7 +557,16 @@ static void dyn_dshift_ev_gv(bool left,bool immediate) {
 		MOV_REG_WORD_TO_HOST_REG(FC_OP1,decode.modrm.rm,decode.big_op);
 	}
 	MOV_REG_WORD_TO_HOST_REG(FC_OP2,decode.modrm.reg,decode.big_op);
-	if (immediate) gen_mov_byte_to_reg_low_imm(FC_OP3,decode_fetchb());
+	if (immediate) {
+		Bitu val;
+		// self-modifying inner loops (Build engine) patch this count byte
+		// per call; read it indirectly so the write can't invalidate the block
+		if (decode_fetchb_imm(val)) {
+			gen_mov_byte_to_reg_low(FC_OP3,(void*)val);
+		} else {
+			gen_mov_byte_to_reg_low_imm(FC_OP3,(uint8_t)val);
+		}
+	}
 	else MOV_REG_BYTE_TO_HOST_REG_LOW(FC_OP3,DRC_REG_ECX,0);
 	if (decode.big_op) dyn_dpshift_dword_gencall(left);
 	else dyn_dpshift_word_gencall(left);

@@ -49,10 +49,15 @@ extern bool do_lds_wraparound;
 
 #if defined(__EMSCRIPTEN__)
 #define CACHE_MAXSIZE	(4096*8)	/* fixed-size IR records are larger than native code */
+/* the IR records are ~4x the density of native code, so the stock 8MB arena
+ * holds only ~2MB worth of translated guest code; a large protected-mode game
+ * (Duke3D) wrapped it several times a minute, each wrap forcing the hot
+ * working set to recompile - visible as a stutter burst */
+#define CACHE_TOTAL		(1024*1024*32)
 #else
 #define CACHE_MAXSIZE	(4096*2)
-#endif
 #define CACHE_TOTAL		(1024*1024*8)
+#endif
 #define CACHE_PAGES		(512)
 #define CACHE_BLOCKS	(128*1024)
 #define CACHE_ALIGN		(16)

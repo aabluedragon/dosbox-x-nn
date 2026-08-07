@@ -163,6 +163,9 @@ static bool MakeCodePage(Bitu lin_addr,CodePageHandlerDynRec * &cph) {
 	}
 	// find a free CodePage
 	if (!cache.free_pages) {
+#if defined(__EMSCRIPTEN__)
+		drc_note_bail(52);	/* diagnostic: code page pool exhausted, evicting */
+#endif
 		if (cache.used_pages!=decode.page.code) cache.used_pages->ClearRelease();
 		else {
 			// try another page to avoid clearing our source-crosspage
@@ -1121,8 +1124,20 @@ skip_extend_word:
 				base_reg=DRC_REG_EBP;seg_base=DRC_SEG_SS;
 			} else {
 				// no base, no scalereg
-
-				imm=(int32_t)decode_fetchd();
+				Bitu val;
+				// try to get a pointer to the next dword code position
+				if (decode_fetchd_imm(val)) {
+					// succeeded, use the pointer to avoid code invalidation
+					if (!addseg) {
+						gen_mov_word_to_reg(ea_reg,(void*)val,true);
+					} else {
+						MOV_SEG_PHYS_TO_HOST_REG(ea_reg,(decode.seg_prefix_used ? decode.seg_prefix : seg_base));
+						gen_add(ea_reg,(void*)val);
+					}
+					return;
+				}
+				// couldn't get a pointer, use the current value
+				imm=(int32_t)val;
 				if (!addseg) {
 					gen_mov_dword_to_reg_imm(ea_reg,(uint32_t)imm);
 				} else {
