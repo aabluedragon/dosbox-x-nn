@@ -52,8 +52,10 @@ extern bool do_lds_wraparound;
 /* the IR records are ~4x the density of native code, so the stock 8MB arena
  * holds only ~2MB worth of translated guest code; a large protected-mode game
  * (Duke3D) wrapped it several times a minute, each wrap forcing the hot
- * working set to recompile - visible as a stutter burst */
-#define CACHE_TOTAL		(1024*1024*32)
+ * working set to recompile - visible as a stutter burst. 32MB still wrapped
+ * about twice in a five minute session once heavily-patched code was allowed
+ * to retranslate freely, so it was doubled again - the wasm heap is 512MB. */
+#define CACHE_TOTAL		(1024*1024*64)
 #else
 #define CACHE_MAXSIZE	(4096*2)
 #define CACHE_TOTAL		(1024*1024*8)
