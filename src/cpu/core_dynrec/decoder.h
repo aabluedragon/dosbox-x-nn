@@ -206,11 +206,22 @@ restart_prefix:
 					goto finish_block;
 
 				// conditional byte set instructions
-/*				case 0x90:case 0x91:case 0x92:case 0x93:case 0x94:case 0x95:case 0x96:case 0x97:	
-				case 0x98:case 0x99:case 0x9a:case 0x9b:case 0x9c:case 0x9d:case 0x9e:case 0x9f:	
+#if defined(__EMSCRIPTEN__)
+				case 0x90:case 0x91:case 0x92:case 0x93:case 0x94:case 0x95:case 0x96:case 0x97:
+				case 0x98:case 0x99:case 0x9a:case 0x9b:case 0x9c:case 0x9d:case 0x9e:case 0x9f:
+					/* AcquireFlags keeps the pending flag-writer (the cmp
+					 * this reads) from being demoted to its no-lazy-state
+					 * _simple variant */
+					AcquireFlags(FMASK_TEST);
+					dyn_set_byte_on_condition((BranchTypes)(dual_code&0xf));
+					break;
+#else
+/*				case 0x90:case 0x91:case 0x92:case 0x93:case 0x94:case 0x95:case 0x96:case 0x97:
+				case 0x98:case 0x99:case 0x9a:case 0x9b:case 0x9c:case 0x9d:case 0x9e:case 0x9f:
 					dyn_set_byte_on_condition((BranchTypes)(dual_code&0xf));
 					AcquireFlags(FMASK_TEST);
 					break; */
+#endif
 
 				// push/pop segment registers
 				case 0xa0:dyn_push_seg(DRC_SEG_FS);break;

@@ -87,6 +87,7 @@ enum {
     DRCIR_ADDMEM,      // a=reg x=addr
     DRCIR_ADDI,        // a=reg x=imm
     DRCIR_ANDI,        // a=reg x=imm
+    DRCIR_BOOL,        // a=reg: reg = (reg != 0) ? 1 : 0
     DRCIR_SHRI,        // a=reg b=imm
     DRCIR_LEA2,        // a=dst b=scale_reg c=scale x=imm
     DRCIR_LEA1,        // a=dst c=scale x=imm
@@ -156,6 +157,14 @@ EM_JS(int, drc_wasm_compile, (const uint8_t* bytes, int len), {
 EM_JS(void, drc_note_bail, (int reason), {
     if (!Module.__drcBail) Module.__drcBail = {};
     Module.__drcBail[reason] = (Module.__drcBail[reason] || 0) + 1;
+});
+
+/* diagnostic: which opcodes the translator rejected (BR_Opcode) - each one
+ * costs a full core exit and an interpreter round trip per execution */
+EM_JS(void, drc_note_op, (int b0, int b1, int b2), {
+    if (!Module.__drcOps) Module.__drcOps = {};
+    const k = b0.toString(16) + ':' + b1.toString(16) + ':' + b2.toString(16);
+    Module.__drcOps[k] = (Module.__drcOps[k] || 0) + 1;
 });
 
 /* diagnostic: histogram of self-modifying-code invalidations, keyed by
@@ -314,6 +323,12 @@ static void gen_add_imm(HostReg reg,uint32_t imm) {
 
 static void gen_and_imm(HostReg reg,uint32_t imm) {
     DRCIRRec* r = drcir_emit(DRCIR_ANDI); r->a = reg; r->x = imm;
+}
+
+/* reg = reg != 0 - the branch-condition helpers return raw flag masks, not
+ * booleans, so consumers that need a strict 0/1 (SETcc) normalize this way */
+static void gen_bool_reg(HostReg reg) {
+    DRCIRRec* r = drcir_emit(DRCIR_BOOL); r->a = reg;
 }
 
 static void gen_shr_imm(HostReg reg,uint8_t imm) {
@@ -1573,6 +1588,9 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     DRC_FORGET(r->a); break;
                 case DRCIR_ANDI:
                     drc_getl(r->a); drc_iconst(r->x); drc_b(0x71); drc_setl(r->a);
+                    DRC_FORGET(r->a); break;
+                case DRCIR_BOOL:
+                    drc_getl(r->a); drc_b(0x45); drc_b(0x45); drc_setl(r->a);
                     DRC_FORGET(r->a); break;
                 case DRCIR_SHRI:
                     drc_getl(r->a); drc_iconst(r->b); drc_b(0x76); drc_setl(r->a);

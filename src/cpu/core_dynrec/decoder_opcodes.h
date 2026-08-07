@@ -1146,6 +1146,34 @@ static void dyn_set_byte_on_condition(BranchTypes btype) {
 }
 */
 
+#if defined(__EMSCRIPTEN__)
+/* SETcc, revived from the commented-out draft above (the decode site must
+ * call AcquireFlags first, exactly like Jcc, or the flag-producing compare
+ * gets demoted to its no-lazy-state _simple variant and the condition reads
+ * stale flags). Watcom output leans on these hard: a Duke3D profile measured
+ * 2.7 million untranslated SETcc per second, each one a full core exit and
+ * an interpreted single instruction. The condition read is the same
+ * dynrec_get_* helper set the conditional branches use, so the translate-time
+ * flag tracking turns it into a couple of inline instructions. */
+static void dyn_set_byte_on_condition(BranchTypes btype) {
+	dyn_get_modrm();
+	if (decode.modrm.mod<3) {
+		/* resolve the address first so the condition value cannot be
+		 * disturbed by the EA computation on any backend */
+		dyn_fill_ea(FC_ADDR);
+		gen_protect_addr_reg();
+		dyn_branchflag_to_reg(btype);
+		gen_bool_reg(FC_RETOP);
+		gen_restore_addr_reg();
+		dyn_write_byte(FC_ADDR,FC_RETOP);
+	} else {
+		dyn_branchflag_to_reg(btype);
+		gen_bool_reg(FC_RETOP);
+		MOV_REG_BYTE_FROM_HOST_REG_LOW(FC_RETOP,decode.modrm.rm&3,(decode.modrm.rm>>2)&1);
+	}
+}
+#endif
+
 static void dyn_loop(LoopTypes type) {
 	dyn_reduce_cycles();
 	int8_t eip_add=(int8_t)decode_fetchb();

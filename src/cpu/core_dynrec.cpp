@@ -299,7 +299,20 @@ Bits CPU_Core_Dynrec_Run(void) {
 		if (!block) {
 			// no block found, thus translate the instruction stream
 			// unless the instruction is known to be modified
+#if defined(__EMSCRIPTEN__)
+			/* Always translate. The stock threshold permanently demotes any
+			 * block start with 4+ recorded invalidations to single-stepping
+			 * through the normal core - which is exactly where Build engine
+			 * games land, since they patch their render inner loops per call.
+			 * This backend reads patched immediates and displacements
+			 * indirectly (so most patches no longer invalidate at all), and a
+			 * retranslation costs tens of microseconds against a render loop
+			 * interpreted one instruction at a time, with a MakeCodePage
+			 * lookup per instruction, indefinitely. */
+			if (true) {
+#else
 			if (!chandler->invalidation_map || (chandler->invalidation_map[ip_point&4095]<4)) {
+#endif
 				// translate up to 32 instructions
 				block=CreateCacheBlock(chandler,ip_point,32);
 			} else {
@@ -387,6 +400,12 @@ run_block:
 			// some instruction has been encountered that could not be translated
 			// (thus it is not part of the code block), the normal core will
 			// handle this instruction
+#if defined(__EMSCRIPTEN__)
+			{
+				const PhysPt op_ip = SegPhys(cs)+reg_eip;
+				drc_note_op((int)mem_readb(op_ip), (int)mem_readb(op_ip+1), (int)mem_readb(op_ip+2));
+			}
+#endif
 			CPU_CycleLeft+=CPU_Cycles;
 			CPU_Cycles=1;
 			dosbox_allow_nonrecursive_page_fault = true;
