@@ -158,6 +158,25 @@ EM_JS(void, drc_note_bail, (int reason), {
     Module.__drcBail[reason] = (Module.__drcBail[reason] || 0) + 1;
 });
 
+/* diagnostic: histogram of self-modifying-code invalidations, keyed by
+ * physical page and 16-byte line of the written address, so a capture can
+ * show whether SMC churn concentrates on a few patch points */
+EM_JS(void, drc_note_smc, (int page, int addr, int bstart, int hostptr), {
+    if (!Module.__smc) Module.__smc = {};
+    const k = page.toString(16) + ':' + (addr >> 4).toString(16) + ':' + (bstart >> 4).toString(16);
+    Module.__smc[k] = (Module.__smc[k] || 0) + 1;
+    /* snapshot the code bytes around the patch point a few times so the
+     * patched instruction can be disassembled (and diffed across writes) */
+    if (!Module.__smcBytes) Module.__smcBytes = {};
+    const seen = Module.__smcBytes[k];
+    if (!seen || (seen.length < 4 && Module.__smc[k] % 50 === 0)) {
+        const base = hostptr - (addr & 15) - 16;
+        const hex = Array.from(HEAPU8.subarray(base, base + 48))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+        (Module.__smcBytes[k] = seen || []).push('off' + (addr & 15).toString(16) + ':' + hex);
+    }
+});
+
 /* debug aid: Module.__drcLimit caps how many blocks may be JIT compiled, so a
  * misbehaving block can be bisected without rebuilding */
 EM_JS(int, drc_get_limit, (), {

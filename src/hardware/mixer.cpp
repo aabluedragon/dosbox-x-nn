@@ -49,6 +49,9 @@
 #include "mem.h"
 #include "pic.h"
 #include "cpu.h"
+#ifdef __EMSCRIPTEN__
+#include "vga.h"
+#endif
 #include "dosbox.h"
 #include "logging.h"
 #include "mixer.h"
@@ -907,6 +910,11 @@ EMSCRIPTEN_KEEPALIVE double EMWORKER_CyclesRun(void) {
 }
 EMSCRIPTEN_KEEPALIVE int EMWORKER_CycleMax(void) {
     return (int)CPU_CycleMax;   /* declared in cpu.h */
+}
+/* current VGA display start address: EGA/VGA games scroll by moving it, so a
+ * probe can tell "screen is static by content" from "frames were dropped" */
+EMSCRIPTEN_KEEPALIVE int EMWORKER_VgaStart(void) {
+    return (int)vga.config.display_start;
 }
 EMSCRIPTEN_KEEPALIVE int16_t* EMWORKER_AudioBuffer(void) {
     static int16_t buf[8192]; /* up to 4096 stereo frames per pull */

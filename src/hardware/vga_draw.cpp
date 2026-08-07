@@ -87,6 +87,11 @@ extern bool vga_render_on_demand;
 extern signed char vga_render_on_demand_user;
 extern bool vga_render_wait_for_changes;
 extern signed char vga_render_wait_for_changes_user;
+#if defined(__EMSCRIPTEN__)
+extern "C" unsigned int emw_latch_count;
+extern "C" unsigned int emw_line_sum;
+extern "C" unsigned int emw_flip_count;
+#endif
 extern bool vga_ignore_extended_memory_bit;
 
 /* S3 streams processor state.
@@ -3947,6 +3952,15 @@ again:
                 }
             }
 
+#if defined(__EMSCRIPTEN__)
+            /* diagnostic: fingerprint one mid-screen scanline per frame so a
+             * probe can tell "renderer output identical" from "differ missed" */
+            if (vga.draw.lines_done == 100) {
+                unsigned int s = 0;
+                for (unsigned int i = 0; i < 256; i++) s = s * 31u + data[i];
+                emw_line_sum = s;
+            }
+#endif
             RENDER_DrawLine(data);
         }
     }
@@ -4046,9 +4060,18 @@ static void VGA_DrawEGASingleLine(Bitu /*blah*/) {
                     rawshot.render_y++;
                 }
             }
-            uint8_t * data=VGA_DrawLine(address, vga.draw.address_line ); 
+            uint8_t * data=VGA_DrawLine(address, vga.draw.address_line );
             if (video_debug_overlay && vga.draw.width < render.src.width) VGA_DrawDebugLine(data+(vga.draw.width*((vga.draw.bpp+7u)>>3u)),render.src.width-vga.draw.width);
 
+#if defined(__EMSCRIPTEN__)
+            /* diagnostic: fingerprint one mid-screen scanline per frame so a
+             * probe can tell "renderer output identical" from "differ missed" */
+            if (vga.draw.lines_done == 100) {
+                unsigned int s = 0;
+                for (unsigned int i = 0; i < 256; i++) s = s * 31u + data[i];
+                emw_line_sum = s;
+            }
+#endif
             RENDER_DrawLine(data);
         }
     }
@@ -4169,6 +4192,10 @@ static void VGA_Other_VertInterrupt(Bitu val) {
 
 static void VGA_DisplayStartLatch(Bitu /*val*/) {
     const Bitu old_start = vga.config.real_start;
+#if defined(__EMSCRIPTEN__)
+    emw_latch_count++;
+    if ((vga.config.display_start & vga.mem.memmask) != old_start) emw_flip_count++;
+#endif
 
     if (!IS_PC98_ARCH) OnDemandCompleteFrame();
 
@@ -5987,8 +6014,37 @@ extern bool DEBUG_HaltOnRetrace;
 Bitu DEBUG_EnableDebugger(void);
 #endif
 
+#if defined(__EMSCRIPTEN__)
+/* frame-pipeline drop diagnostics: which stage lost a frame */
+extern "C" {
+unsigned int emw_vt_count = 0;       /* vertical retrace events */
+unsigned int emw_abort_count = 0;    /* frames aborted with lines undrawn */
+unsigned int emw_abort_lines = 0;    /* lines_done at the last abort */
+unsigned int emw_sufail_count = 0;   /* RENDER_StartUpdate refused a frame */
+unsigned int emw_latch_count = 0;    /* VGA_DisplayStartLatch invocations */
+unsigned int emw_line_sum = 0;       /* checksum of scanline 100 as last rendered */
+unsigned int emw_flip_count = 0;     /* display start changes = guest page flips */
+__attribute__((used)) unsigned int EMWORKER_FrameDiag(int which) {
+    switch (which) {
+        case 0: return emw_vt_count;
+        case 1: return emw_abort_count;
+        case 2: return emw_abort_lines;
+        case 3: return emw_sufail_count;
+        case 4: return (unsigned int)vga.config.real_start;
+        case 5: return emw_latch_count;
+        case 6: return emw_line_sum;
+        case 7: return emw_flip_count;
+    }
+    return 0;
+}
+}
+#endif
+
 static void VGA_VerticalTimer(Bitu /*val*/) {
 	double current_time = PIC_GetCurrentEventTime();
+#if defined(__EMSCRIPTEN__)
+	emw_vt_count++;
+#endif
 
 #if C_DEBUG
 	if (DEBUG_HaltOnRetrace) {
@@ -6258,6 +6314,10 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 					LOG(LOG_VGAMISC,LOG_NORMAL)( "Lines left: %d",
 						(int)(vga.draw.lines_total-vga.draw.lines_done));
 					renderAbort = true;
+#if defined(__EMSCRIPTEN__)
+					emw_abort_count++;
+					emw_abort_lines = (unsigned int)vga.draw.lines_done;
+#endif
 				}
 			}
 			break;
@@ -6278,7 +6338,12 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
     }
 #endif
     //Check if we can actually render, else skip the rest
-    if (vga.draw.vga_override || !RENDER_StartUpdate()) return;
+    if (vga.draw.vga_override || !RENDER_StartUpdate()) {
+#if defined(__EMSCRIPTEN__)
+        emw_sufail_count++;
+#endif
+        return;
+    }
 
 	if (svgaCard == SVGA_S3Trio) {
 		if (s3Card >= S3_ViRGE || s3Card == S3_Trio64V) {

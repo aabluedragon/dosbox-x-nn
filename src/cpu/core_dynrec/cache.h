@@ -20,6 +20,7 @@
 /* diagnostic counters shared with the wasm backend (Module.__drcBail):
  * 50 = cache arena wrapped, 51 = a block was cleared by self-modifying code */
 extern "C" void drc_note_bail(int reason);
+extern "C" void drc_note_smc(int page, int addr, int bstart, int hostptr);
 #endif
 
 #include <assert.h>
@@ -149,6 +150,7 @@ public:
 					if (ip_point<=block->page.end && ip_point>=block->page.start) is_current_block=true;
 #if defined(__EMSCRIPTEN__)
 					drc_note_bail(51);	/* diagnostic: SMC invalidation */
+					drc_note_smc((int)phys_page,(int)start,(int)block->page.start,(int)(uintptr_t)(hostmem+start));
 #endif
 					block->Clear();		// clear the block, decrements the write_map accordingly
 				}
