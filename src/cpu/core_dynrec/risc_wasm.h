@@ -203,6 +203,12 @@ static uint32_t DRC_CALL_CONV dynrec_adc_dword_simple(uint32_t op1,uint32_t op2)
 static uint8_t  DRC_CALL_CONV dynrec_sbb_byte_simple(uint8_t op1,uint8_t op2) DRC_FC;
 static uint16_t DRC_CALL_CONV dynrec_sbb_word_simple(uint16_t op1,uint16_t op2) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_sbb_dword_simple(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t  DRC_CALL_CONV dynrec_adc_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_adc_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_adc_dword(uint32_t op1,uint32_t op2) DRC_FC;
+static uint8_t  DRC_CALL_CONV dynrec_sbb_byte(uint8_t op1,uint8_t op2) DRC_FC;
+static uint16_t DRC_CALL_CONV dynrec_sbb_word(uint16_t op1,uint16_t op2) DRC_FC;
+static uint32_t DRC_CALL_CONV dynrec_sbb_dword(uint32_t op1,uint32_t op2) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_sf(void) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_nsf(void) DRC_FC;
 static uint32_t DRC_CALL_CONV dynrec_get_cf_or_zf(void) DRC_FC;
@@ -621,14 +627,15 @@ enum { DRC_F_CF, DRC_F_ZF, DRC_F_SF, DRC_F_OF };
 /* With the flag type known, push the given flag as an i32 0/1 - the exact
  * formula the matching case in flags.cpp computes. With emit=false, only
  * answer whether the type/flag pair is statically computable; a false return
- * means the caller must call the helper. ADC and SBB are left out (their
- * carry also depends on lflags.oldcf), as are the shift counts carry needs. */
+ * means the caller must call the helper. The shift-count-dependent carries
+ * are left out. */
 static bool drc_flag_emit(int t, int which, bool emit) {
     if (t < 0 || t >= t_LASTFLAG) return false;
     const uint32_t a_var1 = (uint32_t)(uintptr_t)&lf_var1d;
     const uint32_t a_var2 = (uint32_t)(uintptr_t)&lf_var2d;
     const uint32_t a_res  = (uint32_t)(uintptr_t)&lf_resd;
     const uint32_t a_flag = (uint32_t)(uintptr_t)DRCD_REG_FLAGS;
+    const uint32_t a_oldcf = (uint32_t)(uintptr_t)&lflags.oldcf;
     const uint32_t m = drc_type_mask(t);
     const uint32_t sign = (m >> 1) + 1;
 
@@ -665,6 +672,24 @@ static bool drc_flag_emit(int t, int which, bool emit) {
         case t_CMPb: case t_CMPw: case t_CMPd:
             if (emit) { DRC_LOADM(a_var1); DRC_LOADM(a_var2); drc_b(0x49); }
             return true;
+        case t_ADCb: case t_ADCw: case t_ADCd:
+            /* (res < var1) || (oldcf && res == var1) */
+            if (emit) {
+                DRC_LOADM(a_res); DRC_LOADM(a_var1); drc_b(0x49);
+                drc_iconst(a_oldcf); drc_load8u();
+                DRC_LOADM(a_res); DRC_LOADM(a_var1); drc_b(0x46);
+                drc_b(0x71); drc_b(0x72);
+            }
+            return true;
+        case t_SBBb: case t_SBBw: case t_SBBd:
+            /* (var1 < res) || (oldcf && var2 == mask) */
+            if (emit) {
+                DRC_LOADM(a_var1); DRC_LOADM(a_res); drc_b(0x49);
+                drc_iconst(a_oldcf); drc_load8u();
+                DRC_LOADM(a_var2); drc_iconst(m); drc_b(0x46);
+                drc_b(0x71); drc_b(0x72);
+            }
+            return true;
         case t_ANDb: case t_ANDw: case t_ANDd:
         case t_ORb:  case t_ORw:  case t_ORd:
         case t_XORb: case t_XORw: case t_XORd:
@@ -686,6 +711,7 @@ static bool drc_flag_emit(int t, int which, bool emit) {
     case DRC_F_OF:
         switch (t) {
         case t_ADDb: case t_ADDw: case t_ADDd:
+        case t_ADCb: case t_ADCw: case t_ADCd:
             /* ((v1 ^ v2 ^ sign) & (res ^ v2)) & sign */
             if (emit) {
                 drc_iconst(a_var1); drc_load32();
@@ -699,6 +725,7 @@ static bool drc_flag_emit(int t, int which, bool emit) {
             return true;
         case t_SUBb: case t_SUBw: case t_SUBd:
         case t_CMPb: case t_CMPw: case t_CMPd:
+        case t_SBBb: case t_SBBw: case t_SBBd:
             /* ((v1 ^ v2) & (v1 ^ res)) & sign */
             if (emit) {
                 drc_iconst(a_var1); drc_load32();
@@ -752,7 +779,8 @@ static INLINE void drc_push_flag(int t, int which) { (void)drc_flag_emit(t, whic
 /* diagnostic twin of drc_note_bail: which path each flag consumer took at
  * translate time (1/2/3 adc-sbb static/helper/dynamic, 4/5/6 inc-dec helper/
  * static/dynamic, 7/8/9 carry read, 10/11/12 zero read, 13/14/15 branch
- * condition). Read via Module.__drcPath / the worker's stats message. */
+ * condition, 16/17 flag-setting adc-sbb inline/helper). Read via
+ * Module.__drcPath / the worker's stats message. */
 EM_JS(void, drc_note_path, (int reason), {
     if (!Module.__drcPath) Module.__drcPath = {};
     Module.__drcPath[reason] = (Module.__drcPath[reason] || 0) + 1;
@@ -977,14 +1005,64 @@ static bool drc_emit_flagop_inline(uint32_t target, unsigned import_slot) {
  * the same compare/subtract fast path used by the branches; any other flag
  * type calls the helper, which computes it the long way. */
 static bool drc_emit_adcsbb_inline(uint32_t target, unsigned import_slot) {
-    uint32_t opmask; bool is_sbb;
+    uint32_t opmask; bool is_sbb; int full_type = -1;
     if      (target == (uint32_t)(uintptr_t)dynrec_adc_byte_simple)  { opmask = 0xFFu;       is_sbb = false; }
     else if (target == (uint32_t)(uintptr_t)dynrec_adc_word_simple)  { opmask = 0xFFFFu;     is_sbb = false; }
     else if (target == (uint32_t)(uintptr_t)dynrec_adc_dword_simple) { opmask = 0xFFFFFFFFu; is_sbb = false; }
     else if (target == (uint32_t)(uintptr_t)dynrec_sbb_byte_simple)  { opmask = 0xFFu;       is_sbb = true;  }
     else if (target == (uint32_t)(uintptr_t)dynrec_sbb_word_simple)  { opmask = 0xFFFFu;     is_sbb = true;  }
     else if (target == (uint32_t)(uintptr_t)dynrec_sbb_dword_simple) { opmask = 0xFFFFFFFFu; is_sbb = true;  }
+    else if (target == (uint32_t)(uintptr_t)dynrec_adc_byte)  { opmask = 0xFFu;       is_sbb = false; full_type = t_ADCb; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_adc_word)  { opmask = 0xFFFFu;     is_sbb = false; full_type = t_ADCw; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_adc_dword) { opmask = 0xFFFFFFFFu; is_sbb = false; full_type = t_ADCd; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_sbb_byte)  { opmask = 0xFFu;       is_sbb = true;  full_type = t_SBBb; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_sbb_word)  { opmask = 0xFFFFu;     is_sbb = true;  full_type = t_SBBw; }
+    else if (target == (uint32_t)(uintptr_t)dynrec_sbb_dword) { opmask = 0xFFFFFFFFu; is_sbb = true;  full_type = t_SBBd; }
     else return false;
+
+    /* full variants: the adc/sbb's own flags are live afterwards, so the
+     * helper stores the whole lazy state. With the incoming flag type known
+     * that is only a handful of stores: carry (computed statically before
+     * the state it reads is overwritten), both operands, the sum, the type.
+     * Either way the resulting flag type is known - the helper sets it too -
+     * so tracking continues through adc chains. */
+    if (full_type >= 0) {
+        drc_used_extra_locals = true;
+        const uint32_t a_oldcf = (uint32_t)(uintptr_t)&lflags.oldcf;
+        const uint32_t a_type  = (uint32_t)(uintptr_t)&lflags.type;
+        const uint32_t a_var1  = (uint32_t)(uintptr_t)&lf_var1d;
+        const uint32_t a_var2  = (uint32_t)(uintptr_t)&lf_var2d;
+        const uint32_t a_res   = (uint32_t)(uintptr_t)&lf_resd;
+        if (drc_flag_type >= 0 && drc_flag_supported(drc_flag_type, DRC_F_CF)) {
+            drc_note_path(16);
+            drc_push_flag(drc_flag_type, DRC_F_CF); drc_setl(DRC_LOCAL_SCRATCH);
+            drc_iconst(a_oldcf); drc_getl(DRC_LOCAL_SCRATCH); drc_store8();
+            drc_iconst(a_var1); drc_getl(FC_OP1);
+            if (opmask == 0xFFu) drc_store8(); else if (opmask == 0xFFFFu) drc_store16(); else drc_store32();
+            drc_iconst(a_var2); drc_getl(FC_OP2);
+            if (opmask == 0xFFu) drc_store8(); else if (opmask == 0xFFFFu) drc_store16(); else drc_store32();
+            if (is_sbb) {   /* op1 - (op2 + carry) */
+                drc_getl(FC_OP1);
+                drc_getl(FC_OP2); drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x6A);
+                drc_b(0x6B);
+            } else {        /* op1 + op2 + carry */
+                drc_getl(FC_OP1); drc_getl(FC_OP2); drc_b(0x6A);
+                drc_getl(DRC_LOCAL_SCRATCH); drc_b(0x6A);
+            }
+            if (opmask != 0xFFFFFFFFu) { drc_iconst(opmask); drc_b(0x71); }
+            drc_setl(FC_RETOP);
+            drc_iconst(a_res); drc_getl(FC_RETOP);
+            if (opmask == 0xFFu) drc_store8(); else if (opmask == 0xFFFFu) drc_store16(); else drc_store32();
+            drc_iconst(a_type); drc_iconst((uint32_t)full_type); drc_store32();
+        } else {
+            drc_note_path(17);
+            drc_getl(FC_OP1); drc_getl(FC_OP2);
+            drc_b(0x10); drc_uleb(import_slot);
+            drc_setl(FC_RETOP);
+        }
+        drc_flag_type = full_type;
+        return true;
+    }
 
     /* the _simple helpers only read the lazy state, so the tracked type
      * survives either path */
@@ -1533,7 +1611,11 @@ static uint32_t drc_translate_and_compile(uint8_t* start, uint8_t* end) {
                     if (drc_emit_zf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cf_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
                     if (drc_emit_cond_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
-                    if (drc_emit_adcsbb_inline(r->x, slot)) { DRC_FORGET(FC_RETOP); break; }
+                    if (drc_emit_adcsbb_inline(r->x, slot)) {
+                        DRC_FORGET(FC_RETOP);
+                        DRC_FORGET_RANGE(a_lflags, (uint32_t)sizeof(lflags));
+                        break;
+                    }
                     if (drc_emit_flagop_inline(r->x, slot)) {
                         DRC_FORGET(FC_RETOP);
                         DRC_FORGET_RANGE(a_lflags, (uint32_t)sizeof(lflags));
