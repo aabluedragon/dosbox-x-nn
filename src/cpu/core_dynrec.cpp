@@ -335,7 +335,21 @@ Bits CPU_Core_Dynrec_Run(void) {
 			if (!chandler->invalidation_map || (chandler->invalidation_map[ip_point&4095]<4)) {
 #endif
 				// translate up to 32 instructions
+#if defined(__EMSCRIPTEN__)
+				/* charge translation time to the same overhead bucket as
+				 * I/O delay so the cycle auto-tuner does not read a
+				 * translation wave (entering a new area compiles thousands
+				 * of blocks) as "the host cannot keep up" and slash the
+				 * guest's cycles - that was a 1M -> 430k collapse and a
+				 * 3-second dip to 23fps on level entry */
+				{
+					const double t0 = emscripten_get_now();
+					block=CreateCacheBlock(chandler,ip_point,32);
+					CPU_IODelayRemoved += (cpu_cycles_count_t)((emscripten_get_now() - t0) * (double)CPU_CycleMax / 1000.0);
+				}
+#else
 				block=CreateCacheBlock(chandler,ip_point,32);
+#endif
 			} else {
 				dosbox_allow_nonrecursive_page_fault = true;
 				// let the normal core handle this instruction to avoid zero-sized blocks
