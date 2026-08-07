@@ -162,6 +162,14 @@ async function audioInit(freq) {
           this.drops = 0; this.underruns = 0; this.rebuffers = 0;
           this.minQ = 1e9; this.maxQ = 0;
           this.statTick = 0;
+          /* clock-skew servo: the mixer produces on the emulator's clock,
+           * this processor consumes on the audio device's clock, and the two
+           * drift (measured ~0.3%/s here) - any fixed cushion drains on a
+           * schedule, which was the periodic ~200ms silence. Duplicating or
+           * skipping one sample per few hundred, steered by the queue level,
+           * makes the pipeline self-clocking; at these rates it is far below
+           * audibility. */
+          this.servo = 0;
           this.port.onmessage = e => {
             const q = new Int16Array(e.data);
             this.queue.push(q);
@@ -198,13 +206,22 @@ async function audioInit(freq) {
             for (; i < L.length; i++) { L[i] = 0; R[i] = 0; }
             return true;
           }
+          const target = this.rebuildFrames;
+          let dir = 0, period = 0;
+          if (this.frames < target) { dir = 1; period = this.frames < (target >> 1) ? 96 : 384; }
+          else if (this.frames > target * 2) { dir = -1; period = 384; }
           while (i < L.length && this.queue.length) {
             const q = this.queue[0];
             const frames = q.length >> 1;
             while (i < L.length && this.offset < frames) {
               L[i] = q[this.offset*2] / 32768;
               R[i] = q[this.offset*2+1] / 32768;
-              i++; this.offset++; this.frames--;
+              i++;
+              if (dir > 0 && ++this.servo >= period) { this.servo = 0; continue; }  /* emit this frame again */
+              this.offset++; this.frames--;
+              if (dir < 0 && ++this.servo >= period && this.offset < frames) {
+                this.servo = 0; this.offset++; this.frames--;                       /* skip one frame */
+              }
             }
             if (this.offset >= frames) { this.queue.shift(); this.offset = 0; }
           }

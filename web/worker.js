@@ -60,7 +60,17 @@ function startAudioPump() {
      * stale (it played "during" the freeze) - discard down to this much and
      * ship the rest. */
     const shipMax = Math.round(freq * 0.10);
+    /* diagnostic: pump ticks that arrived late enough to threaten the
+     * page-side cushion, with what the ring held when they finally ran */
+    self.__audioGaps = [];
+    let lastTick = 0;
     setInterval(() => {
+      const tickNow = performance.now();
+      if (lastTick && tickNow - lastTick > 40) {
+        self.__audioGaps.push({ t: tickNow, gap: tickNow - lastTick, avail: Module._EMWORKER_AudioAvail() });
+        if (self.__audioGaps.length > 200) self.__audioGaps.splice(0, 100);
+      }
+      lastTick = tickNow;
       let avail = Module._EMWORKER_AudioAvail();
       if (!started) { if (avail < cushion) return; started = true; }
       const heap = Module.HEAP16 || (typeof HEAP16 !== 'undefined' ? HEAP16 : null);
@@ -173,6 +183,7 @@ onmessage = (e) => {
                     path: Module.__drcPath || {},
                     smc: Module.__smc || {},
                     smcBytes: Module.__smcBytes || {},
+                    audioGaps: (self.__audioGaps || []).slice(),
                     frames: (self.__frameTimes || []).slice(),
                     events: (Module.__drcEvents || []).slice(),
                     beats: (self.__beats || []).slice(),

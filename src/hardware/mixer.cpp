@@ -914,6 +914,18 @@ EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioAvail(void) {
     if (remains < 0) remains = 0;
     return remains;
 }
+/* mixer internals for diagnosing audio gaps from a live session */
+EMSCRIPTEN_KEEPALIVE int EMWORKER_AudioDiag(int which) {
+    switch (which) {
+        case 0: return EMWORKER_AudioAvail();
+        case 1: return mixer.prebuffer_wait ? 1 : 0;
+        case 2: return (int)mixer.work_in;
+        case 3: return (int)mixer.work_out;
+        case 4: return (int)mixer.work_wrap;
+        case 5: return mixer.mute ? 1 : 0;
+    }
+    return 0;
+}
 EMSCRIPTEN_KEEPALIVE double EMWORKER_CyclesRun(void) {
     extern uint64_t emu_cycles_run;
     return (double)emu_cycles_run;
