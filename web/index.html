@@ -59,6 +59,7 @@ const SKIP_FILE_LIMIT = 256 * 1024 * 1024;
 const confText = document.getElementById('confText');
 const DEFAULT_CONF = `[dosbox]
 memsize=63
+machine=vesa_nolfb
 
 [cpu]
 # The WebAssembly recompiler runs everything. Real-mode games once paced
@@ -97,6 +98,7 @@ if (!storedConf.includes('[log]')) storedConf += '\n[log]\nsb=false\n';
 if (!storedConf.includes('showmenu')) storedConf = storedConf.replace(/\[sdl\]\n/, '[sdl]\nshowmenu=false\n');
 if (!storedConf.includes('[render]')) storedConf += '\n[render]\nscaler=none\n';
 if (!storedConf.includes('[video]')) storedConf += '\n[video]\nforcerate=60\n';
+if (!/^machine=/m.test(storedConf)) storedConf = storedConf.replace(/^memsize=63$/m, 'memsize=63\nmachine=vesa_nolfb');
 /* migrate stored configs from earlier page defaults: the recompiler now
  * paces real-mode games as well as the interpreter, with far more headroom */
 storedConf = storedConf.replace(/^core=(auto|normal)$/m, 'core=dynamic');
