@@ -34,7 +34,7 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(C_IOS)
 #include <IOKit/serial/ioss.h>
 #endif
 

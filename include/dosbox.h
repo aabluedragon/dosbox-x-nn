@@ -24,6 +24,16 @@
 /* for mkdir_p, needed by emscripten */
 #include <sys/stat.h>
 #endif
+
+#if defined(C_IOS)
+/* iOS forbids spawning processes (system() is marked unavailable in the
+   SDK). All call sites are "run a host command" conveniences - printer
+   and serial file handlers, config reboot helpers - so let them fail
+   cleanly instead of conditioning every one of them. */
+#include <stdlib.h>
+static inline int dosbox_ios_no_system(const char *cmd) { (void)cmd; return -1; }
+#define system(x) dosbox_ios_no_system(x)
+#endif
 #include <algorithm>
 #include <functional>
 #include <map>

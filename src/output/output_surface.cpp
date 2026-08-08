@@ -22,7 +22,7 @@ extern Bitu currentWindowHeight;
 
 bool setSizeButNotResize();
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(C_IOS)
 /* Framebuffer the emulator renders into on Android; see OUTPUT_SURFACE_SetSize. */
 static uint8_t* android_fb = NULL;
 static size_t android_fb_size = 0;
@@ -71,7 +71,7 @@ Bitu OUTPUT_SURFACE_SetSize()
     sdl.clip.h = sdl.draw.height;
     if (GFX_IsFullscreen()) {
         if (sdl.desktop.full.fixed) {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(C_IOS)
             /* The desktop dimensions dosbox derives are unreliable on
                Android (no X11); use the real display mode so the clip and
                window-too-small sanity checks work with sane numbers. */
@@ -231,7 +231,7 @@ Bitu OUTPUT_SURFACE_SetSize()
         break;
     }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(C_IOS)
     /* Android's RGBX8888 window surface reports 24 bits per pixel stored in
        4 bytes; without this the switch above yields no capability flags at
        all and the render code shuts down after the first mode change. */
@@ -239,7 +239,7 @@ Bitu OUTPUT_SURFACE_SetSize()
         retFlags = GFX_CAN_32;
 #endif
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(C_IOS)
     /* Android can recreate the window surface at any time (immersive-mode
        insets, rotation), freeing the pixel buffer the emulator draws into
        mid-frame. Render into our own framebuffer instead; EndUpdate
@@ -670,7 +670,7 @@ bool OUTPUT_SURFACE_StartUpdate(uint8_t* &pixels, Bitu &pitch)
         else
 #endif
         {
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(C_IOS)
             if (android_fb)
             {
                 pixels = android_fb;
@@ -782,7 +782,7 @@ void OUTPUT_SURFACE_EndUpdate(const uint16_t *changedLines)
     else
 #endif /*C_SURFACE_POSTRENDER_ASPECT*/
     {
-#if defined(C_SDL2) && defined(__ANDROID__)
+#if defined(C_SDL2) && (defined(__ANDROID__) || defined(C_IOS))
         if (android_fb) {
             /* The frame was rendered into our own framebuffer; the window
                surface may have been recreated by the system at any time,

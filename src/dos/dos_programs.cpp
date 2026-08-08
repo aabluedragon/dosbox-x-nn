@@ -1966,7 +1966,7 @@ int IDE_MatchCDROMDrive(char drv);
 #if defined(WIN32)
 #include <fcntl.h>
 #else
-#if defined(MACOSX)
+#if defined(MACOSX) || defined(C_IOS)
 #define _DARWIN_C_SOURCE
 #endif
 #include <sys/file.h>

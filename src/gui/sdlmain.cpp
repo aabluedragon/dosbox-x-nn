@@ -6188,7 +6188,7 @@ void GFX_Events() {
             case SDL_WINDOWEVENT_RESIZED:
                 GFX_HandleVideoResize(event.window.data1, event.window.data2);
                 continue;
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(C_IOS)
             case SDL_WINDOWEVENT_SIZE_CHANGED:
                 /* Android resizes the window itself (immersive mode insets,
                    rotation). The emulator renders into an intermediate

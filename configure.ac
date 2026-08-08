@@ -701,8 +701,14 @@ case "$host" in
        dnl FEATURE: Whether to support direct serial port pass-through
        AC_DEFINE(C_DIRECTSERIAL, 1, [ Define to 1 if you want serial pass-through support (Win32, Posix and OS/2).])
        ;;
+    *-*-ios*)
+       dnl iOS (UIKit SDL2 port). Not the macOS desktop: no Carbon/AppKit
+       dnl frameworks and no direct serial/parallel port access. The
+       dnl needed UIKit frameworks are supplied when the app is linked.
+       ios_target=1
+       ;;
     *-*-darwin*)
-       dnl We have a problem here: both Mac OS X and Darwin report 
+       dnl We have a problem here: both Mac OS X and Darwin report
        dnl the same signature "powerpc-apple-darwin*" - so we have
        dnl to do more to distinguish them.
        dnl For now I am lazy and do not add proper detection code.
@@ -785,6 +791,7 @@ esac
 fi
 
 AM_CONDITIONAL(MACOSX, test x"$macosx" = x"1")
+AM_CONDITIONAL(IOS, test x"$ios_target" = x"1")
 AM_CONDITIONAL(DUKTAPE, test x"$HAVE_DUKTAPE" = x"1")
 AM_CONDITIONAL(EMSCRIPTEN, test x"$enable_emscripten" = x"yes")
 

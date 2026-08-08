@@ -129,7 +129,7 @@ struct DOS_Version {
 };
 
 #ifndef MACOSX
-#if defined (__APPLE__)
+#if defined (__APPLE__) && !defined(C_IOS)
 #define MACOSX 1
 #endif
 #endif

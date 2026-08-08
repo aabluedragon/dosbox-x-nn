@@ -5134,7 +5134,7 @@ extern "C" {
             return (0);
         }
     #endif
-    #elif __APPLE__ && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
+    #elif __APPLE__ && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
 #include <Availability.h>
 #define STR2(x) #x
 #define STR(x) STR2(x)

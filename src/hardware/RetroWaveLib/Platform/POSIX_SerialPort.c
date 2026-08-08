@@ -61,7 +61,7 @@ int set_tty(int fd) {
 		return -1;
 	}
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(C_IOS)
 	int speed = 2000000;
 
 	if (ioctl(fd, IOSSIOSPEED, &speed) == -1) {

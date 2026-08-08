@@ -10,7 +10,7 @@
 
 #include <unistd.h>
 
-#if (C_HAVE_MPROTECT) && (C_HAVE_MACH_VM_REMAP)
+#if (C_HAVE_MPROTECT) && (C_HAVE_MACH_VM_REMAP) && !defined(C_IOS)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #endif
@@ -157,7 +157,7 @@ static void cache_dynamic_common_alloc(Bitu allocsz) {
 
     cache_code=(uint8_t*)(((Bitu)cache_code_start_ptr+(PAGESIZE_TEMP-1)) & ~(PAGESIZE_TEMP-1)); //Bitu is same size as a pointer.
 
-#if (C_HAVE_MPROTECT) && (C_HAVE_MACH_VM_REMAP)
+#if (C_HAVE_MPROTECT) && (C_HAVE_MACH_VM_REMAP) && !defined(C_IOS)
     if (dyncore_method == DYNCOREM_MPROTECT_RW_RX && (dyncore_flags&DYNCOREF_W_XOR_X)) {
         /* Darwin has a kernel call to remap our own process space twice. Try it. */
         mach_vm_address_t rw = (mach_vm_address_t)cache_code;

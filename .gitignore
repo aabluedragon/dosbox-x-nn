@@ -151,3 +151,4 @@ web/sw/
 web/abuse/
 build-wasm/
 build-android/
+build-ios/
