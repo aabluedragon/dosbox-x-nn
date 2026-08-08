@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.nukemnet.dosboxx" android:versionCode="1" android:versionName="1.0">
+
+  <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="34"/>
+  <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+  <!-- IPX/modem emulation (SDL2_net) needs sockets. -->
+  <uses-permission android:name="android.permission.INTERNET"/>
+
+  <application android:label="DOSBox-X"
+               android:hasCode="true"
+               android:debuggable="true"
+               android:extractNativeLibs="true">
+    <activity android:name="org.nukemnet.dosboxx.DosBoxActivity"
+              android:label="DOSBox-X"
+              android:exported="true"
+              android:screenOrientation="sensorLandscape"
+              android:configChanges="orientation|keyboard|keyboardHidden|screenSize|navigation"
+              android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>
