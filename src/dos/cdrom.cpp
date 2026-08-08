@@ -35,7 +35,7 @@
 #if defined(WIN32)
 #define SDL_CDROM_WIN32
 #include "../../vs/sdl/src/cdrom/win32/SDL_syscdrom.c"
-#elif defined(LINUX)
+#elif defined(LINUX) && !defined(__ANDROID__)
 #define SDL_CDROM_LINUX
 #include "../../vs/sdl/src/cdrom/linux/SDL_syscdrom.c"
 #elif defined(MACOSX)

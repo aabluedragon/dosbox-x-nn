@@ -6188,6 +6188,16 @@ void GFX_Events() {
             case SDL_WINDOWEVENT_RESIZED:
                 GFX_HandleVideoResize(event.window.data1, event.window.data2);
                 continue;
+#if defined(__ANDROID__)
+            case SDL_WINDOWEVENT_SIZE_CHANGED:
+                /* Android resizes the window itself (immersive mode insets,
+                   rotation). The emulator renders into an intermediate
+                   surface and the output code re-acquires the window surface
+                   every frame, so nothing must be done here — and calling
+                   GFX_ResetScreen() here can loop, as the reset itself can
+                   generate another size change event. */
+                continue;
+#endif
             case SDL_WINDOWEVENT_EXPOSED:
                 if (sdl.desktop.type == SCREEN_GAMELINK) break;
                 if (sdl.draw.callback) sdl.draw.callback( GFX_CallBackRedraw );
@@ -9527,7 +9537,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         else {
             const char* env_driver = getenv("SDL_VIDEODRIVER");
             if(!env_driver || !*env_driver) {
-#if defined(LINUX)
+#if defined(LINUX) && !defined(__ANDROID__)
                 putenv("SDL_VIDEODRIVER=x11"); // default to x11 (xwayland) on Linux
 #elif defined(WIN32)
                 /* hack: Encourage SDL to use windib if not otherwise specified */

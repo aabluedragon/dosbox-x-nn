@@ -22,6 +22,13 @@ extern Bitu currentWindowHeight;
 
 bool setSizeButNotResize();
 
+#if defined(__ANDROID__)
+/* Framebuffer the emulator renders into on Android; see OUTPUT_SURFACE_SetSize. */
+static uint8_t* android_fb = NULL;
+static size_t android_fb_size = 0;
+static int android_fb_w = 0, android_fb_h = 0;
+#endif
+
 // output API below
 
 #if defined(C_X11) && defined(LINUX)
@@ -64,6 +71,22 @@ Bitu OUTPUT_SURFACE_SetSize()
     sdl.clip.h = sdl.draw.height;
     if (GFX_IsFullscreen()) {
         if (sdl.desktop.full.fixed) {
+#if defined(__ANDROID__)
+            /* The desktop dimensions dosbox derives are unreliable on
+               Android (no X11); use the real display mode so the clip and
+               window-too-small sanity checks work with sane numbers. */
+            {
+                SDL_DisplayMode dm;
+                if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
+                    sdl.desktop.full.width = (unsigned int)dm.w;
+                    sdl.desktop.full.height = (unsigned int)dm.h;
+                }
+            }
+            if (sdl.desktop.full.width < sdl.draw.width)
+                sdl.desktop.full.width = (unsigned int)sdl.draw.width;
+            if (sdl.desktop.full.height < sdl.draw.height)
+                sdl.desktop.full.height = (unsigned int)sdl.draw.height;
+#endif
             sdl.clip.x = (Sint16)((sdl.desktop.full.width - sdl.draw.width) / 2);
             sdl.clip.y = (Sint16)((sdl.desktop.full.height - sdl.draw.height) / 2);
             sdl.window = GFX_SetSDLWindowMode(sdl.desktop.full.width, sdl.desktop.full.height, SCREEN_SURFACE);
@@ -207,6 +230,36 @@ Bitu OUTPUT_SURFACE_SetSize()
         retFlags = GFX_CAN_32;
         break;
     }
+
+#if defined(__ANDROID__)
+    /* Android's RGBX8888 window surface reports 24 bits per pixel stored in
+       4 bytes; without this the switch above yields no capability flags at
+       all and the render code shuts down after the first mode change. */
+    if (retFlags == 0 && sdl.surface->format->BytesPerPixel == 4)
+        retFlags = GFX_CAN_32;
+#endif
+
+#if defined(__ANDROID__)
+    /* Android can recreate the window surface at any time (immersive-mode
+       insets, rotation), freeing the pixel buffer the emulator draws into
+       mid-frame. Render into our own framebuffer instead; EndUpdate
+       re-acquires the window surface and blits the finished frame. The
+       buffer only ever grows and old blocks are deliberately leaked on
+       growth: a video mode change can occur mid-frame while the scaler
+       still writes through the previous pointer. */
+    if (sdl.surface->format->BytesPerPixel == 4) {
+        size_t need = (size_t)sdl.draw.width * (size_t)sdl.draw.height * 4;
+        if (android_fb == NULL || android_fb_size < need) {
+            android_fb = (uint8_t*)malloc(need);
+            android_fb_size = need;
+        }
+        android_fb_w = (int)sdl.draw.width;
+        android_fb_h = (int)sdl.draw.height;
+    } else {
+        android_fb = NULL;
+        android_fb_size = 0;
+    }
+#endif
 
 #if C_XBRZ
     if (sdl_xbrz.enable)
@@ -617,6 +670,14 @@ bool OUTPUT_SURFACE_StartUpdate(uint8_t* &pixels, Bitu &pitch)
         else
 #endif
         {
+#if defined(__ANDROID__)
+            if (android_fb)
+            {
+                pixels = android_fb;
+                pitch = (Bitu)android_fb_w * 4;
+            }
+            else
+#endif
             if (sdl.blit.surface)
             {
                 if (SDL_MUSTLOCK(sdl.blit.surface) && SDL_LockSurface(sdl.blit.surface))
@@ -721,6 +782,41 @@ void OUTPUT_SURFACE_EndUpdate(const uint16_t *changedLines)
     else
 #endif /*C_SURFACE_POSTRENDER_ASPECT*/
     {
+#if defined(C_SDL2) && defined(__ANDROID__)
+        if (android_fb) {
+            /* The frame was rendered into our own framebuffer; the window
+               surface may have been recreated by the system at any time,
+               so re-acquire it before presenting. The desktop/fullscreen
+               geometry dosbox computes is not reliable on Android, so
+               scale to the actual window surface, preserving aspect,
+               centered (letterboxed). */
+            if (changedLines == NULL)
+                return;
+            sdl.surface = SDL_GetWindowSurface(sdl.window);
+            if (sdl.surface != NULL && sdl.surface->format->BytesPerPixel == 4 &&
+                android_fb_w > 0 && android_fb_h > 0) {
+                SDL_Surface* src = SDL_CreateRGBSurfaceFrom(android_fb,
+                    android_fb_w, android_fb_h, 32, android_fb_w * 4,
+                    sdl.surface->format->Rmask, sdl.surface->format->Gmask,
+                    sdl.surface->format->Bmask, 0);
+                if (src != NULL) {
+                    SDL_Rect dst;
+                    double sx = (double)sdl.surface->w / android_fb_w;
+                    double sy = (double)sdl.surface->h / android_fb_h;
+                    double s = (sx < sy) ? sx : sy;
+                    dst.w = (int)(android_fb_w * s);
+                    dst.h = (int)(android_fb_h * s);
+                    dst.x = ((int)sdl.surface->w - dst.w) / 2;
+                    dst.y = ((int)sdl.surface->h - dst.h) / 2;
+                    SDL_BlitScaled(src, nullptr, sdl.surface, &dst);
+                    SDL_FreeSurface(src);
+                    SDL_UpdateWindowSurface(sdl.window);
+                    if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
+                }
+            }
+            return;
+        }
+#endif
         if (SDL_MUSTLOCK(sdl.surface)) {
             if (sdl.blit.surface) {
                 SDL_UnlockSurface(sdl.blit.surface);

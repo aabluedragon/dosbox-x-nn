@@ -713,6 +713,12 @@ case "$host" in
        dnl FEATURE: Whether to support direct serial port pass-through
        AC_DEFINE(C_DIRECTSERIAL, 1, [ Define to 1 if you want serial pass-through support (Win32, Posix and OS/2).])
        ;;
+    *-*-linux-android*)
+       AC_DEFINE(LINUX, 1, [Compiling on GNU/Linux])
+       CXXFLAGS="$CXXFLAGS -D_XOPEN_SOURCE=700 -D_POSIX_C_SOURCE=200809L"
+       dnl Android's bionic libc has no separate librt, and no direct
+       dnl parallel/serial port access is possible.
+       ;;
     *-*-linux*)
        AC_DEFINE(LINUX, 1, [Compiling on GNU/Linux])
        CXXFLAGS="$CXXFLAGS -D_XOPEN_SOURCE=700 -D_POSIX_C_SOURCE=200809L"
