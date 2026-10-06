@@ -45,6 +45,13 @@
 #include "cdrom.h"
 #include "builtin.h"
 #include "bios_disk.h"
+#include "imagedisk_d88.h"
+#include "imagedisk_eltorito.h"
+#include "imagedisk_emptydrive.h"
+#include "imagedisk_int13.h"
+#include "imagedisk_nfd.h"
+#include "imagedisk_teledisk.h"
+#include "imagedisk_vfd.h"
 #include "dos_system.h"
 #include "dos_inc.h"
 #include "bios.h"
@@ -655,8 +662,8 @@ void MenuBrowseFDImage(char drive, int num, int type) {
 	getcwd(Temp_CurrentDir, 512);
 	char const * lTheOpenFileName;
 	std::string files="", fname="";
-	const char *lFilterPatterns[] = {"*.ima","*.img","*.xdf","*.fdi","*.hdm","*.nfd","*.d88","*.IMA","*.IMG","*.XDF","*.FDI","*.HDM","*.NFD","*.D88"};
-	const char *lFilterDescription = "Floppy image files (*.ima, *.img, *.xdf, *.fdi, *.hdm, *.nfd, *.d88)";
+	const char *lFilterPatterns[] = {"*.ima","*.img","*.xdf","*.fdi","*.hdm","*.nfd","*.d88","*.td0","*.IMA","*.IMG","*.XDF","*.FDI","*.HDM","*.NFD","*.D88","*.TD0"};
+	const char *lFilterDescription = "Floppy image files (*.ima, *.img, *.xdf, *.fdi, *.hdm, *.nfd, *.d88, *.td0)";
 	lTheOpenFileName = tinyfd_openFileDialog("Select a floppy image file","",sizeof(lFilterPatterns)/sizeof(lFilterPatterns[0]), lFilterPatterns, lFilterDescription, 0);
 
 #if !defined(OSFREE)
@@ -741,7 +748,7 @@ void MenuBrowseImageFile(char drive, bool arc, bool boot, bool multiple, const s
 			paths.push_back(lTheOpenFileName);
 		}
 	} else {
-		const char *lFilterPatterns[] = {"*.ima","*.img","*.vhd","*.fdi","*.hdi","*.nfd","*.nhd","*.d88","*.hdm","*.xdf","*.iso","*.cue","*.bin","*.chd","*.mdf","*.gog","*.ins","*.ccd","*.inst","*.IMA","*.IMG","*.VHD","*.FDI","*.HDI","*.NFD","*.NHD","*.D88","*.HDM","*.XDF","*.ISO","*.CUE","*.BIN","*.CHD","*.MDF","*.GOG","*.INS","*.CCD","*.INST"};
+		const char *lFilterPatterns[] = {"*.ima","*.img","*.vhd","*.fdi","*.hdi","*.nfd","*.nhd","*.d88","*.td0","*.hdm","*.xdf","*.iso","*.cue","*.bin","*.chd","*.mdf","*.gog","*.ins","*.ccd","*.inst","*.IMA","*.IMG","*.VHD","*.FDI","*.HDI","*.NFD","*.NHD","*.D88","*.TD0","*.HDM","*.XDF","*.ISO","*.CUE","*.BIN","*.CHD","*.MDF","*.GOG","*.INS","*.CCD","*.INST"};
 		const char *lFilterDescription = "Disk/CD image files";
 		lTheOpenFileName = tinyfd_openFileDialog(((multiple?"Select image file(s) for Drive ":"Select an image file for Drive ")+str+":").c_str(),"", sizeof(lFilterPatterns) / sizeof(lFilterPatterns[0]),lFilterPatterns,lFilterDescription,multiple?1:0);
 		if (lTheOpenFileName) {
@@ -886,7 +893,7 @@ void MenuBrowseImageFile(char drive, bool arc, bool boot, bool multiple, const s
 					chdir( Temp_CurrentDir );
 					return;
 				}
-#if defined(MACOSX)
+#if defined(MACOSX) || defined(LINUX)
 				auto MSGX = MSG_GetUTF8;
 #else
 				auto MSGX = MSG_Get;
@@ -906,7 +913,7 @@ void MenuBrowseImageFile(char drive, bool arc, bool boot, bool multiple, const s
 							GetNewStr(lTheOpenFileName).c_str(), readonly.c_str());
 				}
 				std::string title = MSGX("INFORMATION");
-#if defined(MACOSX)
+#if defined(MACOSX) || defined(LINUX)
 				tinyfd_messageBox(title.c_str(), drive_warn.c_str(), "ok", "info", 1);
 #else
 				systemmessagebox(title.c_str(), drive_warn.c_str(), "ok", "info", 1);
@@ -2035,7 +2042,7 @@ extern uint16_t boot_code_image_stack_sp;
  */
 class BOOT : public Program {
 public:
-    BOOT() {
+    BOOT(const unsigned int fl=0) : Program(fl) {
         for (size_t i=0;i < MAX_SWAPPABLE_DISKS;i++) newDiskSwap[i] = NULL;
     }
     virtual ~BOOT() {
@@ -2155,10 +2162,11 @@ public:
         bool pc98_640x200 = true;
         bool pc98_show_graphics = false;
         bool bios_boot = false;
-        bool swaponedrive = false;
         bool convertro = false;
         bool zeromem = false;
         bool force = false;
+        bool auto_floppy = false;
+        bool auto_cdrom = false;
         int loadseg_user = -1;
         int convimg = -1;
         int quiet = 0;
@@ -2169,9 +2177,6 @@ public:
         boot_debug_break = false;
         if (cmd->FindExist("-debug",true))
             boot_debug_break = true;
-
-        if (cmd->FindExist("-swap-one-drive",true))
-            swaponedrive = true;
 
         if (cmd->FindExist("-zeromem",true))
             zeromem = true;
@@ -2226,6 +2231,16 @@ public:
         cmd->FindString("-load-seg",tmp,true);
         if (!tmp.empty())
             loadseg_user = strtoul(tmp.c_str(),NULL,0);
+
+        if(cmd->FindExist("-auto-floppy", true))
+            // Mount an empty floppy image if no floppy is mounted to enable mounting
+            // floppy images after booting a guest OS.
+            auto_floppy = true; 
+
+        if(cmd->FindExist("-auto-cdrom", true))
+            // Mount an empty CD-ROM image if no CD-ROM is mounted to enable mounting
+            // CD-ROM images after booting a guest OS.
+            auto_cdrom = true;
 
         cmd->FindString("-boothax",boothax_str,true);
 
@@ -2335,7 +2350,6 @@ public:
             throw int(8);
         }
 
-        bool bootbyDrive=false;
         FILE *usefile_1=NULL;
         FILE *usefile_2=NULL;
         Bitu i=0;
@@ -2650,6 +2664,8 @@ public:
 
             if(ext && !strcasecmp(ext, ".d88"))
                 newDiskSwap[index] = new imageDiskD88(usefile, fname, floppysize, false);
+            else if(!memcmp(hdr, "TD\0", 3))
+                newDiskSwap[index] = new imageDiskTeledisk(usefile, fname, floppysize, false);
             else if(!memcmp(hdr, "VFD1.", 5))
                 newDiskSwap[index] = new imageDiskVFD(usefile, fname, floppysize, false);
             else if(!memcmp(hdr, "T98FDDIMAGE.R0\0\0", 16))
@@ -2680,15 +2696,12 @@ public:
             /* No drives or images specified */
             if (Drives[0] && !strncmp(Drives[0]->GetInfo(), "fatDrive ", 9)) {
                 drive = 'A';
-                bootbyDrive = true;
             }
             else if (Drives[2] && !strncmp(Drives[2]->GetInfo(), "fatDrive ", 9)){
                 drive = 'C';
-                bootbyDrive = true;
             }
             else if(Drives[3] && !strncmp(Drives[3]->GetInfo(), "fatDrive ", 9)) {
                 drive = 'D';
-                bootbyDrive = true;
             }
             else {
                 printError();
@@ -2706,7 +2719,6 @@ public:
                     printError();
                     return;
                 }
-                bootbyDrive = true;
             }
             else if(temp_line.length() == 2 && ((temp_line == "/?") || (temp_line == "-?"))) {
                 printError();
@@ -2716,7 +2728,6 @@ public:
                 /* Drive number specified */
                 if(temp_line[0] == '0') drive = 'A';
                 else if(temp_line[0] == '2') drive = 'C';
-                bootbyDrive = true;
             }
             else {
                 /* Single image specified */
@@ -2929,10 +2940,10 @@ public:
         if (!has_read && IS_PC98_ARCH && drive < 'C') {
             /* this may be one of those odd FDD images where track 0, head 0 is all 128-byte sectors
              * and the rest of the disk is 256-byte sectors. */
-            if (imageDiskList[drive - 65]->Read_Sector(0, 0, 1, (uint8_t *)&bootarea, 128) == 0 &&
-                imageDiskList[drive - 65]->Read_Sector(0, 0, 2, (uint8_t *)&bootarea + 128, 128) == 0 &&
-                imageDiskList[drive - 65]->Read_Sector(0, 0, 3, (uint8_t *)&bootarea + 256, 128) == 0 &&
-                imageDiskList[drive - 65]->Read_Sector(0, 0, 4, (uint8_t *)&bootarea + 384, 128) == 0) {
+            if (imageDiskList[drive - 65]->Read_Sector(0, 0, 1, (uint8_t *)&bootarea, 128) == Int13Status::NoError &&
+                imageDiskList[drive - 65]->Read_Sector(0, 0, 2, (uint8_t *)&bootarea + 128, 128) == Int13Status::NoError &&
+                imageDiskList[drive - 65]->Read_Sector(0, 0, 3, (uint8_t *)&bootarea + 256, 128) == Int13Status::NoError &&
+                imageDiskList[drive - 65]->Read_Sector(0, 0, 4, (uint8_t *)&bootarea + 384, 128) == Int13Status::NoError) {
                 LOG_MSG("First sector is 128 byte/sector. Booting from first four sectors.");
                 has_read = true;
                 bootsize = 512; // 128 x 4
@@ -2942,10 +2953,10 @@ public:
 
         if (!has_read && IS_PC98_ARCH && drive < 'C') {
             /* another nonstandard one with track 0 having 256 bytes/sector while the rest have 1024 bytes/sector */
-            if (imageDiskList[drive - 65]->Read_Sector(0, 0, 1, (uint8_t *)&bootarea,       256) == 0 &&
-                imageDiskList[drive - 65]->Read_Sector(0, 0, 2, (uint8_t *)&bootarea + 256, 256) == 0 &&
-                imageDiskList[drive - 65]->Read_Sector(0, 0, 3, (uint8_t *)&bootarea + 512, 256) == 0 &&
-                imageDiskList[drive - 65]->Read_Sector(0, 0, 4, (uint8_t *)&bootarea + 768, 256) == 0) {
+            if (imageDiskList[drive - 65]->Read_Sector(0, 0, 1, (uint8_t *)&bootarea,       256) == Int13Status::NoError &&
+                imageDiskList[drive - 65]->Read_Sector(0, 0, 2, (uint8_t *)&bootarea + 256, 256) == Int13Status::NoError &&
+                imageDiskList[drive - 65]->Read_Sector(0, 0, 3, (uint8_t *)&bootarea + 512, 256) == Int13Status::NoError &&
+                imageDiskList[drive - 65]->Read_Sector(0, 0, 4, (uint8_t *)&bootarea + 768, 256) == Int13Status::NoError) {
                 LOG_MSG("First sector is 256 byte/sector. Booting from first two sectors.");
                 has_read = true;
                 bootsize = 1024; // 256 x 4
@@ -2966,7 +2977,7 @@ public:
         }
 
         if (!has_read) {
-            if (imageDiskList[drive - 65]->Read_Sector(0, 0, 1, (uint8_t *)&bootarea) != 0) {
+            if (imageDiskList[drive - 65]->Read_Sector(0, 0, 1, (uint8_t *)&bootarea) != Int13Status::NoError) {
                 if (!quiet) WriteOut(MSG_Get("PROGRAM_BOOT_DRIVE_READERROR"));
                 return;
             }
@@ -3260,8 +3271,73 @@ public:
                 }
             }
 
-            if(!Drives[0]) runImgmount("0 empty");
-            if(!Drives[1]) runImgmount("1 empty");
+            /* If no floppy images are mounted on Drives A & B, mount an empty one. (requires -auto-floppy option) */
+            if(auto_floppy) {
+                if(!Drives[0]) runImgmount("0 empty");
+                if(!Drives[1]) runImgmount("1 empty");
+            }
+
+            /* If no mounted CD-ROM drives are found, mount an empty CD-ROM drive to a non-occupied slot (requires -auto-cdrom option) */
+            if(auto_cdrom) {
+                int8_t ide_index = -1;
+                bool ide_slave = false;
+
+                /* Parse IDE Controllers for CDROM */
+                bool isIDEControllerPresent(int8_t idx);
+                for(i = 0; i < MAX_IDE_CONTROLLERS && ide_index < 0; i++) {
+                    for(uint8_t j = 0; j < 2; j++) {
+                        const bool master = (j == 0);
+
+                        if(isIDEControllerPresent(i) &&
+                            IDE_controller_occupied(i, master) &&
+                            IDE_is_CDROM(i, master)) {
+                            /* Found a mounted CD-ROM Drive */
+                            ide_index = i;
+                            ide_slave = !master;
+                            break;
+                        }
+                    }
+                }
+
+                if(ide_index < 0) {
+                    int8_t drive_index = 2;
+                    for(drive_index = 2; drive_index < DOS_DRIVES; drive_index++) {
+                        if(!Drives[drive_index]) {
+                            const bool secondary_present = isIDEControllerPresent(1); // Secondary IDE controller is recommended for CD-ROM drives
+
+                            if((secondary_present &&
+                                IDE_controller_occupied(1, false)) ||
+                                !secondary_present) {
+                                /* Search for empty slot if IDE secondary master is already occupied */
+                                IDE_Auto(ide_index, ide_slave);
+
+                                if(ide_index < 0) {
+                                    LOG_MSG("BOOT: No available IDE index for CD-ROM drive");
+                                }
+                            }
+                            else {
+                                /* Mount empty drive to IDE secondary master (recommended) */
+                                ide_index = 1;
+                                ide_slave = false;
+                            }
+
+                            if(ide_index >= 0) {
+                                std::string mount_string =
+                                    std::string(1, drive_index + 'A') +
+                                    " empty -ide " +
+                                    std::to_string(ide_index + 1) +
+                                    (ide_slave ? "s" : "m")
+                                    + " -t cdrom ";
+
+                                //LOG_MSG("BOOT: imgmount command = [%s]", mount_string.c_str());
+
+                                runImgmount(mount_string.c_str());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
 
             /* zero out DOS memory */
             if (!dos_kernel_disabled && zeromem) {
@@ -3500,7 +3576,7 @@ static void BOOT_ProgramStart(Program * * make) {
 }
 
 void runBoot(const char *str) {
-	BOOT boot;
+	BOOT boot(dos_kernel_disabled ? Program::prg_nopsp : 0);
 	boot.cmd=new CommandLine("BOOT", str);
 	boot.Run();
 }
@@ -6173,9 +6249,10 @@ class IMGMOUNT : public Program {
 							if (!paths.empty()) {
 								const char *ext = strrchr(paths[0].c_str(), '.');
 								if (ext != NULL) {
-									if ((!IS_PC98_ARCH && strcasecmp(ext,".img") && strcasecmp(ext,".ima") && strcasecmp(ext,".vhd") && strcasecmp(ext,".qcow2")) ||
+									if ((!IS_PC98_ARCH && strcasecmp(ext,".img") && strcasecmp(ext,".ima") && strcasecmp(ext,".vhd") && strcasecmp(ext,".qcow2") && strcasecmp(ext,".td0")) ||
 											(IS_PC98_ARCH && strcasecmp(ext,".hdi") && strcasecmp(ext,".nhd") && strcasecmp(ext,".img") && strcasecmp(ext,".ima"))){
 										WriteOut(MSG_Get("PROGRAM_MOUNT_UNSUPPORTED_EXT"), ext);
+                                        LOG_MSG("IMGMOUNT: Warning: Unsupported extension '%s' for image file '%s'", ext, paths[0].c_str());
 									}
 								}
 							}
@@ -6313,13 +6390,15 @@ class IMGMOUNT : public Program {
 		bool ParseFiles(std::string &commandLine, std::vector<std::string> &paths, bool nodef) {
 			char drive=commandLine[0];
 			bool nocont=false;
-			int num = 0;
-			while (!nocont&&cmd->ExistsCommand(1)) {
+            if(!isalpha(drive) && !isdigit(drive)) return false;
+
+			while (!nocont) {
 				bool usedef=false;
 				if (!cmd->FindCommand(1, commandLine)) {
 					if (!nodef && !paths.size()) {
 						commandLine="IMGMAKE.IMG";
 						usedef=true;
+                        LOG_MSG("IMGMOUNT: No file specified, using default 'IMGMAKE.IMG'");
 					}
 					else {
 						break;
@@ -6400,7 +6479,6 @@ class IMGMOUNT : public Program {
 						temp_line = tmp;
 						int res = get_expanded_files(temp_line, paths, readonly);
 						if (res) {
-							num += res - 1;
 							temp_line = paths[0];
 							continue;
 						} else if ((!DOS_MakeName(tmp, fullname, &dummy) || strncmp(Drives[dummy]->GetInfo(), "local directory", 15)) && !qmount) {
@@ -6421,7 +6499,6 @@ class IMGMOUNT : public Program {
 							temp_line = readonly?tmp+1:tmp;
 							int res = get_expanded_files(temp_line, paths, readonly);
 							if (res) {
-								num += res - 1;
 								temp_line = paths[0];
 								continue;
 							} else if (!qmount)
@@ -6435,6 +6512,7 @@ class IMGMOUNT : public Program {
 					return false;
 				}
 				paths.push_back(commandLine);
+                if(usedef) break;
 			}
 			return false;
 		}
@@ -7277,7 +7355,6 @@ class IMGMOUNT : public Program {
 
 			uint32_t sectorsPerTrack;
 			uint32_t heads;
-			uint32_t cylinders;
 			uint32_t cylinderTimesHeads = 0;
 
 			if(totalSectors > 65535ULL * 16ULL * 255ULL)
@@ -7286,12 +7363,10 @@ class IMGMOUNT : public Program {
 			if(totalSectors > 65535ULL * 16ULL * 63ULL){
 				sectorsPerTrack = 255;
 				heads = 16;
-				cylinders = (uint32_t)(totalSectors / (heads * sectorsPerTrack));
 			}
 			else {
 				sectorsPerTrack = 63;
 				cylinderTimesHeads = (uint32_t)(totalSectors / sectorsPerTrack);
-				cylinders = (uint32_t)(totalSectors / sectorsPerTrack);
 				heads = (cylinderTimesHeads + 1023) / 1024;
 			}
 
@@ -7708,6 +7783,13 @@ class IMGMOUNT : public Program {
 					imagesize = (uint32_t)(sectors / 2); /* orig. code wants it in KBs */
 					setbuf(newDisk, NULL);
 					newImage = new imageDiskD88(newDisk, fname, (uint32_t)imagesize, false/*this is a FLOPPY image format*/);
+				}
+				else if (!memcmp(tmp, "TD\0", 3)) {
+					fseeko64(newDisk, 0L, SEEK_END);
+					sectors = (uint64_t)ftello64(newDisk) / (uint64_t)sizes[0];
+					imagesize = (uint32_t)(sectors / 2); /* orig. code wants it in KBs */
+					setbuf(newDisk, NULL);
+					newImage = new imageDiskTeledisk(newDisk, fname, (uint32_t)imagesize, false/*this is a FLOPPY image format*/);
 				}
 				else if (!memcmp(tmp, "VFD1.", 5)) { /* FDD files */
 					fseeko64(newDisk, 0L, SEEK_END);
@@ -9914,6 +9996,7 @@ int flagged_backup(char *zip)
 					uint16_t handle = 0;
 					if (DOS_FindDevice(("\""+std::string(g_flagged_files[i])+"\"").c_str()) != DOS_DEVICES || !DOS_OpenFile(("\""+std::string(g_flagged_files[i])+"\"").c_str(),0,&handle)) {
 						LOG_MSG(MSG_Get("SHELL_CMD_FILE_NOT_FOUND"),g_flagged_files[i]);
+						i++;
 						continue;
 					}
 
@@ -10263,14 +10346,17 @@ void Add_VFiles(bool usecp) {
 #if defined(C_SDL_NET) || defined(C_SDL2_NET)
 	if (addinputnet) PROGRAMS_MakeFile("INPUTNET.COM",INPUTNET_ProgramStart,"/SYSTEM/");
 #endif
-	if (addne2k) {
-		VFILE_RegisterBuiltinFileBlob(bfb_NE2000_COM, "/SYSTEM/");
-#if defined(C_SDL_NET) || defined(C_SDL2_NET)
-        PROGRAMS_MakeFile("ETHNET.COM",ETHNET_ProgramStart,"/SYSTEM/");
-#endif
-    }
 	if (addovl) VFILE_RegisterBuiltinFileBlob(bfb_GLIDE2X_OVL, "/SYSTEM/");
 #endif
+
+	if (addne2k) {
+#if !defined(OSFREE)
+		VFILE_RegisterBuiltinFileBlob(bfb_NE2000_COM, "/SYSTEM/");
+#endif
+#if defined(C_SDL_NET) || defined(C_SDL2_NET)
+		PROGRAMS_MakeFile("ETHNET.COM",ETHNET_ProgramStart,"/SYSTEM/");
+#endif
+	}
 
 	/* These are IBM PC/XT/AT ONLY. They will not work in PC-98 mode. */
 	if (!IS_PC98_ARCH) {
@@ -10703,7 +10789,8 @@ void DOS_SetupPrograms(void) {
         "  harddrive.img    Specify a single hard disk image to boot from drive C:.\n"
         "  Add a leading colon (:) to treat the image as write-protected.\n\n"
         "  [-E <command>]   Specify a command string for PCjr cartridge images.\n"
-        "  [-L driveletter] Ignored option, accepted only for compatibility.\n\n"
+        "  [-L driveletter] Ignored option, accepted only for compatibility.\n"
+        "  [-auto-floppy][-auto-cdrom] Mount an empty floppy/CD image if not mounted.\n\n"
         "Examples:\n"
         "\033[32;1mBOOT A:\033[0m       Boot from drive A: if it is mounted and bootable.\n"
         "\033[32;1mBOOT disk1.img disk2.img\033[0m Boot from floppy images using a swap list on drive A:.\n"

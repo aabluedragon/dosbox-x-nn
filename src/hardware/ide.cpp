@@ -52,6 +52,10 @@
 # pragma warning(disable:4065) /* switch statement no case labels */
 #endif
 
+static inline unsigned int ide_chs_cylinder(const uint16_t lba[3]) {
+    return ((unsigned int)lba[1] & 0xffu) | (((unsigned int)lba[2] & 0xffu) << 8u);
+}
+
 struct IDEEventPack {
 #if defined(HX_DOS) || (defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
 	IDEEventPack() = default;
@@ -1799,7 +1803,9 @@ bool IDEATADevice::increment_current_address(Bitu count) {
                     if (heads == 16) drivehead -= 0x10;
                     /* increment cylinder */
                     if (((++lba[1])&0xFF) == 0x00) {
+                        lba[1] = 0x00;
                         if (((++lba[2])&0xFF) == 0x00) {
+                            lba[2] = 0x00;
                             return false;
                         }
                     }
@@ -2837,6 +2843,7 @@ void IDE_Auto(signed char &index,bool &slave) {
 }
 
 bool IDE_controller_occupied(signed char index, bool slave) { // Return true if specified slot is occupied 
+    if(idecontroller[index] == NULL) return false;
     const uint8_t ide_device = slave ? 1 : 0;
     if(idecontroller[index]->device[ide_device] == NULL) {
         return false;
@@ -3309,6 +3316,10 @@ void Get_IDECD_drives(std::vector<int> &v) {
 static IDEController* GetIDEController(Bitu idx) {
     if (idx >= MAX_IDE_CONTROLLERS) return NULL;
     return idecontroller[idx];
+}
+
+bool isIDEControllerPresent(int8_t idx) {
+    return (idecontroller[idx] != NULL);
 }
 
 static bool IDE_CPU_Is_Vm86() {
@@ -3792,9 +3803,9 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
                     else if ((unsigned int)(ata->drivehead & 0xFu) >= (unsigned int)ata->heads ||
                         (unsigned int)ata->lba[0] > (unsigned int)ata->sects ||
-                        (unsigned int)(ata->lba[1] | (ata->lba[2] << 8u)) >= (unsigned int)ata->cyls) {
+                        ide_chs_cylinder(ata->lba) >= (unsigned int)ata->cyls) {
                         LOG_MSG("C/H/S %u/%u/%u out of bounds %u/%u/%u\n",
-                            (unsigned int)(ata->lba[1] | (ata->lba[2] << 8u)),
+                            ide_chs_cylinder(ata->lba),
                             (unsigned int)(ata->drivehead&0xFu),
                             (unsigned int)(ata->lba[0]),
                             (unsigned int)ata->cyls,
@@ -3806,11 +3817,11 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
 
                     sectorn = ((ata->drivehead & 0xF) * ata->sects) +
-                        (((unsigned int)ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) * ata->sects * ata->heads) +
+                        (ide_chs_cylinder(ata->lba) * ata->sects * ata->heads) +
                         ((unsigned int)ata->lba[0] - 1u);
                 }
 
-                if (disk->Write_AbsoluteSector(sectorn, ata->sector) != 0) {
+                if (disk->Write_AbsoluteSector(sectorn, ata->sector) != Int13Status::NoError) {
                     LOG_MSG("Failed to write sector\n");
                     ata->abort_error();
                     dev->raise_irq();
@@ -3874,9 +3885,9 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
                     else if ((unsigned int)(ata->drivehead & 0xF) >= (unsigned int)ata->heads ||
                         (unsigned int)ata->lba[0] > (unsigned int)ata->sects ||
-                        (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) >= (unsigned int)ata->cyls) {
+                        ide_chs_cylinder(ata->lba) >= (unsigned int)ata->cyls) {
                         LOG_MSG("C/H/S %u/%u/%u out of bounds %u/%u/%u\n",
-                            (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)),
+                            ide_chs_cylinder(ata->lba),
                             (unsigned int)(ata->drivehead&0xF),
                             (unsigned int)ata->lba[0],
                             (unsigned int)ata->cyls,
@@ -3888,11 +3899,11 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
 
                     sectorn = ((ata->drivehead & 0xFu) * ata->sects) +
-                        (((unsigned int)ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) * ata->sects * ata->heads) +
+                        (ide_chs_cylinder(ata->lba) * ata->sects * ata->heads) +
                         ((unsigned int)ata->lba[0] - 1u);
                 }
 
-                if (disk->Read_AbsoluteSector(sectorn, ata->sector) != 0) {
+                if (disk->Read_AbsoluteSector(sectorn, ata->sector) != Int13Status::NoError) {
                     LOG_MSG("ATA read failed\n");
                     ata->abort_error();
                     dev->raise_irq();
@@ -3938,9 +3949,9 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
                     else if ((unsigned int)(ata->drivehead & 0xF) >= (unsigned int)ata->heads ||
                         (unsigned int)ata->lba[0] > (unsigned int)ata->sects ||
-                        (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) >= (unsigned int)ata->cyls) {
+                        ide_chs_cylinder(ata->lba) >= (unsigned int)ata->cyls) {
                         LOG_MSG("C/H/S %u/%u/%u out of bounds %u/%u/%u\n",
-                            (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)),
+                            ide_chs_cylinder(ata->lba),
                             (unsigned int)(ata->drivehead&0xFu),
                             (unsigned int)ata->lba[0],
                             (unsigned int)ata->cyls,
@@ -3952,11 +3963,11 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
 
                     sectorn = (((unsigned int)ata->drivehead & 0xFu) * ata->sects) +
-                        (((unsigned int)ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) * ata->sects * ata->heads) +
+                        (ide_chs_cylinder(ata->lba) * ata->sects * ata->heads) +
                         ((unsigned int)ata->lba[0] - 1u);
                 }
 
-                if (disk->Read_AbsoluteSector(sectorn, ata->sector) != 0) {
+                if (disk->Read_AbsoluteSector(sectorn, ata->sector) != Int13Status::NoError) {
                     LOG_MSG("ATA read failed\n");
                     ata->abort_error();
                     dev->raise_irq();
@@ -4015,9 +4026,9 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
                     else if ((unsigned int)(ata->drivehead & 0xF) >= (unsigned int)ata->heads ||
                         (unsigned int)ata->lba[0] > (unsigned int)ata->sects ||
-                        (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) >= (unsigned int)ata->cyls) {
+                        ide_chs_cylinder(ata->lba) >= (unsigned int)ata->cyls) {
                         LOG_MSG("C/H/S %u/%u/%u out of bounds %u/%u/%u\n",
-                            (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)),
+                            ide_chs_cylinder(ata->lba),
                             (unsigned int)(ata->drivehead&0xF),
                             (unsigned int)ata->lba[0],
                             (unsigned int)ata->cyls,
@@ -4029,7 +4040,7 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
 
                     sectorn = ((ata->drivehead & 0xF) * ata->sects) +
-                        (((unsigned int)ata->lba[1] | ((unsigned int)ata->lba[2] << 8u)) * ata->sects * ata->heads) +
+                        (ide_chs_cylinder(ata->lba) * ata->sects * ata->heads) +
                         ((unsigned int)ata->lba[0] - 1);
                 }
 
@@ -4038,7 +4049,7 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
 
                 for (unsigned int cc=0;cc < MIN((Bitu)ata->multiple_sector_count,(Bitu)sectcount);cc++) {
                     /* it would be great if the disk object had a "read multiple sectors" member function */
-                    if (disk->Read_AbsoluteSector(sectorn+cc, ata->sector+(cc*512)) != 0) {
+                    if (disk->Read_AbsoluteSector(sectorn+cc, ata->sector+(cc*512)) != Int13Status::NoError) {
                         LOG_MSG("ATA read failed\n");
                         ata->abort_error();
                         dev->raise_irq();
@@ -4084,9 +4095,9 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
                     else if ((unsigned int)(ata->drivehead & 0xF) >= (unsigned int)ata->heads ||
                         (unsigned int)ata->lba[0] > (unsigned int)ata->sects ||
-                        (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8)) >= (unsigned int)ata->cyls) {
+                        ide_chs_cylinder(ata->lba) >= (unsigned int)ata->cyls) {
                         LOG_MSG("C/H/S %u/%u/%u out of bounds %u/%u/%u\n",
-                            (unsigned int)(ata->lba[1] | ((unsigned int)ata->lba[2] << 8)),
+                            ide_chs_cylinder(ata->lba),
                             (unsigned int)(ata->drivehead&0xF),
                             (unsigned int)ata->lba[0],
                             (unsigned int)ata->cyls,
@@ -4098,13 +4109,13 @@ static void IDE_DelayedCommand(Bitu pk/*which IDE device*/) {
                     }
 
                     sectorn = ((unsigned int)(ata->drivehead & 0xF) * ata->sects) +
-                        (((unsigned int)ata->lba[1] | ((unsigned int)ata->lba[2] << 8)) * ata->sects * ata->heads) +
+                        (ide_chs_cylinder(ata->lba) * ata->sects * ata->heads) +
                         ((unsigned int)ata->lba[0] - 1);
                 }
 
                 for (unsigned int cc=0;cc < MIN((Bitu)ata->multiple_sector_count,(Bitu)sectcount);cc++) {
                     /* it would be great if the disk object had a "write multiple sectors" member function */
-                    if (disk->Write_AbsoluteSector(sectorn+cc, ata->sector+(cc*512)) != 0) {
+                    if (disk->Write_AbsoluteSector(sectorn+cc, ata->sector+(cc*512)) != Int13Status::NoError) {
                         LOG_MSG("Failed to write sector\n");
                         ata->abort_error();
                         dev->raise_irq();

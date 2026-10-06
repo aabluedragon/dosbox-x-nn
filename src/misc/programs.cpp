@@ -46,6 +46,7 @@
 #include "render.h"
 #include "../ints/int10.h"
 #include "bios_disk.h"
+#include "imagedisk_msdosblockdev.h"
 #include "sdlmain.h"
 #include "cpu.h"
 #if defined(WIN32)
@@ -63,7 +64,7 @@ extern const char *modifier;
 extern unsigned int sendkeymap;
 extern std::string langname, configfile, dosbox_title;
 extern int autofixwarn, enablelfn, fat32setver, paste_speed, wheel_key, freesizecap, wpType, wpVersion, wpBG, wpFG, lastset, blinkCursor, msgcodepage;
-extern bool dos_kernel_disabled, force_nocachedir, wpcolon, convertimg, lockmount, enable_config_as_shell_commands, lesssize, load, winrun, winautorun, startcmd, startwait, startquiet, starttranspath, mountwarning, wheel_guest, clipboard_dosapi, noremark_save_state, force_load_state, sync_time, manualtime, ttfswitch, loadlang, showbold, showital, showline, showsout, char512, printfont, rtl, gbk, chinasea, uao, showdbcs, dbcs_sbcs, autoboxdraw, halfwidthkana, ticksLocked, outcon, enable_dbcs_tables, show_recorded_filename, internal_program, pipetmpdev, notrysgf, uselangcp, incall;
+extern bool dos_kernel_disabled, force_nocachedir, wpcolon, convertimg, lockmount, enable_config_as_shell_commands, lesssize, load, winrun, winautorun, startcmd, startwait, startquiet, starttranspath, mountwarning, wheel_guest, clipboard_dosapi, dos_utf8names, noremark_save_state, force_load_state, sync_time, manualtime, ttfswitch, loadlang, showbold, showital, showline, showsout, char512, printfont, rtl, gbk, chinasea, uao, showdbcs, dbcs_sbcs, autoboxdraw, halfwidthkana, ticksLocked, outcon, enable_dbcs_tables, show_recorded_filename, internal_program, pipetmpdev, notrysgf, uselangcp, incall;
 extern bool clipboard_biospaste;
 /* This registers a file on the virtual drive and creates the correct structure for it*/
 
@@ -236,6 +237,11 @@ void Program::ChangeToLongCmd() {
 bool resetcolor = false;
 static char last_written_character = 0;//For 0xA to OxD 0xA expansion
 void Program::WriteOut(const char * format,...) {
+	if (dos_kernel_disabled) {
+		LOG(LOG_MISC,LOG_WARN)("Call to Program::WriteOut while DOS kernel is disabled string format='%s'",format);
+		return;
+	}
+
 	uint8_t attr = DOS_GetAnsiAttr();
 	char buf[2048];
 	va_list msg;
@@ -270,6 +276,11 @@ void Program::WriteOut(const char * format,...) {
 }
 
 void Program::WriteOut(const char *format, const char *arguments) {
+	if (dos_kernel_disabled) {
+		LOG(LOG_MISC,LOG_WARN)("Call to Program::WriteOut while DOS kernel is disabled string format='%s'",format);
+		return;
+	}
+
 	char buf[2048 + CMD_MAXLINE];
 	sprintf(buf,format,arguments);
 
@@ -297,6 +308,11 @@ void Program::WriteOut(const char *format, const char *arguments) {
 }
 
 int Program::WriteOut_NoParsing(const char * format, bool dbcs) {
+	if (dos_kernel_disabled) {
+		LOG(LOG_MISC,LOG_WARN)("Call to Program::WriteOut_NoParsing while DOS kernel is disabled string format='%s'",format);
+		return 0;
+	}
+
 	uint16_t size = (uint16_t)strlen(format);
 	char const* buf = format;
 	char last2 = 0, last3 = 0;
@@ -778,7 +794,7 @@ void Load_Language(std::string name) {
 }
 
 void ApplySetting(std::string pvar, std::string inputline, bool quiet) {
-    if (!strcasecmp(pvar.c_str(), "dosbox")||!strcasecmp(pvar.c_str(), "dos")||!strcasecmp(pvar.c_str(), "dosv")||!strcasecmp(pvar.c_str(), "cpu")||!strcasecmp(pvar.c_str(), "sdl")||!strcasecmp(pvar.c_str(), "ttf")||!strcasecmp(pvar.c_str(), "render")||!strcasecmp(pvar.c_str(), "serial")||!strcasecmp(pvar.c_str(), "parallel")||!strcasecmp(pvar.c_str(), "printer")) {
+    if (!strcasecmp(pvar.c_str(), "dosbox")||!strcasecmp(pvar.c_str(), "dos")||!strcasecmp(pvar.c_str(), "dosv")||!strcasecmp(pvar.c_str(), "cpu")||!strcasecmp(pvar.c_str(), "sdl")||!strcasecmp(pvar.c_str(), "ttf")||!strcasecmp(pvar.c_str(), "render")||!strcasecmp(pvar.c_str(), "video")||!strcasecmp(pvar.c_str(), "serial")||!strcasecmp(pvar.c_str(), "parallel")||!strcasecmp(pvar.c_str(), "printer")) {
         Section_prop *section = static_cast<Section_prop *>(control->GetSection(pvar.c_str()));
         if (section != NULL) {
             if (!strcasecmp(pvar.c_str(), "dosbox")) {
@@ -1032,6 +1048,8 @@ void ApplySetting(std::string pvar, std::string inputline, bool quiet) {
                 } else if (!strcasecmp(inputline.substr(0, 18).c_str(), "dos clipboard api=")) {
                     clipboard_dosapi = section->Get_bool("dos clipboard api");
                     mainMenu.get_item("clipboard_dosapi").check(clipboard_dosapi).refresh_item(mainMenu);
+                } else if (!strcasecmp(inputline.substr(0, 16).c_str(), "utf8 file names=")) {
+                    dos_utf8names = section->Get_bool("utf8 file names");
                 } else if (!strcasecmp(inputline.substr(0, 22).c_str(), "pipe temporary device=")) {
                     pipetmpdev = section->Get_bool("pipe temporary device");
 #if defined(WIN32) && !defined(HX_DOS)
@@ -1283,6 +1301,11 @@ void ApplySetting(std::string pvar, std::string inputline, bool quiet) {
                     setAspectRatio(section);
                     if (render.aspect) GFX_ForceRedrawScreen();
                 }
+            } else if (!strcasecmp(pvar.c_str(), "video")) {
+                if (!strcasecmp(inputline.substr(0, 10).c_str(), "composite=")) {
+                    void CGA_ApplyCompositeSetting(bool apply);
+                    CGA_ApplyCompositeSetting(true);
+                }
             } else if (!strcasecmp(pvar.c_str(), "serial")) {
                 if (!strcasecmp(inputline.substr(0, 6).c_str(), "serial") && inputline[7]=='=') {
                     std::string val = section->Get_string("serial" + std::string(1, inputline[6])), cmd = std::string(1, inputline[6]) + " " + (val.size()?val:"dummy");
@@ -1305,142 +1328,6 @@ void ApplySetting(std::string pvar, std::string inputline, bool quiet) {
 
 #if !defined(OSFREE)
 uint8_t device_nextdrive = 0;
-#endif
-
-#if !defined(OSFREE)
-uint8_t imageDiskMSDOSBlockDevice::Read_AbsoluteSector(uint32_t sectnum, void * data) {
-	const unsigned int max_sects = (bdevbuf_sz - 16) / sector_size;
-	if (max_sects == 0) return 0x05;
-
-	const uint16_t count = 1;
-	const uint32_t sector = sectnum;
-	const uint16_t strategy = mem_readw(devhdr+6);
-	const uint16_t intrupt = mem_readw(devhdr+8);
-	unsigned char *p_data = (unsigned char*)data;
-
-	uint16_t oldbx = reg_bx;
-	uint16_t oldds = SegValue(ds);
-	uint16_t oldes = SegValue(es);
-
-	DOS_DEVHDR::req_rwio req = {0};
-	req.hdr.record_length = sizeof(req);
-	req.hdr.unit_code = unit_code;
-	req.hdr.cmd_code = DEVFUNC_READ;
-	req.xfer_addr = RealMake(bdevbuf_seg+1,0);
-	req.count = count;
-	req.ptr_volid = RealMake(bdevbuf_seg,0);
-	if (attr & DEVATTRBLK_EXTENDED) {
-		req.start_sector = 0xFFFF;
-		req.start_sector32 = sector;
-	}
-	else {
-		if (sector > 0xFFFFu) return 0x05;
-		req.start_sector = sector;
-		req.start_sector32 = 0;
-	}
-	req.media_dpb = media_dpb;
-	MEM_BlockWrite(PhysMake(dos.dcp,0),&req,sizeof(req));
-
-	LOG(LOG_MISC,LOG_DEBUG)("Block device read devseg=%x sectnum %x devseg %x strat %x intr %x xfer=%x:%x",
-		devseg,sectnum,devseg,strategy,intrupt,
-		req.xfer_addr>>16,req.xfer_addr&0xFFFFu);
-
-	reg_bx = 0;
-	SegSet16(ds, devseg);
-	SegSet16(es, dos.dcp);
-	CALLBACK_RunRealFar(devseg, strategy);
-	CALLBACK_RunRealFar(devseg, intrupt);
-	reg_bx = oldbx;
-	SegSet16(es, oldes);
-	SegSet16(ds, oldds);
-
-	MEM_BlockRead(PhysMake(dos.dcp,0),&req,sizeof(req));
-
-	LOG(LOG_MISC,LOG_DEBUG)("--result status=%x count=%u",
-		req.hdr.status,req.count);
-
-	if (req.hdr.status & 0x8000) return 0x05;/*error*/
-	if (req.count == 0) return 0x05;/*error*/
-
-	MEM_BlockRead(PhysMake(bdevbuf_seg+1,0),p_data,sector_size);
-        return 0;
-}
-#endif
-
-#if !defined(OSFREE)
-uint8_t imageDiskMSDOSBlockDevice::Write_AbsoluteSector(uint32_t sectnum, const void * data) {
-	const unsigned int max_sects = (bdevbuf_sz - 16) / sector_size;
-	if (max_sects == 0) return 0x05;
-
-	const uint16_t count = 1;
-	const uint32_t sector = sectnum;
-	const uint16_t strategy = mem_readw(devhdr+6);
-	const uint16_t intrupt = mem_readw(devhdr+8);
-	const unsigned char *p_data = (const unsigned char*)data;
-
-	uint16_t oldbx = reg_bx;
-	uint16_t oldds = SegValue(ds);
-	uint16_t oldes = SegValue(es);
-
-	DOS_DEVHDR::req_rwio req = {0};
-	req.hdr.record_length = sizeof(req);
-	req.hdr.unit_code = unit_code;
-	req.hdr.cmd_code = DEVFUNC_WRITE;
-	req.xfer_addr = RealMake(bdevbuf_seg+1,0);
-	req.count = count;
-	req.ptr_volid = RealMake(bdevbuf_seg,0);
-	if (attr & DEVATTRBLK_EXTENDED) {
-		req.start_sector = 0xFFFF;
-		req.start_sector32 = sector;
-	}
-	else {
-		if (sector > 0xFFFFu) return 0x05;
-		req.start_sector = sector;
-		req.start_sector32 = 0;
-	}
-	req.media_dpb = media_dpb;
-	MEM_BlockWrite(PhysMake(dos.dcp,0),&req,sizeof(req));
-	MEM_BlockWrite(PhysMake(bdevbuf_seg+1,0),p_data,sector_size);
-
-	LOG(LOG_MISC,LOG_DEBUG)("Block device write devseg=%x sectnum %x devseg %x strat %x intr %x xfer=%x:%x",
-		devseg,sectnum,devseg,strategy,intrupt,
-		req.xfer_addr>>16,req.xfer_addr&0xFFFFu);
-
-	reg_bx = 0;
-	SegSet16(ds, devseg);
-	SegSet16(es, dos.dcp);
-	CALLBACK_RunRealFar(devseg, strategy);
-	CALLBACK_RunRealFar(devseg, intrupt);
-	reg_bx = oldbx;
-	SegSet16(es, oldes);
-	SegSet16(ds, oldds);
-
-	MEM_BlockRead(PhysMake(dos.dcp,0),&req,sizeof(req));
-
-	LOG(LOG_MISC,LOG_DEBUG)("--result status=%x count=%u",
-		req.hdr.status,req.count);
-
-	if (req.hdr.status & 0x8000) return 0x05;/*error*/
-	if (req.count == 0) return 0x05;/*error*/
-
-        return 0;
-}
-#endif
-
-#if !defined(OSFREE)
-bool imageDiskMSDOSBlockDevice::detectDiskChange(void) {
-	return false;//TODO
-}
-#endif
-
-#if !defined(OSFREE)
-imageDiskMSDOSBlockDevice::imageDiskMSDOSBlockDevice() : imageDisk(ID_MSDOSBLOCKDEV) {
-}
-#endif
-
-#if !defined(OSFREE)
-imageDiskMSDOSBlockDevice::~imageDiskMSDOSBlockDevice() {
-}
 #endif
 
 #if !defined(OSFREE)
@@ -1514,7 +1401,11 @@ bool DeviceLoad(const std::string &device,const std::string &devparm) {
 
 	/* redirect the stack pointer */
 	CPU_SetSegGeneral(ss,dos.psp());
-	reg_esp = psp_sz - 2u;
+
+	// WARNING: We're going to call DOS_Execute() which calls CALLBACK_SCF() which modifies reg_sp+4 to set/clear CF.
+	//          Therefore instead of using psp_sz - 2 this code must use psp_sz - 6 or else CALLBACK_SCF() will corrupt
+	//          one bit in the next MCB block following ours.
+	reg_esp = psp_sz - 6u;
 
 	/* allocate a new memory block to hold the device driver image. */
 	/* ownership remains with CONFIG unless successful driver init and initialization, so that on error it is freed automatically */
@@ -1525,6 +1416,7 @@ bool DeviceLoad(const std::string &device,const std::string &devparm) {
 	if (!DOS_AllocateMemory(&devseg,&blocks))
 		return false;
 
+	uint16_t initfmcb = dos_infoblock.GetFirstMCB();
 	uint8_t devseg_mcb[16];
 	MEM_BlockRead(PhysMake(devseg-1,0),devseg_mcb,16);
 
@@ -1540,6 +1432,10 @@ bool DeviceLoad(const std::string &device,const std::string &devparm) {
 			LOG(LOG_MISC,LOG_DEBUG)("Allocated memory for driver is the first in MCB chain, may adjust it forward");
 			adj_mcb_base = true;
 			devseg--; /* load overtop the MCB */
+
+			/* temporarily place the first MCB segment at ourself to avoid "corrupt MCB chain" faults if anything happens during this process */
+			LOG(LOG_MISC,LOG_DEBUG)("Temporarily setting MCB chain start to %x",(uint16_t)(dos.psp()-1));
+			dos_infoblock.SetFirstMCB(dos.firstMCB=(uint16_t)(dos.psp()-1));
 		}
 	}
 
@@ -1554,7 +1450,10 @@ bool DeviceLoad(const std::string &device,const std::string &devparm) {
 	 * If you've ever wondered how MS-DOS allows EMM386.EXE to work as both an executable program
 	 * AND a device driver, and how DEVICE=C:\DOS\EMM386.EXE is even allowed, that is how. */
 	if (!DOS_Execute(device.c_str(),devseg | ((devseg+blocks)<<16u),DOSEXEC_DEVICEDRIVER)) {
-		if (adj_mcb_base) MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+		if (adj_mcb_base) {
+			MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+			dos_infoblock.SetFirstMCB(dos.firstMCB=initfmcb);
+		}
 		return false;
 	}
 
@@ -1665,7 +1564,10 @@ bool DeviceLoad(const std::string &device,const std::string &devparm) {
 			while (s.drive_num<DOS_DRIVES && Drives[s.drive_num]) s.drive_num++;
 
 			if (s.drive_num >= DOS_DRIVES) {
-				if (adj_mcb_base) MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+				if (adj_mcb_base) {
+					MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+					dos_infoblock.SetFirstMCB(dos.firstMCB=initfmcb);
+				}
 				LOG(LOG_MISC,LOG_DEBUG)("No available drive letters for block device");
 				return false;
 			}
@@ -1715,14 +1617,20 @@ bool DeviceLoad(const std::string &device,const std::string &devparm) {
 		if (newend_seg == 0 || PhysMake(newend_seg,newend_ofs) == PhysMake(devseg,0)) { /* normal error out */
 			/* don't need to say anything, the driver will normally say it failed and probably why */
 			LOG(LOG_MISC,LOG_DEBUG)("Device driver indicates normal error out by setting the end_ptr to effectively remove itself from memory");
-			if (adj_mcb_base) MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+			if (adj_mcb_base) {
+				MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+				dos_infoblock.SetFirstMCB(dos.firstMCB=initfmcb);
+			}
 			return false;
 		}
 		else if (
 			PhysMake(newend_seg,newend_ofs) < PhysMake(devseg,32)/*oh come on, keep at least 32 bytes of yourself around!*/ ||
 			PhysMake(newend_seg,newend_ofs) > PhysMake(devseg+blocks,0)/*you cannot make your driver bigger than the original size!*/) {
 			LOG(LOG_MISC,LOG_DEBUG)("Device driver indicates error with invalid end_ptr");
-			if (adj_mcb_base) MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+			if (adj_mcb_base) {
+				MEM_BlockWrite(PhysMake(devseg,0),devseg_mcb,16); /* put the MCB back */
+				dos_infoblock.SetFirstMCB(dos.firstMCB=initfmcb);
+			}
 			return false;
 		}
 

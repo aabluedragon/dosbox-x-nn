@@ -46,6 +46,7 @@
 #include "pic.h"
 
 extern bool do_lds_wraparound;
+extern bool use_dynamic_core_with_fpu;
 
 #if defined(__EMSCRIPTEN__)
 #define CACHE_MAXSIZE	(4096*8)	/* fixed-size IR records are larger than native code */

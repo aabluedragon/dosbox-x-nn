@@ -67,6 +67,10 @@ public:
     std::string opt_editconf,opt_opensaves,opt_opencaptures,opt_lang="",opt_machine="";
     std::string opt_inputnet_connect="";    /* -inputnet-connect <host[:port]> */
     int opt_inputnet_server = -1;           /* -inputnet-server [port], -1 = not requested */
+#if defined(C_DOSBOX_AGENT)
+    std::string opt_agent_config;
+    bool opt_agent_self_test = false;
+#endif
     std::vector<std::string> config_file_list;
     std::vector<std::string> opt_o;
     std::vector<std::string> opt_c;

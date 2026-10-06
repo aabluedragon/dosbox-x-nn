@@ -247,7 +247,7 @@ unsigned int APM_BIOS_minor_version = 2;    // what version to emulate e.g to em
 static bool apm_realmode_connected = false;
 
 /* default bios type/version/date strings */
-const char* const bios_type_string = "IBM COMPATIBLE BIOS for DOSBox-X";
+const char*       bios_type_string = "IBM COMPATIBLE BIOS for DOSBox-X";
 const char* const bios_version_string = "DOSBox-X BIOS v1.0";
 const char* const bios_date_string = "01/01/92";
 
@@ -2782,10 +2782,14 @@ static Bitu ISAPNP_Handler_RM(void) {
     return ISAPNP_Handler(false);
 }
 
+static uint8_t INT70_RTC_last_status = 0;
+static uint8_t INT70_RTC_last_status_pending = 0;
+
 static Bitu INT70_Handler(void) {
     /* Acknowledge irq with cmos */
     IO_Write(0x70,0xc);
-    IO_Read(0x71);
+    INT70_RTC_last_status = IO_Read(0x71);
+    INT70_RTC_last_status_pending |= INT70_RTC_last_status;
     if (mem_readb(BIOS_WAIT_FLAG_ACTIVE)) {
         uint32_t count=mem_readd(BIOS_WAIT_FLAG_COUNT);
         if (count>997) {
@@ -4916,7 +4920,7 @@ void PC98_BIOS_SCSI_CALL(void) {
 
                     for (i=0;i < ssize;i++) PC98_BIOS_FLOPPY_BUFFER[i] = mem_readb(memaddr+i);
 
-                    if (floppy->Write_AbsoluteSector(sector,PC98_BIOS_FLOPPY_BUFFER) != 0) {
+                    if (floppy->Write_AbsoluteSector(sector,PC98_BIOS_FLOPPY_BUFFER) != Int13Status::NoError) {
                         reg_ah = 0xD0;
                         CALLBACK_SCF(true);
                         break;
@@ -4953,7 +4957,7 @@ void PC98_BIOS_SCSI_CALL(void) {
 //                    LOG_MSG(" ... memaddr=0x%lx ssize=0x%x sector=0x%lx",
 //                        (unsigned long)memaddr,(unsigned int)ssize,(unsigned long)sector);
 
-                    if (floppy->Read_AbsoluteSector(sector,PC98_BIOS_FLOPPY_BUFFER) == 0) {
+                    if (floppy->Read_AbsoluteSector(sector,PC98_BIOS_FLOPPY_BUFFER) == Int13Status::NoError) {
                         for (i=0;i < ssize;i++) mem_writeb(memaddr+i,PC98_BIOS_FLOPPY_BUFFER[i]);
                     }
                     else {
@@ -5196,10 +5200,10 @@ void PC98_BIOS_FDC_CALL(unsigned int flags) {
             while (size > 0) {
                 accsize = size > unitsize ? unitsize : size;
 
-                if (floppy->Read_Sector(fdc_head[drive],fdc_cyl[drive],fdc_sect[drive],PC98_BIOS_FLOPPY_BUFFER,unitsize) != 0) {
+                Int13Status status = floppy->Read_Sector(fdc_head[drive],fdc_cyl[drive],fdc_sect[drive],PC98_BIOS_FLOPPY_BUFFER,unitsize);
+                if (status != Int13Status::NoError) {
                     CALLBACK_SCF(true);
-                    reg_ah = 0x00;
-                    /* TODO? Error code? */
+                    reg_ah = (uint8_t)status;
                     return;
                 }
 
@@ -5278,10 +5282,10 @@ void PC98_BIOS_FDC_CALL(unsigned int flags) {
             while (size > 0) {
                 accsize = size > unitsize ? unitsize : size;
 
-                if (floppy->Read_Sector(fdc_head[drive],fdc_cyl[drive],fdc_sect[drive],PC98_BIOS_FLOPPY_BUFFER,unitsize) != 0) {
+                Int13Status status = floppy->Read_Sector(fdc_head[drive],fdc_cyl[drive],fdc_sect[drive],PC98_BIOS_FLOPPY_BUFFER,unitsize);
+                if (status != Int13Status::NoError) {
                     CALLBACK_SCF(true);
-                    reg_ah = 0x00;
-                    /* TODO? Error code? */
+                    reg_ah = (uint8_t)status;
                     return;
                 }
 
@@ -5385,10 +5389,10 @@ void PC98_BIOS_FDC_CALL(unsigned int flags) {
                 for (unsigned int i=0;i < accsize;i++)
                     PC98_BIOS_FLOPPY_BUFFER[i] = mem_readb(memaddr+i);
 
-                if (floppy->Write_Sector(fdc_head[drive],fdc_cyl[drive],fdc_sect[drive],PC98_BIOS_FLOPPY_BUFFER,unitsize) != 0) {
+                Int13Status status = floppy->Write_Sector(fdc_head[drive],fdc_cyl[drive],fdc_sect[drive],PC98_BIOS_FLOPPY_BUFFER,unitsize);
+                if (status != Int13Status::NoError) {
                     CALLBACK_SCF(true);
-                    reg_ah = 0x00;
-                    /* TODO? Error code? */
+                    reg_ah = (uint8_t)status;
                     return;
                 }
 
@@ -6864,6 +6868,7 @@ static Bitu INT14_Handler(void) {
 
 Bits HLT_Decode(void);
 void KEYBOARD_AUX_Write(Bitu val);
+void KEYBOARD_SetAUXActive(bool on);
 unsigned char KEYBOARD_AUX_GetType();
 unsigned char KEYBOARD_AUX_DevStatus();
 unsigned char KEYBOARD_AUX_Resolution();
@@ -7176,6 +7181,7 @@ static Bitu INT15_Handler(void) {
                     if (reg_bh==0) {    // disable
                         KEYBOARD_AUX_Write(0xF5);
                         Mouse_SetPS2State(false);
+                        KEYBOARD_SetAUXActive(false);
                         reg_ah=0;
                         CALLBACK_SCF(false);
                         KEYBOARD_ClrBuffer();
@@ -7185,6 +7191,7 @@ static Bitu INT15_Handler(void) {
                             CALLBACK_SCF(true);
                             break;
                         }
+                        KEYBOARD_SetAUXActive(true);
                         KEYBOARD_AUX_Write(0xF4);
                         KEYBOARD_ClrBuffer();
                         reg_ah=0;
@@ -8182,6 +8189,152 @@ char *getSetupLine(const char *capt, const char *cont) {
     return line;
 }
 
+struct setuptime_t {
+    unsigned int year=0;
+    unsigned char month=0,day=0,hour=0,minute=0,second=0;
+};
+
+static unsigned char BCD2BIN(unsigned char x) {
+	return ((x >> 4) * 10) + (x & 0xF);
+}
+
+static unsigned char BIN2BCD(unsigned char x) {
+	return (x % 10) + ((x / 10) << 4);
+}
+
+bool (*setupGetDateTime)(struct setuptime_t *dt) = NULL;
+bool (*setupSetDateTime)(struct setuptime_t *dt) = NULL;
+bool (*setupStopClock)(bool stop) = NULL;
+bool (*setupPollClockUpdated)(void) = NULL;
+
+bool setupGetDateTime_PC98(struct setuptime_t *dt) {
+    //TODO
+    return true;
+}
+
+bool setupSetDateTime_PC98(struct setuptime_t *dt) {
+    //TODO
+    return true;
+}
+
+bool setupStopClock_PC98(bool stop) {
+    //TODO
+    return true;
+}
+
+bool setupPollClockUpdated_PC98(void) {
+    //TODO
+    return false;
+}
+
+static void waitBusyCMOS(void) {
+    //FIXME: You're supposed to wait while bit 7 status register A is set indicating the clock is busy.
+    //       But in this emulation updates are instanstaneous as far as the guest is concerned.
+}
+
+static unsigned char cmos_regb = 0; /* well since CMOS emulation makes register B write-only */
+
+void CMOS_EnableUIE(bool enable) {
+    uint8_t pB;
+
+    pB = cmos_regb;
+
+    if ((pB & 0x10) != (enable ? 0x10 : 0x00)) {
+        IO_Write(0x70,0xB);
+        IO_Write(0x71,cmos_regb=((pB & ~0x10) | (enable ? 0x10 : 0x00)));
+    }
+}
+
+bool setupGetDateTime_CMOS(struct setuptime_t *dt) {
+    uint8_t pB;
+
+    waitBusyCMOS();
+
+    pB = cmos_regb;
+
+    IO_Write(0x70,0xB);
+    IO_Write(0x71,pB | 0x80); // LOCK
+
+    IO_Write(0x70,0);
+    dt->second = BCD2BIN(IO_Read(0x71));
+    IO_Write(0x70,2);
+    dt->minute = BCD2BIN(IO_Read(0x71));
+    IO_Write(0x70,4);
+    dt->hour = BCD2BIN(IO_Read(0x71));
+
+    IO_Write(0x70,7);
+    dt->day = BCD2BIN(IO_Read(0x71));
+    IO_Write(0x70,8);
+    dt->month = BCD2BIN(IO_Read(0x71));
+    IO_Write(0x70,9);
+    dt->year = BCD2BIN(IO_Read(0x71))%100;
+    IO_Write(0x70,0x32);
+    dt->year += BCD2BIN(IO_Read(0x71))*100;
+
+    IO_Write(0x70,0xB);
+    IO_Write(0x71,pB);
+
+    return true;
+}
+
+bool setupSetDateTime_CMOS(struct setuptime_t *dt) {
+    uint8_t pB;
+
+    waitBusyCMOS();
+
+    pB = cmos_regb;
+
+    IO_Write(0x70,0xB);
+    IO_Write(0x71,pB | 0x80); // LOCK
+
+    IO_Write(0x70,0);
+    IO_Write(0x71,BIN2BCD(dt->second));
+    IO_Write(0x70,2);
+    IO_Write(0x71,BIN2BCD(dt->minute));
+    IO_Write(0x70,4);
+    IO_Write(0x71,BIN2BCD(dt->hour));
+
+    IO_Write(0x70,7);
+    IO_Write(0x71,BIN2BCD(dt->day));
+    IO_Write(0x70,8);
+    IO_Write(0x71,BIN2BCD(dt->month));
+    IO_Write(0x70,9);
+    IO_Write(0x71,BIN2BCD(dt->year%100));
+    IO_Write(0x70,0x32);
+    IO_Write(0x71,BIN2BCD(dt->year/100));
+
+    IO_Write(0x70,0xB);
+    IO_Write(0x71,pB);
+
+    mem_writed(BIOS_TIMER,(uint32_t)((double)dt->hour*3600+dt->minute*60+dt->second)*18.206481481);
+
+    return true;
+}
+
+bool setupStopClock_CMOS(bool stop) {
+    uint8_t pB;
+
+    waitBusyCMOS();
+
+    pB = cmos_regb;
+
+    IO_Write(0x70,0xB);
+    IO_Write(0x71,cmos_regb=((pB & 0x7F) | (stop ? 0x80 : 0x00)));
+
+    return true;
+}
+
+bool setupPollClockUpdated_CMOS(void) {
+    /* Actually, The INT 70 handler (IRQ8) reads status for us. All we have to do is just enable the update interrupt */
+    if (INT70_RTC_last_status_pending & 0x10/*UIE*/) {
+        INT70_RTC_last_status_pending &= ~0x10;
+        return true;
+    }
+    return false;
+}
+
+static struct setuptime_t cmos_dt;
+
 const char *GetCPUType();
 void updateDateTime(int x, int y, int pos)
 {
@@ -8190,44 +8343,39 @@ void updateDateTime(int x, int y, int pos)
     char str[50];
     time_t curtime = time(NULL);
     struct tm *loctime = localtime (&curtime);
-    Bitu time=(Bitu)((100.0/((double)PIT_TICK_RATE/65536.0)) * mem_readd(BIOS_TIMER))/100;
-    unsigned int sec=(uint8_t)((Bitu)time % 60);
-    time/=60;
-    unsigned int min=(uint8_t)((Bitu)time % 60);
-    time/=60;
-    unsigned int hour=(uint8_t)((Bitu)time % 24);
+    //Bitu time=(Bitu)((100.0/((double)PIT_TICK_RATE/65536.0)) * mem_readd(BIOS_TIMER))/100;
     int val=0;
     unsigned int bo;
     Bitu edx=0, pdx=0x0500u;
     for (int i=1; i<7; i++) {
         switch (i) {
             case 1:
-                val = machine==MCH_PC98?loctime->tm_year+1900:dos.date.year;
+                val = machine==MCH_PC98?loctime->tm_year+1900:cmos_dt.year;
                 reg_edx = 0x0326u;
                 if (i==pos) pdx = reg_edx;
                 break;
             case 2:
-                val = machine==MCH_PC98?loctime->tm_mon+1:dos.date.month;
+                val = machine==MCH_PC98?loctime->tm_mon+1:cmos_dt.month;
                 reg_edx = 0x032bu;
                 if (i==pos) pdx = reg_edx;
                 break;
             case 3:
-                val = machine==MCH_PC98?loctime->tm_mday:dos.date.day;
+                val = machine==MCH_PC98?loctime->tm_mday:cmos_dt.day;
                 reg_edx = 0x032eu;
                 if (i==pos) pdx = reg_edx;
                 break;
             case 4:
-                val = machine==MCH_PC98?loctime->tm_hour:hour;
+                val = machine==MCH_PC98?loctime->tm_hour:cmos_dt.hour;
                 reg_edx = 0x0426u;
                 if (i==pos) pdx = reg_edx;
                 break;
             case 5:
-                val = machine==MCH_PC98?loctime->tm_min:min;
+                val = machine==MCH_PC98?loctime->tm_min:cmos_dt.minute;
                 reg_edx = 0x0429u;
                 if (i==pos) pdx = reg_edx;
                 break;
             case 6:
-                val = machine==MCH_PC98?loctime->tm_sec:sec;
+                val = machine==MCH_PC98?loctime->tm_sec:cmos_dt.second;
                 reg_edx = 0x042cu;
                 if (i==pos) pdx = reg_edx;
                 break;
@@ -8238,14 +8386,17 @@ void updateDateTime(int x, int y, int pos)
             if (machine == MCH_PC98) {
                 bo = (((unsigned int)(edx/0x100) * 80u) + (unsigned int)(edx%0x100) + j) * 2u;
                 mem_writew(0xA0000+bo,str[j]);
-                mem_writeb(0xA2000+bo,0xE1);
+                mem_writeb(0xA2000+bo,i==pos?0xE5:0xE1);
             } else {
                 reg_eax = 0x0200u;
                 reg_ebx = 0x0000u;
                 reg_edx = edx + j;
                 CALLBACK_RunRealInt(0x10);
                 reg_eax = 0x0900u+str[j];
-                reg_ebx = i==pos?0x001fu:0x001eu;
+                if (machine == MCH_MDA || machine == MCH_HERC)
+                    reg_ebx = i==pos?0x0070u:0x000Fu;/* MDA/Herc doesn't have color, use underline attribute */
+                else
+                    reg_ebx = i==pos?0x004Fu:0x001Eu;/* Award Software 1990s BIOS vibes [https://www.youtube.com/watch?v=Ejcz5L5uS70] */
                 reg_ecx = 0x0001u;
                 CALLBACK_RunRealInt(0x10);
             }
@@ -8264,7 +8415,7 @@ void updateDateTime(int x, int y, int pos)
                 reg_edx = 0x0F26u + j;
                 CALLBACK_RunRealInt(0x10);
                 reg_eax = 0x0900u+str[j];
-                reg_ebx = 0x001eu;
+                reg_ebx = 0x001fu;
                 reg_ecx = 0x0001u;
                 CALLBACK_RunRealInt(0x10);
             }
@@ -8281,7 +8432,7 @@ void updateDateTime(int x, int y, int pos)
                 reg_edx = 0x1026u + j;
                 CALLBACK_RunRealInt(0x10);
                 reg_eax = 0x0900u+str[j];
-                reg_ebx = 0x001eu;
+                reg_ebx = 0x001fu;
                 reg_ecx = 0x0001u;
                 CALLBACK_RunRealInt(0x10);
             }
@@ -8324,7 +8475,7 @@ void showBIOSSetup(const char* card, int x, int y) {
         reg_edx = 0x0000u;
         CALLBACK_RunRealInt(0x10);
         reg_eax = 0x0600u;
-        reg_ebx = 0x1e00u;
+        reg_ebx = 0x1F00u;
         reg_ecx = 0x0000u;
         reg_edx =
 #if defined(USE_TTF)
@@ -8341,10 +8492,13 @@ void showBIOSSetup(const char* card, int x, int y) {
     BIOS_Int10RightJustifiedPrint(x,y,p);
     BIOS_Int10RightJustifiedPrint(x,y,"\x0c9\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0bb", true);
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("", ""), true);
-    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("System date:", "0000-00-00"), true);
-    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("System time:", "00:00:00"), true);
-    updateDateTime(x,y,0);
+    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("System date:", "....-..-.."), true);
+    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("System time:", "..:..:.."), true);
+#if defined(OSFREE)
+    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("Installed OS:", "(none)"), true);
+#else
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("Installed OS:", "DOS"), true);
+#endif
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("", ""), true);
 #define DOSNAMEBUF 256
     char pcname[DOSNAMEBUF];
@@ -8381,7 +8535,7 @@ void showBIOSSetup(const char* card, int x, int y) {
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("", ""), true);
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("Video card:", card), true);
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("Video memory:", (std::to_string(vga.mem.memsize/1024)+"K").c_str()), true);
-    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("Total memory:", (std::to_string(MEM_TotalPages()*4096/1024)+"K").c_str()), true);
+    BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("System memory:", (std::to_string(MEM_TotalPages()*4096/1024)+"K").c_str()), true);
     BIOS_Int10RightJustifiedPrint(x,y,getSetupLine("", ""), true);
     BIOS_Int10RightJustifiedPrint(x,y,"\x0c8\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0cd\x0bc", true);
     if (machine == MCH_PC98)
@@ -8522,11 +8676,6 @@ static Bitu pc98_default_stop_handler(void) {
 
     return CBRET_NONE;
 }
-
-static unsigned char BCD2BIN(unsigned char x) {
-	return ((x >> 4) * 10) + (x & 0xF);
-}
-
 
 /* NTS: Remember the 8259 is non-sentient, and the term "slave" is used in a computer programming context */
 static Bitu Default_IRQ_Handler_Cooperative_Slave_Pic(void) {
@@ -11714,6 +11863,19 @@ startfunction:
         }
 #endif
 
+        if (IS_PC98_ARCH) {
+            setupStopClock = setupStopClock_PC98;
+            setupGetDateTime = setupGetDateTime_PC98;
+            setupSetDateTime = setupSetDateTime_PC98;
+            setupPollClockUpdated = setupPollClockUpdated_PC98;
+        }
+        else {
+            setupStopClock = setupStopClock_CMOS;
+            setupGetDateTime = setupGetDateTime_CMOS;
+            setupSetDateTime = setupSetDateTime_CMOS;
+            setupPollClockUpdated = setupPollClockUpdated_CMOS;
+        }
+
         // TODO: Then at this screen, we can print messages demonstrating the detection of
         //       IDE devices, floppy, ISA PnP initialization, anything of importance.
         //       I also envision adding the ability to hit DEL or F2 at this point to enter
@@ -11731,7 +11893,8 @@ startfunction:
         if (!fastbioslogo&&!bootguest&&!bootfast&&(bootvm||!use_quick_reboot)) {
             bool wait_for_user = false, bios_setup = false;
             int pos=1;
-            uint32_t lasttick=GetTicks();
+            uint32_t startclockat=0;
+            uint32_t lasttick=GetTicks(),lasttickdelay=500;
             while ((GetTicks()-lasttick)<1000) {
                 if (machine == MCH_PC98) {
                     reg_eax = 0x0100;   // sense key
@@ -11761,8 +11924,19 @@ startfunction:
                     }
 
                     if ((machine != MCH_PC98 && reg_ax == 0x5300) || (machine == MCH_PC98 && reg_ax == 0x3900)) { // user hit Del
+                        if (IS_PC98_ARCH) {
+                        }
+                        else {
+                            cmos_regb=0x02;//BCD
+                            CMOS_EnableUIE(true);
+                        }
                         bios_setup = true;
+                        VGA_FreeBiosLogo();
                         showBIOSSetup(card, x, y);
+                        lasttick=GetTicks();
+                        lasttickdelay=1001;//give the clock update interrupt a chance
+                        if (setupGetDateTime) setupGetDateTime(&cmos_dt);
+                        updateDateTime(x,y,pos);
                         break;
                     }
                 }
@@ -11779,9 +11953,19 @@ startfunction:
                 }
 
                 if ((machine != MCH_PC98 && reg_ax == 0x5300/*DEL*/) || (machine == MCH_PC98 && reg_ax == 0x3900)) {
+                    if (IS_PC98_ARCH) {
+                    }
+                    else {
+                        cmos_regb=0x02;//BCD
+                        CMOS_EnableUIE(true);
+                    }
                     bios_setup = true;
                     VGA_FreeBiosLogo();
                     showBIOSSetup(card, x, y);
+                    lasttick=GetTicks();
+                    lasttickdelay=1001;//give the clock update interrupt a chance
+                    if (setupGetDateTime) setupGetDateTime(&cmos_dt);
+                    updateDateTime(x,y,pos);
                     break;
                 }
 
@@ -11790,11 +11974,36 @@ startfunction:
             }
 
             lasttick=GetTicks();
-            bool askexit = false, mod = false;
+            bool askexit = false, mod = false, clockmod = false, clockUpdate = false,redrawclock = false;
             while (bios_setup) {
-                if (GetTicks()-lasttick>=500 && !askexit) {
+                if (setupPollClockUpdated_CMOS()) clockUpdate = true;
+
+                if (clockUpdate) {
+                    clockUpdate = false;
                     lasttick=GetTicks();
+                    if (setupGetDateTime) setupGetDateTime(&cmos_dt);
                     updateDateTime(x,y,pos);
+                    lasttickdelay=1100;
+                    redrawclock = false;
+                }
+                else if (GetTicks()-lasttick>=lasttickdelay && !askexit) {
+                    lasttick=GetTicks();
+                    if (setupGetDateTime) setupGetDateTime(&cmos_dt);
+                    updateDateTime(x,y,pos);
+                    lasttickdelay=500;
+                    redrawclock = false;
+                }
+                else if (redrawclock) {
+                    /* do not re-read the clock, just update the display */
+                    updateDateTime(x,y,pos);
+                    redrawclock = false;
+                }
+
+                if (startclockat) {
+                    if (GetTicks() >= startclockat) {
+                        if (setupStopClock) setupStopClock(false);
+                        startclockat = 0;
+                    }
                 }
                 if (machine == MCH_PC98) {
                     reg_eax = 0x0100;   // sense key
@@ -11817,12 +12026,21 @@ startfunction:
                     }
                     if (askexit) {
                         if (reg_al == 'Y' || reg_al == 'y') {
+                            if (setupStopClock) setupStopClock(false);
+                            if (IS_PC98_ARCH) {
+                            }
+                            else {
+                                CMOS_EnableUIE(false);
+                            }
                             if (machine == MCH_PC98) {
                                 reg_eax = 0x1600;
                                 reg_edx = 0xE100;
                                 CALLBACK_RunRealInt(0x18);
                             }
-                            goto startfunction;
+                            if (mod)
+                                goto startfunction;
+                            else
+                                break;
                         } else if (machine == MCH_PC98) {
                             const char *exitstr = "ESC = Exit";
                             unsigned int bo;
@@ -11845,56 +12063,54 @@ startfunction:
                     }
                     if ((machine != MCH_PC98 && reg_ax == 0x4B00) || (machine == MCH_PC98 && reg_ax == 0x3B00)) { // Left key
                         pos=pos>1?pos-1:6;
-                        lasttick-=500;
+                        if (pos <= 6) redrawclock = true;
                     } else if ((machine != MCH_PC98 && reg_ax == 0x4D00) || (machine == MCH_PC98 && reg_ax == 0x3C00)) { // Right key
                         pos=pos<6?pos+1:1;
-                        lasttick-=500;
+                        if (pos <= 6) redrawclock = true;
                     } else if (((machine != MCH_PC98 && reg_ax == 0x4800) || (machine == MCH_PC98 && reg_ax == 0x3A00)) && pos>3) { // Up key
                         if (pos==4||pos==5) pos=1;
                         else if (pos==6) pos=2;
-                        lasttick-=500;
+                        if (pos <= 6) redrawclock = true;
                     } else if (((machine != MCH_PC98 && reg_ax == 0x5000) || (machine == MCH_PC98 && reg_ax == 0x3D00)) && pos<4) { // Down key
                         if (pos==1) pos=4;
                         else if (pos==2||pos==3) pos=6;
-                        lasttick-=500;
+                        if (pos <= 6) redrawclock = true;
                     } else if (machine != MCH_PC98 && reg_al == 43) { // '+' key
-                        if (pos==1&&dos.date.year<2100) dos.date.year++;
-                        else if (pos==2) dos.date.month=dos.date.month<12?dos.date.month+1:1;
-                        else if (pos==3) dos.date.day=dos.date.day<(dos.date.month==1||dos.date.month==3||dos.date.month==5||dos.date.month==7||dos.date.month==8||dos.date.month==10||dos.date.month==12?31:(dos.date.month==2?29:30))?dos.date.day+1:1;
-                        else if (pos==4||pos==5||pos==6) {
-                            Bitu time=(Bitu)((100.0/((double)PIT_TICK_RATE/65536.0)) * mem_readd(BIOS_TIMER))/100;
-                            unsigned int sec=(uint8_t)((Bitu)time % 60);
-                            time/=60;
-                            unsigned int min=(uint8_t)((Bitu)time % 60);
-                            time/=60;
-                            unsigned int hour=(uint8_t)((Bitu)time % 24);
-                            if (pos==4) hour=hour<23?hour+1:0;
-                            else if (pos==5) min=min<59?min+1:0;
-                            else if (pos==6) sec=sec<59?sec+1:0;
-                            mem_writed(BIOS_TIMER,(uint32_t)((double)hour*3600+min*60+sec)*18.206481481);
-                        }
-                        mod = true;
+                        if (setupStopClock) setupStopClock(true);
+                        if (pos==1&&dos.date.year<2100) cmos_dt.year++;
+                        else if (pos==2) cmos_dt.month=cmos_dt.month<12?cmos_dt.month+1:1;
+                        else if (pos==3) cmos_dt.day=cmos_dt.day<(cmos_dt.month==1||cmos_dt.month==3||cmos_dt.month==5||cmos_dt.month==7||cmos_dt.month==8||cmos_dt.month==10||cmos_dt.month==12?31:(cmos_dt.month==2?29:30))?cmos_dt.day+1:1;
+                        else if (pos==4) cmos_dt.hour=cmos_dt.hour<23?cmos_dt.hour+1:0;
+                        else if (pos==5) cmos_dt.minute=cmos_dt.minute<59?cmos_dt.minute+1:0;
+                        else if (pos==6) cmos_dt.second=cmos_dt.second<59?cmos_dt.second+1:0;
+                        clockmod = true;//changing the clock time/date is no reason to reboot the system on exit
                         if (sync_time) {manualtime=true;mainMenu.get_item("sync_host_datetime").check(false).refresh_item(mainMenu);}
-                        lasttick-=500;
+                        if (setupSetDateTime) setupSetDateTime(&cmos_dt);
+                        if (pos == 6) { /* seconds */
+                            startclockat = GetTicks() + 500; /* delay unlock so that the user can modify seconds without jumps in the value */
+                        }
+                        else {
+                            if (setupStopClock) setupStopClock(false);
+                        }
+                        redrawclock = true;
                     } else if (machine != MCH_PC98 && reg_al == 45) { // '-' key
-                        if (pos==1&&dos.date.year>1900) dos.date.year--;
-                        else if (pos==2) dos.date.month=dos.date.month>1?dos.date.month-1:12;
-                        else if (pos==3) dos.date.day=dos.date.day>1?dos.date.day-1:(dos.date.month==1||dos.date.month==3||dos.date.month==5||dos.date.month==7||dos.date.month==8||dos.date.month==10||dos.date.month==12?31:(dos.date.month==2?29:30));
-                        else if (pos==4||pos==5||pos==6) {
-                            Bitu time=(Bitu)((100.0/((double)PIT_TICK_RATE/65536.0)) * mem_readd(BIOS_TIMER))/100;
-                            unsigned int sec=(uint8_t)(time % 60);
-                            time/=60;
-                            unsigned int min=(uint8_t)(time % 60);
-                            time/=60;
-                            unsigned int hour=(uint8_t)(time % 24);
-                            if (pos==4) hour=hour>0?hour-1:23;
-                            else if (pos==5) min=min>0?min-1:59;
-                            else if (pos==6) sec=sec>0?sec-1:59;
-                            mem_writed(BIOS_TIMER,(uint32_t)((double)hour*3600+min*60+sec)*18.206481481);
-                        }
-                        mod = true;
+                        if (setupStopClock) setupStopClock(true);
+                        if (pos==1&&cmos_dt.year>1900) cmos_dt.year--;
+                        else if (pos==2) cmos_dt.month=cmos_dt.month>1?cmos_dt.month-1:12;
+                        else if (pos==3) cmos_dt.day=cmos_dt.day>1?cmos_dt.day-1:(cmos_dt.month==1||cmos_dt.month==3||cmos_dt.month==5||cmos_dt.month==7||cmos_dt.month==8||cmos_dt.month==10||cmos_dt.month==12?31:(cmos_dt.month==2?29:30));
+                        else if (pos==4) cmos_dt.hour=cmos_dt.hour>0?cmos_dt.hour-1:23;
+                        else if (pos==5) cmos_dt.minute=cmos_dt.minute>0?cmos_dt.minute-1:59;
+                        else if (pos==6) cmos_dt.second=cmos_dt.second>0?cmos_dt.second-1:59;
+                        clockmod = true;//changing the clock time/date is no reason to reboot the system on exit
                         if (sync_time) {manualtime=true;mainMenu.get_item("sync_host_datetime").check(false).refresh_item(mainMenu);}
-                        lasttick-=500;
+                        if (setupSetDateTime) setupSetDateTime(&cmos_dt);
+                        if (pos == 6) { /* seconds */
+                            startclockat = GetTicks() + 500; /* delay unlock so that the user can modify seconds without jumps in the value */
+                        }
+                        else {
+                            if (setupStopClock) setupStopClock(false);
+                        }
+                        redrawclock = true;
                     } else if (reg_al == 27/*ESC*/) {
                         if (machine == MCH_PC98) {
                             const char *exitstr = "Exit[Y/N]?";
@@ -11910,9 +12126,9 @@ startfunction:
                             reg_edx = 0x1800u;
                             CALLBACK_RunRealInt(0x10);
                             if (mod)
-                                BIOS_Int10RightJustifiedPrint(x,y,"              Save settings and exit the BIOS Setup Utility [Y/N]? ");
+                                BIOS_Int10RightJustifiedPrint(x,y,"              Save settings, exit Setup Utility and reboot  [Y/N]? ");
                             else
-                                BIOS_Int10RightJustifiedPrint(x,y,"              Exit the BIOS Setup Utility and reboot system [Y/N]? ");
+                                BIOS_Int10RightJustifiedPrint(x,y,"              Exit the BIOS Setup Utility and boot system   [Y/N]? ");
                         }
                         askexit = true;
                     }
@@ -12020,22 +12236,27 @@ startfunction:
         LOG(LOG_MISC,LOG_DEBUG)("BIOS boot SS:SP %04x:%04x",(unsigned int)0x60,(unsigned int)reg_esp);
 
         for (Bitu i=0;i < 0x400;i++) mem_writeb(0x7C00+i,0);
-		if ((bootguest||(!bootvm&&use_quick_reboot))&&!bootfast&&bootdrive>=0&&imageDiskList[bootdrive]) {
-			MOUSE_Startup(NULL);
-			char drive[] = "-QQ A:";
-			drive[4]='A'+bootdrive;
-			runBoot(drive);
-		}
-        if (!bootguest&&!bootvm&&!bootfast&&bootdrive>=0) {
-            void IDE_CDROM_DetachAll();
-            IDE_CDROM_DetachAll();
-        }
-		if ((use_quick_reboot||IS_DOSV)&&!bootvm&&!bootfast&&bootdrive<0&&first_shell != NULL) throw int(6);
 
-		bootvm=false;
-		bootfast=false;
-		bootguest=false;
-		bootdrive=-1;
+        if ((bootguest||(!bootvm&&use_quick_reboot))&&!bootfast&&bootdrive>=0&&imageDiskList[bootdrive]) {
+                MOUSE_Startup(NULL);
+                char drive[] = "-QQ A:";
+                drive[4]='A'+bootdrive;
+                runBoot(drive);
+        }
+        if (!bootguest&&!bootvm&&!bootfast&&bootdrive>=0) {
+                void IDE_CDROM_DetachAll();
+                IDE_CDROM_DetachAll();
+        }
+        if ((use_quick_reboot||IS_DOSV)&&!bootvm&&!bootfast&&bootdrive<0&&first_shell != NULL) throw int(6);
+
+        void MSCDEX_Reset(Section* /*sec*/);
+        MSCDEX_Reset(NULL);
+
+        bootvm=false;
+        bootfast=false;
+        bootguest=false;
+        bootdrive=-1;
+
         // Begin booting the DOSBox-X shell. NOTE: VM_Boot_DOSBox_Kernel will change CS:IP instruction pointer!
         if (!VM_Boot_DOSBox_Kernel()) E_Exit("BIOS error: BOOT function failed to boot DOSBox-X kernel");
         return CBRET_NONE;
@@ -12786,7 +13007,10 @@ void BIOS_OnPowerOn(Section* sec) {
 }
 
 void swapInNextDisk(bool pressed);
+void swapInPrevDisk(bool pressed);
+void swapInCD(bool pressed, bool rev);
 void swapInNextCD(bool pressed);
+void swapInPrevCD(bool pressed);
 
 void INT10_OnResetComplete();
 void CALLBACK_DeAllocate(Bitu in);
@@ -12845,8 +13069,15 @@ void BIOS_Init() {
     MAPPER_AddHandler(swapInNextDisk,MK_o,MMODHOST,"swapimg","Swap floppy drive",&item); /* Originally "Swap Image" but this version does not swap CDs */
     item->set_text("Swap floppy drive");
 
+    /* make sure CD swap and floppy swap mapper events are available */
+    MAPPER_AddHandler(swapInPrevDisk, MK_o, MMODHOST | MMOD3, "swapimgrev", "Swap floppy drive (prev)", &item); /*  */
+    item->set_text("Swap floppy drive (prev)");
+
     MAPPER_AddHandler(swapInNextCD,MK_d,MMODHOST,"swapcd","Swap CD drive",&item); /* Variant of "Swap Image" for CDs */
     item->set_text("Swap CD drive");
+
+    MAPPER_AddHandler(swapInPrevCD, MK_d, MMODHOST | MMOD3, "swapcdrev", "Swap CD drive (prev)", &item); /* Variant of "Swap Image" for CDs */
+    item->set_text("Swap CD drive (prev)");
 
     /* NTS: VM_EVENT_BIOS_INIT this callback must be first. */
     AddExitFunction(AddExitFunctionFuncPair(BIOS_Destroy),false);
@@ -13018,6 +13249,9 @@ void ROMBIOS_Init() {
 		    }
 	    }
     }
+
+    if (IS_PC98_ARCH)
+        bios_type_string = "PC-98 COMPATIBLE BIOS for DOSBox-X";
 
     write_ID_version_string();
 

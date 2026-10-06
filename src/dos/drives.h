@@ -20,6 +20,7 @@
 #ifndef _DRIVES_H__
 #define _DRIVES_H__
 
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <string>
@@ -48,9 +49,9 @@ public:
 	static char * GetDrivePosition(int drive);
 //	static void CycleDrive(bool pressed);
 //	static void CycleDisk(bool pressed);
-	static void CycleDisks(int drive, bool notify, unsigned int position=0);
-	static void CycleAllDisks(void);
-	static void CycleAllCDs(void);
+	static void CycleDisks(int drive, bool notify, bool rev = false, unsigned int position=0);
+	static void CycleAllDisks(bool rev=false);
+	static void CycleAllCDs(bool rev=false);
 	static void Init(Section* s);
 	
 	static void SaveState( std::ostream& stream );
@@ -461,7 +462,7 @@ private:
 	char* Generate_SFN(const char *path, const char *name);
 	uint32_t getClusterValue(uint32_t clustNum);
 	void setClusterValue(uint32_t clustNum, uint32_t clustValue);
-	uint32_t getClustFirstSect(uint32_t clustNum);
+	uint32_t getClustFirstSect(uint32_t clustNum) const;
 	bool FindNextInternal(uint32_t dirClustNumber, DOS_DTA & dta, direntry *foundEntry);
 	bool getDirClustNum(const char * dir, uint32_t * clustNum, bool parDir);
 	bool getFileDirEntry(char const * const filename, direntry * useEntry, uint32_t * dirClust, uint32_t * subEntry,bool dirOk=false);

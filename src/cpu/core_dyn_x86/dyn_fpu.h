@@ -28,13 +28,9 @@
 #include "dosbox.h"
 #if C_FPU
 
-#include <math.h>
-#include <float.h>
-#include "cross.h"
-#include "mem.h"
+#include "cpu/lazyflags.h"
 #include "fpu.h"
-#include "cpu.h"
-
+#include "mem.h"
 
 static void FPU_FDECSTP(){
 	TOP = (TOP - 1) & 7;
@@ -48,18 +44,6 @@ static void FPU_FNSTCW(PhysPt addr){
 	mem_writew(addr,fpu.cw);
 }
 
-static void FPU_FFREE(Bitu st) {
-	fpu.tags[st]=TAG_Empty;
-}
-
-
-#if C_FPU_X86
-#include "../../fpu/fpu_instructions_x86.h"
-#elif defined(HAS_LONG_DOUBLE)
-#include "../../fpu/fpu_instructions_longdouble.h"
-#else
-#include "../../fpu/fpu_instructions.h"
-#endif
 
 #define dyn_fpu_top() {				\
 	gen_protectflags();				\
@@ -72,16 +56,8 @@ static void FPU_FFREE(Bitu st) {
 	gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7);  \
 }
 
-static void dyn_save_fpu_top_for_pagefault() {
-	gen_load_host(&FPUSW,DREG(TMPB),4); 
-	gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-	gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-	gen_save_host(&core_dyn.pagefault_old_fpu_top, DREG(TMPB), 4);
-	decode.pf_restore.data.fpu_top = 1;
-}
-
 static void dyn_eatree() {
-	Bitu group=(decode.modrm.val >> 3) & 7;
+	auto group = decode.modrm.reg;
 	switch (group){
 	case 0x00:		/* FADD ST,STi */
 		gen_call_function((void*)&FPU_FADD_EA,"%Drd",DREG(TMPB));
@@ -115,10 +91,9 @@ static void dyn_eatree() {
 
 static void dyn_fpu_esc0(){
 	dyn_get_modrm(); 
-	if (decode.modrm.val >= 0xc0) { 
+	if (decode.modrm.mod == 3) {
 		dyn_fpu_top();
-		Bitu group=(decode.modrm.val >> 3) & 7;
-		switch (group){
+		switch (decode.modrm.reg) {
 		case 0x00:		//FADD ST,STi /
 			gen_call_function((void*)&FPU_FADD,"%Drd%Drd",DREG(TMPB),DREG(EA));
 			break;
@@ -158,10 +133,10 @@ static void dyn_fpu_esc0(){
 }
 
 static void dyn_fpu_esc1(){
-	dyn_get_modrm();  
-	if (decode.modrm.val >= 0xc0) { 
-		Bitu group=(decode.modrm.val >> 3) & 7;
-		Bitu sub=(decode.modrm.val & 7);
+	dyn_get_modrm();
+	if (decode.modrm.mod == 3) {
+		auto group=decode.modrm.reg;
+		auto sub=decode.modrm.rm;
 		switch (group){
 		case 0x00: /* FLD STi */
 			gen_protectflags(); 
@@ -169,11 +144,7 @@ static void dyn_fpu_esc1(){
 			gen_sop_word_imm(SHIFT_SHR,true,DREG(EA),11);
 			gen_dop_word_imm(DOP_ADD,true,DREG(EA),decode.modrm.rm); 
 			gen_dop_word_imm(DOP_AND,true,DREG(EA),7); 
-			gen_call_function((void*)&FPU_PREP_PUSH,""); 
-			gen_load_host(&FPUSW,DREG(TMPB),4); 
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			gen_call_function((void*)&FPU_FST,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			gen_call_function((void*)&FPU_FLD,"%Drd",DREG(EA));
 			break;
 		case 0x01: /* FXCH STi */
 			dyn_fpu_top();
@@ -306,18 +277,12 @@ static void dyn_fpu_esc1(){
 			break;
 		}
 	} else {
-		Bitu group=(decode.modrm.val >> 3) & 7;
-		Bitu sub=(decode.modrm.val & 7);
+		auto group=decode.modrm.reg;
+		auto sub=decode.modrm.rm;
 		dyn_fill_ea(); 
 		switch(group){
 		case 0x00: /* FLD float*/
-			gen_protectflags(); 
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
-			gen_load_host(&FPUSW,DREG(TMPB),4); 
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			dyn_call_function_pagefault_check((void*)&FPU_FLD_F32,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			dyn_call_function_pagefault_check((void*)&FPU_FLD_F32,"%Drd",DREG(EA));
 			break;
 		case 0x01: /* UNKNOWN */
 			FPU_LOG_WARN(1,true,group,sub);
@@ -349,11 +314,35 @@ static void dyn_fpu_esc1(){
 }
 
 static void dyn_fpu_esc2(){
-	dyn_get_modrm();  
-	if (decode.modrm.val >= 0xc0) { 
-		Bitu group=(decode.modrm.val >> 3) & 7;
-		Bitu sub=(decode.modrm.val & 7);
+	dyn_get_modrm();
+	if (decode.modrm.mod == 3) {
+		auto group=decode.modrm.reg;
+		auto sub=decode.modrm.rm;
 		switch(group){
+		case 0x00: /* FCMOVB STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_B,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x01: /* FCMOVE STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_E,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x02: /* FCMOVBE STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_BE,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x03: /* FCMOVU STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_U,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
 		case 0x05:
 			switch(sub){
 			case 0x01:		/* FUCOMPP */
@@ -389,11 +378,35 @@ static void dyn_fpu_esc2(){
 }
 
 static void dyn_fpu_esc3(){
-	dyn_get_modrm();  
-	if (decode.modrm.val >= 0xc0) { 
-		Bitu group=(decode.modrm.val >> 3) & 7;
-		Bitu sub=(decode.modrm.val & 7);
+	dyn_get_modrm();
+	if (decode.modrm.mod == 3) {
+		auto group=decode.modrm.reg;
+		auto sub=decode.modrm.rm;
 		switch (group) {
+		case 0x00: /* FCMOVNB STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_NB,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x01: /* FCMOVNE STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_NE,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x02: /* FCMOVNBE STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_NBE,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x03: /* FCMOVNU STi */
+			dyn_fpu_top();
+			dyn_flags_gen_to_host();
+			gen_call_function((void *)&DestroyConditionFlags,"");
+			gen_call_function((void *)&FPU_FCMOV_NU,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
 		case 0x04:
 			switch (sub) {
 			case 0x00:				//FNENI
@@ -414,23 +427,25 @@ static void dyn_fpu_esc3(){
 				E_Exit("ESC 3:ILLEGAL OPCODE group %d subfunction %d",(int)group,(int)sub);
 			}
 			break;
+		case 0x05: /* FUCOMI STi */
+			dyn_fpu_top();
+			gen_call_function((void *)&FPU_FUCOMI,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
+		case 0x06: /* FCOMI STi */
+			dyn_fpu_top();
+			gen_call_function((void *)&FPU_FCOMI,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			break;
 		default:
 			FPU_LOG_WARN(3,false,group,sub);
 			break;
 		}
 	} else {
-		Bitu group=(decode.modrm.val >> 3) & 7;
-		Bitu sub=(decode.modrm.val & 7);
+		auto group=decode.modrm.reg;
+		auto sub=decode.modrm.rm;
 		dyn_fill_ea(); 
 		switch(group){
 		case 0x00:	/* FILD */
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
-			gen_protectflags(); 
-			gen_load_host(&FPUSW,DREG(TMPB),4); 
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			dyn_call_function_pagefault_check((void*)&FPU_FLD_I32,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			dyn_call_function_pagefault_check((void*)&FPU_FLD_I32,"%Drd",DREG(EA));
 			break;
 		case 0x01:	/* FISTTP */
 			FPU_LOG_WARN(3,false,1,sub);
@@ -443,8 +458,6 @@ static void dyn_fpu_esc3(){
 			gen_call_function((void*)&FPU_FPOP,"");
 			break;
 		case 0x05:	/* FLD 80 Bits Real */
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
 			dyn_call_function_pagefault_check((void*)&FPU_FLD_F80,"%Drd",DREG(EA));
 			break;
 		case 0x07:	/* FSTP 80 Bits Real */
@@ -459,9 +472,9 @@ static void dyn_fpu_esc3(){
 }
 
 static void dyn_fpu_esc4(){
-	dyn_get_modrm();  
-	Bitu group=(decode.modrm.val >> 3) & 7;
-	if (decode.modrm.val >= 0xc0) { 
+	dyn_get_modrm();
+	auto group=decode.modrm.reg;
+	if (decode.modrm.mod == 3) {
 		dyn_fpu_top();
 		switch(group){
 		case 0x00:	/* FADD STi,ST*/
@@ -503,10 +516,10 @@ static void dyn_fpu_esc4(){
 }
 
 static void dyn_fpu_esc5(){
-	dyn_get_modrm();  
-	Bitu group=(decode.modrm.val >> 3) & 7;
-	Bitu sub=(decode.modrm.val & 7);
-	if (decode.modrm.val >= 0xc0) { 
+	dyn_get_modrm();
+	auto group=decode.modrm.reg;
+	auto sub=decode.modrm.rm;
+	if (decode.modrm.mod == 3) {
 		dyn_fpu_top();
 		switch(group){
 		case 0x00: /* FFREE STi */
@@ -539,13 +552,7 @@ static void dyn_fpu_esc5(){
 		dyn_fill_ea(); 
 		switch(group){
 		case 0x00:  /* FLD double real*/
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
-			gen_protectflags(); 
-			gen_load_host(&FPUSW,DREG(TMPB),4); 
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			dyn_call_function_pagefault_check((void*)&FPU_FLD_F64,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			dyn_call_function_pagefault_check((void*)&FPU_FLD_F64,"%Drd",DREG(EA));
 			break;
 		case 0x01:  /* FISTTP longint*/
 			FPU_LOG_WARN(5,true,1,sub);
@@ -576,10 +583,10 @@ static void dyn_fpu_esc5(){
 }
 
 static void dyn_fpu_esc6(){
-	dyn_get_modrm();  
-	Bitu group=(decode.modrm.val >> 3) & 7;
-	Bitu sub=(decode.modrm.val & 7);
-	if (decode.modrm.val >= 0xc0) { 
+	dyn_get_modrm();
+	auto group=decode.modrm.reg;
+	auto sub=decode.modrm.rm;
+	if (decode.modrm.mod == 3) {
 		dyn_fpu_top();
 		switch(group){
 		case 0x00:	/*FADDP STi,ST*/
@@ -630,10 +637,10 @@ static void dyn_fpu_esc6(){
 }
 
 static void dyn_fpu_esc7(){
-	dyn_get_modrm();  
-	Bitu group=(decode.modrm.val >> 3) & 7;
-	Bitu sub=(decode.modrm.val & 7);
-	if (decode.modrm.val >= 0xc0) { 
+	dyn_get_modrm();
+	auto group=decode.modrm.reg;
+	auto sub=decode.modrm.rm;
+	if (decode.modrm.mod == 3) {
 		switch (group){
 		case 0x00: /* FFREEP STi*/
 			dyn_fpu_top();
@@ -660,6 +667,16 @@ static void dyn_fpu_esc7(){
 					break;
 			}
 			break;
+		case 0x05: /* FUCOMIP STi */
+			dyn_fpu_top();
+			gen_call_function((void *)&FPU_FUCOMI,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			gen_call_function((void *)&FPU_FPOP,"");
+			break;
+		case 0x06: /* FCOMIP STi */
+			dyn_fpu_top();
+			gen_call_function((void *)&FPU_FCOMI,"%Drd%Drd",DREG(TMPB),DREG(EA));
+			gen_call_function((void *)&FPU_FPOP,"");
+			break;
 		default:
 			FPU_LOG_WARN(7,false,group,sub);
 			break;
@@ -668,12 +685,7 @@ static void dyn_fpu_esc7(){
 		dyn_fill_ea(); 
 		switch(group){
 		case 0x00:  /* FILD Bit16s */
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
-			gen_load_host(&FPUSW,DREG(TMPB),4); 
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			dyn_call_function_pagefault_check((void*)&FPU_FLD_I16,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			dyn_call_function_pagefault_check((void*)&FPU_FLD_I16,"%Drd",DREG(EA));
 			break;
 		case 0x01:
 			FPU_LOG_WARN(7,true,group,sub);
@@ -686,20 +698,10 @@ static void dyn_fpu_esc7(){
 			gen_call_function((void*)&FPU_FPOP,"");
 			break;
 		case 0x04:   /* FBLD packed BCD */
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
-			gen_load_host(&FPUSW,DREG(TMPB),4);
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			dyn_call_function_pagefault_check((void*)&FPU_FBLD,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			dyn_call_function_pagefault_check((void*)&FPU_FBLD,"%Drd",DREG(EA));
 			break;
 		case 0x05:  /* FILD Bit64s */
-			if (use_dynamic_core_with_paging) dyn_save_fpu_top_for_pagefault();
-			gen_call_function((void*)&FPU_PREP_PUSH,"");
-			gen_load_host(&FPUSW,DREG(TMPB),4);
-			gen_sop_word_imm(SHIFT_SHR,true,DREG(TMPB),11);
-			gen_dop_word_imm(DOP_AND,true,DREG(TMPB),7); 
-			dyn_call_function_pagefault_check((void*)&FPU_FLD_I64,"%Drd%Drd",DREG(EA),DREG(TMPB));
+			dyn_call_function_pagefault_check((void*)&FPU_FLD_I64,"%Drd",DREG(EA));
 			break;
 		case 0x06:	/* FBSTP packed BCD */
 			dyn_call_function_pagefault_check((void*)&FPU_FBST,"%Drd",DREG(EA));

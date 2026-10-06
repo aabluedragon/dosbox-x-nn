@@ -76,6 +76,8 @@ extern std::string log_dev_con_str;
 extern bool use_quick_reboot;
 #if !defined(OSFREE)
 extern bool j3100_start;
+unsigned int extdev_read_limit = 0;
+unsigned int extdev_write_limit = 0;
 #endif
 extern bool enable_config_as_shell_commands;
 extern bool checkwat, loadlang, pcibus_enable;
@@ -176,7 +178,7 @@ bool uselfn, winautorun=false;
 extern int infix, log_dev_con;
 extern bool int15_wait_force_unmask_irq, shellrun, logging_con, ctrlbrk;
 extern bool winrun, startcmd, startwait, startquiet, starttranspath, i4dos;
-extern bool startup_state_numlock, mountwarning, clipboard_dosapi;
+extern bool startup_state_numlock, mountwarning, clipboard_dosapi, dos_utf8names;
 std::string startincon;
 
 uint32_t dos_hma_allocator = 0; /* physical memory addr */
@@ -592,6 +594,12 @@ static Bitu DOS_21Handler(void);
 void XMS_DOS_LocalA20DisableIfNotEnabled(void);
 void XMS_DOS_LocalA20DisableIfNotEnabled_XMSCALL(void);
 #if !defined(OSFREE)
+/* UTF-8 names (dos_utf8names.cpp): for a process in the UTF-8 mode the names of the long file name functions are converted */
+void DOS_LFN_StrCopy(PhysPt src, char *dst, Bitu max);
+void DOS_LFN_NameWrite(PhysPt dst, const char *name, Bitu len);
+void DOS_LFN_FindData(char *finddata);
+bool DOS_LFN_InputOK(void);
+uint32_t DOS_UTF8Names_IdentityUpcase(void);
 void DOS_Int21_7139(char *name1, const char *name2);
 void DOS_Int21_713a(char *name1, const char *name2);
 void DOS_Int21_713b(char *name1, const char *name2);
@@ -2803,7 +2811,7 @@ static Bitu DOS_21Handler(void) {
                     case 0x02: // Get pointer to uppercase table
                     case 0x04: // Get pointer to filename uppercase table
                         mem_writeb(data + 0x00, reg_al);
-                        mem_writed(data + 0x01, dos.tables.upcase);
+                        mem_writed(data + 0x01, DOS_UTF8NamesMode() ? DOS_UTF8Names_IdentityUpcase() : dos.tables.upcase);
                         reg_cx = 5;
                         CALLBACK_SCF(false);
                         break;
@@ -2825,7 +2833,7 @@ static Bitu DOS_21Handler(void) {
                     case 0x20: /* Capitalize Character */
                         {
                             int in  = reg_dl;
-                            int out = toupper(in);
+                            int out = (DOS_UTF8NamesMode() && in >= 0x80) ? in : toupper(in);
                             reg_dl  = (uint8_t)out;
                         }
                         CALLBACK_SCF(false);
@@ -2842,7 +2850,7 @@ static Bitu DOS_21Handler(void) {
                             dos_copybuf[len] = 0;
                             //No upcase as String(0x21) might be multiple asciz strings
                             for (Bitu count = 0; count < len;count++)
-                                dos_copybuf[count] = (uint8_t)toupper(*reinterpret_cast<unsigned char*>(dos_copybuf+count));
+                                dos_copybuf[count] = (DOS_UTF8NamesMode() && dos_copybuf[count] >= 0x80) ? dos_copybuf[count] : (uint8_t)toupper(*reinterpret_cast<unsigned char*>(dos_copybuf+count));
                             MEM_BlockWrite(data,dos_copybuf,len);
                         }
                         CALLBACK_SCF(false);
@@ -3026,6 +3034,11 @@ static Bitu DOS_21Handler(void) {
 		    break;
 	    }
 #if !defined(OSFREE)
+	    if (!DOS_LFN_InputOK()) {   /* UTF-8 mode: the name is not valid UTF-8 */
+		    reg_ax=2;
+		    CALLBACK_SCF(true);
+		    break;
+	    }
 	    switch(reg_al) {
 		    case 0x39:              /* LFN MKDIR */
 			    DOS_Int21_7139(name1, name2);
@@ -4228,6 +4241,9 @@ public:
 						dos.version.major, dos.version.minor);
 			}
 		}
+
+		::extdev_read_limit = section->Get_int("ext dev read limit");
+		::extdev_write_limit = section->Get_int("ext dev write limit");
 #endif
 
 		::disk_data_rate = section->Get_int("hard drive data rate limit");
@@ -4365,6 +4381,7 @@ public:
 		dos_clipboard_device_name = section->Get_string("dos clipboard device name");
 		clipboard_dosapi = section->Get_bool("dos clipboard api");
 		if (control->SecureMode()) clipboard_dosapi = false;
+		dos_utf8names = section->Get_bool("utf8 file names");
 		pipetmpdev = section->Get_bool("pipe temporary device");
 		force_conversion=true;
 		mainMenu.get_item("clipboard_dosapi").check(clipboard_dosapi).enable(true).refresh_item(mainMenu);
@@ -4770,8 +4787,10 @@ public:
 
 		LOG(LOG_DOSMISC,LOG_DEBUG)("   min free:     seg 0x%04x",minimum_mcb_free);
 
-#if C_IPX
+#if !defined(OSFREE)
+# if C_IPX
 		IPX_Setup(NULL);
+# endif
 #endif
 
 		INPUTNET_Setup(NULL);
@@ -5196,7 +5215,7 @@ void DOS_Int21_7139(char *name1, const char *name2) {
 #if !defined(OSFREE)
 void DOS_Int21_713a(char *name1, const char *name2) {
 	(void)name2;
-	MEM_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;
@@ -5216,7 +5235,7 @@ void DOS_Int21_713a(char *name1, const char *name2) {
 #if !defined(OSFREE)
 void DOS_Int21_713b(char *name1, const char *name2) {
 	(void)name2;
-	MEM_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;
@@ -5235,7 +5254,7 @@ void DOS_Int21_713b(char *name1, const char *name2) {
 #if !defined(OSFREE)
 void DOS_Int21_7141(char *name1, const char *name2) {
 	(void)name2;
-	MEM_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;
@@ -5254,7 +5273,7 @@ void DOS_Int21_7141(char *name1, const char *name2) {
 #if !defined(OSFREE)
 void DOS_Int21_7143(char *name1, const char *name2) {
 	(void)name2;
-	MEM_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;
@@ -5373,7 +5392,7 @@ void DOS_Int21_7147(char *name1, const char *name2) {
 	DOS_PSP psp(dos.psp());
 	psp.StoreCommandTail();
 	if (DOS_GetCurrentDir(reg_dl,name1,true)) {
-		MEM_BlockWrite(SegPhys(ds)+reg_si,name1,(Bitu)(strlen(name1)+1));
+		DOS_LFN_NameWrite(SegPhys(ds)+reg_si,name1,(Bitu)(strlen(name1)+1));
 		psp.RestoreCommandTail();
 		reg_ax=0;
 		CALLBACK_SCF(false);
@@ -5386,7 +5405,7 @@ void DOS_Int21_7147(char *name1, const char *name2) {
 
 #if !defined(OSFREE)
 void DOS_Int21_714e(char *name1, char *name2) {
-	MEM_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;
@@ -5447,7 +5466,7 @@ void DOS_Int21_714e(char *name1, char *name2) {
 		DOS_DTA dta(dos.dta());
 		char finddata[CROSS_LEN];
 		int c=0;
-		MEM_BlockWrite(SegPhys(es)+reg_di,finddata,dta.GetFindData((int)reg_si,finddata,&c));
+		int fdlen=dta.GetFindData((int)reg_si,finddata,&c); DOS_LFN_FindData(finddata); MEM_BlockWrite(SegPhys(es)+reg_di,finddata,fdlen);
 		reg_cx=c;
 		CALLBACK_SCF(false);
 	} else {
@@ -5473,7 +5492,7 @@ void DOS_Int21_714f(const char *name1, const char *name2) {
 		DOS_DTA dta(dos.dta());
 		char finddata[CROSS_LEN];
 		int c=0;
-		MEM_BlockWrite(SegPhys(es)+reg_di,finddata,dta.GetFindData((int)reg_si,finddata,&c));
+		int fdlen=dta.GetFindData((int)reg_si,finddata,&c); DOS_LFN_FindData(finddata); MEM_BlockWrite(SegPhys(es)+reg_di,finddata,fdlen);
 		reg_cx=c;
 		CALLBACK_SCF(false);
 		reg_ax=0x4f00+handle;
@@ -5487,13 +5506,13 @@ void DOS_Int21_714f(const char *name1, const char *name2) {
 
 #if !defined(OSFREE)
 void DOS_Int21_7156(char *name1, char *name2) {
-	MEM_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;
 	*(p+1)='\"';
 	*(p+2)=0;
-	MEM_StrCopy(SegPhys(es)+reg_di,name2+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(es)+reg_di,name2+1,DOSNAMEBUF);
 	*name2='\"';
 	p=name2+strlen(name2);
 	while (*p==' '||*p==0) p--;
@@ -5511,7 +5530,7 @@ void DOS_Int21_7156(char *name1, char *name2) {
 
 #if !defined(OSFREE)
 void DOS_Int21_7160(char *name1, char *name2) {
-	MEM_StrCopy(SegPhys(ds)+reg_si,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_si,name1+1,DOSNAMEBUF);
 	if (*(name1+1)>=0 && *(name1+1)<32) {
 		reg_ax=!*(name1+1)?2:3;
 		CALLBACK_SCF(true);
@@ -5533,7 +5552,7 @@ void DOS_Int21_7160(char *name1, char *name2) {
 			case 0:         // Canonoical path name
                 //if(tail) strcat(name2, "\\");
                 if(tail && name2[strlen(name2) - 1] != '\\') strcat(name2, "\\");
-                MEM_BlockWrite(SegPhys(es)+reg_di,name2,(Bitu)(strlen(name2)+1));
+                DOS_LFN_NameWrite(SegPhys(es)+reg_di,name2,(Bitu)(strlen(name2)+1));
 				reg_ax=0;
 				CALLBACK_SCF(false);
 				break;
@@ -5542,7 +5561,7 @@ void DOS_Int21_7160(char *name1, char *name2) {
 				if (DOS_GetSFNPath(name1,name2,false)) {
                     //if(tail) strcat(name2, "\\");
                     if(tail && name2[strlen(name2) - 1] != '\\') strcat(name2, "\\");
-                    MEM_BlockWrite(SegPhys(es)+reg_di,name2,(Bitu)(strlen(name2)+1));
+                    DOS_LFN_NameWrite(SegPhys(es)+reg_di,name2,(Bitu)(strlen(name2)+1));
 					reg_ax=0;
 					CALLBACK_SCF(false);
 				} else {
@@ -5555,7 +5574,7 @@ void DOS_Int21_7160(char *name1, char *name2) {
 				if (DOS_GetSFNPath(name1,name2,true)) {
 					//if(tail) strcat(name2, "\\");
                     if(tail && name2[strlen(name2) - 1] != '\\') strcat(name2, "\\");
-					MEM_BlockWrite(SegPhys(es)+reg_di,name2,(Bitu)(strlen(name2)+1));
+					DOS_LFN_NameWrite(SegPhys(es)+reg_di,name2,(Bitu)(strlen(name2)+1));
 					reg_ax=0;
 					CALLBACK_SCF(false);
 				} else {
@@ -5576,7 +5595,7 @@ void DOS_Int21_7160(char *name1, char *name2) {
 #if !defined(OSFREE)
 void DOS_Int21_716c(char *name1, const char *name2) {
 	(void)name2;
-	MEM_StrCopy(SegPhys(ds)+reg_si,name1+1,DOSNAMEBUF);
+	DOS_LFN_StrCopy(SegPhys(ds)+reg_si,name1+1,DOSNAMEBUF);
 	*name1='\"';
 	char *p=name1+strlen(name1);
 	while (*p==' '||*p==0) p--;

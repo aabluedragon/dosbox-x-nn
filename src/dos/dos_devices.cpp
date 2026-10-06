@@ -49,6 +49,8 @@ extern bool morelen, halfwidthkana, showdbcs;
 extern const char * dos_clipboard_device_name;
 bool isDBCSCP(), shiftjis_lead_byte(int c);
 #if !defined(OSFREE)
+extern unsigned int extdev_read_limit;
+extern unsigned int extdev_write_limit;
 bool Network_IsNetworkResource(const char * filename), TTF_using(void);
 #endif
 bool CodePageGuestToHostUTF16(uint16_t *d/*CROSS_LEN*/,const char *s/*CROSS_LEN*/);
@@ -123,7 +125,10 @@ bool DOS_ExtDevice::Read(uint8_t * data,uint16_t * size) {
 	unsigned int todo = *size;
 	unsigned int done = 0;
 	unsigned int rd;
-
+#if !defined(OSFREE)
+	if (extdev_read_limit && batch_size > extdev_read_limit)
+		batch_size = extdev_read_limit;
+#endif
 	const auto inproc = [bufptr, &todo, &done, &rd, &data, this](const unsigned int batch_size) {
 		rd = 0;
 
@@ -171,7 +176,10 @@ bool DOS_ExtDevice::Write(const uint8_t * data,uint16_t * size) {
 	unsigned int todo = *size;
 	unsigned int done = 0;
 	unsigned int wd;
-
+#if !defined(OSFREE)
+	if (extdev_write_limit && batch_size > extdev_write_limit)
+		batch_size = extdev_write_limit;
+#endif
 	const auto inproc = [bufptr, &todo, &done, &wd, &data, this](const unsigned int batch_size) {
 		wd = 0;
 
@@ -255,7 +263,11 @@ uint32_t DOS_CheckExtDevice(const char *name, bool already_flag) {
 
 	seg = addr >> 16;
 	off = addr & 0xffff;
+	/* The chain lives in guest memory and ends only at FFFF:FFFF. A DOS program that overwrites a device header (or a chain that was
+	 * never closed) must not hang the emulator: give up after more links than any real chain has. */
+	unsigned int links = 0;
 	while(1) {
+		if(++links > 1024) return 0;
 		no = real_readw(seg, off + 4);
 		next_seg = real_readw(seg, off + 2);
 		next_off = real_readw(seg, off);
