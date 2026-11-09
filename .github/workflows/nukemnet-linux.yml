@@ -1,0 +1,33 @@
+name: NukemNet Linux packages
+# Portable Linux packages that NukemNet downloads (storage.nukemnet.com/misc/dosbox-x-nn/).
+# The recipe in nukemnet/linux builds the commit pinned in build.sh.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  linux_package:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64, armv7l]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: nukemnet
+      - name: Build
+        run: docker build --build-arg TARGET_ARCH=${{ matrix.arch }} -t nn-dosbox-x nukemnet/linux
+      - name: Collect
+        run: mkdir output && docker run --rm -v "$PWD/output:/output" nn-dosbox-x && ls -la output
+      - name: Check full-size IPX forwarding (x64)
+        if: matrix.arch == 'x64'
+        run: |
+          mkdir pkg && (cd pkg && unzip -q ../output/dosbox-x-nn-linux-x64-*.zip)
+          # The build image has the libraries the binary links against.
+          docker run --rm -v "$PWD:/w" nn-dosbox-x python3 /w/nukemnet/linux/verify-ipx.py /w/pkg/bin/dosbox-x
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dosbox-x-nn-linux-${{ matrix.arch }}
+          path: output/
