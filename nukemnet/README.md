@@ -15,3 +15,15 @@ Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, e
   libraries), run by the *NukemNet Linux packages* workflow.
 - Windows (MinGW x64 and x86, Visual Studio ARM64) and macOS (Intel and Apple silicon): the
   standard workflows in `.github/workflows`, repackaged by NukemNet with the capability file.
+
+## Publishing a release
+
+1. Change the source, then pin its commit, archive checksum and `RELEASE` in `nukemnet/linux/build.sh`
+   and `release` in `nukemnet/linux/bundle.py`.
+2. Run the *NukemNet Linux packages* workflow and the standard MinGW 64-bit, MinGW 32-bit, 64-bit
+   Visual Studio (ARM64 job) and macOS workflows. Each standard workflow cancels its own earlier runs
+   when it starts, so avoid pushing while they run.
+3. Repackage the Windows and macOS artifacts with `nukemnet/repackage.py`, copy the Linux outputs, and
+   upload everything with a `dosbox-x-nn-<release>.sha256` file to `storage.nukemnet.com/misc/dosbox-x-nn/`.
+4. Update the release and SHA-256 values in NukemNet's `app/src/lib/dosbox-x-download.ts` and `RELEASE` in
+   `site/src/components/DosboxFork.tsx`. nukemnet.com's Downloads page links to these packages.
