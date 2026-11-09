@@ -35,6 +35,10 @@ jobs:
           echo "#define GIT_COMMIT_HASH \"${shortsha}\""  >> include/build_timestamp.h
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
           cat include/build_timestamp.h
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)(-osfree)?$/\1/' || echo "unknown")
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+          fi
       - name: Detect OSFREE build
         id: osfree
         shell: bash
@@ -138,7 +142,7 @@ jobs:
           #cd $top
           #ls -lg
       - name: Upload preview package(VS x86/x64)
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dosbox-x-vsbuild-win-x86_x64-${{ env.timestamp }}
           path: ${{ github.workspace }}/package/
@@ -159,7 +163,7 @@ jobs:
           $top/vs/tool/zip.exe -r -9 "$top/dosbox-x-vsbuild-ARM32_64-${{ env.timestamp }}.zip" "*"
           cd $top
       - name: Upload preview package(ARM 32/64-bit)
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dosbox-x-vsbuild-ARM32_64-${{ env.timestamp }}
           path: ${{ github.workspace }}/package/
@@ -241,7 +245,7 @@ jobs:
           $top/vs/tool/zip.exe -r -9 "$top/dosbox-x-vsbuild-win-x86_x64-osfree-${{ env.timestamp }}.zip" "*"
           cd $top
       - name: Upload Visual Studio 32/64-bit osfree builds
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dosbox-x-vsbuild-win-x86_x64-osfree-${{ env.timestamp }}
           path: ${{ github.workspace }}/package/
@@ -262,7 +266,7 @@ jobs:
           $top/vs/tool/zip.exe -r -9 "$top/dosbox-x-vsbuild-ARM32_64-osfree-${{ env.timestamp }}.zip" "*"
           cd $top
       - name: Upload preview package(ARM 32/64-bit)
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dosbox-x-vsbuild-ARM32_64-osfree-${{ env.timestamp }}
           path: ${{ github.workspace }}/package/
@@ -297,6 +301,10 @@ jobs:
           echo "#define GIT_COMMIT_HASH \"${shortsha}\""  >> include/build_timestamp.h
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
           cat include/build_timestamp.h
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)(-osfree)?$/\1/' || echo "unknown")
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+          fi         
       - name: Install libslirp
         run: |
           # Run this job when MinGW drops 32-bit library support (Other libraries can be built as well)
@@ -370,6 +378,10 @@ jobs:
           echo "#define GIT_COMMIT_HASH \"${shortsha}\""  >> include/build_timestamp.h
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
           cat include/build_timestamp.h
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)(-osfree)?$/\1/' || echo "unknown")
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+          fi
       - name: Install libslirp
         run: |
           # Run this job when MSYS2 drops MinGW 64-bit library support (Other libraries can be built as well)
@@ -492,7 +504,7 @@ jobs:
           cd $top/package/
           cd $top
       - name: Upload preview package (MinGW)
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dosbox-x-mingw-x86_x64-${{ env.timestamp }}
           path: ${{ github.workspace }}/package/
@@ -500,7 +512,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') 
         shell: bash
         run: |
-          DOSBOX_X_RELEASE=$(echo "${GITHUB_REF##*/}" | sed -nE 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')
+          DOSBOX_X_RELEASE=$(echo "${GITHUB_REF##*/}" | sed -nE 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+(-osfree)?)$/\1/p')
           if [[ -z "$DOSBOX_X_RELEASE" ]]; then
             DOSBOX_X_RELEASE=$(gh release list -L1 | grep -o "....-..-.." | head -n 1 | sed -e "s/-/./g")
           fi
@@ -522,7 +534,7 @@ jobs:
           cd contrib/windows/installer/
           ISCC.exe ./DOSBox-X-installer.iss
       - name: Upload preview installer
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: dosbox-x-windows-${{ env.timestamp }}-setup.exe
           path: contrib/windows/installer/dosbox-x-windows*.exe

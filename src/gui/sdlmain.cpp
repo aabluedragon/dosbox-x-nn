@@ -93,6 +93,11 @@ void DOSBox_SetSysMenu(void), GFX_OpenGLRedrawScreen(void), InitFontHandle(void)
 void MenuBrowseProgramFile(void), OutputSettingMenuUpdate(void), aspect_ratio_menu(void), update_pc98_clock_pit_menu(void), AllocCallback1(void), AllocCallback2(void), ToggleMenu(bool pressed);
 extern int tryconvertcp, Reflect_Menu(void);
 bool kana_input = false; // true if a half-width kana was typed
+bool displayMainMenubar = false;
+
+#if defined (LINUX)
+void voodoo_ogl_update_dimensions(void);
+#endif
 
 #if __APPLE__ && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
 #define IS_OLDMACOS 1 /* FIX_ME: Tested on El Capitan (10.11). If this macro is required for Sierra (10.12), change to 101300 */
@@ -165,6 +170,10 @@ char* revert_escape_newlines(const char* aMessage);
 #endif
 #if C_DEBUG
 #include "display2.cpp"
+#endif
+
+#if C_MONITOR
+#include "../monitor/monitor.h"
 #endif
 
 #if (defined __i386__ || defined __x86_64__) && (!defined IS_OLDMACOS && (defined BSD || defined LINUX))
@@ -506,6 +515,7 @@ void FormFeed(bool pressed), PrintText(bool pressed);
 void DOSBOX_UnlockSpeed2(bool pressed), DEBUG_Enable_Handler(bool pressed);
 int FileDirExistCP(const char *name), FileDirExistUTF8(std::string &localname, const char *name);
 bool CodePageHostToGuestUTF16(char *d/*CROSS_LEN*/,const uint16_t *s/*CROSS_LEN*/);
+bool RestrictDOSBoxXMenu=false;
 
 #if (defined(WIN32) && !defined(HX_DOS) || defined(LINUX) && C_X11 || defined(MACOSX)) && defined(C_SDL2)
 static std::string ime_text = "";
@@ -1689,7 +1699,7 @@ int menuwidth_atleast(int width) {
 #endif
 
 void HideMenu_mapper_shortcut(bool pressed) {
-    if (!pressed) return;
+    if (!pressed || !displayMainMenubar) return;
 
     ToggleMenu(true);
 
@@ -2029,23 +2039,20 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
     SDL_SetWindowResizable(sdl.window, SDL2_resize_enable ? SDL_TRUE : SDL_FALSE);
     SDL_WindowFlags flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
 
-#if C_SDL2
-	/*
-	 * When modeswitching _is_ enabled let's go with sane values.
-	 */
-	bool isModeswicthSet = vga.draw.modeswitch_set;
-
-#endif
-
     if (GFX_IsFullscreen()) {
         SDL_DisplayMode displayMode;
         SDL_GetWindowDisplayMode(sdl.window, &displayMode);
 
-	if(isModeswicthSet) {
+#if C_SDL2
+	/*
+	 * When modeswitching _is_ enabled let's go with sane values.
+	 */
+	if(GFX_IsModeswitch()) {
 		flags = SDL_WINDOW_FULLSCREEN;
 		width = vga.draw.width;
 		height = vga.draw.height;
 	}
+#endif
 
         displayMode.w = width;
         displayMode.h = height;
@@ -3140,8 +3147,6 @@ void GFX_SwitchFullScreen(void)
     }
 #endif
 #if !defined(HX_DOS)
-    if (sdl.desktop.prevent_fullscreen)
-        return;
 
     if (!sdl.desktop.fullscreen) {/*is GOING fullscreen*/
         UpdateWindowDimensions();
@@ -3256,8 +3261,11 @@ void GFX_SwitchFullScreen(void)
 	if (glide.enabled)
 		GLIDE_ResetScreen();
 	else
-        GFX_ResetScreen();
+	    GFX_ResetScreen();
 
+#if C_OPENGL
+	if (Voodoo_OGL_Active()) voodoo_ogl_update_dimensions();
+#endif
     // set vsync to host
     // NOTE why forcing ???
 #ifdef WIN32
@@ -3321,6 +3329,29 @@ void GFX_PreventFullscreen(bool lockout) {
 #endif
 #endif
     }
+}
+
+bool GFX_GetDisplayMainMenubar(void) {
+    return displayMainMenubar;
+}
+
+void GFX_DisplayMainMenubar(bool lockout) {
+    if (displayMainMenubar != lockout) {
+        displayMainMenubar = lockout;
+#if defined(WIN32)
+        DOSBox_SetSysMenu();
+#if !defined(C_SDL2) && defined(SDL_DOSBOX_X_SPECIAL)
+        SDL1_hax_RemoveMinimize = lockout ? 1 : 0;
+#endif
+#if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU
+        Reflect_Menu();
+#endif
+#endif
+    }
+}
+
+bool GFX_IsModeswitch(void) {
+	return vga.draw.modeswitch_set;
 }
 
 void GFX_RestoreMode(void) {
@@ -3435,7 +3466,7 @@ void GFX_EndUpdate(const uint16_t *changedLines) {
     bool actually_updating = false;
 #endif
     /* don't present our output if 3Dfx is in OpenGL mode */
-    if (sdl.desktop.prevent_fullscreen)
+    if (Voodoo_OGL_Active())
         return;
 
 #if defined(MACOSX) && defined(C_SDL2) && C_METAL
@@ -4660,7 +4691,7 @@ bool GFX_MustActOnResize() {
 void GFX_HandleVideoResize(int width, int height) {
 
     /* don't act if 3Dfx OpenGL emulation is active */
-    if (GFX_GetPreventFullscreen()) {
+    if (Voodoo_OGL_Active()) {
 #if C_OPENGL
         if (new_width == width && new_height == height) return;
         new_width = width;
@@ -4737,7 +4768,15 @@ void GFX_HandleVideoResize(int width, int height) {
      */
     sdl.update_window = false;
     GFX_ResetScreen();
+#if C_OPENGL
+	if( Voodoo_OGL_Active() )
+	    voodoo_ogl_update_dimensions();
+#endif
     sdl.update_window = true;
+
+#if C_OPENGL
+	if(Voodoo_OGL_Active()) voodoo_ogl_update_dimensions();
+#endif
 }
 #else
 static void HandleVideoResize(void * event) {
@@ -4750,7 +4789,7 @@ static void HandleVideoResize(void * event) {
     SDL_ResizeEvent* ResizeEvent = (SDL_ResizeEvent*)event;
 
     /* don't act if 3Dfx OpenGL emulation is active */
-    if (GFX_GetPreventFullscreen()) {
+    if (Voodoo_OGL_Active()) {
 #if C_OPENGL
         if (new_width == ResizeEvent->w && new_height == ResizeEvent->h) return;
         new_width = ResizeEvent->w;
@@ -4923,7 +4962,7 @@ static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
 	}
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW /* SDL drawn menus */
-    if (GFX_GetPreventFullscreen()) {
+    if (Voodoo_OGL_Active()) {
         /* do NOT draw SDL menu in OpenGL mode when 3Dfx emulation is using OpenGL */
     }
     else if (!sdl.mouse.locked && !sdl.desktop.fullscreen && mainMenu.isVisible() && motion->y < mainMenu.menuBox.h && Mouse_GetButtonState() == 0) {
@@ -5115,7 +5154,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
     std::string munlock;
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW /* SDL drawn menus */
-    if (GFX_GetPreventFullscreen()) {
+    if (Voodoo_OGL_Active()) {
         /* do NOT draw SDL menu in OpenGL mode when 3Dfx emulation is using OpenGL */
         mainMenu.menuUserHoverAt = DOSBoxMenu::unassigned_item_handle;
     }
@@ -6132,14 +6171,14 @@ void GFX_Events() {
                     switch (event.syswm.msg->msg.win.wParam) {
                         case ID_WIN_SYSMENU_RESTOREMENU:
                             /* prevent removing the menu in 3Dfx mode */
-                            if (!GFX_GetPreventFullscreen()) {
+                            if (!Voodoo_OGL_Active()) {
                                 DOSBox_SetMenu();
                                 mainMenu.get_item("mapper_togmenu").check(!menu.toggle).refresh_item(mainMenu);
                             }
                             break;
                         case ID_WIN_SYSMENU_TOGGLEMENU:
                             /* prevent removing the menu in 3Dfx mode */
-                            if (!GFX_GetPreventFullscreen())
+                            if (!Voodoo_OGL_Active())
                             {
                                 ToggleMenu(true);
                                 mainMenu.get_item("mapper_togmenu").check(!menu.toggle).refresh_item(mainMenu);
@@ -6596,14 +6635,14 @@ void GFX_Events() {
                             break;
                         case ID_WIN_SYSMENU_RESTOREMENU:
                             /* prevent removing the menu in 3Dfx mode */
-                            if (!GFX_GetPreventFullscreen()) {
+                            if (!Voodoo_OGL_Active()) {
                                 DOSBox_SetMenu();
                                 mainMenu.get_item("mapper_togmenu").check(!menu.toggle).refresh_item(mainMenu);
                             }
                             break;
                         case ID_WIN_SYSMENU_TOGGLEMENU:
                             /* prevent removing the menu in 3Dfx mode */
-                            if (!GFX_GetPreventFullscreen())
+                            if (!Voodoo_OGL_Active())
                             {
                                 if (menu.toggle) DOSBox_NoMenu(); else DOSBox_SetMenu();
                                 mainMenu.get_item("mapper_togmenu").check(!menu.toggle).refresh_item(mainMenu);
@@ -10387,6 +10426,16 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             else
                 DOSBox_NoMenu();
 
+            section = static_cast<Section_prop *>(control->GetSection("dosbox"));
+            assert(section != NULL);
+
+#if C_MONITOR 
+				std::string mon_sock = section->Get_string("monitor socket");
+				if ( Monitor::StartMonitor( mon_sock ) ) {
+    				LOG_MSG( "MONITOR: Unable to open Monitor Console on... %s\n", mon_sock.c_str() );
+				}
+#endif
+
 #if defined(WIN32) && !defined(C_SDL2)
             if (maximize && !TTF_using() && !GFX_IsFullscreen()) ShowWindow(GetHWND(), SW_MAXIMIZE);
 #endif
@@ -10930,6 +10979,7 @@ fresh_boot:
 #if defined(C_SDL2)
         SDL_CDROMQuit();
 #endif
+
         SDL_Quit();//Let's hope sdl will quit as well when it catches an exception
 
 #if defined(WIN32) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
@@ -11033,7 +11083,7 @@ void GUI_ResetResize(bool pressed) {
     userResizeWindowWidth = 0;
     userResizeWindowHeight = 0;
 
-    if (GFX_GetPreventFullscreen())
+    if (Voodoo_OGL_Active())
         return;
 
     if (sdl.updating && !GFX_MustActOnResize()) {

@@ -441,6 +441,29 @@ static void dyn_check_bool_exception_al(void) {
 	used_save_info++;
 }
 
+#ifdef X86_DYNFPU_DH_ENABLED
+static void dyn_check_bool_normal_al(void) {
+	cache_addw(0xC084);     // test al,al
+	save_info[used_save_info].branch_pos=gen_create_branch_long(BR_NZ);
+	dyn_savestate(&save_info[used_save_info].state);
+	if (!decode.cycles) decode.cycles++;
+	save_info[used_save_info].cycles=decode.cycles;
+	save_info[used_save_info].eip_change=decode.code-decode.code_start;
+	if (!cpu.code.big) save_info[used_save_info].eip_change&=0xffff;
+	save_info[used_save_info].type=normal;
+	used_save_info++;
+}
+
+static void dyn_dh_fpu_post_instruction(uint16_t opcode = 0) {
+	gen_call_function((void *)&dh_fpu_update_mode, "%Id%Id",
+	                  decode.op_start - decode.code_start, opcode);
+	gen_call_function((void *)&dh_fpu_take_numeric_exception, "");
+	dyn_check_bool_exception_al();
+	gen_call_function((void *)&dh_fpu_mode_change_pending, "");
+	dyn_check_bool_normal_al();
+}
+#endif
+
 #include "pic.h"
 
 static void dyn_check_irqrequest(void) {
@@ -456,6 +479,34 @@ static void dyn_check_irqrequest(void) {
 	save_info[used_save_info].type=normal;
 	used_save_info++;
 }
+
+static void dyn_fpu_post_instruction(uint16_t opcode) {
+	gen_call_function((void *)&FPU_NumericExceptionWithContext, "%Id%Id",
+	                  decode.op_start - decode.code_start, opcode);
+	dyn_check_bool_exception_al();
+#ifdef X86_DYNFPU_DH_ENABLED
+	if (dyn_dh_fpu.dh_fpu_allowed) dyn_dh_fpu_post_instruction(opcode);
+#endif
+	dyn_check_irqrequest();
+}
+
+static void dyn_fpu_post_wait() {
+	gen_call_function((void *)&FPU_NumericException, "");
+	dyn_check_bool_exception_al();
+	dyn_check_irqrequest();
+}
+
+static void dyn_fpu_pre_instruction(void) {
+	gen_call_function((void *)&FPU_CoprocessorException, "");
+	dyn_check_bool_exception_al();
+}
+
+#ifdef X86_DYNREC_MMX_ENABLED
+static void dyn_mmx_pre_instruction(void) {
+	gen_call_function((void *)&MMX_CoprocessorException, "");
+	dyn_check_bool_exception_al();
+}
+#endif
 
 static void dyn_check_trapflag(void) {
 	gen_dop_word_imm(DOP_TEST,true,DREG(FLAGS),FLAG_TF);
@@ -2481,7 +2532,11 @@ static void dyn_larlsl(bool islar) {
 
 #ifdef X86_DYNREC_MMX_ENABLED
 #include "dyn_mmx.h"
-#define dyn_mmx_check() if ((dyn_dh_fpu.dh_fpu_enabled) && (!fpu_used)) {dh_fpu_startup();}
+#define dyn_mmx_check()                                                   \
+	do {                                                                   \
+		dyn_mmx_pre_instruction();                                       \
+		if ((dyn_dh_fpu.dh_fpu_enabled) && (!fpu_used)) dh_fpu_startup(); \
+	} while (0)
 #endif
 
 #include "lock.h"
@@ -2639,37 +2694,36 @@ restart_prefix:
 			case 0xe2:case 0xe5:case 0xe8:case 0xe9:case 0xeb:case 0xec:
 			case 0xed:case 0xef:case 0xf1:case 0xf2:case 0xf3:case 0xf5:
 			case 0xf8:case 0xf9:case 0xfa:case 0xfc:case 0xfd:case 0xfe:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
+				if (decode.rep != REP_NONE || decode.big_op != cpu.code.big) goto illegalopcode;	/* 66/F2/F3 0F xx is SSE2, let the normal core raise #UD */
 				dyn_mmx_check(); dyn_mmx_op(dual_code); break;
 			/* SHIFT mm, imm8*/
 			case 0x71:case 0x72:case 0x73:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
+				if (decode.rep != REP_NONE || decode.big_op != cpu.code.big) goto illegalopcode;	/* 66/F2/F3 0F xx is SSE2, let the normal core raise #UD */
 				dyn_mmx_check(); dyn_mmx_shift_imm8((uint8_t)dual_code); break;
 			/* MOVD mm, r/m32 */
 			case 0x6e:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
+				if (decode.rep != REP_NONE || decode.big_op != cpu.code.big) goto illegalopcode;	/* 66/F2/F3 0F xx is SSE2, let the normal core raise #UD */
 				dyn_mmx_check(); dyn_mmx_movd_pqed(); break;
 			/* MOVQ mm, mm/m64 */
 			case 0x6f:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
+				if (decode.rep != REP_NONE || decode.big_op != cpu.code.big) goto illegalopcode;	/* 66/F2/F3 0F xx is SSE2, let the normal core raise #UD */
 				dyn_mmx_check(); dyn_mmx_movq_pqqq(); break;
 			/* MOVD r/m32, mm */
 			case 0x7e:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
+				if (decode.rep != REP_NONE || decode.big_op != cpu.code.big) goto illegalopcode;	/* 66/F2/F3 0F xx is SSE2, let the normal core raise #UD */
 				dyn_mmx_check(); dyn_mmx_movd_edpq(); break;
 			/* MOVQ mm/m64, mm */
 			case 0x7f:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
+				if (decode.rep != REP_NONE || decode.big_op != cpu.code.big) goto illegalopcode;	/* 66/F2/F3 0F xx is SSE2, let the normal core raise #UD */
 				dyn_mmx_check(); dyn_mmx_movq_qqpq(); break;
 			/* EMMS */
 			case 0x77:
-				if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
 				if (CPU_ArchitectureType<CPU_ARCHTYPE_PMMXSLOW) goto illegalopcode;
 				dyn_mmx_check(); dyn_mmx_emms(); break;
 #endif
@@ -2832,7 +2886,16 @@ restart_prefix:
 		/* POP Ev */
 		case 0x8f:dyn_pop_ev();break;
 		case 0x90:	//NOP
+			break;
 		case 0x9b:	//WAIT/FWAIT
+			gen_call_function((void *)&FPU_WaitException, "");
+			dyn_check_bool_exception_al();
+#ifdef CPU_FPU
+#ifdef X86_DYNFPU_DH_ENABLED
+			if (!dyn_dh_fpu.dh_fpu_enabled)
+#endif
+				dyn_fpu_post_wait();
+#endif
 			break;
 		//XCHG ax,reg
 		case 0x91:case 0x92:case 0x93:case 0x94:case 0x95:case 0x96:case 0x97:	
@@ -2976,7 +3039,8 @@ restart_prefix:
 		//FPU
 #ifdef CPU_FPU
 		case 0xd8:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc0();
@@ -2986,10 +3050,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc0();
+			{
+				dyn_fpu_esc0();
+				dyn_fpu_post_instruction((0 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xd9:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc1();
@@ -2999,10 +3068,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc1();
+			{
+				dyn_fpu_esc1();
+				dyn_fpu_post_instruction((1 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xda:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc2();
@@ -3012,10 +3086,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc2();
+			{
+				dyn_fpu_esc2();
+				dyn_fpu_post_instruction((2 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xdb:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc3();
@@ -3025,10 +3104,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc3();
+			{
+				dyn_fpu_esc3();
+				dyn_fpu_post_instruction((3 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xdc:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc4();
@@ -3038,10 +3122,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc4();
+			{
+				dyn_fpu_esc4();
+				dyn_fpu_post_instruction((4 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xdd:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc5();
@@ -3051,10 +3140,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc5();
+			{
+				dyn_fpu_esc5();
+				dyn_fpu_post_instruction((5 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xde:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc6();
@@ -3064,10 +3158,15 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc6();
+			{
+				dyn_fpu_esc6();
+				dyn_fpu_post_instruction((6 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 		case 0xdf:
-			if (!use_dynamic_core_with_fpu) goto let_normal_core_handle_it;
+			if (!enable_fpu) goto let_normal_core_handle_it;
+			dyn_fpu_pre_instruction();
 #ifdef X86_DYNFPU_DH_ENABLED
 			if (dyn_dh_fpu.dh_fpu_enabled) {
 				if (fpu_used) dh_fpu_esc7();
@@ -3077,7 +3176,11 @@ restart_prefix:
 				}
 			} else
 #endif
-			dyn_fpu_esc7();
+			{
+				dyn_fpu_esc7();
+				dyn_fpu_post_instruction((7 << 8) | (decode.modrm.mod << 6) |
+				                         (decode.modrm.reg << 3) | decode.modrm.rm);
+			}
 			break;
 #endif
 		//Loops

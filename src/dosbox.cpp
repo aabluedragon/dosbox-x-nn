@@ -884,6 +884,7 @@ static void DOSBOX_UnlockSpeed( bool pressed ) {
         LOG_MSG("Fast Forward OFF");
         ticksLocked = false;
         turbolasttick = 0;
+        SetVal("cpu", "turbo", "false");
         if (autoadjust) {
             autoadjust = false;
             CPU_CycleAutoAdjust = true;
@@ -1538,7 +1539,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char* capturechromaformats[] = { "auto", "4:4:4", "4:2:2", "4:2:0", nullptr };
     const char* controllertypes[] = { "auto", "at", "xt", "pcjr", "pc98", nullptr }; // Future work: Tandy(?) and USB
     const char* auxdevices[] = {"none","2button","3button","intellimouse","intellimouse45",nullptr};
-    const char* cputype_values[] = {"auto", "8086", "8086_prefetch", "80186", "80186_prefetch", "286", "286_prefetch", "386", "386_prefetch", "486old", "486old_prefetch", "486", "486_prefetch", "pentium", "pentium_mmx", "ppro_slow", "pentium_ii", "pentium_iii", "experimental", nullptr };
+    const char* cputype_values[] = {"auto", "8086", "8086_prefetch", "80186", "80186_prefetch", "286", "286_prefetch", "386", "386_prefetch", "486old", "486old_prefetch", "486", "486_prefetch", "pentium", "pentium_mmx", "ppro_slow", "pentium_ii", "pentium_iii", "pentium_4", "experimental", nullptr };
     const char* rates[] = {  "49716", "48000", "44100", "32000","22050", "16000", "11025", "8000", nullptr };
     const char* pcrates[] = {  "65536", "49716", "48000", "44100", "32000","22050", "16000", "11025", "8000", nullptr };
 #if C_FLUIDSYNTH || defined(WIN32) && !defined(HX_DOS)
@@ -2288,6 +2289,10 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pbool = secprop->Add_bool("enable pci bus",Property::Changeable::OnlyAtStart,true);
     Pbool->Set_help("Enable PCI bus emulation");
+
+    Pstring = secprop->Add_string("monitor socket", Property::Changeable::WhenIdle,"");
+    Pstring->Set_help("The console monitor can be use to configure some aspects of a running machine with a CONFIG.COM clone and a command to change an already mounted CD drive\n"
+            " Can be either a port number (e.g. 4444) or a path (e.g. /tmp/dosbox-x.sock)");
 
     secprop=control->AddSection_prop("render",&Null_Init,true);
     Pint = secprop->Add_int("frameskip",Property::Changeable::Always,0);
@@ -3268,6 +3273,10 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("Enable Pentium CMPXCHG8B instruction. Enable this explicitly if using software that uses this instruction.\n"
             "You must enable this option to run Windows ME because portions of the kernel rely on this instruction.");
 
+    Pbool = secprop->Add_bool("enable sse2",Property::Changeable::Always,false);
+    Pbool->Set_help("Report and allow SSE2 (CPUID.1:EDX bit 26, LFENCE, MFENCE, CLFLUSH, and the SSE2 instructions that are implemented). Experimental: SSE2 is added step by step.\n"
+            "Only meaningful when cputype=pentium_iii or experimental. CR4.OSFXSR must be set by the guest, as for SSE.");
+
     Pbool = secprop->Add_bool("enable syscall",Property::Changeable::Always,true);
     Pbool->Set_help("Allow SYSENTER/SYSEXIT instructions. This option is only meaningful when is cputype=pentium_ii or higher.\n");
 
@@ -3352,16 +3361,6 @@ void DOSBOX_SetupConfigSections(void) {
                     "If the dynamic_x86 core is set, this allows Windows 9x/ME to run properly, but may somewhat decrease the performance.\n"
                     "If the dynamic_rec core is set, this disables the dynamic core if the 386 paging functions are currently enabled.\n"
                     "If set to auto, this option will be enabled depending on if the 386 paging and a guest system are currently active.");
-
-    // this is an option, even if enabling it will cause problems with Windows 95 games, because
-    // perhaps someone needs dynamic core for their DOS gaming because "ever since you added this
-    // option my Quake FPS is slower than DOSBox SVN why did you break it etc. etc."
-    Pstring = secprop->Add_string("use dynamic core with fpu",Property::Changeable::Always,"auto");
-    Pstring->Set_values(truefalseautoopt);
-    Pstring->Set_help("Allow dynamic cores (dynamic_x86 and dynamic_rec) to handle floating point, MMX, and SSE instructions.\n"
-                    "Set this option to true if running DOS games in a pure DOS environment.\n"
-                    "Set this option to false or leave it set to auto if you will be running a multi-tasking environment and an application that uses the FPU,\n"
-                    "especially Windows 95-era or later games in Microsoft Windows where dynamic core cannot properly allow Windows 95 to task switch the FPU.");
 
     Pbool = secprop->Add_bool("ignore opcode 63",Property::Changeable::Always,true);
     Pbool->Set_help("When debugging, do not report illegal opcode 0x63.\n"

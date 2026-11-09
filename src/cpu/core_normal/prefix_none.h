@@ -792,6 +792,10 @@
 			continue;
 		}
 	CASE_B(0x9b)												/* WAIT */
+		if (FPU_WaitException()) RUNEXCEPTION();
+	#if C_FPU
+		if (FPU_NumericExceptionPending()) EXCEPTION(EXCEPTION_MF);
+	#endif
 		break; /* No waiting here */
 	CASE_W(0x9c)												/* PUSHF */
 		if (CPU_PUSHF(false)) RUNEXCEPTION();

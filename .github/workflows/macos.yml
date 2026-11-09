@@ -37,9 +37,10 @@ jobs:
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
           cat include/build_timestamp.h
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' || echo "unknown")
+            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+(-osfree)?)$/\1/' || echo "unknown")
             echo "VERSION=$VERSION" >> $GITHUB_ENV
           fi
+
       - name: Build macOS SDL1
         run: |
           top=`pwd`
@@ -91,7 +92,7 @@ jobs:
           7zz a "$top/$ZIPNAME" *
           cd $top
       - name: Upload preview package
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.ZIPNAME }}
           path: "${{ github.workspace }}/${{ env.ZIPNAME }}"
@@ -142,7 +143,7 @@ jobs:
           cd $top
       - name: Upload preview package
         if: steps.osfree.outputs.osfree != 'true'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.ZIPNAME }}
           path: "${{ github.workspace }}/${{ env.ZIPNAME }}"
@@ -177,7 +178,7 @@ jobs:
           echo "#define COPYRIGHT_END_YEAR \"${copyrightyear}\"" >> include/build_timestamp.h
           cat include/build_timestamp.h
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+)$/\1/' || echo "unknown")
+            VERSION=$(echo "${GITHUB_REF##*/}" | sed -E 's/^dosbox-x-v([0-9]+\.[0-9]+\.[0-9]+(-osfree)?)$/\1/' || echo "unknown")
             echo "VERSION=$VERSION" >> $GITHUB_ENV
           fi
       - name: Build macOS SDL1
@@ -231,7 +232,7 @@ jobs:
           7zz a "$top/$ZIPNAME" *
           cd $top
       - name: Upload preview package
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.ZIPNAME }}
           path: "${{ github.workspace }}/${{ env.ZIPNAME }}"
@@ -282,7 +283,7 @@ jobs:
           cd $top
       - name: Upload preview package
         if: steps.osfree.outputs.osfree != 'true'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.ZIPNAME }}
           path: "${{ github.workspace }}/${{ env.ZIPNAME }}"

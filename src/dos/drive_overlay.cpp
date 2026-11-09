@@ -1139,7 +1139,7 @@ again:
         if (len & 4) find_attr|=DOS_ATTR_SYSTEM;
     }
 #endif
- 	if (~srch_attr & find_attr & DOS_ATTR_DIRECTORY) goto again;
+ 	if (~srch_attr & (find_attr & (DOS_ATTR_HIDDEN | DOS_ATTR_SYSTEM | DOS_ATTR_DIRECTORY))) goto again;
 	
 	/* file is okay, setup everything to be copied in DTA Block */
 	char find_name[DOS_NAMELENGTH_ASCII], lfind_name[LFN_NAMELENGTH+1];
@@ -1152,9 +1152,16 @@ again:
 	strcpy(lfind_name,ldir_entcopy);
     lfind_name[LFN_NAMELENGTH]=0;
 
-	find_hsize=(uint32_t) (stat_block.st_size / 0x100000000);
-	find_size=(uint32_t) (stat_block.st_size % 0x100000000);
-	struct tm *time;
+    if(find_attr & DOS_ATTR_DIRECTORY) {
+        find_hsize = 0;
+        find_size = 0;
+    }
+    else {
+        find_hsize = (uint32_t)(stat_block.st_size / 0x100000000);
+        find_size = (uint32_t)(stat_block.st_size % 0x100000000);
+    }
+
+    struct tm *time;
 	if((time=
 #if defined(__MINGW32__) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
     _localtime64

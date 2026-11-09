@@ -4410,6 +4410,14 @@ static Bitu INT18_PC98_Handler(void) {
                 }
             }
             break;
+        case 0x1B: /* set KCG access mode (AL=0 code access, AL=1 dot access) */
+            /* Same mode as bit 3 of AH=0Ah, and kept in the same place in the data area,
+             * so that AH=0Bh reads it back. Neko Project II handles this call the same way. */
+            if (reg_al <= 1) {
+                mem_writeb(0x53C,(mem_readb(0x53C) & ~0x08u) | (reg_al ? 0x08u : 0x00u));
+                pc98_cg_kanji_dot_access_mode = (reg_al != 0);
+            }
+            break;
         case 0x30: /* Set display mode */
             /* FIXME: There is still a lot that is inaccurate about this call */
             if (enable_pc98_egc) {
@@ -7839,8 +7847,8 @@ static Bitu INT15_Handler(void) {
                 }
         }
         break;
-    case 0x50:
-        if(isDBCSCP()) {
+    case 0x50: // DOS/V - FONT SUBSYSTEM ACCESS
+        if(IS_DOSV /* && DOSV_CheckCJKVideoMode() */) {
             if(reg_al == 0x00) {
                 if(reg_bl == 0x00 && reg_bp == 0x00) {
                     enum DOSV_FONT font = DOSV_FONT_MAX;
@@ -7888,13 +7896,18 @@ static Bitu INT15_Handler(void) {
             }
             CALLBACK_SCF(true);
         }
+        else {
+            reg_ah = 0x86; // function not supported
+            CALLBACK_SCF(true);
+        }
         break;
-    case 0x49:
-        if(isDBCSCP()) {
+    case 0x49: // Far East MS-DOS - GET BIOS TYPE
+        if(IS_DOSV) {
             reg_ah = 0x00;
-            reg_bl = 0x00;
+            reg_bl = 0x00; // DOSV
             CALLBACK_SCF(false);
         } else {
+            reg_ah = 0x86; // function not supported
             CALLBACK_SCF(true);
         }
         break;

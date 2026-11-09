@@ -46,7 +46,7 @@
 #include "pic.h"
 
 extern bool do_lds_wraparound;
-extern bool use_dynamic_core_with_fpu;
+extern bool enable_fpu;
 
 #if defined(__EMSCRIPTEN__)
 #define CACHE_MAXSIZE	(4096*8)	/* fixed-size IR records are larger than native code */
@@ -58,7 +58,7 @@ extern bool use_dynamic_core_with_fpu;
  * to retranslate freely, so it was doubled again - the wasm heap is 512MB. */
 #define CACHE_TOTAL		(1024*1024*64)
 #else
-#define CACHE_MAXSIZE	(4096*2)
+#define CACHE_MAXSIZE	(4096*3)
 #define CACHE_TOTAL		(1024*1024*8)
 #endif
 #define CACHE_PAGES		(512)

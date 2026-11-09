@@ -15,6 +15,18 @@ Next version:
     instead of letting it silently ruin the game. Enabled with
     "inputnet=true" in the new [inputnet] section, or with the
     -inputnet-server / -inputnet-connect command line options.
+  - macOS: Switching to full screen or zooming the window with output=opengl
+    no longer garbles the picture (the image sheared into several copies with
+    video memory junk below). The window surface DOSBox-X also uses on the
+    OpenGL window is drawn by a GL renderer of SDL's own, which left its
+    context current and GL_UNPACK_ROW_LENGTH at the window width. The OpenGL
+    output now restores its context and the unpack state before setting up
+    and uploading. (risenowrise)
+  - PC-98: INT 18h AH=1Bh (set KCG access mode, AL=0 code, AL=1 dot) is now
+    handled instead of being logged as an unknown call. It sets the same
+    dot access mode as port 68h commands 0Ah/0Bh and bit 3 of AH=0Ah, and
+    updates bit 3 of 0000:053Ch so AH=0Bh reads it back. Policenauts calls it
+    at startup. (mattkanwisher)
   - DOS: DOS_CheckExtDevice() no longer loops forever when the chain of device
     headers in guest memory is damaged or never closed (the CON header was found
     zeroed while DOS Navigator was running, and every FindFirst then hung the
@@ -38,6 +50,7 @@ Next version:
     error 2. Specification: docs/UTF8NAMES.md in github.com/unxed/go2dos. (unxed)
   - BOOT: Added option to mount 'Empty' floppy/CD-ROM drives in advance if no
     floppy/CD-ROM drives are mounted. (maron2000)
+  - Added support for cycling disk images in reverse order.(maron2000)
   - FPU: Consolidated remaining x87 instruction handling across the normal,
     long-double, and native-x86 FPU backends. Improved denormal, exceptional
     value, rounding, remainder, integer-store, and stack behavior, and removed
@@ -50,6 +63,91 @@ Next version:
     the legacy backend-specific FPU instruction headers. (cimarronm)
   - DOS: Fixed FAT volume label searches (INT 21h AH=4Eh) returning a stray
     '.' and padding for labels of 8 characters or fewer. (cimarronm)
+  - Fixed typing Shift + A by removing mapping Shift+A to MuteAWE function.
+    (maron2000) 
+  - FPU: Wired FISTTP into the dynamic x86 and dynrec CPU cores. (cimarronm)
+  - Fixed MEMDUMP and MEMDUMPBIN parsing to reject invalid or missing required
+    arguments and correctly use the default filename when omitted. (cimarronm)
+  - macOS: Added resource path candidates considering Homebrew and Macports.
+    (maron2000)
+  - Improved SoundFont discovery and path handling. (maron2000)
+  - D3D11: Fixed window resizing (maron2000)
+  - FPU: Added unmasked x87 numeric exception delivery (#MF when CR0.NE is
+    set, IRQ 13 otherwise), enabled IRQ 13 on FPU-configured PC resets,
+    and suppressed writes/pops after unmasked pre-commit exceptions. Dynamic
+    FPU cores deliver them too with the dynamic_x86 core switching between
+    its host-FPU fast path and generic handler depending on guest exception
+    masks. (cimarronm)
+  - FPU: Dynamic CPU cores now always handle x87 and MMX instructions;
+    removed the "use dynamic core with fpu" configuration setting. (cimarronm)
+  - Added support for commands to be sent over a TCP network connection and 
+    system information to be read. Utility is called Monitor and can be enabled
+    in the [dosbox] section of the .conf. (DieSkaarj)
+  - Debugger: Fixed the command-prompt cursor not being visible when moving
+    within a command line. (cimarronm)
+  - INT 13h: Moved the INT 13h handler into its own source file and refactored
+    CHS (AH=02h) and EDD (AH=42h) reads. Floppy CHS transfers now honor disk
+    base-table sector sizes through 8 KiB, padding or truncating image data as
+    needed and reads transfer data on sectors designated with a CRC error. This
+    improves compatibility with a range of copy-protected disk images. (cimarronm)
+  - Direct serial: Refactored platform backends and fixed POSIX device-path,
+    error-marker, break-state, and setup failure handling, and Windows write
+    failure handling. (cimarronm)
+  - Direct serial: Fixed the multiplier setting to configure the host serial
+    port at the multiplied baud rate. (cimarronm)
+  - D3D11: Fixed hardware scaling in CGA (maron2000)
+  - Fixed startup crash on macOS 10.9 when building menu (maron2000)
+  - Microphone input: Prefer the default capture device (maron2000)
+  - debugger: Added synchronous STEPIN single-step command (MnHebi)
+  - debugger: Added bounded read-only MEMREAD command (MnHebi)
+  - Feature: Send Commands Through Host Socket, Console Monitor (DieSkaarj)
+  - cmos: Fixed RTC date skipping the last day of every month and all of
+    December (maron2000)
+  - Fixed directory size reported by FindFirst/FindNext (maron2000)
+  - Extended Functionality of Monitor (DieSkaarj)
+  - Fixed build error on gcc due to a missing header (gojun077)
+  - Parallel port: The LPT DOS device now reports end of input for all
+    backends, fixing programs such as dBase IV that hang when printing to
+    LPT1 because they poll input status and read zero bytes forever.
+    (cimarronm)
+  - FindNext: Fix filtering of hidden and system files. (maron2000)
+  - Fixed DOS_OpenFileExtended() handle leak on existing files. (maron2000)
+  - Fixed FCB renaming using wildcards. (maron2000)
+  - INT 21h AH=41h; Fixed deleting read-only files. (maron2000)
+  - bios.cpp: Fixed DOS/V detection (AH=49h, 50h) (maron2000)
+  - Fixed FCB find first/next (AH=11h/12h) aborted when FCB delete
+    (INT 21h AH=13h) executed in between. (maron2000)
+  - CPU: dynamic_x86: MMX opcodes with a 66/F2/F3 prefix go to the normal core.
+    (unxed)
+  - CPU: SSE2 (opt-in "enable sse2"), and optionally cputype=pentium_4 (unxed)
+  - Fixed bug with detection of GUS of official 4.11 driver. (firevaran)
+  - Added MIDI port emulation for GUS. (firevaran)
+  - DOS_OpenFile: Fixed FCB open incorrectly updating PSP JFT (maron2000)
+  - MSCDEX: Fixed BUSY status for paused audio playback (maron2000)
+  - Fixed 8087 FPU control word reset value (cimarronm)
+  - Change workaround for the dynamic core (henk717)
+  - drive_local: Fixed handles on the same file not seeing each other's writes
+    (wleeaf)
+  - FPU: Save x87 instruction/data pointers and opcode in FSTENV/FSAVE and
+    FXSAVE state after unmasked exceptions, including 8087, 80287, and 80387
+    environment layouts. (cimarronm)
+  - Handle empty pipe temporary filenames safely (maron2000)
+  - Fixed behavior of redirection and pipe handling to match PC-DOS (maron2000)
+  - dynamic_x86: Fixed MMX shift by immediate after self-modifying code
+    (maitchison)
+  - Respect the NMI mask during PIC interrupt delivery (tbullock)
+  - Fixed double fault detection during exception delivery (tbullock)
+  - Fixed the 286 EXT bit during exception delivery (tbullock)
+  - Fixed build error due to HAS_LONG_DOUBLE macro definition (pkubaj)
+  - PC-98: Fixed 12-bit analog palette conversion to 24-bit due to converting
+    from 4 -> 6 -> 8-bit to 4 -> 8-bit directly to avoid conversion errors.
+    (SergioMartin86, maron2000)
+  - Fixed misplaced text underline in 20-line mode (SergioMartin86, maron2000)
+  - Fixed turbo option remained true even after it is stopped (maron2000)
+  - FPU: Clear the C2 status flag before FPREM/FPREM1 input checks so an
+    early return does not leave a stale incomplete-remainder status. (cimarronm)
+  - FPU: Fixed x87 underflow reporting for inexact tiny results that round to
+    the minimum normal IEEE floating-point value. (cimarronm)
 
 2026.10.01:
   - Fixed DOS FCB operations trying to read/write from device_CON when performed

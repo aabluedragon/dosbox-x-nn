@@ -60,10 +60,11 @@ struct FPUControlWord
 
 	enum
 	{
-		mask8087     = 0x1fff,
-		maskNon8087  = 0x1f7f,
-		reservedMask = 0x40,
-		initValue    = 0x37f
+		mask8087      = 0x1fff,
+		maskNon8087   = 0x1f7f,
+		reservedMask  = 0x40,
+		initValue     = 0x37f,
+		initValue8087 = 0x3ff
 	};
 	enum RoundMode
 	{
@@ -96,7 +97,10 @@ struct FPUControlWord
 		*this = reg | val;
 		return *this;
 	}
-	void init() { reg = initValue; }
+	void init()
+	{
+		reg = FPU_ArchitectureType <= FPU_ARCHTYPE_8087 ? initValue8087 : initValue;
+	}
 	FPUControlWord allMasked() const
 	{
 		auto masked = *this;
@@ -165,7 +169,7 @@ struct FPUStatusWord
 	{
 		conditionMask = 0x4700,
 		conditionAndExceptionMask = 0x47bf,
-        exceptionMask = 0xff
+		exceptionMask = 0x3f
 	};
 	std::string to_string() const;
 };
@@ -194,6 +198,15 @@ struct FPU
 	uint32_t            mxcsr; // SSE control register
 	FPUControlWord      cw;
 	FPUStatusWord       sw;
+
+	// The x87 environment also contains the instruction and operand pointers.
+	// They describe the instruction that raised the saved x87 exception, not the instruction
+    // that happens to be executing when FSTENV/FSAVE is issued.
+	uint32_t            fip = 0;
+	uint32_t            fdp = 0;
+	uint16_t            fcs = 0;
+	uint16_t            fds = 0;
+	uint16_t            fop = 0;
 };
 
 extern FPU fpu;

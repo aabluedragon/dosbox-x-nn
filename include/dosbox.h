@@ -119,6 +119,9 @@ static inline int dosbox_ios_no_system(const char *cmd) { (void)cmd; return -1; 
 // emulated in software (__multf3 and friends), which profiling shows eating
 // several percent of total runtime through the PIC tick index and FPU core.
 // Treat it like ARM and use double.
+#elif defined(__LDBL_MANT_DIG__) && __LDBL_MANT_DIG__ != 64
+// long double is not the x87 80-bit extended format: either the same as double (FreeBSD/powerpc64
+// and powerpc64le before 16.0) or IEEE binary128 (Linux ppc64le, riscv64, s390x, loongarch64)
 #else
 // GCC, other compilers, have sizeof(long double) == 10 80-bit IEEE
 #define HAS_LONG_DOUBLE		1
