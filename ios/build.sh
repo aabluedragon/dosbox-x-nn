@@ -30,11 +30,11 @@ FORCE=""
 for a in \
     debug/libdebug.a dos/libdos.a shell/libshell.a builtin/libbuiltin.a \
     ints/libints.a hardware/serialport/libserial.a hardware/parport/libparallel.a \
-    libs/passthroughio/libpassthroughio.a gui/libgui.a libs/gui_tk/libgui_tk.a \
+    libs/passthroughio/libpassthroughio.a gui/libgui.a monitor/libmonitor.a libs/gui_tk/libgui_tk.a \
     hardware/libhardware.a cpu/libcpu.a hardware/reSID/libresid.a fpu/libfpu.a \
     misc/libmisc.a output/liboutput.a hardware/mame/libmame.a libs/zmbv/libzmbv.a \
     libs/decoders/internal/libopusint.a aviwriter/libaviwriter.a libs/xBRZ/libxbrz.a \
-    libs/fluidsynth/libfluidsynth.a; do
+    libs/fluidsynth/libfluidsynth.a agent/libagent.a; do
   FORCE="$FORCE -Wl,-force_load,$TREE/$a"
 done
 
