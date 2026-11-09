@@ -2,7 +2,7 @@
 set -eu
 # NukemNet's DOSBox-X fork (github.com/aabluedragon/dosbox-x-nn), which carries the
 # full-size IPX and guest turbo changes. RELEASE names the packages.
-COMMIT=fea1fd9076d8cf92c38767b6ea9bba9e0d32ac30
+COMMIT=fa5f1c0539ba1e42733dc1f29bfda75231389559
 RELEASE=20261109
 TARGET_ARCH=${TARGET_ARCH:-armv7l}
 export TARGET_ARCH
@@ -14,7 +14,7 @@ case "$TARGET_ARCH" in
 esac
 mkdir -p /build/src /build/sdl /build/output
 curl -fL --retry 3 "https://github.com/aabluedragon/dosbox-x-nn/archive/$COMMIT.tar.gz" -o /build/source.tar.gz
-printf '%s\n' '90027705110c686d351fcf44da1811e94a1646cbe893f8b259eed5abfc622913  /build/source.tar.gz' | sha256sum -c -
+printf '%s\n' '1ec5c133a0f18610d955ae94f86eea4dae431f32fb6a915e9b848d37c617aa93  /build/source.tar.gz' | sha256sum -c -
 tar -xf /build/source.tar.gz -C /build/src --strip-components=1
 export CC=$TARGET_TRIPLE-gcc CXX=$TARGET_TRIPLE-g++
 export CFLAGS="-O2 $CPU_FLAGS"
