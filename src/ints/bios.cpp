@@ -623,6 +623,9 @@ static bool dosbox_int_busy = false;
 #define INTDEV_VERSION_MINOR 1
 #define INTDEV_VERSION_SUB 0
 
+extern bool ticksLocked;
+extern void DOSBOX_UnlockSpeed2(bool pressed);
+
 static const char *dosbox_int_version = "DOSBox-X integration device v" STRINGIZE(PPCAT(INTDEV_VERSION_MAJOR, INTDEV_VERSION_MINOR, INTDEV_VERSION_SUB));
 static const char *dosbox_int_ver_read = NULL;
 
@@ -887,6 +890,10 @@ void dosbox_integration_trigger_read() {
 			break;
 
 		case DOSBOX_ID_RESET_INDEX_CODE: /* interface reset result */
+			break;
+
+		case DOSBOX_ID_REG_CPU_TURBO:
+			dosbox_int_register = ticksLocked ? 1 : 0;
 			break;
 
 		case DOSBOX_ID_REG_CPU_CYCLES:
@@ -1338,6 +1345,11 @@ void dosbox_integration_trigger_write() {
 					if (vga.dosboxig.svga) VGA_StartResize(0);
 				}
 			}
+			break;
+
+		case DOSBOX_ID_REG_CPU_TURBO:
+			if (dosbox_int_register > 1) dosbox_int_error = true;
+			else if (ticksLocked != (dosbox_int_register != 0)) DOSBOX_UnlockSpeed2(true);
 			break;
 
 		case DOSBOX_ID_REG_CPU_CYCLES:
