@@ -44,6 +44,7 @@
 
 #include "dosbox.h"
 #include "dos_inc.h"
+#include "inputnet.h"
 #include "drives.h"
 #include "logging.h"
 #include "support.h"
@@ -2395,6 +2396,7 @@ HANDLE localDrive::CreateOpenFile(const char* name) {
 }
 
 unsigned long localDrive::GetSerial() {
+	if (INPUTNET_IsConnected()) return 0x1234; /* the same on every shared input machine */
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	CROSS_FILENAME(newname);
@@ -2570,7 +2572,17 @@ bool localDrive::Rename(const char * oldname,const char * newname) {
 #include <sys/statvfs.h>
 #endif
 
+/* Shared input (INPUTNET) machines must answer the guest identically, but host disks differ.
+ * Unless the mount set a size, report the same 1 GB drive with 512 MB free on every machine. */
+static bool INPUTNET_FixedAllocation(bool sized) {
+    return !sized && INPUTNET_IsConnected();
+}
+
 bool localDrive::AllocationInfo64(uint32_t* _bytes_sector, uint32_t* _sectors_cluster, uint64_t* _total_clusters, uint64_t* _free_clusters) {
+    if (INPUTNET_FixedAllocation(allocation.total_clusters || allocation.free_clusters)) {
+        *_bytes_sector = 512; *_sectors_cluster = 32; *_total_clusters = 65535; *_free_clusters = 32768;
+        return true;
+    }
     *_bytes_sector = allocation.bytes_sector;
     *_sectors_cluster = allocation.sectors_cluster;
     *_total_clusters = allocation.total_clusters;
@@ -2694,6 +2706,10 @@ bool localDrive::AllocationInfo64(uint32_t* _bytes_sector, uint32_t* _sectors_cl
  }
 
  bool localDrive::AllocationInfo(uint16_t* _bytes_sector, uint8_t* _sectors_cluster, uint16_t* _total_clusters, uint16_t* _free_clusters) {
+     if (INPUTNET_FixedAllocation(allocation.total_clusters || allocation.free_clusters)) {
+         *_bytes_sector = 512; *_sectors_cluster = 32; *_total_clusters = 65535; *_free_clusters = 32768;
+         return true;
+     }
      *_bytes_sector = allocation.bytes_sector;
      *_sectors_cluster = allocation.sectors_cluster;
      *_total_clusters = allocation.total_clusters;

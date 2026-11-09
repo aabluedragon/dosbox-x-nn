@@ -103,6 +103,15 @@ bool inputnet_capture_active = false;
 /* ------------------------------------------------------------------------- */
 
 uint32_t CALLBACK_LayoutSignature(void);
+extern bool savestate_keep_local_drives;
+#include "dos_inc.h"
+
+/* Host volume labels (read from the host disk on Windows) differ between computers. Shared input
+ * machines must answer the guest identically, so local folder drives show no label in a session. */
+static void INPUTNET_ClearHostVolumeLabels(void) {
+    for (unsigned i=0;i < DOS_DRIVES;i++)
+        if (Drives[i] && !strncmp(Drives[i]->GetInfo(),"local directory ",16)) Drives[i]->SetLabel("",false,true);
+}
 
 #define INPUTNET_DEFAULT_PORT   2130u   /* not an assigned port, but adjacent to IPX's 213 */
 #define INPUTNET_MAX_PEERS      8u
@@ -933,15 +942,18 @@ public:
         savefilename = path;
         noremark_save_state = true;
         if (force_load) force_load_state = true;
+        old_keep = savestate_keep_local_drives;
+        if (force_load) savestate_keep_local_drives = true;
     }
     ~InputNetSaveStateOverride() {
         use_save_file = old_use;
         savefilename = old_name;
         noremark_save_state = old_noremark;
         force_load_state = old_force;
+        savestate_keep_local_drives = old_keep;
     }
 private:
-    bool old_use, old_noremark, old_force;
+    bool old_use, old_noremark, old_force, old_keep;
     std::string old_name;
 };
 
@@ -1014,6 +1026,7 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
     if (ok && ttf.inUse) resetFontSize();
 #endif
 
+    if (ok) INPUTNET_ClearHostVolumeLabels();
     remove(path.c_str());
     return ok;
 }
@@ -1708,6 +1721,7 @@ static bool INPUTNET_StartServer(uint16_t port) {
     self.name = "server";
     self.resetFrames();
 
+    INPUTNET_ClearHostVolumeLabels();
     LOG_MSG("INPUTNET: waiting for participants on UDP port %u",(unsigned)port);
     return true;
 }
