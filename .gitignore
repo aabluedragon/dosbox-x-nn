@@ -150,5 +150,5 @@ web/nk/
 web/sw/
 web/abuse/
 build-wasm/
-build-android/
-build-ios/
+/build-android
+/build-ios

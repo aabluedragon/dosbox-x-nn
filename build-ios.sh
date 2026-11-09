@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build the iOS simulator (arm64) target: dosbox-x compiled and archived so
 # an SDL2/UIKit app can link it into its binary (the app supplies main(),
-# calls SDL_UIKitRunApp with dosbox-x's SDL_main; see the dosbox-x-ios app
-# project). Mirrors build-wasm.sh / build-android.sh: built from a git
-# worktree under build-ios/ (ignored), so the native build in the source
-# tree keeps its own configuration.
+# calls SDL_UIKitRunApp with dosbox-x's SDL_main; ios/build.sh links these
+# products into DOSBox-X.app). Mirrors build-wasm.sh / build-android.sh:
+# built from a git worktree under build-ios/ (ignored), so the native build
+# in the source tree keeps its own configuration.
 #
 #   ./build-ios.sh          # build into build-ios/
 #

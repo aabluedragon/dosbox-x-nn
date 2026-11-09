@@ -10,17 +10,22 @@
 # Products (under build-android/):
 #   prefix/lib/libSDL2.so       - ship in the APK (lib/arm64-v8a/)
 #   tree/src/libmain.so         - ship in the APK (lib/arm64-v8a/)
+# android/build.sh then packages them into out/dosbox-x.apk.
 # The SDL2 Java glue the app needs is under
 #   SDL2-*/android-project/app/src/main/java/org/libsdl/app/
 #
 # Needs the Android NDK; set ANDROID_SDK or ANDROID_NDK to override the
-# default macOS SDK location. API 28+ is required (bionic gained iconv in
-# API 28).
+# default SDK location (macOS ~/Library/Android/sdk, Linux ~/Android/Sdk).
+# API 28+ is required (bionic gained iconv in API 28).
 set -e
 cd "$(dirname "$0")"
 repo=$(pwd)
 
-: "${ANDROID_SDK:=$HOME/Library/Android/sdk}"
+if [ -z "$ANDROID_SDK" ]; then
+    for d in "$ANDROID_HOME" "$HOME/Library/Android/sdk" "$HOME/Android/Sdk"; do
+        [ -n "$d" ] && [ -d "$d" ] && { ANDROID_SDK=$d; break; }
+    done
+fi
 : "${ANDROID_NDK:=$(ls -d "$ANDROID_SDK"/ndk/* 2>/dev/null | sort -V | tail -1)}"
 : "${ANDROID_API:=28}"
 : "${SDL2_VERSION:=2.32.10}"

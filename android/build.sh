@@ -1,12 +1,34 @@
 #!/bin/sh
 # Builds the DOSBox-X Android APK: SDL2 Java glue + DosBoxActivity on the
 # Java side, libSDL2.so + libmain.so (dosbox-x) on the native side, and a
-# DOS environment (Duke3D + dosbox conf) in assets.
+# DOS environment (stage/assets/dos: conf + e.g. Duke3D) in assets.
+#
+# Run ../build-android.sh first: it produces libSDL2.so and libmain.so
+# (under ../build-android/), which are staged into stage/lib/arm64-v8a/.
+#
+#   ./build.sh                  # -> out/dosbox-x.apk
+#   adb install -r out/dosbox-x.apk
 set -e
 cd "$(dirname "$0")"
-SDK=$HOME/Library/Android/sdk
-BT=$SDK/build-tools/36.0.0
-AJ=$SDK/platforms/android-34/android.jar
+repo=$(cd .. && pwd)
+if [ -z "$ANDROID_SDK" ]; then
+    for d in "$ANDROID_HOME" "$HOME/Library/Android/sdk" "$HOME/Android/Sdk"; do
+        [ -n "$d" ] && [ -d "$d" ] && { ANDROID_SDK=$d; break; }
+    done
+fi
+[ -d "$ANDROID_SDK" ] || { echo "Android SDK not found; set ANDROID_SDK." >&2; exit 1; }
+: "${BUILD_TOOLS:=36.0.0}"
+: "${ANDROID_PLATFORM:=android-34}"
+BT=$ANDROID_SDK/build-tools/$BUILD_TOOLS
+AJ=$ANDROID_SDK/platforms/$ANDROID_PLATFORM/android.jar
+
+# Native libraries from ../build-android.sh (skipped if already staged by hand).
+BA=$repo/build-android
+if [ -f "$BA/tree/src/libmain.so" ]; then
+    mkdir -p stage/lib/arm64-v8a
+    cp "$BA/prefix/lib/libSDL2.so" "$BA/tree/src/libmain.so" stage/lib/arm64-v8a/
+fi
+[ -f stage/lib/arm64-v8a/libmain.so ] || { echo "libmain.so missing; run ../build-android.sh first" >&2; exit 1; }
 
 rm -rf out/classes out/classes.dex out/base.apk out/app.apk
 mkdir -p out/classes

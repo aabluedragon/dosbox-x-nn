@@ -1,16 +1,23 @@
 #!/bin/sh
 # Builds the DOSBox-X iOS simulator app: dosbox-x static archives + SDL2
 # linked into one binary with a small UIKit shim (app/main.m), bundled with
-# the DOS environment (Duke3D + conf template) and installed into the
-# booted simulator.
+# the DOS environment (app/dos-assets, e.g. Duke3D) and signed ad hoc.
+#
+# Run ../build-ios.sh first: it produces the dosbox-x archives and static
+# SDL2/libpng/SDL2_net this script links against (under ../build-ios/).
+# Then ./run.sh installs and launches the bundle on the booted simulator.
 set -e
 cd "$(dirname "$0")"
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+repo=$(cd .. && pwd)
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+: "${IOS_MIN:=13.0}"
 SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
-TARGET="-target arm64-apple-ios13.0-simulator -isysroot $SDK"
-TREE=/Users/alonamir/dev/dosbox-x/build-ios/tree/src
-PREFIX=/Users/alonamir/dev/dosbox-x/build-ios/prefix
+TARGET="-target arm64-apple-ios${IOS_MIN}-simulator -isysroot $SDK"
+TREE="${TREE:-$repo/build-ios/tree/src}"
+PREFIX="${PREFIX:-$repo/build-ios/prefix}"
 APP=out/DOSBox-X.app
+
+[ -f "$TREE/dosbox.o" ] || { echo "dosbox-x not built; run ../build-ios.sh first" >&2; exit 1; }
 
 CLANG="$(xcrun -f clang)"
 
@@ -42,7 +49,7 @@ done
     -framework GameController -framework Metal -framework OpenGLES \
     -framework QuartzCore -framework UIKit
 
-mkdir -p "$APP"
+mkdir -p "$APP" app/dos-assets
 cp out/dosbox-x "$APP/"
 cp app/Info.plist "$APP/"
 cp -r app/dos-assets "$APP/dos"
