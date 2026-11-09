@@ -1207,10 +1207,11 @@ static unsigned char logo[32*32*4]= {
 static void DOSBox_SetOriginalIcon(void) {
     SDL_Surface *logos;
 
+        /* RGBA bytes; the alpha channel keeps the icon's background transparent. */
 #ifdef WORDS_BIGENDIAN
-        logos = SDL_CreateRGBSurfaceFrom((void*)logo,32,32,32,128,0xff000000,0x00ff0000,0x0000ff00,0);
+        logos = SDL_CreateRGBSurfaceFrom((void*)logo,32,32,32,128,0xff000000,0x00ff0000,0x0000ff00,0x000000ff);
 #else
-        logos = SDL_CreateRGBSurfaceFrom((void*)logo,32,32,32,128,0x000000ff,0x0000ff00,0x00ff0000,0);
+        logos = SDL_CreateRGBSurfaceFrom((void*)logo,32,32,32,128,0x000000ff,0x0000ff00,0x00ff0000,0xff000000);
 #endif
 
 #if defined(C_SDL2)
