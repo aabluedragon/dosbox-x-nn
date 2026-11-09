@@ -104,6 +104,14 @@ bool inputnet_capture_active = false;
 
 uint32_t CALLBACK_LayoutSignature(void);
 extern bool savestate_keep_local_drives;
+void CMOS_GetSharedClock(uint8_t out[16]);
+void CMOS_SetSharedClock(const uint8_t in[16]);
+/* The real-time clock and the DOS date are not part of a save state: a joining machine takes
+ * the server's, sent with the WELCOME, and applies them with the server's emulator state. */
+static uint8_t inputnet_pending_clock[16];
+static uint16_t inputnet_pending_year;
+static uint8_t inputnet_pending_month, inputnet_pending_day;
+static bool inputnet_have_pending_clock = false;
 #include "dos_inc.h"
 
 /* Host volume labels (read from the host disk on Windows) differ between computers. Shared input
@@ -1027,6 +1035,13 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
 #endif
 
     if (ok) INPUTNET_ClearHostVolumeLabels();
+    if (ok && inputnet_have_pending_clock) {
+        CMOS_SetSharedClock(inputnet_pending_clock);
+        dos.date.year = inputnet_pending_year;
+        dos.date.month = inputnet_pending_month;
+        dos.date.day = inputnet_pending_day;
+        inputnet_have_pending_clock = false;
+    }
     remove(path.c_str());
     return ok;
 }
@@ -1334,6 +1349,14 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
     /* Lets the client refuse a state it would run differently (see CALLBACK_LayoutSignature). */
     w.u32(CALLBACK_LayoutSignature());
     LOG_MSG("INPUTNET: callback layout %08x",(unsigned int)CALLBACK_LayoutSignature());
+    {
+        uint8_t clock[16];
+        CMOS_GetSharedClock(clock);
+        w.bytes(clock,sizeof(clock));
+        w.u16(dos.date.year);
+        w.u8(dos.date.month);
+        w.u8(dos.date.day);
+    }
     const size_t welcomelen = w.size();
     INPUTNET_SendRaw(p->addr,welcome,welcomelen);
 
@@ -1785,6 +1808,14 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                                 return false;
                             }
                             LOG_MSG("INPUTNET: callback layout %08x matches the server",(unsigned int)ours);
+                        }
+                        if (!r.bad() && r.remain() >= 20) {
+                            const uint8_t *clock = r.bytes(16);
+                            if (clock != NULL) memcpy(inputnet_pending_clock,clock,16);
+                            inputnet_pending_year = r.u16();
+                            inputnet_pending_month = r.u8();
+                            inputnet_pending_day = r.u8();
+                            inputnet_have_pending_clock = (clock != NULL && !r.bad());
                         }
                         if (!r.bad() && myid < INPUTNET_MAX_PEERS) {
                             /* Clamp: these drive our ring buffer and packet sizes. */

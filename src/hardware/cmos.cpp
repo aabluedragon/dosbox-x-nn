@@ -35,6 +35,7 @@
 #else
 #include "sys/time.h"
 #endif
+#include "inputnet.h"
 
 static struct {
     uint8_t regs[0x40];
@@ -89,7 +90,8 @@ uint8_t cmos_sync_sec = 0,cmos_sync_min = 0,cmos_sync_hour = 0;
 static void cmos_tick(void) {
     ++cmos.clock_time_t;
 
-    if (sync_time) {
+    /* Shared input (INPUTNET) machines keep the server's clock in step by emulated time only. */
+    if (sync_time && !INPUTNET_IsConnected()) {
         time_t now = time(NULL);
         long dt = (long)now - (long)cmos.clock_time_t;
         if (labs(dt) >= 5l) {
@@ -606,6 +608,23 @@ void CMOS_Init() {
 
     AddExitFunction(AddExitFunctionFuncPair(CMOS_Destroy),true);
     AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(CMOS_Reset));
+}
+
+/* Shared input (INPUTNET): the server hands its real-time clock to joining machines as broken-down
+ * fields, so that a different host time zone or clock does not change what the guest reads. */
+void CMOS_GetSharedClock(uint8_t out[16]) {
+    const uint64_t t = (uint64_t)cmos.clock_time_t;
+    out[0] = cmos.clock.sec; out[1] = cmos.clock.min; out[2] = cmos.clock.hour; out[3] = cmos.clock.weekday;
+    out[4] = cmos.clock.day; out[5] = cmos.clock.month; out[6] = (uint8_t)cmos.clock.year; out[7] = (uint8_t)(cmos.clock.year >> 8);
+    for (unsigned i=0;i < 8;i++) out[8+i] = (uint8_t)(t >> (8u*i));
+}
+
+void CMOS_SetSharedClock(const uint8_t in[16]) {
+    uint64_t t = 0;
+    for (unsigned i=0;i < 8;i++) t |= (uint64_t)in[8+i] << (8u*i);
+    cmos.clock.sec = in[0]; cmos.clock.min = in[1]; cmos.clock.hour = in[2]; cmos.clock.weekday = in[3];
+    cmos.clock.day = in[4]; cmos.clock.month = in[5]; cmos.clock.year = (uint16_t)(in[6] | (in[7] << 8));
+    cmos.clock_time_t = (time_t)t;
 }
 
 // save state support

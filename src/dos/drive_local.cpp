@@ -45,6 +45,13 @@
 #include "dosbox.h"
 #include "dos_inc.h"
 #include "inputnet.h"
+
+/* Shared input (INPUTNET) machines must answer the guest identically, but file times differ
+ * between computers (copied or downloaded at different times, other time zones). While a
+ * session runs, local folder drives report one fixed date and time for every file. */
+static inline void INPUTNET_FixFileTime(uint16_t &date,uint16_t &time) {
+    if (INPUTNET_IsConnected()) { date = DOS_PackDate(1996,1,1); time = DOS_PackTime(12,0,0); }
+}
 #include "drives.h"
 #include "logging.h"
 #include "support.h"
@@ -1436,6 +1443,7 @@ bool localDrive::MountedFileFindNext(DOS_DTA &dta,uint16_t id) {
 			find_time=6;
 			find_date=4;
 		}
+		INPUTNET_FixFileTime(find_date,find_time);
 
 		char find_name[DOS_NAMELENGTH_ASCII];
 		strcpy(find_name,entry_name.c_str());
@@ -2143,6 +2151,7 @@ again:
 		find_time=6; 
 		find_date=4;
 	}
+	INPUTNET_FixFileTime(find_date,find_time);
 	dta.SetResult(find_name,lfind_name,find_size,find_hsize,find_date,find_time,find_attr);
 	return true;
 }
@@ -2864,6 +2873,7 @@ bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
 				stat_block->time=DOS_PackTime((uint16_t)mtime->tm_hour,(uint16_t)mtime->tm_min,(uint16_t)mtime->tm_sec);
 				stat_block->date=DOS_PackDate((uint16_t)(mtime->tm_year+1900),(uint16_t)(mtime->tm_mon+1),(uint16_t)mtime->tm_mday);
 			}
+			INPUTNET_FixFileTime(stat_block->date,stat_block->time);
 			stat_block->size=(uint32_t)st.st_size;
 			return true;
 		}
@@ -2897,6 +2907,7 @@ bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
 		stat_block->time=DOS_PackTime((uint16_t)time->tm_hour,(uint16_t)time->tm_min,(uint16_t)time->tm_sec);
 		stat_block->date=DOS_PackDate((uint16_t)(time->tm_year+1900),(uint16_t)(time->tm_mon+1),(uint16_t)time->tm_mday);
 	}
+	INPUTNET_FixFileTime(stat_block->date,stat_block->time);
 	stat_block->size=(uint32_t)temp_stat.st_size;
 	return true;
 }
@@ -3425,6 +3436,7 @@ bool LocalFile::UpdateDateTimeFromHost(void) {
 	} else {
 		time=1;date=1;
 	}
+	INPUTNET_FixFileTime(date,time);
 	return true;
 }
 
