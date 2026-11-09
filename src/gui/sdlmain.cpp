@@ -10026,6 +10026,9 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         CALLBACK_Init(); /* <- NTS: This relies on ROM BIOS allocation and it must happen AFTER ROMBIOS init */
 #if C_DEBUG
         DEBUG_Init(); /* <- NTS: Relies on callback system */
+#else
+        void CALLBACK_ReserveDebuggerSlot(void);
+        CALLBACK_ReserveDebuggerSlot(); /* keep callback numbers identical to debugger builds */
 #endif
         Init_VGABIOS();
         VOODOO_Init();
@@ -10841,6 +10844,9 @@ fresh_boot:
 #if C_DEBUG
                 void DEBUG_ReinitCallback(void);
                 DEBUG_ReinitCallback();
+#else
+                void CALLBACK_ReserveDebuggerSlot(void);
+                CALLBACK_ReserveDebuggerSlot();
 #endif
             }
 

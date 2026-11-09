@@ -52,6 +52,34 @@ static Bitu illegal_handler(void) {
 	return 1;
 }
 
+/* Debugger builds allocate a "debugger" callback during startup (DEBUG_Init). Other builds reserve
+ * the same slot, so that callback numbers, which guest memory refers to, are identical whether or
+ * not the debugger is compiled in. Save states and shared input (INPUTNET) sessions carry guest
+ * memory from one build to another; a shifted callback table makes the receiving machine run the
+ * wrong native handlers. */
+static Bitu debugger_placeholder_handler(void) {
+	return CBRET_NONE;
+}
+
+void CALLBACK_ReserveDebuggerSlot(void) {
+	const Bitu cb = CALLBACK_Allocate();
+	CALLBACK_Setup(cb,&debugger_placeholder_handler,CB_RETF,"debugger");
+}
+
+/* FNV-1a over the allocated callback numbers and their descriptions. Two machines can only share
+ * guest memory (save states, INPUTNET) when these match. */
+uint32_t CALLBACK_LayoutSignature(void) {
+	uint32_t h = 2166136261u;
+	for (Bitu i=0;i < CB_MAX;i++) {
+		if (CallBack_Handlers[i] == &illegal_handler) continue;
+		h = (h ^ (uint32_t)i) * 16777619u;
+		for (const char *d = CallBack_Description[i] != NULL ? CallBack_Description[i] : ""; *d; d++)
+			h = (h ^ (uint8_t)*d) * 16777619u;
+		h = (h ^ 0xFFu) * 16777619u;
+	}
+	return h;
+}
+
 void DBG_CALLBACK_Dump(void) {
 	LOG_MSG("Callbacks");
     for (Bitu i=0;i < CB_MAX;i++) {

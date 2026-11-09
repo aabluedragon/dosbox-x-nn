@@ -102,6 +102,8 @@ bool inputnet_capture_active = false;
 /* Tunables                                                                   */
 /* ------------------------------------------------------------------------- */
 
+uint32_t CALLBACK_LayoutSignature(void);
+
 #define INPUTNET_DEFAULT_PORT   2130u   /* not an assigned port, but adjacent to IPX's 213 */
 #define INPUTNET_MAX_PEERS      8u
 #define INPUTNET_RING           256u    /* input frames kept per peer, power of two */
@@ -1316,6 +1318,9 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
     w.u8(inputnet_share_mouse ? 1 : 0);
     w.u8((uint8_t)inputnet_cyclesync);
     w.u32((uint32_t)state.size());
+    /* Lets the client refuse a state it would run differently (see CALLBACK_LayoutSignature). */
+    w.u32(CALLBACK_LayoutSignature());
+    LOG_MSG("INPUTNET: callback layout %08x",(unsigned int)CALLBACK_LayoutSignature());
     const size_t welcomelen = w.size();
     INPUTNET_SendRaw(p->addr,welcome,welcomelen);
 
@@ -1755,6 +1760,18 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                         const uint8_t shm = r.u8();
                         const uint8_t csy = r.u8();
                         total = r.u32();
+                        /* Older servers do not send the callback layout signature. */
+                        if (!r.bad() && r.remain() >= 4) {
+                            const uint32_t theirs = r.u32(), ours = CALLBACK_LayoutSignature();
+                            if (theirs != ours) {
+                                LOG_MSG("INPUTNET: callback layout %08x differs from the server's %08x",
+                                    (unsigned int)ours,(unsigned int)theirs);
+                                errmsg = "this DOSBox-X build is not compatible with the server's (its callback layout differs); use the same DOSBox-X build on every computer";
+                                INPUTNET_CloseLink(NULL,false);
+                                return false;
+                            }
+                            LOG_MSG("INPUTNET: callback layout %08x matches the server",(unsigned int)ours);
+                        }
                         if (!r.bad() && myid < INPUTNET_MAX_PEERS) {
                             /* Clamp: these drive our ring buffer and packet sizes. */
                             inputnet_selfid = myid;
