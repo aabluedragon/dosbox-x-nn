@@ -112,6 +112,22 @@ static uint8_t inputnet_pending_clock[16];
 static uint16_t inputnet_pending_year;
 static uint8_t inputnet_pending_month, inputnet_pending_day;
 static bool inputnet_have_pending_clock = false;
+/* Neither is the time stamp counter's base: the server rebases it at the snapshot and sends the
+ * count, and the client rebases to that count at the same emulated moment. */
+extern uint64_t rdtsc_count_base;
+extern pic_tickindex_t rdtsc_pic_base;
+void RDTSC_rebase();
+static uint64_t inputnet_pending_tsc = 0;
+static bool inputnet_have_pending_tsc = false;
+/* Nor is the VGA's frame pacing reference (an absolute emulated time): without it the joining
+ * machine schedules its vertical retrace up to 0.1 ms away from the server's. */
+extern double vga_fps, vga_mode_time_base;
+extern int vga_mode_frames_since_time_base;
+static double inputnet_pending_vga_fps = 0, inputnet_pending_vga_base = 0;
+static uint32_t inputnet_pending_vga_frames = 0;
+static bool inputnet_have_pending_vga = false;
+static uint64_t INPUTNET_DoubleBits(double d) { uint64_t u; memcpy(&u,&d,8); return u; }
+static double INPUTNET_BitsDouble(uint64_t u) { double d; memcpy(&d,&u,8); return d; }
 #include "dos_inc.h"
 
 /* Host volume labels (read from the host disk on Windows) differ between computers. Shared input
@@ -335,6 +351,7 @@ static uint32_t inputnet_frame = 0;
 static uint32_t inputnet_local_confirmed = 0;
 static unsigned int inputnet_tickaccum = 0;
 static bool inputnet_busy = false;          /* a blocking operation is in progress */
+static bool inputnet_in_tick = false;       /* running inside INPUTNET_TickHandler */
 static bool inputnet_tick_installed = false;
 
 /* Pending save state to apply at the next safe point */
@@ -1042,6 +1059,17 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
         dos.date.day = inputnet_pending_day;
         inputnet_have_pending_clock = false;
     }
+    if (ok && inputnet_have_pending_tsc) {
+        rdtsc_count_base = inputnet_pending_tsc;
+        rdtsc_pic_base = PIC_FullIndex();
+        inputnet_have_pending_tsc = false;
+    }
+    if (ok && inputnet_have_pending_vga) {
+        vga_fps = inputnet_pending_vga_fps;
+        vga_mode_time_base = inputnet_pending_vga_base;
+        vga_mode_frames_since_time_base = (int)inputnet_pending_vga_frames;
+        inputnet_have_pending_vga = false;
+    }
     remove(path.c_str());
     return ok;
 }
@@ -1335,6 +1363,19 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         return;
     }
 
+    /* Continue from the very bytes the new participant gets. A save state does
+     * not round-trip every detail exactly (event times are stored at a lower
+     * precision than they run at, and loading cuts the current round of timer
+     * tick handlers short), so a machine that kept running from its live state
+     * would drift a few CPU cycles away from one that loaded the copy. */
+    if (!state.empty() && !INPUTNET_ApplyStateSnapshot(state)) {
+        LOG_MSG("INPUTNET: could not reload the emulator state, dropping the new participant");
+        p->active = false;
+        inputnet_accepting = false;
+        if (INPUTNET_PeerCount() > 1) INPUTNET_StartSession();
+        return;
+    }
+
     uint8_t welcome[128];
     InputNetWriter w(welcome,sizeof(welcome));
     INPUTNET_BeginPacket(w,INPKT_WELCOME);
@@ -1356,6 +1397,13 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         w.u16(dos.date.year);
         w.u8(dos.date.month);
         w.u8(dos.date.day);
+        RDTSC_rebase();
+        w.u32((uint32_t)(rdtsc_count_base >> 32u));
+        w.u32((uint32_t)rdtsc_count_base);
+        const uint64_t fps = INPUTNET_DoubleBits(vga_fps), base = INPUTNET_DoubleBits(vga_mode_time_base);
+        w.u32((uint32_t)(fps >> 32u)); w.u32((uint32_t)fps);
+        w.u32((uint32_t)(base >> 32u)); w.u32((uint32_t)base);
+        w.u32((uint32_t)vga_mode_frames_since_time_base);
     }
     const size_t welcomelen = w.size();
     INPUTNET_SendRaw(p->addr,welcome,welcomelen);
@@ -1467,6 +1515,10 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
             const uint8_t *nb = r.bytes(namelen);
             if (nb != NULL) name.assign((const char*)nb,namelen);
             if (r.bad()) return;
+            /* Only take joins between timer ticks, where the state is saved and
+             * reloaded on both sides at the same point; the client says hello
+             * again until it is answered. */
+            if (!inputnet_in_tick) return;
             INPUTNET_ServerAcceptClient(from,name);
             break;
         }
@@ -1817,6 +1869,21 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                             inputnet_pending_day = r.u8();
                             inputnet_have_pending_clock = (clock != NULL && !r.bad());
                         }
+                        inputnet_have_pending_tsc = false;
+                        if (!r.bad() && r.remain() >= 8) {
+                            const uint32_t hi = r.u32(), lo = r.u32();
+                            inputnet_pending_tsc = ((uint64_t)hi << 32u) | lo;
+                            inputnet_have_pending_tsc = !r.bad();
+                        }
+                        inputnet_have_pending_vga = false;
+                        if (!r.bad() && r.remain() >= 20) {
+                            uint64_t fps = (uint64_t)r.u32() << 32u; fps |= r.u32();
+                            uint64_t base = (uint64_t)r.u32() << 32u; base |= r.u32();
+                            inputnet_pending_vga_frames = r.u32();
+                            inputnet_pending_vga_fps = INPUTNET_BitsDouble(fps);
+                            inputnet_pending_vga_base = INPUTNET_BitsDouble(base);
+                            inputnet_have_pending_vga = !r.bad();
+                        }
                         if (!r.bad() && myid < INPUTNET_MAX_PEERS) {
                             /* Clamp: these drive our ring buffer and packet sizes. */
                             inputnet_selfid = myid;
@@ -1935,6 +2002,7 @@ static void INPUTNET_FinishJoin(void) {
 static void INPUTNET_TickHandler(void) {
     if (inputnet_busy) return;
     inputnet_busy = true;
+    struct InTick { InTick() { inputnet_in_tick = true; } ~InTick() { inputnet_in_tick = false; } } in_tick;
 
     /* Deferred start from the config file or the command line. Wait until the
      * shell sits idle at its prompt: joining swaps in the server's emulator
