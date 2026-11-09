@@ -2833,14 +2833,16 @@ bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
 		if (mounted_host != NULL) {
 			struct stat st;
 			if (stat(mounted_host,&st) != 0) return false;
+			// struct stat's time_t is 32-bit on 32-bit MinGW; convert to the type each function takes.
 			const struct tm* mtime;
-			if((mtime=
 #if defined(__MINGW32__) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
-			_localtime64
+			const __time64_t mtime_value = st.st_mtime;
+			mtime = _localtime64(&mtime_value);
 #else
-			localtime
+			const time_t mtime_value = st.st_mtime;
+			mtime = localtime(&mtime_value);
 #endif
-			(&st.st_mtime))!=nullptr) {
+			if(mtime!=nullptr) {
 				stat_block->time=DOS_PackTime((uint16_t)mtime->tm_hour,(uint16_t)mtime->tm_min,(uint16_t)mtime->tm_sec);
 				stat_block->date=DOS_PackDate((uint16_t)(mtime->tm_year+1900),(uint16_t)(mtime->tm_mon+1),(uint16_t)mtime->tm_mday);
 			}
