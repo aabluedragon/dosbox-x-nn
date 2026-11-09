@@ -1,69 +1,61 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <!-- DOSBox-X-NN: chunky "DOS" letters and a cartoon "X" in the spirit of DOSBox-X,
-       with NukemNet's trefoil where the X's strokes cross. -->
+  <!-- DOSBox-X-NN: DOSBox-X's crossword of chunky letters ("DOS" down, "BOX" across), with NukemNet's
+       trefoil as the shared O, the green X of DOSBox-X, and "NN" in NukemNet's white and orange. -->
   <defs>
-    <linearGradient id="x" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#a8f0a0"/><stop offset="0.5" stop-color="#3fc83a"/><stop offset="1" stop-color="#1a8526"/>
-    </linearGradient>
-    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.75"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
-    </linearGradient>
-    <radialGradient id="disc" cx="0.4" cy="0.35" r="0.75">
-      <stop offset="0" stop-color="#3a4a9a"/><stop offset="1" stop-color="#141a40"/>
-    </radialGradient>
-    <radialGradient id="blade" cx="0.5" cy="0.3" r="0.8">
-      <stop offset="0" stop-color="#9cf59a"/><stop offset="0.6" stop-color="#3cbf3f"/><stop offset="1" stop-color="#176b22"/>
-    </radialGradient>
-    <radialGradient id="core" cx="0.38" cy="0.32" r="0.75">
-      <stop offset="0" stop-color="#fffbb0"/><stop offset="0.6" stop-color="#ffd12a"/><stop offset="1" stop-color="#c98a00"/>
-    </radialGradient>
-    <g id="arms">
-      <rect x="-31" y="-110" width="62" height="220" rx="20"/>
-      <rect x="-31" y="-110" width="62" height="220" rx="20" transform="rotate(90)"/>
-    </g>
-    <path id="b" d="M 0 -18 A 18 18 0 0 1 15.6 -9 L 41.6 -24 A 48 48 0 0 0 0 -48 Z"/>
-  
     <linearGradient id="dred" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8a5c"/><stop offset="1" stop-color="#d9361a"/></linearGradient>
-    <linearGradient id="dpurple" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#e08cff"/><stop offset="1" stop-color="#9a2fd0"/></linearGradient>
+    <linearGradient id="dblue" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7cc4ff"/><stop offset="1" stop-color="#1e6fd0"/></linearGradient>
     <linearGradient id="dyellow" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff7a0"/><stop offset="1" stop-color="#f2c400"/></linearGradient>
+    <linearGradient id="dgreen" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a8f0a0"/><stop offset="0.5" stop-color="#3fc83a"/><stop offset="1" stop-color="#1a8526"/></linearGradient>
+    <linearGradient id="nwhite" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#c9d1d9"/></linearGradient>
+    <linearGradient id="norange" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd27a"/><stop offset="1" stop-color="#e8901e"/></linearGradient>
+    <radialGradient id="disc" cx="0.4" cy="0.35" r="0.75"><stop offset="0" stop-color="#3a4a9a"/><stop offset="1" stop-color="#141a40"/></radialGradient>
+    <radialGradient id="blade" cx="0.5" cy="0.3" r="0.8"><stop offset="0" stop-color="#9cf59a"/><stop offset="0.6" stop-color="#3cbf3f"/><stop offset="1" stop-color="#176b22"/></radialGradient>
+    <radialGradient id="core" cx="0.38" cy="0.32" r="0.75"><stop offset="0" stop-color="#fffbb0"/><stop offset="0.6" stop-color="#ffd12a"/><stop offset="1" stop-color="#c98a00"/></radialGradient>
+    <path id="b" d="M 0 -9 A 9 9 0 0 1 7.8 -4.5 L 22.5 -13 A 26 26 0 0 0 0 -26 Z"/>
   </defs>
-  <g transform="translate(146 160) scale(0.8) translate(-126 -126)">
-  <g transform="translate(126 126) rotate(41)">
-    <use href="#arms" transform="translate(6 7) rotate(-41) translate(0 0) rotate(41)" fill="#000" opacity="0.35"/>
-    <use href="#arms" fill="#111" stroke="#111" stroke-width="20" stroke-linejoin="round"/>
-    <use href="#arms" fill="url(#x)"/>
-    <!-- cartoon gloss along each arm -->
-    <rect x="-22" y="-100" width="15" height="70" rx="7" fill="url(#gloss)"/>
-    <rect x="-22" y="-100" width="15" height="70" rx="7" fill="url(#gloss)" transform="rotate(90)"/>
-  </g>
-  <g transform="translate(126 126)">
-    <circle r="62" fill="#111"/>
-    <circle r="53" fill="url(#disc)"/>
-    <g fill="url(#blade)" stroke="#0a3a10" stroke-width="2.5" stroke-linejoin="round">
-      <use href="#b" transform="rotate(-30)"/>
-      <use href="#b" transform="rotate(90)"/>
-      <use href="#b" transform="rotate(210)"/>
-    </g>
-    <circle r="12.5" fill="url(#core)" stroke="#5a4200" stroke-width="2.5"/>
-    <ellipse cx="-18" cy="-28" rx="16" ry="7" fill="#fff" opacity="0.18" transform="rotate(-30)"/>
-  </g>
-  </g>
-  <!-- "DOS" in chunky cartoon letters: shadow, black outline, coloured stroke -->
   <g stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <g transform="translate(44 50) rotate(-12) scale(0.9)">
-      <path d="M -10 -27 V 27 H 0 A 27 27 0 0 0 0 -27 Z" stroke="#000" stroke-width="24" transform="translate(5 6)" opacity="0.3"/>
-      <path d="M -10 -27 V 27 H 0 A 27 27 0 0 0 0 -27 Z" stroke="#111" stroke-width="24"/>
-      <path d="M -10 -27 V 27 H 0 A 27 27 0 0 0 0 -27 Z" stroke="url(#dred)" stroke-width="12"/>
+    <!-- D (top of DOS) -->
+    <g transform="translate(116 42) rotate(-8)">
+      <path d="M -10 -24 V 24 H 0 A 24 24 0 0 0 0 -24 Z" stroke="#000" stroke-width="24" opacity="0.3" transform="translate(4 5)"/>
+      <path d="M -10 -24 V 24 H 0 A 24 24 0 0 0 0 -24 Z" stroke="#111" stroke-width="24"/>
+      <path d="M -10 -24 V 24 H 0 A 24 24 0 0 0 0 -24 Z" stroke="url(#dred)" stroke-width="12"/>
     </g>
-    <g transform="translate(106 42) rotate(6) scale(0.9)">
-      <circle r="23" stroke="#000" stroke-width="24" transform="translate(5 6)" opacity="0.3"/>
-      <circle r="23" stroke="#111" stroke-width="24"/>
-      <circle r="23" stroke="url(#dpurple)" stroke-width="12"/>
+    <!-- B (start of BOX) -->
+    <g transform="translate(46 122) rotate(-6)">
+      <path d="M -12 -24 V 24 H 2 C 22 24 22 1 2 1 H -12 M -12 1 H 0 C 17 1 17 -24 0 -24 H -12" stroke="#000" stroke-width="24" opacity="0.3" transform="translate(4 5)"/>
+      <path d="M -12 -24 V 24 H 2 C 22 24 22 1 2 1 H -12 M -12 1 H 0 C 17 1 17 -24 0 -24 H -12" stroke="#111" stroke-width="24"/>
+      <path d="M -12 -24 V 24 H 2 C 22 24 22 1 2 1 H -12 M -12 1 H 0 C 17 1 17 -24 0 -24 H -12" stroke="url(#dblue)" stroke-width="12"/>
     </g>
-    <g transform="translate(166 54) rotate(10) scale(0.9)">
-      <path d="M 17 -19 C 10 -31 -19 -29 -17 -11 C -15 3 17 -3 17 13 C 17 31 -12 32 -19 19" stroke="#000" stroke-width="24" transform="translate(5 6)" opacity="0.3"/>
-      <path d="M 17 -19 C 10 -31 -19 -29 -17 -11 C -15 3 17 -3 17 13 C 17 31 -12 32 -19 19" stroke="#111" stroke-width="24"/>
-      <path d="M 17 -19 C 10 -31 -19 -29 -17 -11 C -15 3 17 -3 17 13 C 17 31 -12 32 -19 19" stroke="url(#dyellow)" stroke-width="12"/>
+    <!-- X (end of BOX, DOSBox-X's green X) -->
+    <g transform="translate(196 118) rotate(6)">
+      <path d="M -26 -28 L 26 28 M 26 -28 L -26 28" stroke="#000" stroke-width="34" opacity="0.3" transform="translate(4 5)"/>
+      <path d="M -26 -28 L 26 28 M 26 -28 L -26 28" stroke="#111" stroke-width="34"/>
+      <path d="M -26 -28 L 26 28 M 26 -28 L -26 28" stroke="url(#dgreen)" stroke-width="20"/>
+      <path d="M -21 -23 L -8 -9" stroke="#fff" stroke-width="5" opacity="0.6"/>
     </g>
+    <!-- S (bottom of DOS) -->
+    <g transform="translate(112 204) rotate(8)">
+      <path d="M 16 -18 C 9 -29 -18 -27 -16 -10 C -14 3 16 -3 16 12 C 16 29 -11 30 -18 18" stroke="#000" stroke-width="24" opacity="0.3" transform="translate(4 5)"/>
+      <path d="M 16 -18 C 9 -29 -18 -27 -16 -10 C -14 3 16 -3 16 12 C 16 29 -11 30 -18 18" stroke="#111" stroke-width="24"/>
+      <path d="M 16 -18 C 9 -29 -18 -27 -16 -10 C -14 3 16 -3 16 12 C 16 29 -11 30 -18 18" stroke="url(#dyellow)" stroke-width="12"/>
+    </g>
+    <!-- NN (NukemNet) on its own tag, so it does not read as part of "DOS" -->
+    <g transform="translate(200 206) rotate(-6)">
+      <rect x="-44" y="-30" width="88" height="60" rx="14" fill="#000" opacity="0.3" transform="translate(4 5)" stroke="none"/>
+      <rect x="-44" y="-30" width="88" height="60" rx="14" fill="#1b1f3f" stroke="#111" stroke-width="6"/>
+      <rect x="-38" y="-24" width="76" height="48" rx="9" fill="none" stroke="#e8901e" stroke-width="3"/>
+      <path d="M -28 15 V -15 L -8 15 V -15" stroke="url(#nwhite)" stroke-width="9"/>
+      <path d="M 8 15 V -15 L 28 15 V -15" stroke="url(#norange)" stroke-width="9"/>
+    </g>
+  </g>
+  <!-- O shared by DOS and BOX: NukemNet's trefoil -->
+  <g transform="translate(118 122)">
+    <circle r="40" fill="#000" opacity="0.3" transform="translate(4 5)"/>
+    <circle r="40" fill="#111"/>
+    <circle r="33" fill="url(#disc)"/>
+    <g fill="url(#blade)" stroke="#0a3a10" stroke-width="2" stroke-linejoin="round">
+      <use href="#b" transform="rotate(-30)"/><use href="#b" transform="rotate(90)"/><use href="#b" transform="rotate(210)"/>
+    </g>
+    <circle r="7" fill="url(#core)" stroke="#5a4200" stroke-width="2"/>
   </g>
 </svg>
