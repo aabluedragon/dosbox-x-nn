@@ -35,7 +35,8 @@ UDPsocket ipxServerSocket;  // Listening server socket
 
 packetBuffer connBuffer[SOCKETTABLESIZE];
 
-uint8_t inBuffer[IPXBUFFERSIZE];
+// Booted guests send full Ethernet IPX frames; keep the DOS API limit unchanged.
+uint8_t inBuffer[1500];
 PackedIP ipconnguest[SOCKETTABLESIZE]; // the MAC address associated with each connection
 IPaddress ipconn[SOCKETTABLESIZE];  // Active TCP/IP connection 
 UDPsocket tcpconn[SOCKETTABLESIZE];  // Active TCP/IP connections
@@ -166,7 +167,7 @@ static void IPX_ServerLoop() {
 
 	inPacket.channel = -1;
 	inPacket.data = &inBuffer[0];
-	inPacket.maxlen = IPXBUFFERSIZE;
+	inPacket.maxlen = sizeof(inBuffer);
 
 
 	result = SDLNet_UDP_Recv(ipxServerSocket, &inPacket);

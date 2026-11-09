@@ -68,7 +68,8 @@ bool isIpxConnected;
 IPaddress ipxServConnIp;			// IPAddress for client connection to server
 UDPsocket ipxClientSocket;
 int UDPChannel;						// Channel used by UDP connection
-uint8_t recvBuffer[IPXBUFFERSIZE];	// Incoming packet buffer
+// Booted guests send full Ethernet IPX frames; keep the DOS API limit unchanged.
+uint8_t recvBuffer[1500];	// Incoming packet buffer
 
 static RealPt ipx_callback;
 
@@ -666,7 +667,7 @@ static void IPX_ClientLoop(void) {
 	int numrecv;
 	UDPpacket inPacket;
 	inPacket.data = (Uint8 *)recvBuffer;
-	inPacket.maxlen = IPXBUFFERSIZE;
+	inPacket.maxlen = sizeof(recvBuffer);
 	inPacket.channel = UDPChannel;
 
 	// Its amazing how much simpler UDP is than TCP
