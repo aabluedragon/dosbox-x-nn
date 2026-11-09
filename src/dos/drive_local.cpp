@@ -1419,14 +1419,16 @@ bool localDrive::MountedFileFindNext(DOS_DTA &dta,uint16_t id) {
 #endif
 
 		uint16_t find_date,find_time;
+		// struct stat's time_t is 32-bit on 32-bit MinGW; convert to the type each function takes.
 		const struct tm* time;
-		if((time=
 #if defined(__MINGW32__) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
-			_localtime64
+		const __time64_t mtime_value = st.st_mtime;
+		time = _localtime64(&mtime_value);
 #else
-			localtime
+		const time_t mtime_value = st.st_mtime;
+		time = localtime(&mtime_value);
 #endif
-			(&st.st_mtime))!=nullptr){
+		if(time!=nullptr){
 			find_date=DOS_PackDate((uint16_t)(time->tm_year+1900),(uint16_t)(time->tm_mon+1),(uint16_t)time->tm_mday);
 			find_time=DOS_PackTime((uint16_t)time->tm_hour,(uint16_t)time->tm_min,(uint16_t)time->tm_sec);
 		} else {

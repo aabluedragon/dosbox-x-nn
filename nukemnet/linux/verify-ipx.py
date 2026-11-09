@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix='nn-dosbox-ipx-', dir=args.temp_dir) as 
                         reply = peer.recv(2048)
                         if len(reply) >= 30 and reply[4] == ord('M'):
                             break
-                    except TimeoutError:
+                    except (TimeoutError, socket.timeout):  # distinct before Python 3.10
                         time.sleep(.1)
                 peers.append((peer, mac))
             packet = bytearray(1470)
