@@ -13,7 +13,7 @@ triple, loader = {
     'arm64': ('aarch64-linux-gnu', 'ld-linux-aarch64.so.1'),
     'armv7l': ('arm-linux-gnueabihf', 'ld-linux-armhf.so.3'),
 }[arch]
-release = '20261109-2'  # dosbox-x-nn commit 21a6f90 (keep in step with build.sh)
+release = '20261109-2'  # dosbox-x-nn commit 916cbda (keep in step with build.sh)
 root = Path('/build/portable')
 source = Path('/build/src')
 if root.exists():
@@ -80,7 +80,7 @@ Non-debug build with SDL 2.32.10, IPX, ENet serial, SLIRP, overlays, and the dyn
 The fork receives full Ethernet IPX frames (needed for Windows 95 multiplayer) and adds
 guest-controlled turbo so Windows 95 can restore normal speed before launching a game.
 The default is software video output for compatibility. Later -conf options can override it.
-Fork: https://github.com/aabluedragon/dosbox-x-nn (commit 21a6f90247870e046b6294c9a5076fd4d2d242c1)
+Fork: https://github.com/aabluedragon/dosbox-x-nn (commit 916cbdad9b45a785f1e44f51d9aac4079ed6a76c)
 Build recipe: https://storage.nukemnet.com/misc/dosbox-x-nn/dosbox-x-nn-linux-{arch}-build-{release}.zip
 DOSBox-X/SDL source: https://storage.nukemnet.com/misc/dosbox-x-nn/dosbox-x-nn-{release}-source.tar.gz
 Dependency sources: https://storage.nukemnet.com/misc/dosbox-x-nn/dosbox-x-nn-linux-{arch}-dependency-sources-{release}.tar.gz
