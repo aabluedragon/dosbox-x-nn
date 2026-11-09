@@ -10,4 +10,4 @@ for source in sorted(set(json.load(open('/build/portable/sources.json')).values(
     package, version = source.split(' ', 1)
     subprocess.run(['apt-get', 'source', '--download-only', '--only-source', package + '=' + version], check=True)
 PY
-tar -czf "/build/output/dosbox-x-nn-linux-${TARGET_ARCH:-armv7l}-dependency-sources-20261109.tar.gz" -C /build/dependency-sources .
+tar -czf "/build/output/dosbox-x-nn-linux-${TARGET_ARCH:-armv7l}-dependency-sources-$RELEASE.tar.gz" -C /build/dependency-sources .

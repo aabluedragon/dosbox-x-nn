@@ -24,7 +24,7 @@ jobs:
       - name: Check full-size IPX forwarding (x64)
         if: matrix.arch == 'x64'
         run: |
-          mkdir pkg && (cd pkg && unzip -q ../output/dosbox-x-nn-linux-x64-20261109.zip)
+          mkdir pkg && (cd pkg && unzip -q "$(ls ../output/dosbox-x-nn-linux-x64-*.zip | grep -v -- -build-)")
           # The build image has the libraries the binary links against.
           docker run --rm -v "$PWD:/w" nn-dosbox-x python3 /w/nukemnet/linux/verify-ipx.py /w/pkg/bin/dosbox-x
       - uses: actions/upload-artifact@v7.0.2
