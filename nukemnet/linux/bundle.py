@@ -71,7 +71,7 @@ exec "$base/lib/{loader}" --library-path "$base/lib" "$base/bin/dosbox-x" -conf 
 (root / 'dosbox-x').chmod(0o755)
 (root / 'portable.conf').write_text('[sdl]\noutput=surface\n')
 (root / 'sources.json').write_text(json.dumps(packages, indent=2) + '\n')
-(root / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true}\n')
+(root / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true}\n')
 (root / 'README.txt').write_text(f'''DOSBox-X (dosbox-x-nn {release}) — NukemNet portable Linux {arch} build
 Built from NukemNet's DOSBox-X fork, which is based on DOSBox-X 2026.10.01 and later upstream changes.
 Requires Linux {arch} and an X11/XWayland display. ARMv7 requires VFPv3-D16 (hard float).

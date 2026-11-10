@@ -16,7 +16,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   player runs an identical machine.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.
