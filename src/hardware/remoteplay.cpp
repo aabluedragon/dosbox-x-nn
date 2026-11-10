@@ -1208,8 +1208,10 @@ public:
             pumpAudio();
             if (redraw) present();
 
-            if (now - lastheard > timeout) {
-                error = welcomed ? "The connection to the host was lost." : "The host did not answer.";
+            /* Until the host answers, keep trying: its DOSBox-X may still be starting.
+             * The window title says "connecting..." and closing it gives up. */
+            if (welcomed && now - lastheard > timeout) {
+                error = "The connection to the host was lost.";
                 running = false;
             }
         }
