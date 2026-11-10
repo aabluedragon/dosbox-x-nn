@@ -889,7 +889,7 @@ public:
     }
 
     void updateTitle(void) {
-        std::string t = "DOSBox-X-NN remote play - " + target;
+        std::string t = "DOSBox-X-NN remote play"; /* the host's address stays private */
         if (!welcomed) t += " (connecting...)";
         else if (captured) t += " - Ctrl+F10 releases the mouse";
         SDL_SetWindowTitle(window,t.c_str());
