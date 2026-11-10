@@ -16,6 +16,7 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+#include "remoteplay.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1434,6 +1435,7 @@ void ttf_setlines(int cols, int lins) {
 }
 
 void ttf_switch_on(bool ss=true) {
+    if (remoteplay_streaming) return; /* remote play viewers need the regular output */
     if ((ss&&ttfswitch)||(!ss&&switch_output_from_ttf)) {
         checkcol = 0;
         /* Do NOT run a real-mode guest interrupt while the guest CPU is in

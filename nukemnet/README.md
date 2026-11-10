@@ -7,6 +7,13 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   fails to start. DOS IPX games are unaffected.
 - An integration-device turbo register (`0x55504303`) that lets a guest read and set turbo, which
   NukemNet's Windows 95 launcher uses to boot quickly and play at normal speed.
+- Inputnet, for games whose only multiplayer is two players on one PC. In the default remote play
+  mode (`[inputnet] mode = remote`) the host runs the game with `-inputnet-server <port>` and streams
+  its picture and sound. A joining player starts DOSBox-X with `-inputnet-connect <address:port>`,
+  which opens a viewer window instead of an emulated machine and sends keyboard and mouse input back,
+  so the joining player needs neither the game nor matching settings. `[inputnet] stream fps` caps
+  the frame rate to save upload bandwidth. `mode = lockstep` keeps the older mode in which every
+  player runs an identical machine.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
 `nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true}`.

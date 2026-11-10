@@ -39,6 +39,7 @@ bool remoteplay_streaming = false;
 #include "logging.h"
 #include "mouse.h"
 #include "programs.h"
+#include "render.h"   /* defines USE_TTF */
 #include "setup.h"
 
 #if defined(C_SDL2_NET) && C_SDL2_NET
@@ -52,6 +53,10 @@ bool remoteplay_streaming = false;
 #endif
 
 extern bool SDLNetInited;
+bool TTF_using(void);
+#if defined(USE_TTF)
+void ttf_switch_off(bool ss);
+#endif
 
 namespace {
 
@@ -492,6 +497,13 @@ void REMOTEPLAY_Poll(void) {
     while (SDLNet_UDP_Recv(host_sock,host_in) > 0)
         Host_HandlePacket(host_in->address,host_in->data,(size_t)host_in->len);
 
+#if defined(USE_TTF)
+    /* TrueType text output draws the DOS prompt without filling the frame
+     * the viewers are sent, so use the regular output while anyone watches
+     * (ttf_switch_on stays off meanwhile). */
+    if (remoteplay_streaming && TTF_using()) ttf_switch_off(false);
+#endif
+
     static uint32_t lastcheck = 0;
     if (now - lastcheck >= 100) {
         lastcheck = now;
@@ -506,7 +518,7 @@ void REMOTEPLAY_Poll(void) {
 
 void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pitch,
     const uint8_t *data,const uint8_t *pal) {
-    if (!host_running || !remoteplay_streaming || data == NULL) return;
+    if (!host_running || !remoteplay_streaming || data == NULL || TTF_using()) return;
 
     const unsigned bytespp = RP_BytesPerPixel(bpp);
     if (bytespp == 0 || width == 0 || height == 0 || width > 4096 || height > 4096) return;
