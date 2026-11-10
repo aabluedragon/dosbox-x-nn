@@ -7,6 +7,10 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   fails to start. DOS IPX games are unaffected.
 - An integration-device turbo register (`0x55504303`) that lets a guest read and set turbo, which
   NukemNet's Windows 95 launcher uses to boot quickly and play at normal speed.
+- `FILEMOUNT C:\DIR\NAME.EXT <host file>`, which maps one host file into a mounted folder without
+  copying it there. A real file of that name is hidden while the mapping exists (and left untouched);
+  the folder must exist. NukemNet uses it to add maps, mods and patched files to a game's folder for a
+  launch, while everything the game writes still goes to the real folder (capability `filemount`).
 - Inputnet, for games whose only multiplayer is two players on one PC. In the default remote play
   mode (`[inputnet] mode = remote`) the host runs the game with `-inputnet-server <port>` and streams
   its picture and sound. A joining player starts DOSBox-X with `-inputnet-connect <address:port>`,
@@ -16,7 +20,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   player runs an identical machine.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

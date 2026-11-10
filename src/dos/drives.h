@@ -140,6 +140,7 @@ protected:
 	std::map<uint16_t,std::pair<std::string,size_t> > mounted_file_search; /* dirCache search id -> (DOS dir key, next entry index) */
 	const char* GetMountedFileHost(const char* dosPath);
 	bool MountedFileFindNext(DOS_DTA &dta,uint16_t id);
+	bool MountedFileShadows(uint16_t id,const char* entry);
 };
 
 #if !defined(OSFREE)

@@ -3609,9 +3609,9 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 
 	const bool already = ldp->GetMountedFiles().count(localDrive::MountedFileKey(fullname)) != 0;
 
-	/* refuse to shadow a file or directory that really exists at the target */
+	/* a real file at the target is shadowed while the mapping exists; a real directory is never replaced */
 	uint16_t chk_attr;
-	if (!already && ldp->GetFileAttr(fullname,&chk_attr)) {
+	if (!already && ldp->GetFileAttr(fullname,&chk_attr) && (chk_attr & DOS_ATTR_DIRECTORY)) {
 		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_EXISTS"),(char)('A'+drive),fullname);
 		return;
 	}

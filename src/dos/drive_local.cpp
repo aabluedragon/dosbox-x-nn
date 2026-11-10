@@ -1391,6 +1391,15 @@ const char* localDrive::GetMountedFileHost(const char* dosPath) {
 	return (it != mounted_files.end()) ? it->second.c_str() : NULL;
 }
 
+/* A real directory entry that a mounted file replaces, so a listing shows the name once. */
+bool localDrive::MountedFileShadows(uint16_t id,const char* entry) {
+	if (mounted_files.empty()) return false;
+	const auto sit = mounted_file_search.find(id);
+	if (sit == mounted_file_search.end()) return false;
+	const std::string name = MountedFileKey(entry);
+	return mounted_files.count(sit->second.first.empty() ? name : sit->second.first + "\\" + name) != 0;
+}
+
 bool localDrive::MountedFileFindNext(DOS_DTA &dta,uint16_t id) {
 	if (mounted_files.empty()) return false;
 	const auto sit = mounted_file_search.find(id);
@@ -2064,6 +2073,7 @@ again:
 		return false;
 	}
 	if(!WildFileCmp(dir_ent,srch_pattern)&&!LWildFileCmp(ldir_ent,srch_pattern)) goto again;
+	if (MountedFileShadows(id,dir_ent)) goto again; /* listed with the mounted files instead */
 
 	strcpy(full_name,lfn_filefind_handle>=LFN_FILEFIND_MAX?srchInfo[id].srch_dir:(ldir[lfn_filefind_handle]!=""?ldir[lfn_filefind_handle].c_str():"\\"));
 	strcpy(lfull_name,full_name);
