@@ -62,12 +62,12 @@ namespace {
 const uint8_t RP_VERSION = 1;
 
 enum {
-    RP_HELLO    = 1,    /* viewer -> host: join request and keepalive (name) */
+    RP_HELLO    = 1,    /* viewer -> host: join request and keepalive (name, session id) */
     RP_WELCOME  = 2,    /* host -> viewer: accepted */
     RP_REFUSE   = 3,    /* host -> viewer: not accepted (reason) */
     RP_VIDEO    = 4,    /* host -> viewer: frame fragment */
     RP_AUDIO    = 5,    /* host -> viewer: sound */
-    RP_INPUT    = 6,    /* viewer -> host: numbered input events */
+    RP_INPUT    = 6,    /* viewer -> host: session id, numbered input events */
     RP_INPUTACK = 7,    /* host -> viewer: highest input event applied */
     RP_KEYREQ   = 8,    /* viewer -> host: please send a key frame */
     RP_BYE      = 9     /* either way: leaving (reason) */
@@ -181,6 +181,7 @@ struct Viewer {
     bool active = false;
     IPaddress addr = { 0, 0 };
     std::string name;
+    uint32_t session = 0;               /* random per viewer start: a restart from the same address is a new player */
     uint32_t lastheard = 0;
     uint32_t applied = 0;               /* highest input event applied */
     bool keydown[KBD_LAST];
@@ -317,7 +318,14 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
 
     if (type == RP_HELLO) {
         std::string name = r.str();
+        const uint32_t session = r.u32();
+        if (!r.ok) return;
         if (name.empty()) name = "player";
+        if (v != NULL && v->session != session) {
+            /* Same address, new DOSBox-X: forget the old one's input. */
+            Host_DropViewer(*v,"rejoined",false);
+            v = NULL;
+        }
         if (v == NULL) {
             for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
                 if (!viewers[i].active) { v = &viewers[i]; break; }
@@ -331,6 +339,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             v->active = true;
             v->addr = from;
             v->name = name;
+            v->session = session;
             v->applied = 0;
             v->buttons = 0;
             memset(v->keydown,0,sizeof(v->keydown));
@@ -351,6 +360,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
 
     switch (type) {
         case RP_INPUT: {
+            if (r.u32() != v->session) break;
             const uint32_t first = r.u32();
             const unsigned count = r.u8();
             for (unsigned i=0;i < count && r.ok;i++) {
@@ -611,9 +621,10 @@ void REMOTEPLAY_AddAudio(unsigned rate,unsigned frames,const int16_t *samples) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Viewer                                                                     */
+/* Viewer (needs the SDL2 build: its own window, renderer and audio queue)    */
 /* ------------------------------------------------------------------------- */
 
+#if defined(C_SDL2)
 namespace {
 
 KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
@@ -699,6 +710,7 @@ public:
     bool running = true, welcomed = false, fullscreen = false, captured = false;
     std::string error;
     uint32_t lastheard = 0, lasthello = 0, started = 0;
+    uint32_t session = 0;
     unsigned timeout = 10000;
 
     /* video */
@@ -739,6 +751,7 @@ public:
         const char *user = getenv("USERNAME");
         if (user == NULL) user = getenv("USER");
         w.str(user ? user : "player");
+        w.u32(session);
         send(w);
         lasthello = SDL_GetTicks();
     }
@@ -798,6 +811,7 @@ public:
     void sendInput(void) {
         if (pending.empty() || !welcomed) return;
         Writer w(RP_INPUT);
+        w.u32(session);
         w.u32(pending.front().seq);
         const size_t countpos = w.len;
         w.u8(0);
@@ -1157,6 +1171,8 @@ public:
 
     void loop(void) {
         started = lastheard = SDL_GetTicks();
+        session = (uint32_t)rand() ^ ((uint32_t)rand() << 16) ^ (uint32_t)SDL_GetPerformanceCounter() ^ (uint32_t)(uintptr_t)this;
+        if (session == 0) session = 1;
         sendHello();
         while (running) {
             SDLNet_CheckSockets(set,2);
@@ -1210,16 +1226,6 @@ public:
 
 } /* namespace */
 
-bool REMOTEPLAY_ViewerRequested(std::string &address) {
-    Section_prop *sec = static_cast<Section_prop*>(control->GetSection("inputnet"));
-    if (sec == NULL) return false;
-    if (std::string(sec->Get_string("mode")) == "lockstep") return false;
-    address = control->opt_inputnet_connect;
-    if (address.empty() && control->opt_inputnet_server < 0 && sec->Get_bool("inputnet"))
-        address = sec->Get_string("connect");
-    return !address.empty();
-}
-
 int REMOTEPLAY_RunViewer(const std::string &address) {
     ViewerSession s;
     s.target = address;
@@ -1234,6 +1240,24 @@ int REMOTEPLAY_RunViewer(const std::string &address) {
     }
     return 0;
 }
+#else
+int REMOTEPLAY_RunViewer(const std::string &) {
+    LOG_MSG("INPUTNET: joining a remote play session needs the SDL2 build of DOSBox-X");
+    fprintf(stderr,"Joining a remote play session needs the SDL2 build of DOSBox-X.\n");
+    return 1;
+}
+#endif /* C_SDL2 */
+
+bool REMOTEPLAY_ViewerRequested(std::string &address) {
+    Section_prop *sec = static_cast<Section_prop*>(control->GetSection("inputnet"));
+    if (sec == NULL) return false;
+    if (std::string(sec->Get_string("mode")) == "lockstep") return false;
+    address = control->opt_inputnet_connect;
+    if (address.empty() && control->opt_inputnet_server < 0 && sec->Get_bool("inputnet"))
+        address = sec->Get_string("connect");
+    return !address.empty();
+}
+
 
 #else /* !C_INPUTNET */
 
