@@ -36,5 +36,10 @@ Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, e
    when it starts, so avoid pushing while they run.
 3. Repackage the Windows and macOS artifacts with `nukemnet/repackage.py`, copy the Linux outputs, and
    upload everything with a `dosbox-x-nn-<release>.sha256` file to `storage.nukemnet.com/misc/dosbox-x-nn/`.
-4. Update the release and SHA-256 values in NukemNet's `app/src/lib/dosbox-x-download.ts` and `RELEASE` in
-   `site/src/lib/dosbox-x-nn.ts` (`DOSBOX_X_NN_RELEASE`). nukemnet.com's Downloads page links to these packages.
+4. Write the signed release list from the checksum file in NukemNet's `app/` folder,
+   `node snippets/dosbox-x-nn-manifest.js dosbox-x-nn-<release>.sha256 latest.json` (it uses the app update signing
+   key), and upload it as `storage.nukemnet.com/misc/dosbox-x-nn/latest.json` after the packages. Running NukemNet
+   clients offer the release from it (a Yes/No prompt), without a NukemNet update.
+5. Update `RELEASE` in `site/src/lib/dosbox-x-nn.ts` (`DOSBOX_X_NN_RELEASE`), which nukemnet.com's Downloads page links
+   to. The next NukemNet release should also pin it with its SHA-256 values in `app/src/lib/dosbox-x-download.ts`
+   (`PINNED_DOSBOX_X_NN`): new installations and players whose release check fails get that one.
