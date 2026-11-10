@@ -2464,7 +2464,9 @@ public:
         if (inputnet_remote) {
             REMOTEPLAY_Configure(section);
             addinputnet = true;
-            if (inputnet_auto_server != -1) REMOTEPLAY_StartServer((uint16_t)inputnet_auto_server);
+            if (inputnet_auto_server != -1 && !REMOTEPLAY_StartServer((uint16_t)inputnet_auto_server) &&
+                remoteplay_screen_hidden)
+                GFX_RemotePlaySetScreenHidden(false); /* nobody can watch: show what happened */
             return;
         }
 
@@ -2524,6 +2526,7 @@ void INPUTNET_Init(void) {
 
     AddExitFunction(AddExitFunctionFuncPair(INPUTNET_ShutDown),true);
     AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(INPUTNET_OnReset));
+    REMOTEPLAY_Init();
 }
 
 #else /* !C_INPUTNET */

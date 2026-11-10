@@ -18,9 +18,22 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   so the joining player needs neither the game nor matching settings. `[inputnet] stream fps` caps
   the frame rate to save upload bandwidth. `mode = lockstep` keeps the older mode in which every
   player runs an identical machine.
+- Remote play guard (capability `inputnetShellGuard`): a viewer's keyboard and mouse go straight to
+  the emulated keyboard and mouse (never to DOSBox-X's hotkeys or menus), and only while a DOS program
+  other than a command shell runs, or a guest system was booted. At the DOS prompt (DOSBox-X's shell,
+  a nested `COMMAND`, or a COMMAND.COM/4DOS/NDOS loaded from disk) and while DOSBox-X's own programs
+  (MOUNT, CONFIG, ...) run, viewer input is dropped, keys viewers hold are released, and when a game
+  ends the keystrokes still waiting in the keyboard buffers are discarded. The log says
+  `INPUTNET: remote input blocked/allowed` at each change.
+- Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
+  `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
+  notice, on the surface output), opens it without taking the focus or covering the window in front,
+  and keeps its sound off this machine's speakers, while the viewers still get the full picture and
+  sound. NukemNet uses it for the second copy that plays for a remote player. *Video > Show screen
+  (remote play)* (mapper event `rpscreen`, no default key) shows or hides the picture at any time.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

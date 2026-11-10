@@ -1435,7 +1435,7 @@ void ttf_setlines(int cols, int lins) {
 }
 
 void ttf_switch_on(bool ss=true) {
-    if (remoteplay_streaming) return; /* remote play viewers need the regular output */
+    if (remoteplay_streaming || remoteplay_screen_hidden) return; /* remote play viewers need the regular output */
     if ((ss&&ttfswitch)||(!ss&&switch_output_from_ttf)) {
         checkcol = 0;
         /* Do NOT run a real-mode guest interrupt while the guest CPU is in

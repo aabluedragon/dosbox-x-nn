@@ -898,6 +898,12 @@ static void SDLCALL MIXER_CallBack(void * userdata, Uint8 *stream, int len) {
             drop--;
         }
     }
+
+    /* Remote play host with the local screen hidden: the viewers still get the
+     * sound (REMOTEPLAY_AddAudio in MIXER_MixData, before this output stage),
+     * this machine's speakers only get silence. */
+    if (GCC_UNLIKELY(remoteplay_screen_hidden))
+        memset(stream, 0, (size_t)len);
 }
 
 #if C_EMSCRIPTEN

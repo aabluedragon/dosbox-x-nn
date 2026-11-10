@@ -5376,6 +5376,8 @@ void DOSBOX_SetupConfigSections(void) {
                       "  remote:   only the host runs the game. It sends its picture and sound to the other\n"
                       "            players, whose DOSBox-X only shows them and sends keyboard and mouse input\n"
                       "            back. Joining players need neither the game nor the same configuration.\n"
+                      "            Their keyboard and mouse only reach DOS programs (games) or a booted guest\n"
+                      "            system, never the DOS prompt or DOSBox-X's own commands (MOUNT, ...).\n"
                       "  lockstep: every player runs the same machine and receives everyone's input. Uses\n"
                       "            little bandwidth, but every session must have identical files, DOSBox-X\n"
                       "            version and configuration, or the machines drift apart.");
@@ -5383,6 +5385,12 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("stream fps",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("Remote play: the most frames per second the host sends. 0 sends every frame the\n"
                    "game draws. Lower it to save upload bandwidth.");
+
+    Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
+    Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"
+                    "option -inputnet-hidescreen), the window stays small, without the picture, does not take\n"
+                    "the focus when it opens and plays no sound here; the players still get the full picture\n"
+                    "and sound. \"Show screen (remote play)\" in the Video menu shows or hides it at any time.");
 
     Pint = secprop->Add_int("port",Property::Changeable::WhenIdle, 2130);
     Pint->Set_help("Default UDP port used by the INPUTNET command.");

@@ -365,6 +365,16 @@ static void RENDER_StartLineHandler(const void * s) {
     }
 }
 
+/* Remote play with the local screen hidden: keep only the source cache up to
+ * date (REMOTEPLAY_AddFrame sends it to the viewers) and draw nothing, so the
+ * window can stay small while the viewers get every frame at full size. */
+static void RENDER_RemotePlayCacheLineHandler(const void * s) {
+    if (render.scale.inLine >= render.src.height) return;
+    if (s) memcpy(render.scale.cacheRead, s, render.scale.cachePitch);
+    render.scale.cacheRead += render.scale.cachePitch;
+    render.scale.inLine++;
+}
+
 static void RENDER_FinishLineHandler(const void * s) {
     if (render.disablerender)
         return;
@@ -422,6 +432,16 @@ bool RENDER_StartUpdate(void) {
     render.scale.outPitch = 0;
     Scaler_ChangedLines[0] = 0;
     Scaler_ChangedLineIndex = 0;
+    if (GCC_UNLIKELY(remoteplay_screen_hidden) && sdl.desktop.want_type != SCREEN_TTF) {
+        if (render.scale.clearCache) { /* window exposed or reset: repaint the placeholder */
+            render.scale.clearCache = false;
+            GFX_RemotePlayDrawHidden();
+        }
+        if (!scalerSourceCacheBuffer) return false;
+        RENDER_DrawLine = RENDER_RemotePlayCacheLineHandler;
+        render.updating = true;
+        return true;
+    }
     if (GCC_UNLIKELY( render.scale.clearCache) ) {
 //      LOG_MSG("Clearing cache");
         //Will always have to update the screen with this one anyway, so let's update already

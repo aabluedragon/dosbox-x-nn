@@ -536,6 +536,7 @@ static const char *def_menu_video_pc98[] =
 /* video menu ("VideoMenu") */
 static const char *def_menu_video[] =
 {
+    "mapper_rpscreen", /* Inputnet remote play hosts only; first, so a small hidden-screen window reaches it */
 #if defined(WIN32) || defined(MACOSX)
     "VideoPreventCaptureMenu",
 #endif

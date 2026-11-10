@@ -17,11 +17,14 @@
 
 #include "dosbox.h"
 #include "remoteplay.h"
+#include "menu.h"
 
 bool remoteplay_streaming = false;
+bool remoteplay_screen_hidden = false;
 
 #if C_INPUTNET
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,8 +37,11 @@ bool remoteplay_streaming = false;
 #include <zlib.h>
 
 #include "SDL.h"
+#include "bios.h"
 #include "control.h"
+#include "dos_inc.h"
 #include "keyboard.h"
+#include "mem.h"
 #include "logging.h"
 #include "mouse.h"
 #include "programs.h"
@@ -53,6 +59,9 @@ bool remoteplay_streaming = false;
 #endif
 
 extern bool SDLNetInited;
+extern bool dos_kernel_disabled;
+extern uint16_t shell_psp;
+bool PROGRAMS_IsRunningInternalPSP(uint16_t psp);
 bool TTF_using(void);
 #if defined(USE_TTF)
 void ttf_switch_off(bool ss);
@@ -219,6 +228,71 @@ unsigned aud_rate = 0;
 uint64_t stat_bytes = 0;
 uint32_t stat_frames = 0, stat_keys = 0;
 
+/* Remote input guard. Viewers must never be able to type DOS commands on the
+ * host (DEL, FORMAT, MOUNT, ... on host folders mounted as drives), so their
+ * keyboard and mouse only reach the machine while a DOS program other than a
+ * command shell runs, or once a guest system was booted. */
+bool guard_guest_os = false;    /* BOOT started a guest system: no DOS kernel, no shell */
+int guard_state = -1;           /* -1 not checked yet, 0 allowed, 1 blocked */
+bool guard_typed = false;       /* a viewer pressed keys since remote input was last blocked */
+
+std::string Guard_ProcessName(uint16_t psp) {
+    std::string name = DOS_MCB((uint16_t)(psp - 1)).GetFileName();
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    for (size_t i=0;i < name.size();i++) name[i] = (char)toupper((unsigned char)name[i]);
+    return name;
+}
+
+/* True while the current DOS process is DOSBox-X's shell (the first one or a
+ * nested COMMAND.COM), one of its internal programs (MOUNT, CONFIG, ...), a
+ * command shell loaded from disk, or while DOS is not up yet. This also covers
+ * the moments between a game's exit and the batch file's next line, Ctrl+C or
+ * Ctrl+Break back to the prompt and "Terminate batch job (Y/N)?". */
+bool Guard_Blocked(void) {
+    if (dos_kernel_disabled) return !guard_guest_os;
+    const uint16_t psp = dos.psp();
+    if (psp < 0x40 || psp == shell_psp || PROGRAMS_IsRunningInternalPSP(psp)) return true;
+    const std::string name = Guard_ProcessName(psp);
+    return name == "COMMAND" || name == "4DOS" || name == "NDOS";
+}
+
+/* Throws away keystrokes that are waiting in the keyboard controller and in
+ * the BIOS keyboard buffer (where a game that read them through the BIOS may
+ * have left them), so the DOS prompt never reads what a viewer typed. */
+void Guard_FlushKeyboard(void) {
+    KEYBOARD_ClrBuffer();
+    if (!IS_PC98_ARCH) {
+        mem_writeb(BIOS_KEYBOARD_TOKEN,0);  /* Alt+numpad code being typed */
+        mem_writew(BIOS_KEYBOARD_BUFFER_TAIL,mem_readw(BIOS_KEYBOARD_BUFFER_HEAD));
+    }
+}
+
+void Host_ReleaseInput(Viewer &v);
+
+void Guard_Update(void) {
+    const bool blocked = Guard_Blocked();
+    if (guard_state == (blocked ? 1 : 0)) return;
+    guard_state = blocked ? 1 : 0;
+    if (blocked) {
+        if (guard_typed) Guard_FlushKeyboard();
+        guard_typed = false;
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
+            if (viewers[i].active) Host_ReleaseInput(viewers[i]);
+        LOG_MSG("INPUTNET: remote input blocked: the DOS prompt or a DOSBox-X command is in the foreground");
+    }
+    else if (dos_kernel_disabled) {
+        LOG_MSG("INPUTNET: remote input allowed: a guest system is running");
+    }
+    else {
+        LOG_MSG("INPUTNET: remote input allowed: %s is running",Guard_ProcessName(dos.psp()).c_str());
+    }
+}
+
+bool Guard_Allows(void) {
+    Guard_Update();
+    return guard_state == 0;
+}
+
 void Host_SendTo(const IPaddress &addr,const uint8_t *data,size_t len) {
     if (host_sock == NULL || host_out == NULL || len > (size_t)host_out->maxlen) return;
     memcpy(host_out->data,data,len);
@@ -273,6 +347,9 @@ void Host_DropViewer(Viewer &v,const char *reason,bool notify) {
     Host_UpdateStreaming();
 }
 
+/* Viewer input goes straight to the emulated keyboard and mouse (below the
+ * mapper), so it can never trigger DOSBox-X's own hotkeys or menu functions.
+ * It is dropped while the remote input guard blocks it. */
 void Host_ApplyEvent(Viewer &v,Reader &r) {
     const uint8_t type = r.u8();
     switch (type) {
@@ -280,14 +357,17 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const uint16_t key = r.u16();
             const bool pressed = r.u8() != 0;
             if (!r.ok || key == 0 || key >= (uint16_t)KBD_LAST) return;
+            /* Print Screen makes the BIOS print the screen on the host's printer emulation. */
+            if (key == (uint16_t)KBD_printscreen || !Guard_Allows()) return;
             v.keydown[key] = pressed;
+            if (pressed) guard_typed = true;
             KEYBOARD_AddKeyRaw((KBD_KEYS)key,pressed);
             break;
         }
         case RPEV_MBUTTON: {
             const uint8_t button = r.u8();
             const bool pressed = r.u8() != 0;
-            if (!r.ok || button >= 32) return;
+            if (!r.ok || button >= 32 || !Guard_Allows()) return;
             if (pressed) { v.buttons |= 1u << button; Mouse_ButtonPressedRaw(button); }
             else { v.buttons &= ~(1u << button); Mouse_ButtonReleasedRaw(button); }
             break;
@@ -295,13 +375,13 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
         case RPEV_MMOVE: {
             const float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
             const bool emulate = r.u8() != 0;
-            if (!r.ok) return;
+            if (!r.ok || !Guard_Allows()) return;
             Mouse_CursorMovedRaw(xrel,yrel,x,y,emulate);
             break;
         }
         case RPEV_WHEEL: {
             const int16_t amount = (int16_t)r.u16();
-            if (!r.ok) return;
+            if (!r.ok || !Guard_Allows()) return;
             Mouse_WheelMovedRaw(amount);
             break;
         }
@@ -448,7 +528,10 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     host_port = port;
     enc_needkey = true;
     enc_haveprev = false;
+    guard_state = -1;
+    guard_typed = false;
     LOG_MSG("INPUTNET: remote play: waiting for players on UDP port %u",(unsigned)port);
+    REMOTEPLAY_UpdateMenu();
     return true;
 }
 
@@ -461,10 +544,43 @@ void REMOTEPLAY_StopServer(const char *reason) {
     remoteplay_streaming = false;
     send_queue.clear();
     LOG_MSG("INPUTNET: remote play server stopped");
+    REMOTEPLAY_UpdateMenu();
 }
 
 bool REMOTEPLAY_ServerRunning(void) {
     return host_running;
+}
+
+void REMOTEPLAY_ProcessEnded(void) {
+    if (host_running) Guard_Update();
+}
+
+static void REMOTEPLAY_GuestBoot(Section *) {
+    guard_guest_os = true;
+}
+
+static void REMOTEPLAY_DOSBoot(Section *) {
+    guard_guest_os = false;
+}
+
+void REMOTEPLAY_Init(void) {
+    AddVMEventFunction(VM_EVENT_GUEST_OS_BOOT,AddVMEventFunctionFuncPair(REMOTEPLAY_GuestBoot));
+    AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(REMOTEPLAY_DOSBoot));
+    AddVMEventFunction(VM_EVENT_DOS_BOOT,AddVMEventFunctionFuncPair(REMOTEPLAY_DOSBoot));
+}
+
+bool REMOTEPLAY_HostRequested(void) {
+    Section_prop *sec = static_cast<Section_prop *>(control->GetSection("inputnet"));
+    if (sec == NULL || std::string(sec->Get_string("mode")) == "lockstep") return false;
+    if (control->opt_inputnet_server >= 0) return true;
+    if (!control->opt_inputnet_connect.empty() || !sec->Get_bool("inputnet")) return false;
+    return std::string(sec->Get_string("connect")).empty() && !std::string(sec->Get_string("startserver")).empty();
+}
+
+bool REMOTEPLAY_HideScreenRequested(void) {
+    Section_prop *sec = static_cast<Section_prop *>(control->GetSection("inputnet"));
+    if (sec == NULL) return false;
+    return (control->opt_inputnet_hidescreen || !sec->Get_bool("hostscreen")) && REMOTEPLAY_HostRequested();
 }
 
 void REMOTEPLAY_Status(Program *prog) {
@@ -494,14 +610,18 @@ void REMOTEPLAY_Poll(void) {
     if (now == lastpoll && (send_queue.empty() || send_budget == 0)) return;
     lastpoll = now;
 
+    /* Releases what viewers hold as soon as a game has ended, even when no
+     * input arrives. */
+    Guard_Update();
+
     while (SDLNet_UDP_Recv(host_sock,host_in) > 0)
         Host_HandlePacket(host_in->address,host_in->data,(size_t)host_in->len);
 
 #if defined(USE_TTF)
     /* TrueType text output draws the DOS prompt without filling the frame
      * the viewers are sent, so use the regular output while anyone watches
-     * (ttf_switch_on stays off meanwhile). */
-    if (remoteplay_streaming && TTF_using()) ttf_switch_off(false);
+     * or the local screen is hidden (ttf_switch_on stays off meanwhile). */
+    if ((remoteplay_streaming || remoteplay_screen_hidden) && TTF_using()) ttf_switch_off(false);
 #endif
 
     static uint32_t lastcheck = 0;
@@ -1276,6 +1396,10 @@ bool REMOTEPLAY_ViewerRequested(std::string &address) {
 #else /* !C_INPUTNET */
 
 void REMOTEPLAY_Configure(Section_prop *) { }
+void REMOTEPLAY_Init(void) { }
+void REMOTEPLAY_ProcessEnded(void) { }
+bool REMOTEPLAY_HostRequested(void) { return false; }
+bool REMOTEPLAY_HideScreenRequested(void) { return false; }
 bool REMOTEPLAY_StartServer(uint16_t) { return false; }
 void REMOTEPLAY_StopServer(const char *) { }
 bool REMOTEPLAY_ServerRunning(void) { return false; }
@@ -1287,3 +1411,10 @@ bool REMOTEPLAY_ViewerRequested(std::string &) { return false; }
 int REMOTEPLAY_RunViewer(const std::string &) { return 1; }
 
 #endif
+
+/* The "Show screen (remote play)" menu item only appears on remote play hosts. */
+void REMOTEPLAY_UpdateMenu(void) {
+    if (!mainMenu.item_exists("mapper_rpscreen")) return;
+    const bool host = remoteplay_screen_hidden || REMOTEPLAY_ServerRunning() || REMOTEPLAY_HostRequested();
+    mainMenu.get_item("mapper_rpscreen").hide(!host).check(!remoteplay_screen_hidden).refresh_item(mainMenu);
+}

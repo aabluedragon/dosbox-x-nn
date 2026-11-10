@@ -17,6 +17,7 @@
  */
 
 
+#include <algorithm>
 #include <vector>
 #include <sstream>
 #include <ctype.h>
@@ -149,6 +150,15 @@ void PROGRAMS_MakeFile(char const * const name,PROGRAMS_Main * main,const char *
 	internal_program = false;
 }
 
+/* PSP segments of the internal programs (the shell started as COMMAND.COM,
+ * MOUNT, CONFIG, ...) that are running right now, innermost last. Inputnet
+ * remote play (remoteplay.cpp) never lets viewers type into these. */
+static std::vector<uint16_t> running_internal_psps;
+
+bool PROGRAMS_IsRunningInternalPSP(uint16_t psp) {
+	return std::find(running_internal_psps.begin(),running_internal_psps.end(),psp) != running_internal_psps.end();
+}
+
 static Bitu PROGRAMS_Handler(void) {
 	/* This sets up everything for a program start up call */
 	Bitu size=sizeof(uint8_t);
@@ -165,14 +175,17 @@ static Bitu PROGRAMS_Handler(void) {
 	PROGRAMS_Main * handler = internal_progs[index]->main;
 	(*handler)(&new_program);
 
+	running_internal_psps.push_back(dos.psp());
 	try { /* "BOOT" can throw an exception (int(2)) */
 		new_program->Run();
 		delete new_program;
 	}
 	catch (...) { /* well if it happened, free the program anyway to avert memory leaks */
 		delete new_program;
+		running_internal_psps.pop_back();
 		throw; /* pass it on */
 	}
+	running_internal_psps.pop_back();
 
 	return CBRET_NONE;
 }

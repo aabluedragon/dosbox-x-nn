@@ -33,6 +33,7 @@
 #include "cpu.h"
 #include "menu.h"
 #include "crc32.h"
+#include "remoteplay.h"
 #if defined(OSFREE)
 #include "exepack.h"
 #include "exepackv1.h"
@@ -152,6 +153,7 @@ void DOS_Terminate(uint16_t pspseg,bool tsr,uint8_t exitcode) {
 	// Free memory owned by process
 	if (!tsr) DOS_FreeProcessMemory(pspseg);
 	DOS_UpdatePSPName();
+	REMOTEPLAY_ProcessEnded();
 
 	dos.errorcode=0;
 

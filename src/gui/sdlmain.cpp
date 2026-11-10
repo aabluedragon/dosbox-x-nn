@@ -1322,6 +1322,7 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
 
     if (paused) strcat(title," PAUSED");
     if (ticksLocked) strcat(title, " TURBO");
+    if (remoteplay_screen_hidden && strlen(title) < sizeof(title) - 20) strcat(title, " (screen hidden)");
 #if C_DEBUG
     if (IsDebuggerActive()) strcat(title," DEBUGGER");
 #endif
@@ -1999,7 +2000,8 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
                                       width, height,
                                       (GFX_IsFullscreen() ? (sdl.desktop.full.display_res ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_FULLSCREEN) : 0)
                                       | ((screenType == SCREEN_OPENGL) ? SDL_WINDOW_OPENGL : 0) | (maximize && !TTF_using()? SDL_WINDOW_MAXIMIZED : 0)
-                                      | SDL_WINDOW_SHOWN | (SDL2_resize_enable ? SDL_WINDOW_RESIZABLE : 0)
+                                      | (remoteplay_screen_hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) /* shown later without focus */
+                                      | (SDL2_resize_enable ? SDL_WINDOW_RESIZABLE : 0)
                                       | (dpi_aware_enable ? SDL_WINDOW_ALLOW_HIGHDPI : 0));
         if (sdl.window) {
             GFX_SetTitle(-1, -1, -1, false); //refresh title.
@@ -2345,6 +2347,129 @@ void drawmenu(Bitu) {
 void RENDER_Reset(void);
 void UpdateUserCursorScreenDimensions(void);
 
+/* ------------------------------------------------------------------------- */
+/* Inputnet remote play: hiding the local screen of a streaming host          */
+/* ------------------------------------------------------------------------- */
+
+/* Size of the placeholder below the menu bar while the screen is hidden. */
+static const Bitu RP_HIDDEN_WIDTH = 480;
+static const Bitu RP_HIDDEN_HEIGHT = 64;
+
+#if defined(LINUX) && C_X11 && defined(C_SDL2)
+bool GFX_RemotePlayX11MapQuietly(void);
+#endif
+void OutputSettingMenuUpdate(void);
+
+/* Draws the placeholder (plain background, two lines of text) on the window
+ * surface, below the SDL drawn menu bar. */
+void GFX_RemotePlayDrawHidden(void) {
+    if (!remoteplay_screen_hidden || sdl.desktop.type != SCREEN_SURFACE || sdl.surface == NULL || sdl.updating)
+        return;
+
+    SDL_Surface *surf = sdl.surface;
+    const int bpp = surf->format->BytesPerPixel;
+    if (bpp != 2 && bpp != 4) return;
+
+    int top = 0;
+#if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW
+    if (mainMenu.isVisible() && !sdl.desktop.fullscreen) top = (int)mainMenu.menuBox.h;
+#endif
+    if (top >= surf->h) return;
+    if (SDL_MUSTLOCK(surf) && SDL_LockSurface(surf) != 0) return;
+
+    const uint32_t bg = SDL_MapRGB(surf->format, 0x24, 0x2b, 0x38);
+    const uint32_t colors[2] = { SDL_MapRGB(surf->format, 0xe8, 0xec, 0xf2), SDL_MapRGB(surf->format, 0x9a, 0xa4, 0xb4) };
+    const char *lines[2] = { "Streaming to the remote player. Screen hidden.",
+                             "Video menu: \"Show screen (remote play)\" shows it." };
+
+    uint8_t *pixels = (uint8_t*)surf->pixels;
+    for (int y = top; y < surf->h; y++) {
+        uint8_t *row = pixels + (size_t)y * (size_t)surf->pitch;
+        for (int x = 0; x < surf->w; x++) {
+            if (bpp == 4) ((uint32_t*)row)[x] = bg;
+            else ((uint16_t*)row)[x] = (uint16_t)bg;
+        }
+    }
+
+    /* 8x16 VGA font */
+    const int lineh = 18, total = 2 * lineh;
+    for (int l = 0; l < 2; l++) {
+        const int len = (int)strlen(lines[l]);
+        int x0 = (surf->w - len * 8) / 2;
+        if (x0 < 4) x0 = 4;
+        const int y0 = top + (surf->h - top - total) / 2 + l * lineh;
+        for (int c = 0; c < len; c++) {
+            const uint8_t *glyph = &int10_font_16[(uint8_t)lines[l][c] * 16];
+            for (int gy = 0; gy < 16; gy++) {
+                const int y = y0 + gy;
+                if (y < top || y >= surf->h) continue;
+                uint8_t *row = pixels + (size_t)y * (size_t)surf->pitch;
+                for (int gx = 0; gx < 8; gx++) {
+                    const int x = x0 + c * 8 + gx;
+                    if (x >= surf->w || !(glyph[gy] & (0x80 >> gx))) continue;
+                    if (bpp == 4) ((uint32_t*)row)[x] = colors[l];
+                    else ((uint16_t*)row)[x] = (uint16_t)colors[l];
+                }
+            }
+        }
+    }
+
+    if (SDL_MUSTLOCK(surf)) SDL_UnlockSurface(surf);
+#if defined(C_SDL2)
+    SDL_UpdateWindowSurface(sdl.window);
+#else
+    SDL_Flip(surf);
+#endif
+}
+
+/* Shows the window that was created hidden, without taking the focus or
+ * raising it above the window in front (the host's own game). */
+static void GFX_RemotePlayShowWindowQuietly(void) {
+#if defined(C_SDL2)
+    if (sdl.window == NULL || !(SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN)) return;
+# if defined(LINUX) && C_X11
+    /* SDL would map it raised (and focus it without a window manager) */
+    if (GFX_RemotePlayX11MapQuietly()) return;
+# endif
+# ifdef SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN
+    SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+# endif
+    SDL_ShowWindow(sdl.window);
+# ifdef SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN
+    SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "0");
+# endif
+# if defined(WIN32) && !defined(HX_DOS)
+    {
+        HWND self = GetHWND(), front = GetForegroundWindow();
+        if (self != NULL && front != NULL && front != self)
+            SetWindowPos(self, front, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+# endif
+#endif
+}
+
+void GFX_RemotePlaySetScreenHidden(bool hidden) {
+    if (hidden == remoteplay_screen_hidden) return;
+    if (hidden && !REMOTEPLAY_ServerRunning() && !REMOTEPLAY_HostRequested()) return;
+    if (hidden && sdl.desktop.fullscreen) GFX_SwitchFullScreen();
+
+    remoteplay_screen_hidden = hidden;
+    LOG_MSG("INPUTNET: remote play: local screen %s", hidden ? "hidden" : "shown");
+#if defined(C_SDL2)
+    if (!hidden && sdl.window != NULL && (SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN))
+        SDL_ShowWindow(sdl.window);
+#endif
+    GFX_ResetScreen();
+    GFX_SetTitle(-1, -1, -1, false);
+    REMOTEPLAY_UpdateMenu();
+    OutputSettingMenuUpdate();
+}
+
+static void RemotePlayScreen_mapper_shortcut(bool pressed) {
+    if (!pressed) return;
+    GFX_RemotePlaySetScreenHidden(!remoteplay_screen_hidden);
+}
+
 Bitu GFX_SetSize(Bitu width, Bitu height, Bitu flags, double scalex, double scaley, GFX_CallBack_t callback)
 {
 
@@ -2356,6 +2481,31 @@ Bitu GFX_SetSize(Bitu width, Bitu height, Bitu flags, double scalex, double scal
         E_Exit("GFX_SetSize with width=%d height=%d zero dimensions not allowed",(int)width,(int)height);
         return 0;
     }
+
+    /* Remote play host with the local screen hidden: the emulated picture only
+     * goes to the viewers (RENDER_StartUpdate keeps just the source frame), and
+     * the window becomes a small placeholder drawn through the surface output. */
+    const bool rp_hidden = remoteplay_screen_hidden && !TTF_using();
+    Bitu rp_resize_w = 0, rp_resize_h = 0;
+#if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW
+    extern unsigned int min_sdldraw_menu_height;
+    const unsigned int rp_menu_min_h = min_sdldraw_menu_height;
+#endif
+    if (rp_hidden) {
+        width = RP_HIDDEN_WIDTH;
+        height = RP_HIDDEN_HEIGHT;
+        scalex = scaley = 1.0;
+        if (sdl.desktop.want_type != SCREEN_SURFACE) OUTPUT_SURFACE_Select();
+        /* neither a size the user dragged the window to, nor the room the SDL
+         * drawn menus normally want, may make the placeholder big */
+        rp_resize_w = userResizeWindowWidth;
+        rp_resize_h = userResizeWindowHeight;
+        userResizeWindowWidth = userResizeWindowHeight = 0;
+#if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW
+        min_sdldraw_menu_height = RP_HIDDEN_HEIGHT;
+#endif
+    }
+
     bool diff = width != sdl.draw.width || height != sdl.draw.height;
 
     if (sdl.updating)
@@ -2463,6 +2613,16 @@ Bitu GFX_SetSize(Bitu width, Bitu height, Bitu flags, double scalex, double scal
 
     if (retFlags)
         GFX_Start();
+
+    if (rp_hidden) {
+        userResizeWindowWidth = rp_resize_w;
+        userResizeWindowHeight = rp_resize_h;
+#if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW
+        min_sdldraw_menu_height = rp_menu_min_h;
+#endif
+        GFX_RemotePlayDrawHidden();
+        GFX_RemotePlayShowWindowQuietly();
+    }
 
     if (!sdl.mouse.autoenable && !sdl.mouse.locked)
         SDL_ShowCursor(sdl.mouse.autolock?SDL_DISABLE:SDL_ENABLE);
@@ -3918,6 +4078,15 @@ static void GUI_StartUp() {
 
     maximize = section->Get_bool("maximize");
 
+    /* A remote play host that does not show its picture here (-inputnet-hidescreen,
+     * [inputnet] hostscreen=false) opens a small window, without fullscreen, that
+     * does not take the focus from the host's own game window. */
+    remoteplay_screen_hidden = REMOTEPLAY_HideScreenRequested();
+    if (remoteplay_screen_hidden) {
+        maximize = false;
+        LOG_MSG("INPUTNET: remote play: the local screen is hidden (Video menu: \"Show screen (remote play)\")");
+    }
+
     sdl.desktop.fullscreen=false;
     sdl.wait_on_error=section->Get_bool("waitonerror");
 
@@ -4228,6 +4397,9 @@ static void GUI_StartUp() {
     MAPPER_AddHandler(&HideMenu_mapper_shortcut, MK_escape, MMODHOST, "togmenu", "Toggle menu bar", &item);
     item->set_text("Hide/show menu bar");
 
+    MAPPER_AddHandler(&RemotePlayScreen_mapper_shortcut, MK_nothing, 0, "rpscreen", "Show screen (remote play)", &item);
+    item->set_text("Show screen (remote play)").check(!remoteplay_screen_hidden);
+
     const int display = section->Get_int("display");
     int numscreen = GetNumScreen();
     if (display >= 0 && display <= numscreen)
@@ -4242,6 +4414,9 @@ static void GUI_StartUp() {
 		output=GetDefaultOutput();
 		LOG_MSG("The default output for the video system: %s", output.c_str());
 	}
+
+    /* the hidden remote play screen is a placeholder drawn on the surface output */
+    if (remoteplay_screen_hidden) output = "surface";
 
     const std::string emulation = section->Get_string("mouse_emulation");
     if (emulation == "always")
@@ -7643,6 +7818,7 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -socket <socketnum>                     Specify the socket number for null-modem emulation\n");
             fprintf(stderr,"  -inputnet-server <port>                 Host a shared keyboard/mouse session on this UDP port\n");
             fprintf(stderr,"  -inputnet-connect <address[:port]>      Join the shared keyboard/mouse session hosted there\n");
+            fprintf(stderr,"  -inputnet-hidescreen                    Remote play host: do not show the picture on this machine\n");
             fprintf(stderr,"  -savedir <path>                         Set path for the save slots\n");
             fprintf(stderr,"  -defaultdir <path>                      Set the default working path for DOSBox-X\n");
             fprintf(stderr,"  -defaultconf                            Use the default config settings for DOSBox-X\n");
@@ -7752,6 +7928,9 @@ bool DOSBOX_parse_argv() {
         }
         else if (optname == "inputnet-connect") {
             if (!control->cmdline->NextOptArgv(control->opt_inputnet_connect)) return false;
+        }
+        else if (optname == "inputnet-hidescreen") {
+            control->opt_inputnet_hidescreen = true;
         }
         else if (optname == "time-limit") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
@@ -8296,6 +8475,59 @@ bool VM_PowerOn() {
 # include <X11/Xlib.h>
 # include <X11/Xatom.h>
 # include "SDL_syswm.h"
+#endif
+
+#if defined(LINUX) && C_X11 && defined(C_SDL2)
+/* Maps the hidden remote play window without raising it, and with an EWMH
+ * user time of 0, which asks the window manager not to focus it. */
+bool GFX_RemotePlayX11MapQuietly(void) {
+    SDL_SysWMinfo wmi;
+    SDL_VERSION(&wmi.version);
+    if (sdl.window == NULL || !SDL_GetWindowWMInfo(sdl.window, &wmi) || wmi.subsystem != SDL_SYSWM_X11)
+        return false;
+    Display *dpy = wmi.info.x11.display;
+    Window win = wmi.info.x11.window;
+    if (dpy == NULL || win == 0) return false;
+    long usertime = 0;
+    XChangeProperty(dpy, win, XInternAtom(dpy, "_NET_WM_USER_TIME", False), XA_CARDINAL, 32,
+        PropModeReplace, (unsigned char*)&usertime, 1);
+    XMapWindow(dpy, win);
+    XFlush(dpy);
+
+    /* Window managers may still put a new window on top: once it is mapped,
+     * lower it (enough without a window manager), then ask to restack it just
+     * below the active window. */
+    for (int i = 0; i < 100; i++) {
+        XWindowAttributes attr;
+        if (!XGetWindowAttributes(dpy, win, &attr) || attr.map_state == IsViewable) break;
+        SDL_Delay(5);
+    }
+    XLowerWindow(dpy, win);
+    Window root = DefaultRootWindow(dpy), active = 0;
+    Atom type = None;
+    int format = 0;
+    unsigned long count = 0, after = 0;
+    unsigned char *data = NULL;
+    if (XGetWindowProperty(dpy, root, XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False), 0, 1, False, XA_WINDOW,
+            &type, &format, &count, &after, &data) == Success && data != NULL) {
+        if (type == XA_WINDOW && format == 32 && count == 1) active = (Window)((unsigned long*)data)[0];
+        XFree(data);
+    }
+    if (active != 0 && active != win) {
+        XEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.xclient.type = ClientMessage;
+        ev.xclient.window = win;
+        ev.xclient.message_type = XInternAtom(dpy, "_NET_RESTACK_WINDOW", False);
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = 2; /* source indication (honored as a direct request) */
+        ev.xclient.data.l[1] = (long)active;
+        ev.xclient.data.l[2] = Below;
+        XSendEvent(dpy, root, False, SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    }
+    XFlush(dpy);
+    return true;
+}
 #endif
 
 #if !defined(C_EMSCRIPTEN)
@@ -9986,7 +10218,8 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             /* Some extra SDL Functions */
             Section_prop* sdl_sec = static_cast<Section_prop*>(control->GetSection("sdl"));
 
-            if ((control->opt_fullscreen || sdl_sec->Get_bool("fullscreen")) && sdl.desktop.want_type != SCREEN_GAMELINK) {
+            if ((control->opt_fullscreen || sdl_sec->Get_bool("fullscreen")) && sdl.desktop.want_type != SCREEN_GAMELINK &&
+                !remoteplay_screen_hidden /* a hidden remote play screen must not cover the host's own game */) {
                 LOG(LOG_MISC, LOG_DEBUG)("Going fullscreen immediately, during startup");
 
 #if defined(WIN32)
@@ -10305,6 +10538,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
         /* why show PC-98 options in IBM PC emulation mode? */
         mainMenu.get_item("VideoPC98Menu").hide(!IS_PC98_ARCH).refresh_item(mainMenu);
+        REMOTEPLAY_UpdateMenu();
 
 #if !defined(C_EMSCRIPTEN)
         mainMenu.get_item("show_console").check(showconsole_init).refresh_item(mainMenu);
