@@ -26,6 +26,7 @@
 #include "dosbox.h"
 #include "logging.h"
 #include "video.h"
+#include "remoteplay.h"
 #include "render.h"
 #include "setup.h"
 #include "control.h"
@@ -506,6 +507,10 @@ void RENDER_EndUpdate( bool abort ) {
             CAPTURE_AddImage( render.src.width, render.src.height, render.src.bpp, pitch,
                 flags, fps, (uint8_t*)scalerSourceCacheBuffer, (uint8_t*)&render.pal.rgb );
         }
+        /* Remote play: the source cache holds the whole emulated frame. */
+        if (GCC_UNLIKELY(remoteplay_streaming) && !abort && scalerSourceCacheBuffer)
+            REMOTEPLAY_AddFrame( (unsigned)render.src.width, (unsigned)render.src.height, (unsigned)render.src.bpp,
+                (unsigned)render.scale.cachePitch, (const uint8_t*)scalerSourceCacheBuffer, (const uint8_t*)&render.pal.rgb );
         if ( render.scale.outWrite) {
             GFX_EndUpdate( abort? NULL : Scaler_ChangedLines );
             render.frameskip.hadSkip[render.frameskip.index] = 0;

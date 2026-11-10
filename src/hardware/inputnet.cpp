@@ -52,6 +52,7 @@
 
 #include "dosbox.h"
 #include "inputnet.h"
+#include "remoteplay.h"
 
 /* Fast path flag. Defined unconditionally so that the keyboard/mouse code does
  * not need to know whether networking support was compiled in at all. */
@@ -319,6 +320,7 @@ struct InputNetPeer {
 
 /* Configuration */
 static bool inputnet_enabled = false;
+static bool inputnet_remote = false;        /* "mode = remote": stream from the host instead of lockstep */
 static bool inputnet_share_keyboard = true;
 static bool inputnet_share_mouse = true;
 static bool inputnet_sync_state = true;
@@ -2149,6 +2151,44 @@ public:
         ~InProgram() { inputnet_in_program = false; }
     };
 
+    /* "mode = remote" */
+    void RunRemote(void) {
+        if (strcasecmp("startserver",temp_line.c_str()) == 0) {
+            if (REMOTEPLAY_ServerRunning()) {
+                WriteOut("A remote play server is already running in this DOSBox-X session.\n");
+                return;
+            }
+            uint16_t port = inputnet_default_port;
+            if (cmd->FindCommand(1,temp_line,/*remove*/true))
+                port = (uint16_t)strtol(temp_line.c_str(),NULL,10);
+            if (REMOTEPLAY_StartServer(port)) {
+                WriteOut("Remote play server started on UDP port %u.\n",(unsigned)port);
+                WriteOut("Other players join by starting DOSBox-X with\n");
+                WriteOut("-inputnet-connect <this machine's address>:%u\n",(unsigned)port);
+            }
+            else {
+                WriteOut("Remote play server failed to start.\n");
+            }
+            return;
+        }
+        if (strcasecmp("stopserver",temp_line.c_str()) == 0) {
+            if (!REMOTEPLAY_ServerRunning()) {
+                WriteOut("No remote play server is running in this DOSBox-X session.\n");
+                return;
+            }
+            REMOTEPLAY_StopServer("stopped by the host");
+            WriteOut("Remote play server stopped.\n");
+            return;
+        }
+        if (strcasecmp("status",temp_line.c_str()) == 0) {
+            REMOTEPLAY_Status(this);
+            return;
+        }
+        WriteOut("This DOSBox-X session uses remote play (\"mode = remote\" in [inputnet]).\n");
+        WriteOut("To join a game, start DOSBox-X with -inputnet-connect <address>:<port>.\n");
+        WriteOut("Here only INPUTNET STARTSERVER, STOPSERVER and STATUS are available.\n");
+    }
+
     void Run(void) override {
         InProgram inprogram;
 
@@ -2174,6 +2214,11 @@ public:
                 else {
                     HelpCommand(temp_line.c_str());
                 }
+                return;
+            }
+
+            if (inputnet_remote) {
+                RunRemote();
                 return;
             }
 
@@ -2413,6 +2458,16 @@ public:
         inputnet_buttondown = 0;
         inputnet_autostart_done = false;
 
+        /* Remote play: only this machine runs the game; joining players watch
+         * its picture and send their input (see remoteplay.cpp). */
+        inputnet_remote = std::string(section->Get_string("mode")) != "lockstep";
+        if (inputnet_remote) {
+            REMOTEPLAY_Configure(section);
+            addinputnet = true;
+            if (inputnet_auto_server != -1) REMOTEPLAY_StartServer((uint16_t)inputnet_auto_server);
+            return;
+        }
+
         if (!inputnet_tick_installed) {
             TIMER_AddTickHandler(&INPUTNET_TickHandler);
             inputnet_tick_installed = true;
@@ -2425,6 +2480,7 @@ public:
     }
 
     ~INPUTNETModule() {
+        REMOTEPLAY_StopServer(NULL);
         if (inputnet_tick_installed) {
             TIMER_DelTickHandler(&INPUTNET_TickHandler);
             inputnet_tick_installed = false;

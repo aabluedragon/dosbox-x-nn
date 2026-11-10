@@ -1537,6 +1537,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\hardware\innova.cpp" />
     <ClCompile Include="..\src\hardware\iohandler.cpp" />
     <ClCompile Include="..\src\hardware\inputnet.cpp" />
+    <ClCompile Include="..\src\hardware\remoteplay.cpp" />
     <ClCompile Include="..\src\hardware\ipx.cpp" />
     <ClCompile Include="..\src\hardware\ipxserver.cpp" />
     <ClCompile Include="..\src\hardware\joystick.cpp" />
@@ -1791,6 +1792,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\include\ioapi.h" />
     <ClInclude Include="..\include\iowin32.h" />
     <ClInclude Include="..\include\inputnet.h" />
+    <ClInclude Include="..\include\remoteplay.h" />
     <ClInclude Include="..\include\ipx.h" />
     <ClInclude Include="..\include\ipxserver.h" />
     <ClInclude Include="..\include\joystick.h" />

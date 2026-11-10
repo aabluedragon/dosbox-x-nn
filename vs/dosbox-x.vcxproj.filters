@@ -444,6 +444,9 @@
     <ClCompile Include="..\src\hardware\inputnet.cpp">
       <Filter>Sources\hardware</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\hardware\remoteplay.cpp">
+      <Filter>Sources\hardware</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\hardware\ipx.cpp">
       <Filter>Sources\hardware</Filter>
     </ClCompile>
@@ -2280,6 +2283,9 @@
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\inputnet.h">
+      <Filter>Includes</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\remoteplay.h">
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\ipx.h">

@@ -158,6 +158,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include "bios_disk.h"
 #include "inout.h"
 #include "jfont.h"
+#include "remoteplay.h"
 #include "render.h"
 #include "../dos/cdrom.h"
 #include "../dos/drives.h"
@@ -6083,6 +6084,7 @@ bool gfx_in_mapper = false;
 #endif
 
 void GFX_Events() {
+    REMOTEPLAY_Poll();
 #if C_EMSCRIPTEN
     /* CALLBACK_Idle calls this for every guest idle poll - over a million
      * times a second at cycles=max - and everything below (SDL_GetTicks,
@@ -9817,6 +9819,14 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
 	CheckPreventCap();
 	LOG_MSG("Prevent capture: %u",preventcap);
+
+        /* Joining a remote play session: show the host's game instead of
+         * starting an emulated machine. */
+        {
+            std::string remote_address;
+            if (REMOTEPLAY_ViewerRequested(remote_address))
+                return REMOTEPLAY_RunViewer(remote_address);
+        }
 
         /* -- SDL init */
 #if C_EMSCRIPTEN

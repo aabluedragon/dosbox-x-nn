@@ -5369,6 +5369,21 @@ void DOSBOX_SetupConfigSections(void) {
                     "used; see the \"cycle sync\" option below.");
     Pbool->SetBasic(true);
 
+    const char* inputnetmodes[] = { "remote", "lockstep", 0 };
+    Pstring = secprop->Add_string("mode",Property::Changeable::WhenIdle, "remote");
+    Pstring->Set_values(inputnetmodes);
+    Pstring->Set_help("How the players share the game.\n"
+                      "  remote:   only the host runs the game. It sends its picture and sound to the other\n"
+                      "            players, whose DOSBox-X only shows them and sends keyboard and mouse input\n"
+                      "            back. Joining players need neither the game nor the same configuration.\n"
+                      "  lockstep: every player runs the same machine and receives everyone's input. Uses\n"
+                      "            little bandwidth, but every session must have identical files, DOSBox-X\n"
+                      "            version and configuration, or the machines drift apart.");
+
+    Pint = secprop->Add_int("stream fps",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("Remote play: the most frames per second the host sends. 0 sends every frame the\n"
+                   "game draws. Lower it to save upload bandwidth.");
+
     Pint = secprop->Add_int("port",Property::Changeable::WhenIdle, 2130);
     Pint->Set_help("Default UDP port used by the INPUTNET command.");
 
