@@ -37,4 +37,4 @@ Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, e
 3. Repackage the Windows and macOS artifacts with `nukemnet/repackage.py`, copy the Linux outputs, and
    upload everything with a `dosbox-x-nn-<release>.sha256` file to `storage.nukemnet.com/misc/dosbox-x-nn/`.
 4. Update the release and SHA-256 values in NukemNet's `app/src/lib/dosbox-x-download.ts` and `RELEASE` in
-   `site/src/components/DosboxFork.tsx`. nukemnet.com's Downloads page links to these packages.
+   `site/src/lib/dosbox-x-nn.ts` (`DOSBOX_X_NN_RELEASE`). nukemnet.com's Downloads page links to these packages.
