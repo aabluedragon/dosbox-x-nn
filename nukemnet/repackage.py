@@ -43,7 +43,7 @@ for folder in keep:
     executable = (stage / folder / 'dosbox-x.app') if macos else (stage / folder / 'dosbox-x.exe')
     if not executable.exists():
         sys.exit(f'{executable} is missing')
-    (stage / folder / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true}\n')
+    (stage / folder / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true}\n')
 license_file = next((root / name for name in ['COPYING', 'COPYING.txt'] if (root / name).is_file()), None)
 if license_file:
     shutil.copy2(license_file, stage / 'COPYING')

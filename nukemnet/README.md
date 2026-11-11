@@ -42,6 +42,14 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   could not be turned); on Windows the hidden screen no longer resizes itself on every frame (the native
   menu bar wrapped in the narrow window, the placeholder blinked and no video reached the viewers); a
   viewer's error message no longer opens behind its window.
+- Remote play over slower links and SVGA (capability `inputnetAdaptive`): viewers report the newest frame
+  they decoded and the video fragments that arrived; the host encodes each frame against a frame every
+  viewer has (a lost frame no longer stops the picture until the next key frame), paces video to the rate
+  the link takes (less on loss, more while there is none, from 1.5 MB/s) and skips frames instead of
+  queueing them. 32-bit frames of 256-colour modes (DOSBox-X draws SVGA 8-bit modes such as Shadow
+  Warrior's 800x600 that way) go out as palette and indices, and a frame that compresses better alone
+  than as a difference goes out as a key frame. Viewers and hosts without it keep working together with
+  it, as before. Before, an 800x600 game froze the viewer's picture after its first frames.
 - Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
   `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
   notice, on the surface output), opens it minimized and without the focus, so it never covers the
@@ -53,7 +61,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the picture at any time.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.
