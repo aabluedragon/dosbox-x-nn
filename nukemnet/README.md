@@ -29,6 +29,9 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the host's emulated mouse by relative motion even though the host window has not captured the mouse:
   the INT 33h position no longer snaps back to the host's own cursor, and the motion counters (function
   0Bh) advance, so mouse-driven DOS games (Bonus, for one) work for the remote player.
+- Wayland without XWayland: with no X display (`DISPLAY` unset) and a Wayland one, DOSBox-X-NN uses SDL's Wayland
+  video driver instead of failing at start ("Can't init SDL x11 not available"); X11 (XWayland included) stays the
+  default. The Linux packages' SDL is built with Wayland, loaded from the system when used.
 - FILEMOUNT from asar archives (capability `filemountAsar`): a host path inside an Electron asar archive
   (`.../resources/app.asar/res/gameres/IPXSETUP.EXE`, where NukemNet keeps its DOS helpers) is read from the
   archive: packed files are extracted to a private temporary file (deleted when DOSBox-X exits) and mapped,

@@ -9983,7 +9983,16 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             const char* env_driver = getenv("SDL_VIDEODRIVER");
             if(!env_driver || !*env_driver) {
 #if defined(LINUX) && !defined(__ANDROID__)
-                putenv("SDL_VIDEODRIVER=x11"); // default to x11 (xwayland) on Linux
+                /* default to x11 (xwayland) on Linux, but a Wayland session without an X server (no DISPLAY) has
+                 * only Wayland: forcing x11 there stopped DOSBox-X at start ("Can't init SDL x11 not available") */
+                const char* x_display = getenv("DISPLAY");
+                const char* wl_display = getenv("WAYLAND_DISPLAY");
+                if ((!x_display || !*x_display) && wl_display && *wl_display) {
+                    putenv(const_cast<char*>("SDL_VIDEODRIVER=wayland"));
+                    LOG_MSG("SDL: no X display (DISPLAY is not set), using the Wayland video driver");
+                }
+                else
+                    putenv(const_cast<char*>("SDL_VIDEODRIVER=x11"));
 #elif defined(WIN32)
                 /* hack: Encourage SDL to use windib if not otherwise specified */
 #if defined(C_SDL2)

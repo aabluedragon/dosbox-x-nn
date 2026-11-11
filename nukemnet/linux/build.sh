@@ -22,8 +22,10 @@ export CFLAGS="-O2 $CPU_FLAGS"
 export CXXFLAGS="$CFLAGS"
 export PKG_CONFIG_LIBDIR=/usr/lib/$TARGET_TRIPLE/pkgconfig:/usr/share/pkgconfig
 cd /build/sdl
+# Wayland as well as X11: DOSBox-X-NN picks Wayland when there is no X display (a Wayland session without XWayland).
+# SDL loads libwayland and libxkbcommon from the system when it uses them, so they are not bundled.
 /build/src/vs/sdl2/configure --host=$TARGET_TRIPLE --prefix=/opt/nn-dosbox \
-    --disable-static --disable-video-wayland --disable-video-vulkan
+    --disable-static --enable-video-wayland --enable-video-wayland-shared --disable-libdecor --disable-video-vulkan
 make -j4
 make install
 cd /build/src
