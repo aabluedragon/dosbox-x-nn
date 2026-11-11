@@ -192,7 +192,8 @@ void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel) {
         return;
     }
 
-    if (user_cursor_locked) {
+    extern bool mouse_motion_is_relative; /* motion from a remote play viewer, which captures it on its side */
+    if (user_cursor_locked || mouse_motion_is_relative) {
         /* send relative mouse motion only if the cursor is captured */
         keyb.ps2mouse.acx += x;
         keyb.ps2mouse.acy += y;

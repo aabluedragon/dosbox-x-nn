@@ -1676,7 +1676,10 @@ void Mouse_Read_Motion_Data() {
      * them - games that aim by mickeys (Abuse) read zero otherwise. */
     const auto locked = true;
 #else
-    const auto locked = MOUSE_IsLocked();
+    /* A remote play viewer's motion counts too: it is captured on the viewer's side, and a host streaming to it
+     * never captures its own window (RoTT turns by these counters and could not be turned at all). */
+    extern bool remoteplay_streaming;
+    const auto locked = MOUSE_IsLocked() || remoteplay_streaming;
 #endif
     reg_cx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_x : 0);
     reg_dx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_y : 0);

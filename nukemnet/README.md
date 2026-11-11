@@ -29,6 +29,12 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the host's emulated mouse by relative motion even though the host window has not captured the mouse:
   the INT 33h position no longer snaps back to the host's own cursor, and the motion counters (function
   0Bh) advance, so mouse-driven DOS games (Bonus, for one) work for the remote player.
+- Remote play motion and hidden screen fixes (capability `inputnetMotion`): INT 33h function 0Bh and the
+  PS/2 mouse report the viewer's motion while a viewer is connected (they reported nothing unless the host
+  window had captured the mouse, so games that turn by the motion counters, such as Rise of the Triad,
+  could not be turned); on Windows the hidden screen no longer resizes itself on every frame (the native
+  menu bar wrapped in the narrow window, the placeholder blinked and no video reached the viewers); a
+  viewer's error message no longer opens behind its window.
 - Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
   `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
   notice, on the surface output), opens it minimized and without the focus, so it never covers the
@@ -40,7 +46,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the picture at any time.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

@@ -1,6 +1,7 @@
 #include <sys/types.h>
 #include <assert.h>
 #include <math.h>
+#include <string.h>
 
 #include "dosbox.h"
 #include "logging.h"
@@ -8,6 +9,7 @@
 #include "sdlmain.h"
 #include "render.h"
 #include "vga.h"
+#include "remoteplay.h"
 
 #include <output/output_tools.h>
 #include <output/output_tools_xbrz.h>
@@ -191,11 +193,16 @@ Bitu OUTPUT_SURFACE_SetSize()
             final_height += (int)menuheight + (int)sdl.overscan_width * 2;
             sdl.clip.y += (int)menuheight;
 
-            LOG_MSG("surface consider=%ux%u final=%ux%u",
-                (unsigned int)consider_width,
-                (unsigned int)consider_height,
-                (unsigned int)final_width,
-                (unsigned int)final_height);
+            {
+                /* only when it changes: a log line per mode set adds up (a remote play host's output goes to a pipe) */
+                static unsigned int last_log[4] = { 0, 0, 0, 0 };
+                const unsigned int now_log[4] = { (unsigned int)consider_width, (unsigned int)consider_height,
+                    (unsigned int)final_width, (unsigned int)final_height };
+                if (memcmp(last_log, now_log, sizeof(now_log)) != 0) {
+                    memcpy(last_log, now_log, sizeof(now_log));
+                    LOG_MSG("surface consider=%ux%u final=%ux%u", now_log[0], now_log[1], now_log[2], now_log[3]);
+                }
+            }
         }
 
         sdl.window = GFX_SetSDLWindowMode(final_width, final_height, SCREEN_SURFACE);
@@ -203,8 +210,13 @@ Bitu OUTPUT_SURFACE_SetSize()
             E_Exit("Could not set windowed video mode %ix%i: %s", (int)sdl.draw.width, (int)sdl.draw.height, SDL_GetError());
 
         sdl.surface = SDL_GetWindowSurface(sdl.window);
-        if (sdl.surface->w < (sdl.clip.x+sdl.clip.w) ||
-            sdl.surface->h < (sdl.clip.y+sdl.clip.h)) {
+        /* A remote play host's hidden screen is a placeholder drawn to whatever size the window has. Enforcing its
+         * size looped on Windows: the native menu bar wraps onto a second line in the narrow window, the client area
+         * comes out shorter than asked, the forced resize sends another resize event, and so on every frame (the
+         * placeholder blinked and the log filled with "surface consider" lines). */
+        if (!remoteplay_screen_hidden &&
+            (sdl.surface->w < (sdl.clip.x+sdl.clip.w) ||
+             sdl.surface->h < (sdl.clip.y+sdl.clip.h))) {
             /* the window surface must not be smaller than the size we want!
              * This is a way to prevent that! */
             SDL_SetWindowMinimumSize(sdl.window, sdl.clip.x+sdl.clip.w, sdl.clip.y+sdl.clip.h);
@@ -523,11 +535,16 @@ retry:
             final_height += (int)menuheight + (int)sdl.overscan_width * 2;
             sdl.clip.y += (int)menuheight;
 
-            LOG_MSG("surface consider=%ux%u final=%ux%u",
-                (unsigned int)consider_width,
-                (unsigned int)consider_height,
-                (unsigned int)final_width,
-                (unsigned int)final_height);
+            {
+                /* only when it changes: a log line per mode set adds up (a remote play host's output goes to a pipe) */
+                static unsigned int last_log[4] = { 0, 0, 0, 0 };
+                const unsigned int now_log[4] = { (unsigned int)consider_width, (unsigned int)consider_height,
+                    (unsigned int)final_width, (unsigned int)final_height };
+                if (memcmp(last_log, now_log, sizeof(now_log)) != 0) {
+                    memcpy(last_log, now_log, sizeof(now_log));
+                    LOG_MSG("surface consider=%ux%u final=%ux%u", now_log[0], now_log[1], now_log[2], now_log[3]);
+                }
+            }
 
             sdl.surface = SDL_SetVideoMode((int)final_width, (int)final_height, (int)bpp,
                 (unsigned int)((sdl.draw.flags & GFX_CAN_RANDOM) ? SDL_SWSURFACE : SDL_HWSURFACE) |

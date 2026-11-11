@@ -1351,8 +1351,12 @@ public:
         if (audio) SDL_CloseAudioDevice(audio);
         if (texture) SDL_DestroyTexture(texture);
         if (renderer) SDL_DestroyRenderer(renderer);
-        if (window && !error.empty())
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION,"DOSBox-X-NN remote play",error.c_str(),window);
+        /* The viewer window goes first: on some window managers (labwc, for one) a message box for it opened behind
+         * it, and the player only saw the last frame (or black) and a viewer that no longer reacted. */
+        if (window && !error.empty()) {
+            SDL_HideWindow(window);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION,"DOSBox-X-NN remote play",error.c_str(),NULL);
+        }
         if (window) SDL_DestroyWindow(window);
         if (set) SDLNet_FreeSocketSet(set);
         if (in) SDLNet_FreePacket(in);

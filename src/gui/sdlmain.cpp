@@ -2352,7 +2352,12 @@ void UpdateUserCursorScreenDimensions(void);
 /* ------------------------------------------------------------------------- */
 
 /* Size of the placeholder below the menu bar while the screen is hidden. */
+#if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU
+/* wide enough that Windows' own menu bar stays on one line */
+static const Bitu RP_HIDDEN_WIDTH = 640;
+#else
 static const Bitu RP_HIDDEN_WIDTH = 480;
+#endif
 static const Bitu RP_HIDDEN_HEIGHT = 64;
 
 #if defined(LINUX) && C_X11 && defined(C_SDL2)
