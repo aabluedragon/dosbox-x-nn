@@ -886,6 +886,10 @@ void Mouse_WheelMoved(int32_t scroll) {
 }
 
 /* FIXME: Re-test this code */
+/* Set while applying motion that is relative by nature even though this window has not captured the
+ * mouse: a remote play viewer's (it captures the mouse on its own side). */
+bool mouse_motion_is_relative = false;
+
 void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
     extern bool Mouse_Vertical;
     float dx = xrel * mouse.pixelPerMickey_x;
@@ -906,9 +910,10 @@ void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
     if((fabs(xrel) > 1.0) || (mouse.senv_x < 1.0)) dx *= mouse.senv_x;
     if((fabs(yrel) > 1.0) || (mouse.senv_y < 1.0)) dy *= mouse.senv_y;
 
-    if (user_cursor_locked) {
+    if (user_cursor_locked || mouse_motion_is_relative) {
         /* either device reports relative motion ONLY, and therefore requires that the user
-         * has captured the mouse */
+         * has captured the mouse (or that the motion comes from a remote play viewer, which
+         * captures it on its side; games that read the INT 33h motion counters need this) */
 
         /* serial mouse */
         on_mouse_event_for_serial((int)(dx),(int)(dy*2),mouse.buttons);
@@ -1004,6 +1009,9 @@ void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
     default:
         emu = false;
     }
+    /* A remote play viewer's motion moves the emulated cursor by itself: taking the position from this
+     * window's own (uncaptured, perhaps hidden) host cursor would throw it back on every move. */
+    if (mouse_motion_is_relative) emu = true;
     if (!emu)
     {
         auto x1 = (double)user_cursor_x / ((double)user_cursor_sw - 1);

@@ -376,7 +376,10 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
             const bool emulate = r.u8() != 0;
             if (!r.ok || !Guard_Allows()) return;
+            /* the viewer captured its mouse: relative motion, also for the INT 33h motion counters */
+            mouse_motion_is_relative = emulate;
             Mouse_CursorMovedRaw(xrel,yrel,x,y,emulate);
+            mouse_motion_is_relative = false;
             break;
         }
         case RPEV_WHEEL: {

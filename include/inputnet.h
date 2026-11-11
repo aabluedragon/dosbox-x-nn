@@ -62,6 +62,8 @@ bool INPUTNET_InterceptMouseWheel(int32_t scroll);
  * itself uses for events it generates internally (such as key auto-repeat). */
 void KEYBOARD_AddKeyRaw(KBD_KEYS keytype,bool pressed);
 void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate);
+/* true while Mouse_CursorMovedRaw applies relative motion from a remote play viewer */
+extern bool mouse_motion_is_relative;
 void Mouse_ButtonPressedRaw(uint8_t button);
 void Mouse_ButtonReleasedRaw(uint8_t button);
 void Mouse_WheelMovedRaw(int32_t scroll);
