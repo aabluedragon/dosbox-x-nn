@@ -63,10 +63,27 @@ for name in ['Nouveau_IBM.ttf', 'SarasaGothicFixed.ttf', 'FREECG98.BMP']:
     shutil.copy2(source / 'contrib/fonts' / name, root / 'bin' / name)
 shutil.copy2(Path(__file__).parent / 'licenses/Sarasa-OFL.txt', root / 'licenses/Sarasa-OFL.txt')
 (root / 'licenses/Nouveau-IBM.txt').write_text('Nouveau IBM: "Freeware" (embedded font copyright notice).\nDistributed unchanged from DOSBox-X contrib/fonts/Nouveau_IBM.ttf.\n')
+# The C library, its loader and what has to match the system's graphics drivers go to lib/core. With them the build
+# runs on old distributions, but it cannot load the system's OpenGL drivers (they need the system's newer C library),
+# so DOSBox-X fell back to the surface output (no GLSL shaders such as "sharp"). Where the system's loader finds
+# everything, the launcher uses it with the system's C library, C++ runtime and OpenGL, and the bundled rest.
+core_prefixes = ('ld-linux', 'libc.so', 'libm.so', 'libpthread.so', 'libdl.so', 'librt.so', 'libresolv.so', 'libnss_',
+                 'libutil.so', 'libanl.so', 'libstdc++.so', 'libgcc_s.so', 'libGL.so', 'libGLX.so', 'libGLdispatch.so')
+(root / 'lib/core').mkdir(exist_ok=True)
+for lib in list((root / 'lib').iterdir()):
+    if lib.is_file() and lib.name.startswith(core_prefixes):
+        lib.rename(root / 'lib/core' / lib.name)
+system_loader = {'x64': '/lib64/ld-linux-x86-64.so.2', 'arm64': '/lib/ld-linux-aarch64.so.1',
+                 'armv7l': '/lib/ld-linux-armhf.so.3'}[arch]
 (root / 'dosbox-x').write_text(f'''#!/bin/sh
 set -eu
 base=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec "$base/lib/{loader}" --library-path "$base/lib" "$base/bin/dosbox-x" -conf "$base/portable.conf" "$@"
+# The system's loader when it resolves every library (with the system's OpenGL drivers); else the bundled one.
+if [ -z "${{NN_DOSBOX_BUNDLED_ONLY:-}}" ] && [ -x {system_loader} ] &&
+   ! {system_loader} --library-path "$base/lib" --list "$base/bin/dosbox-x" 2>&1 | grep -q -e 'not found' -e 'No such file'; then
+    exec {system_loader} --library-path "$base/lib" "$base/bin/dosbox-x" -conf "$base/portable.conf" "$@"
+fi
+exec "$base/lib/core/{loader}" --library-path "$base/lib:$base/lib/core" "$base/bin/dosbox-x" -conf "$base/portable.conf" "$@"
 ''')
 (root / 'dosbox-x').chmod(0o755)
 (root / 'portable.conf').write_text('[sdl]\noutput=surface\n')

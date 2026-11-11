@@ -31,8 +31,8 @@ with tempfile.TemporaryDirectory(prefix='nn-dosbox-ipx-', dir=args.temp_dir) as 
     probe.close()
     command = [str(binary)]
     if args.qemu:
-        command = [args.qemu, str(package / 'lib' / args.loader), '--library-path',
-                   str(package / 'lib'), str(binary)]
+        command = [args.qemu, str(package / 'lib/core' / args.loader), '--library-path',
+                   f"{package / 'lib'}:{package / 'lib/core'}", str(binary)]
     command += ['-conf', str(config), '-noautoexec', '-fastlaunch',
                 '-c', f'IPXNET STARTSERVER {port}', '-c', 'pause']
     env = {**os.environ, 'SDL_VIDEODRIVER': 'dummy', 'SDL_AUDIODRIVER': 'dummy', 'HOME': temp}
