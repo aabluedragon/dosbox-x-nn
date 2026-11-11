@@ -27,10 +27,13 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   `INPUTNET: remote input blocked/allowed` at each change.
 - Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
   `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
-  notice, on the surface output), opens it without taking the focus or covering the window in front,
-  and keeps its sound off this machine's speakers, while the viewers still get the full picture and
-  sound. NukemNet uses it for the second copy that plays for a remote player. *Video > Show screen
-  (remote play)* (mapper event `rpscreen`, no default key) shows or hides the picture at any time.
+  notice, on the surface output), opens it minimized and without the focus, so it never covers the
+  window in front (some window managers, labwc for one, put new windows on top whatever they ask), and
+  keeps its sound off this machine's speakers, while the viewers still get the full picture and sound.
+  Streaming goes on while it is minimized, and a `priority` that pauses unfocused windows is ignored.
+  NukemNet uses it for the copies that play for remote players. Restore it from the taskbar for
+  *Video > Show screen (remote play)* (mapper event `rpscreen`, no default key), which shows or hides
+  the picture at any time.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
 `nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true}`.

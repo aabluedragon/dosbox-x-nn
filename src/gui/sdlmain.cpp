@@ -2422,28 +2422,39 @@ void GFX_RemotePlayDrawHidden(void) {
 #endif
 }
 
-/* Shows the window that was created hidden, without taking the focus or
- * raising it above the window in front (the host's own game). */
+/* Shows the window that was created hidden, minimized and without taking the
+ * focus: window managers differ in whether they let a new window open behind
+ * the active one (labwc, for one, puts it on top), but a minimized window
+ * never covers the host's own game. It waits in the taskbar; restoring it
+ * gives the Video menu with "Show screen (remote play)". */
 static void GFX_RemotePlayShowWindowQuietly(void) {
 #if defined(C_SDL2)
-    if (sdl.window == NULL || !(SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN)) return;
+    /* once: an iconic window can stay "hidden" to SDL, and mapping it again
+     * would restore it */
+    static bool shown = false;
+    if (shown || sdl.window == NULL || !(SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN)) return;
+    shown = true;
+    LOG_MSG("INPUTNET: remote play: the window opens minimized");
 # if defined(LINUX) && C_X11
     /* SDL would map it raised (and focus it without a window manager) */
     if (GFX_RemotePlayX11MapQuietly()) return;
+# endif
+# if defined(WIN32) && !defined(HX_DOS)
+    {
+        HWND self = GetHWND();
+        if (self != NULL) {
+            ShowWindow(self, SW_SHOWMINNOACTIVE);
+            return;
+        }
+    }
 # endif
 # ifdef SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN
     SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
 # endif
     SDL_ShowWindow(sdl.window);
+    SDL_MinimizeWindow(sdl.window);
 # ifdef SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN
     SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "0");
-# endif
-# if defined(WIN32) && !defined(HX_DOS)
-    {
-        HWND self = GetHWND(), front = GetForegroundWindow();
-        if (self != NULL && front != NULL && front != self)
-            SetWindowPos(self, front, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    }
 # endif
 #endif
 }
@@ -2458,6 +2469,8 @@ void GFX_RemotePlaySetScreenHidden(bool hidden) {
 #if defined(C_SDL2)
     if (!hidden && sdl.window != NULL && (SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN))
         SDL_ShowWindow(sdl.window);
+    if (!hidden && sdl.window != NULL && (SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_MINIMIZED))
+        SDL_RestoreWindow(sdl.window); /* the mapper shortcut works while minimized */
 #endif
     GFX_ResetScreen();
     GFX_SetTitle(-1, -1, -1, false);
@@ -4111,6 +4124,10 @@ static void GUI_StartUp() {
          */
         sdl.priority.nofocus=PRIORITY_LEVEL_PAUSE;
     }
+    /* A copy that streams to a remote player without showing its screen here
+     * never has the focus: pausing it would freeze that player's game. */
+    if (remoteplay_screen_hidden && sdl.priority.nofocus == PRIORITY_LEVEL_PAUSE)
+        sdl.priority.nofocus = PRIORITY_LEVEL_NORMAL;
 
     SetPriority(sdl.priority.focus); //Assume focus on startup
     sdl.mouse.locked=false;
@@ -8473,6 +8490,7 @@ bool VM_PowerOn() {
 
 #if defined(LINUX) && C_X11
 # include <X11/Xlib.h>
+# include <X11/Xutil.h>
 # include <X11/Xatom.h>
 # include "SDL_syswm.h"
 #endif
@@ -8491,17 +8509,30 @@ bool GFX_RemotePlayX11MapQuietly(void) {
     long usertime = 0;
     XChangeProperty(dpy, win, XInternAtom(dpy, "_NET_WM_USER_TIME", False), XA_CARDINAL, 32,
         PropModeReplace, (unsigned char*)&usertime, 1);
+    /* ask for it to open minimized (ICCCM initial state)... */
+    XWMHints *hints = XGetWMHints(dpy, win);
+    XWMHints fresh;
+    if (hints == NULL) { memset(&fresh, 0, sizeof(fresh)); }
+    XWMHints *h = hints ? hints : &fresh;
+    h->flags |= StateHint | InputHint;
+    h->initial_state = IconicState;
+    h->input = True;
+    XSetWMHints(dpy, win, h);
+    if (hints) XFree(hints);
     XMapWindow(dpy, win);
     XFlush(dpy);
 
-    /* Window managers may still put a new window on top: once it is mapped,
-     * lower it (enough without a window manager), then ask to restack it just
-     * below the active window. */
-    for (int i = 0; i < 100; i++) {
+    /* ...and where the window manager opens it anyway, minimize it once it is
+     * mapped (ICCCM WM_CHANGE_STATE), lower it (enough without a window
+     * manager) and ask to restack it just below the active window. */
+    bool viewable = false;
+    for (int i = 0; i < 100 && !viewable; i++) {
         XWindowAttributes attr;
-        if (!XGetWindowAttributes(dpy, win, &attr) || attr.map_state == IsViewable) break;
-        SDL_Delay(5);
+        if (!XGetWindowAttributes(dpy, win, &attr)) break;
+        viewable = attr.map_state == IsViewable;
+        if (!viewable) SDL_Delay(5);
     }
+    if (viewable) XIconifyWindow(dpy, win, DefaultScreen(dpy));
     XLowerWindow(dpy, win);
     Window root = DefaultRootWindow(dpy), active = 0;
     Atom type = None;
