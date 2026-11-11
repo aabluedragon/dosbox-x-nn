@@ -205,6 +205,17 @@ struct Viewer {
 UDPsocket host_sock = NULL;
 UDPpacket *host_out = NULL, *host_in = NULL;
 bool host_running = false;
+
+/* Keepalive while the emulator stands still. A menu (Windows' own menu bar, or the SDL drawn one), dragging or
+ * resizing the window on Windows, and message boxes stop the main loop, so REMOTEPLAY_Poll stops: the viewers heard
+ * nothing and gave up after the timeout ("The connection to the host was lost"), and hiding the screen from the Video
+ * menu broke the stream. While the main loop has not polled for a while, this thread answers the viewers that are
+ * already in, so they stay connected (the picture waits); their input is left for the main loop (viewers send it
+ * again until it is acknowledged). host_lock guards the socket, its packets and the viewer list. */
+SDL_mutex *host_lock = NULL;
+SDL_Thread *host_keepalive = NULL;
+volatile int host_keepalive_stop = 0;
+volatile uint32_t host_lastpoll = 0;
 uint16_t host_port = 0;
 Viewer viewers[RP_MAX_VIEWERS];
 unsigned cfg_timeout = 10000;
@@ -294,12 +305,15 @@ bool Guard_Allows(void) {
 }
 
 void Host_SendTo(const IPaddress &addr,const uint8_t *data,size_t len) {
-    if (host_sock == NULL || host_out == NULL || len > (size_t)host_out->maxlen) return;
-    memcpy(host_out->data,data,len);
-    host_out->len = (int)len;
-    host_out->address = addr;
-    SDLNet_UDP_Send(host_sock,-1,host_out);
-    stat_bytes += len;
+    if (host_lock) SDL_LockMutex(host_lock);
+    if (host_sock != NULL && host_out != NULL && len <= (size_t)host_out->maxlen) {
+        memcpy(host_out->data,data,len);
+        host_out->len = (int)len;
+        host_out->address = addr;
+        SDLNet_UDP_Send(host_sock,-1,host_out);
+        stat_bytes += len;
+    }
+    if (host_lock) SDL_UnlockMutex(host_lock);
 }
 
 void Host_SendAll(const uint8_t *data,size_t len) {
@@ -505,6 +519,35 @@ void Host_FlushQueue(void) {
     }
 }
 
+int Host_KeepaliveThread(void *) {
+    while (host_keepalive_stop == 0) {
+        SDL_Delay(100);
+        if (SDL_GetTicks() - host_lastpoll < 500) continue;
+        SDL_LockMutex(host_lock);
+        while (host_sock != NULL && SDLNet_UDP_Recv(host_sock,host_in) > 0) {
+            Reader r(host_in->data,(size_t)host_in->len);
+            const uint8_t type = RP_Header(r);
+            if (type == 0) continue;
+            Viewer *v = NULL;
+            for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
+                if (viewers[i].active && RP_SameAddr(viewers[i].addr,host_in->address)) { v = &viewers[i]; break; }
+            if (v == NULL) continue;    /* someone new: their HELLO comes again, the main loop lets them in */
+            if (type == RP_HELLO) {
+                (void)r.str();
+                if (r.u32() != v->session || !r.ok) continue;
+                Writer w(RP_WELCOME);
+                w.u8((uint8_t)(v - viewers));
+                w.u32(aud_rate);
+                Host_SendTo(host_in->address,w.buf,w.len);
+            }
+            if (type == RP_BYE) continue;  /* the main loop sees it through the timeout */
+            v->lastheard = SDL_GetTicks();
+        }
+        SDL_UnlockMutex(host_lock);
+    }
+    return 0;
+}
+
 } /* namespace */
 
 void REMOTEPLAY_Configure(Section_prop *section) {
@@ -529,6 +572,15 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) viewers[i].active = false;
     host_running = true;
     host_port = port;
+    if (host_lock == NULL) host_lock = SDL_CreateMutex();
+    host_lastpoll = SDL_GetTicks();
+    host_keepalive_stop = 0;
+    if (host_lock != NULL && host_keepalive == NULL)
+#if SDL_VERSION_ATLEAST(2,0,0)
+        host_keepalive = SDL_CreateThread(Host_KeepaliveThread,"INPUTNET keepalive",NULL);
+#else
+        host_keepalive = SDL_CreateThread(Host_KeepaliveThread,NULL);
+#endif
     enc_needkey = true;
     enc_haveprev = false;
     guard_state = -1;
@@ -540,6 +592,11 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
 
 void REMOTEPLAY_StopServer(const char *reason) {
     if (!host_running) return;
+    if (host_keepalive != NULL) {
+        host_keepalive_stop = 1;
+        SDL_WaitThread(host_keepalive,NULL);
+        host_keepalive = NULL;
+    }
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) Host_DropViewer(viewers[i],reason ? reason : "the host stopped",true);
     SDLNet_UDP_Close(host_sock);
     host_sock = NULL;
@@ -617,8 +674,11 @@ void REMOTEPLAY_Poll(void) {
      * input arrives. */
     Guard_Update();
 
+    host_lastpoll = now;
+    if (host_lock) SDL_LockMutex(host_lock);
     while (SDLNet_UDP_Recv(host_sock,host_in) > 0)
         Host_HandlePacket(host_in->address,host_in->data,(size_t)host_in->len);
+    if (host_lock) SDL_UnlockMutex(host_lock);
 
 #if defined(USE_TTF)
     /* TrueType text output draws the DOS prompt without filling the frame
@@ -630,10 +690,12 @@ void REMOTEPLAY_Poll(void) {
     static uint32_t lastcheck = 0;
     if (now - lastcheck >= 100) {
         lastcheck = now;
+        if (host_lock) SDL_LockMutex(host_lock);
         for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
-            if (viewers[i].active && now - viewers[i].lastheard > cfg_timeout)
+            if (viewers[i].active && (int32_t)(now - viewers[i].lastheard) > (int32_t)cfg_timeout)
                 Host_DropViewer(viewers[i],"timed out",true);
         }
+        if (host_lock) SDL_UnlockMutex(host_lock);
     }
 
     Host_FlushQueue();
