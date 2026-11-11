@@ -3,6 +3,11 @@ name: NukemNet Linux packages
 # The recipe in nukemnet/linux builds the commit pinned in build.sh.
 on:
   workflow_dispatch:
+    inputs:
+      arches:
+        description: 'Architectures to build, as a JSON list'
+        type: string
+        default: '["x64","arm64","armv7l"]'
 permissions:
   contents: read
 
@@ -11,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, arm64, armv7l]
+        arch: ${{ fromJSON(inputs.arches || '["x64","arm64","armv7l"]') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
