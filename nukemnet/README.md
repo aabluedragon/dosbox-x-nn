@@ -29,6 +29,10 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the host's emulated mouse by relative motion even though the host window has not captured the mouse:
   the INT 33h position no longer snaps back to the host's own cursor, and the motion counters (function
   0Bh) advance, so mouse-driven DOS games (Bonus, for one) work for the remote player.
+- FILEMOUNT from asar archives (capability `filemountAsar`): a host path inside an Electron asar archive
+  (`.../resources/app.asar/res/gameres/IPXSETUP.EXE`, where NukemNet keeps its DOS helpers) is read from the
+  archive: packed files are extracted to a private temporary file (deleted when DOSBox-X exits) and mapped,
+  unpacked ones are mapped from `app.asar.unpacked`, links are followed.
 - Remote play motion and hidden screen fixes (capability `inputnetMotion`): INT 33h function 0Bh and the
   PS/2 mouse report the viewer's motion while a viewer is connected (they reported nothing unless the host
   window had captured the mouse, so games that turn by the motion counters, such as Rise of the Triad,
@@ -46,7 +50,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the picture at any time.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

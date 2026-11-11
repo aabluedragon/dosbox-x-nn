@@ -27,6 +27,11 @@
 #include "shell.h"
 #include "callback.h"
 #include "dos_inc.h"
+#if defined(WIN32)
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
 #include "regs.h"
 #include "pic.h"
 #include "keyboard.h"
@@ -3544,6 +3549,286 @@ void DOS_Shell::CMD_SUBST(char * args) {
 #endif
 
 #if !defined(OSFREE)
+/* FILEMOUNT from Electron asar archives (NukemNet ships its DOS helpers inside resources/app.asar). A host path such as
+ * ".../app.asar/res/gameres/IPXSETUP.EXE" names a file inside the archive, which only Electron's own file system sees.
+ * An asar file is a small header (a JSON tree of "files" with each file's "size" and "offset") followed by the files'
+ * data. A packed file is extracted to a private temporary file, deleted when DOSBox-X exits, and that is mapped; an
+ * "unpacked" one is the real file in "app.asar.unpacked"; "link" entries are followed. */
+namespace {
+
+struct AsarJson {
+	const std::string &s;
+	size_t i = 0;
+	explicit AsarJson(const std::string &str) : s(str) {}
+	void ws() { while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++; }
+	static void utf8(std::string &out,unsigned long cp) {
+		if (cp < 0x80) out += (char)cp;
+		else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+		else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+		else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+	}
+	bool str(std::string &out) {
+		ws();
+		if (i >= s.size() || s[i] != '"') return false;
+		i++; out.clear();
+		while (i < s.size() && s[i] != '"') {
+			const char c = s[i++];
+			if (c != '\\') { out += c; continue; }
+			if (i >= s.size()) return false;
+			const char e = s[i++];
+			switch (e) {
+				case 'n': out += '\n'; break;
+				case 't': out += '\t'; break;
+				case 'r': out += '\r'; break;
+				case 'b': out += '\b'; break;
+				case 'f': out += '\f'; break;
+				case 'u': {
+					if (i + 4 > s.size()) return false;
+					unsigned long cp = strtoul(s.substr(i,4).c_str(),NULL,16);
+					i += 4;
+					if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= s.size() && s[i] == '\\' && s[i+1] == 'u') {
+						const unsigned long lo = strtoul(s.substr(i+2,4).c_str(),NULL,16);
+						if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i += 6; }
+					}
+					utf8(out,cp);
+					break;
+				}
+				default: out += e; break;
+			}
+		}
+		if (i >= s.size()) return false;
+		i++;
+		return true;
+	}
+	/* a number, true, false or null, as written */
+	std::string scalar() {
+		ws();
+		const size_t start = i;
+		while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && s[i] != ' ' && s[i] != '\t' && s[i] != '\n' && s[i] != '\r') i++;
+		return s.substr(start,i - start);
+	}
+	bool skip() {
+		ws();
+		if (i >= s.size()) return false;
+		const char c = s[i];
+		if (c == '"') { std::string t; return str(t); }
+		if (c != '{' && c != '[') { return !scalar().empty(); }
+		const char close = (c == '{') ? '}' : ']';
+		i++; ws();
+		if (i < s.size() && s[i] == close) { i++; return true; }
+		for (;;) {
+			if (c == '{') {
+				std::string key;
+				if (!str(key)) return false;
+				ws();
+				if (i >= s.size() || s[i] != ':') return false;
+				i++;
+			}
+			if (!skip()) return false;
+			ws();
+			if (i >= s.size()) return false;
+			if (s[i] == ',') { i++; continue; }
+			if (s[i] == close) { i++; return true; }
+			return false;
+		}
+	}
+	/* In the object that starts here, moves to the value of `key`. */
+	bool member(const std::string &key) {
+		ws();
+		if (i >= s.size() || s[i] != '{') return false;
+		i++; ws();
+		if (i < s.size() && s[i] == '}') return false;
+		for (;;) {
+			std::string k;
+			if (!str(k)) return false;
+			ws();
+			if (i >= s.size() || s[i] != ':') return false;
+			i++;
+			if (k == key) return true;
+			if (!skip()) return false;
+			ws();
+			if (i < s.size() && s[i] == ',') { i++; continue; }
+			return false;
+		}
+	}
+};
+
+struct AsarEntry {
+	bool directory = false, unpacked = false, haslink = false;
+	std::string link, offset;
+	unsigned long long size = 0;
+};
+
+/* Reads the members that matter of the entry object that starts at the parser's position. */
+bool AsarReadEntry(AsarJson &j,AsarEntry &e) {
+	j.ws();
+	if (j.i >= j.s.size() || j.s[j.i] != '{') return false;
+	j.i++; j.ws();
+	if (j.i < j.s.size() && j.s[j.i] == '}') { j.i++; return true; }
+	for (;;) {
+		std::string key;
+		if (!j.str(key)) return false;
+		j.ws();
+		if (j.i >= j.s.size() || j.s[j.i] != ':') return false;
+		j.i++;
+		if (key == "files") { e.directory = true; if (!j.skip()) return false; }
+		else if (key == "link") { e.haslink = true; if (!j.str(e.link)) return false; }
+		else if (key == "offset") { j.ws(); if (j.i < j.s.size() && j.s[j.i] == '"') { if (!j.str(e.offset)) return false; } else e.offset = j.scalar(); }
+		else if (key == "size") { e.size = strtoull(j.scalar().c_str(),NULL,10); }
+		else if (key == "unpacked") { e.unpacked = (j.scalar() == "true"); }
+		else if (!j.skip()) return false;
+		j.ws();
+		if (j.i < j.s.size() && j.s[j.i] == ',') { j.i++; continue; }
+		if (j.i < j.s.size() && j.s[j.i] == '}') { j.i++; return true; }
+		return false;
+	}
+}
+
+std::vector<std::string> AsarSplit(const std::string &inner) {
+	std::vector<std::string> parts;
+	std::string cur;
+	for (size_t k = 0;k <= inner.size();k++) {
+		if (k == inner.size() || inner[k] == '/' || inner[k] == '\\') {
+			if (cur == "..") { if (!parts.empty()) parts.pop_back(); }
+			else if (!cur.empty() && cur != ".") parts.push_back(cur);
+			cur.clear();
+		}
+		else cur += inner[k];
+	}
+	return parts;
+}
+
+std::vector<std::string> asar_temp_files;
+std::string asar_temp_dir;
+
+void AsarCleanup(void) {
+	for (const auto &f : asar_temp_files) remove(f.c_str());
+	asar_temp_files.clear();
+	if (!asar_temp_dir.empty()) {
+#if defined(WIN32)
+		_rmdir(asar_temp_dir.c_str());
+#else
+		rmdir(asar_temp_dir.c_str());
+#endif
+	}
+}
+
+std::string AsarTempDir(void) {
+	if (!asar_temp_dir.empty()) return asar_temp_dir;
+#if defined(WIN32)
+	const char *base = getenv("TEMP");
+	if (base == NULL || !*base) base = getenv("TMP");
+	if (base == NULL || !*base) base = ".";
+#else
+	const char *base = getenv("TMPDIR");
+	if (base == NULL || !*base) base = "/tmp";
+#endif
+	char name[64];
+	srand((unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)&name);
+	snprintf(name,sizeof(name),"dosbox-x-nn-asar-%08x%04x",(unsigned int)time(NULL),(unsigned int)(rand() & 0xFFFF));
+	std::string dir = std::string(base) + CROSS_FILESPLIT + name;
+	Cross::CreateDir(dir);
+	struct stat st;
+	if (stat(dir.c_str(),&st) != 0 || !(st.st_mode & S_IFDIR)) return "";
+	asar_temp_dir = dir;
+	atexit(AsarCleanup);
+	return asar_temp_dir;
+}
+
+/* The host file to map for `path` when it lies inside an asar archive: true with `host` set (or false with `error`
+ * set). False with an empty error when `path` is not inside an archive. */
+bool AsarResolve(const std::string &path,std::string &host,std::string &error) {
+	error.clear();
+	std::string lower = path;
+	for (auto &c : lower) c = (char)tolower((unsigned char)c);
+	size_t pos = 0;
+	while ((pos = lower.find(".asar",pos)) != std::string::npos) {
+		const size_t end = pos + 5;
+		pos = end;
+		if (end >= path.size() || (path[end] != '/' && path[end] != '\\')) continue;
+		const std::string archive = path.substr(0,end);
+		struct stat ast;
+		if (stat(archive.c_str(),&ast) != 0 || (ast.st_mode & S_IFDIR)) continue;
+
+		FILE *f = fopen(archive.c_str(),"rb");
+		if (f == NULL) { error = "cannot open " + archive; return false; }
+		uint8_t h[16];
+		if (fread(h,1,16,f) != 16) { fclose(f); error = archive + " is not an asar archive"; return false; }
+		const unsigned long header_size = (unsigned long)h[4] | ((unsigned long)h[5] << 8) | ((unsigned long)h[6] << 16) | ((unsigned long)h[7] << 24);
+		const unsigned long json_size = (unsigned long)h[12] | ((unsigned long)h[13] << 8) | ((unsigned long)h[14] << 16) | ((unsigned long)h[15] << 24);
+		if (h[0] != 4 || json_size == 0 || json_size + 8 > header_size || json_size > 512ul * 1024ul * 1024ul) {
+			fclose(f); error = archive + " is not an asar archive"; return false;
+		}
+		std::string json(json_size,'\0');
+		if (fread(&json[0],1,json_size,f) != json_size) { fclose(f); error = "cannot read " + archive; return false; }
+		const unsigned long long data_start = 8ull + header_size;
+
+		std::vector<std::string> parts = AsarSplit(path.substr(end + 1));
+		AsarEntry entry;
+		bool found = false;
+		for (int hops = 0;hops < 16 && !found;hops++) {
+			AsarJson j(json);
+			bool ok = true, relinked = false;
+			for (size_t n = 0;n < parts.size();n++) {
+				if (!j.member("files") || !j.member(parts[n])) { ok = false; break; }
+				const size_t at = j.i;
+				AsarEntry e;
+				if (!AsarReadEntry(j,e)) { ok = false; break; }
+				if (e.haslink) {
+					/* a link points at another path inside the archive (relative to its root) */
+					std::vector<std::string> next = AsarSplit(e.link);
+					next.insert(next.end(),parts.begin() + (long)n + 1,parts.end());
+					parts = next;
+					relinked = true;
+					break;
+				}
+				if (n + 1 == parts.size()) { entry = e; found = true; }
+				else j.i = at;
+			}
+			if (!ok) break;
+			if (!relinked && !found) break;
+		}
+		if (!found || parts.empty()) { fclose(f); error = "not found in " + archive; return false; }
+		if (entry.directory) { fclose(f); error = "a directory in " + archive; return false; }
+
+		std::string inner;
+		for (const auto &part : parts) inner += (inner.empty() ? "" : std::string(1,CROSS_FILESPLIT)) + part;
+		if (entry.unpacked) {
+			fclose(f);
+			host = archive + ".unpacked" + CROSS_FILESPLIT + inner;
+			struct stat ust;
+			if (stat(host.c_str(),&ust) != 0 || (ust.st_mode & S_IFDIR)) { error = "missing unpacked file " + host; return false; }
+			return true;
+		}
+
+		const std::string dir = AsarTempDir();
+		if (dir.empty()) { fclose(f); error = "cannot create a temporary folder"; return false; }
+		char prefix[16];
+		snprintf(prefix,sizeof(prefix),"%u-",(unsigned int)asar_temp_files.size());
+		const std::string out = dir + CROSS_FILESPLIT + prefix + parts.back();
+		FILE *o = fopen(out.c_str(),"wb");
+		if (o == NULL) { fclose(f); error = "cannot create " + out; return false; }
+		asar_temp_files.push_back(out);
+		bool good = fseeko64(f,(fseek_ofs_t)(data_start + strtoull(entry.offset.c_str(),NULL,10)),SEEK_SET) == 0;
+		unsigned long long left = entry.size;
+		char buf[65536];
+		while (good && left > 0) {
+			const size_t want = (size_t)std::min<unsigned long long>(left,sizeof(buf));
+			const size_t got = fread(buf,1,want,f);
+			if (got != want || fwrite(buf,1,got,o) != got) good = false;
+			left -= got;
+		}
+		fclose(o);
+		fclose(f);
+		if (!good) { remove(out.c_str()); error = "cannot read " + inner + " from " + archive; return false; }
+		host = out;
+		return true;
+	}
+	return false;
+}
+
+} /* namespace */
+
 void DOS_Shell::CMD_FILEMOUNT(char * args) {
 	HELP("FILEMOUNT");
 	StripSpaces(args);
@@ -3602,6 +3887,12 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 
 	command.FindCommand(2,arg2);
 	struct stat st;
+	if (stat(arg2.c_str(),&st) != 0) {
+		/* a file inside an asar archive is mapped from a temporary copy (or app.asar.unpacked) */
+		std::string asar_host, asar_error;
+		if (AsarResolve(arg2,asar_host,asar_error)) arg2 = asar_host;
+		else if (!asar_error.empty()) LOG_MSG("FILEMOUNT: %s: %s",arg2.c_str(),asar_error.c_str());
+	}
 	if (stat(arg2.c_str(),&st) != 0 || (st.st_mode & S_IFDIR)) {
 		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_HOST_NOT_FOUND"),arg2.c_str());
 		return;
