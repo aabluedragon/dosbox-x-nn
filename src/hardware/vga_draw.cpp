@@ -4317,6 +4317,8 @@ static void OnDemandCompleteFrame(void) {
  *  - present=flip: when the start address moves to another page, the frame is drawn at once (the game has finished
  *    that page), not at the next retrace. The same when a game that draws off screen has copied a whole frame onto
  *    the page shown (NN_CopyPoll): Build games started with machine=vesa_nolfb, and most 320x200 games, do that.
+ *    Both are guesses at when a frame is complete, so each video mode has to earn them and keeps being checked
+ *    (NN_Verify): a game that goes on drawing after showing a frame gets its frames at vertical retrace.
  * Scrolling with pixel panning or a split screen needs the address and the panning to change in the same frame, so a
  * mode that uses either keeps the VGA's own timing until the next mode change. */
 int REMOTEPLAY_PresentMode(void);           /* remoteplay.cpp: 0 scanout, 1 retrace, 2 flip; 0 while no server runs */
@@ -4381,8 +4383,10 @@ void VGA_RenderOnDemandComplete(void);
  * changed, in that order and not to a single colour (a cleared screen is not a picture). Anything else (a sprite
  * redrawn, a status bar, drawing straight onto the screen in no order) is left to the frame taken at vertical
  * retrace, as before. */
-static const unsigned NN_BANDS = 16, NN_BAND_POINTS = 16;
+static const unsigned NN_BANDS = 16, NN_BAND_POINTS = 128;
 static uint8_t nn_copy_seen[NN_BANDS][NN_BAND_POINTS];
+static uint32_t nn_copy_rel[NN_BANDS][NN_BAND_POINTS];     /* each pixel's place, from the frame's first row */
+static Bitu nn_copy_shape[5] = { 0, 0, 0, 0, 0 };  /* what nn_copy_rel was made for */
 static bool nn_copy_ok = false;             /* this frame's mode can be sampled (set by VGA_VerticalTimer) */
 static bool nn_copy_have = false;           /* nn_copy_seen holds this mode's pixels */
 static Bitu nn_copy_addr = 0;               /* vga.draw.address of the frame's first row */
@@ -4390,32 +4394,60 @@ static uint32_t nn_copy_bands = 0;          /* bands changed in the copy being w
 static int nn_copy_low = -1;                /* the lowest band it has reached */
 static bool nn_copy_ordered = true;
 static unsigned nn_copy_quiet = 0;
+/* When things were drawn (PIC_FullIndex): a game that draws faster than the display shows copies frame after frame,
+ * a game that draws a frame in two steps leaves a long gap before the first and a short one before the second. */
+static double nn_draw_begin = 0, nn_draw_last = 0;  /* the drawing being watched: its first and newest change */
+static double nn_draw_end = -1.0e9;         /* when the last one ended, */
+static double nn_draw_idle = 0;             /* and how long nothing had been drawn before it began */
+/* How much was drawn (vga_memory.cpp, vga_nn_writes): a frame copied again counts even when it looks the same. */
+extern uint32_t vga_nn_writes;
+static uint32_t nn_w_idle = 0;              /* the count when nothing was last seen changing, */
+static uint32_t nn_w_begin = 0;             /* when the drawing being watched began, */
+static uint32_t nn_draw_amount = 0;         /* and what the last drawing came to */
 
 static uint8_t * VGA_Draw_Xlat32_Linear_Line(Bitu vidstart, Bitu line);
 static uint8_t * VGA_Draw_Xlat32_VGA_CRTC_bmode_Line(Bitu vidstart, Bitu line);
 
-/* Looks at the sample pixels: the bands that changed since the last look. */
-static uint32_t NN_CopySample(void) {
-    const Bitu mask = vga.draw.linear_mask;
+/* Where the pixels to look at are, for this mode. False when it cannot be sampled. */
+static bool NN_CopySetup(void) {
     const Bitu rows = vga.draw.lines_total / (vga.draw.address_line_total ? vga.draw.address_line_total : 1u);
     const Bitu width = vga.draw.width;
     const bool planar = (VGA_DrawLine == VGA_Draw_Xlat32_VGA_CRTC_bmode_Line);  /* four pixels to a group, groups apart */
     const Bitu skip = (Bitu)4u << (Bitu)vga.config.addr_shift;
-    uint32_t changed = 0;
-    if (rows < NN_BANDS * 2 || width < NN_BAND_POINTS * 4) return 0;
+    if (rows < NN_BANDS * 2 || width < NN_BAND_POINTS * 2) return false;
+    if (planar && ((vga.draw.address & 3u) != 0 || (vga.draw.address_add & 3u) != 0)) return false;
+    const Bitu shape[5] = { rows, width, vga.draw.address_add, planar ? skip : 0u, vga.draw.linear_mask };
+    if (memcmp(shape,nn_copy_shape,sizeof(shape)) == 0) return true;
+    memcpy(nn_copy_shape,shape,sizeof(shape));
+    nn_copy_have = false;
     for (unsigned b=0;b < NN_BANDS;b++) {
         const Bitu row0 = (rows * b) / NN_BANDS, bandrows = (rows * (b + 1)) / NN_BANDS - row0;
         for (unsigned k=0;k < NN_BAND_POINTS;k++) {
-            const Bitu row = row0 + (bandrows * k) / NN_BAND_POINTS;
-            const Bitu x = (width * k) / NN_BAND_POINTS + (b * 5u + k * 3u) % (width / NN_BAND_POINTS);
-            const Bitu rowaddr = nn_copy_addr + row * vga.draw.address_add;
-            const Bitu off = planar ? ((((rowaddr & ~(Bitu)3u) + (x >> 2) * skip) & mask) | (x & 3u)) : ((rowaddr + x) & mask);
-            const uint8_t v = vga.draw.linear_base[off];
+            /* spread over the band's rows and across the screen, not in columns */
+            const Bitu row = row0 + ((Bitu)k * 7u + b) % bandrows;
+            const Bitu x = (width * k) / NN_BAND_POINTS + ((Bitu)b * 5u + (Bitu)k * 3u) % (width / NN_BAND_POINTS);
+            const Bitu rel = row * vga.draw.address_add + (planar ? ((x >> 2) * skip + (x & 3u)) : x);
+            nn_copy_rel[b][k] = (uint32_t)rel;
+        }
+    }
+    return true;
+}
+
+/* Looks at the sample pixels: the bands that changed since the last look. */
+static uint32_t NN_CopySample(void) {
+    const Bitu mask = vga.draw.linear_mask;
+    const uint8_t *mem = vga.draw.linear_base;
+    uint32_t changed = 0;
+    for (unsigned b=0;b < NN_BANDS;b++) {
+        bool diff = false;
+        for (unsigned k=0;k < NN_BAND_POINTS;k++) {
+            const uint8_t v = mem[(nn_copy_addr + nn_copy_rel[b][k]) & mask];
             if (v != nn_copy_seen[b][k]) {
                 nn_copy_seen[b][k] = v;
-                changed |= (uint32_t)1u << b;
+                diff = true;
             }
         }
+        if (diff) changed |= (uint32_t)1u << b;
     }
     return changed;
 }
@@ -4427,27 +4459,49 @@ static void NN_CopyReset(void) {
     nn_copy_quiet = 0;
 }
 
-/* True when a whole frame has just been copied onto the page shown. */
-static bool NN_CopyPoll(void) {
+static bool nn_check = false;               /* a frame waits to be compared at vertical retrace */
+static bool nn_check_flip = false;          /* it is a page the game flipped to, not a frame it copied */
+static double nn_check_next = -1;           /* a copied frame: when something was next drawn (-1: nothing yet) */
+
+/* What the pixels looked at say since the last call: 0 nothing yet, 1 a whole frame has just been copied onto the
+ * page shown, 2 something else was drawn there and has stopped. */
+static int NN_CopyPoll(void) {
     const uint32_t changed = NN_CopySample();
     if (!nn_copy_have) {        /* the first look in this mode only learns the picture */
         nn_copy_have = true;
         NN_CopyReset();
-        return false;
+        return 0;
     }
     if (changed != 0) {
         int top = 0, low = (int)NN_BANDS - 1;
         while (!(changed & ((uint32_t)1u << top))) top++;
         while (!(changed & ((uint32_t)1u << low))) low--;
+        const double now = PIC_FullIndex();
+        if (nn_copy_bands == 0) {
+            nn_draw_begin = now;
+            nn_w_begin = nn_w_idle;
+            if (nn_check && !nn_check_flip && nn_check_next < 0) nn_check_next = now;
+        }
+        nn_draw_last = now;
         if (nn_copy_bands != 0 && top + 1 < nn_copy_low) nn_copy_ordered = false;   /* back above where it had got to */
         nn_copy_bands |= changed;
         if (low > nn_copy_low) nn_copy_low = low;
         nn_copy_quiet = 0;
-        return false;
+        return 0;
     }
-    if (nn_copy_bands == 0 || ++nn_copy_quiet < 2) return false;
+    if (nn_copy_bands == 0) {
+        nn_w_idle = vga_nn_writes;
+        return 0;
+    }
+    if (++nn_copy_quiet < 2) return 0;
 
-    /* it stopped: was that a frame? */
+    /* it stopped */
+    nn_draw_idle = nn_draw_begin - nn_draw_end;
+    nn_draw_end = nn_draw_last;
+    nn_draw_amount = vga_nn_writes - nn_w_begin;
+    nn_w_idle = vga_nn_writes;
+
+    /* was that a frame? */
     unsigned count = 0;
     int first = -1;
     for (unsigned b=0;b < NN_BANDS;b++) {
@@ -4464,22 +4518,185 @@ static bool NN_CopyPoll(void) {
         if (flat) frame = false;
     }
     NN_CopyReset();
-    return frame;
+    return frame ? 1 : 2;
+}
+
+/* Is a frame taken early the whole picture? A game may go on drawing after the moment that looked like the end: a
+ * mouse pointer or a status line drawn onto a page after flipping to it, sprites drawn onto the screen after the
+ * background was copied there. Taken at vertical retrace the frame has all of that; taken early it does not, and the
+ * players see the picture flicker. So every early frame is checked: the video memory it shows is kept and compared
+ * at vertical retrace. A page a game flipped to must be the same then (a game that flips pages draws on the hidden
+ * ones). A frame copied onto the screen may have changed: a game that draws faster than the display shows has
+ * copied the next one. Another whole copy from the top down is the next frame. Anything less is told from a second
+ * step of the same frame by how much was drawn (vga_nn_writes: a frame copied again is a frame's worth even when it
+ * looks the same), and where that is not counted, by when it came: a second step follows much sooner than its frame
+ * followed the drawing before it, the next frame comes at the pace the frames have.
+ *  - A mode starts by only checking (frames are still taken at retrace): early frames begin after 20 checks with the
+ *    last 16 clean.
+ *  - While they are on, 3 failed checks in the last 12 turn them off again, and a frame that failed is drawn again at
+ *    retrace, so what the players have then is what they would have had anyway.
+ *  - Off, the checking goes on; early frames are tried again after 140 checks with the last 16 clean, twice as many
+ *    each time they had to be turned off (a game may draw in two steps in its menus and not in the game). */
+enum { NN_TRUST_LEARN = 0, NN_TRUST_ON = 1, NN_TRUST_OFF = 2 };
+static int nn_trust = NN_TRUST_LEARN;
+static uint32_t nn_verdicts = 0;            /* the last 32 checks, the newest in bit 0: 1 = more was drawn */
+static unsigned nn_verdict_count = 0;       /* checks since nn_trust last changed */
+static unsigned nn_trust_need = 20;         /* checks before early frames are tried */
+static bool nn_check_shown = false;         /* ...and it was shown early */
+static uint32_t nn_check_start = 0;         /* its start address */
+static Bitu nn_check_addr = 0, nn_check_line = 0;   /* vga.draw.address and address_line of its first row */
+static std::vector<uint8_t> nn_check_mem;   /* the video memory it shows */
+static double nn_check_idle = 0;            /* a copied frame: how long nothing had been drawn before it, */
+static double nn_check_end = 0;             /* when its copy ended, */
+static bool nn_check_newer = false;         /* and whether another whole frame has been copied since */
+static uint32_t nn_check_amount = 0;        /* how much its copy drew, and vga_nn_writes when it was taken */
+static uint32_t nn_check_writes = 0;
+static bool nn_pending = false;             /* a frame was copied when this refresh's frame was drawn already */
+static uint32_t nn_flip_seen = 0xFFFFFFFFu; /* the start address of the last flip taken as a frame */
+
+static inline unsigned NN_Ones(uint32_t v) {
+    unsigned n = 0;
+    for (;v != 0;v &= v - 1) n++;
+    return n;
+}
+
+static void NN_TrustReset(void) {
+    nn_trust = NN_TRUST_LEARN;
+    nn_verdicts = 0;
+    nn_verdict_count = 0;
+    nn_trust_need = 20;
+    nn_check = false;
+    nn_pending = false;
+    nn_flip_seen = 0xFFFFFFFFu;
+}
+
+static void NN_Verdict(bool more_drawn) {
+    nn_verdicts = (nn_verdicts << 1) | (more_drawn ? 1u : 0u);
+    nn_verdict_count++;
+    if (nn_trust == NN_TRUST_ON) {
+        if (NN_Ones(nn_verdicts & 0xFFFu) >= 3) {
+            nn_trust = NN_TRUST_OFF;
+            nn_verdict_count = 0;
+            nn_trust_need = (nn_trust_need < 140) ? 140 : ((nn_trust_need < 3200) ? nn_trust_need * 2 : 6400);
+            LOG_MSG("INPUTNET: frames at vertical retrace again: this game goes on drawing after showing a frame (next try after %u clean frames)",nn_trust_need);
+        }
+    }
+    else if (nn_verdict_count >= nn_trust_need && (nn_verdicts & 0xFFFFu) == 0) {
+        LOG_MSG("INPUTNET: frames as soon as the game shows them (%u checked)",nn_verdict_count);
+        nn_trust = NN_TRUST_ON;
+        nn_verdict_count = 0;
+    }
+}
+
+/* The video memory a frame of the current mode shows, from vga.draw.address addr: copies it out, or compares. */
+static bool NN_CheckMem(Bitu addr,bool compare) {
+    const Bitu mask = vga.draw.linear_mask;
+    const Bitu rows = vga.draw.lines_total / (vga.draw.address_line_total ? vga.draw.address_line_total : 1u);
+    Bitu len = vga.draw.address_add * rows;
+    if (len == 0 || len > mask + 1) len = mask + 1;
+    const Bitu at = addr & mask;
+    const Bitu first = (len < mask + 1 - at) ? len : (mask + 1 - at);
+    if (compare) {
+        if (nn_check_mem.size() != len) return true;
+        return memcmp(nn_check_mem.data(),vga.draw.linear_base + at,first) != 0 ||
+            (len > first && memcmp(nn_check_mem.data() + first,vga.draw.linear_base,len - first) != 0);
+    }
+    nn_check_mem.resize(len);
+    memcpy(nn_check_mem.data(),vga.draw.linear_base + at,first);
+    if (len > first) memcpy(nn_check_mem.data() + first,vga.draw.linear_base,len - first);
+    return false;
+}
+
+/* The game seems to have finished a frame (the one that would be drawn now): it is shown at once when this mode has
+ * earned that, and checked at vertical retrace either way. */
+static void NN_Candidate(bool flip) {
+    NN_CheckMem(vga.draw.address,false);
+    nn_check = true;
+    nn_check_flip = flip;
+    nn_check_idle = nn_draw_idle;
+    nn_check_end = nn_draw_end;
+    nn_check_next = -1;
+    nn_check_newer = false;
+    nn_check_amount = nn_draw_amount;
+    nn_check_writes = vga_nn_writes;
+    nn_check_start = (uint32_t)vga.config.real_start;
+    nn_check_addr = vga.draw.address;
+    nn_check_line = vga.draw.address_line;
+    nn_check_shown = (nn_trust == NN_TRUST_ON);
+    if (nn_check_shown) VGA_RenderOnDemandComplete();
+}
+
+/* An early frame turned out to be less than the picture: the picture as it is at vertical retrace, in its place. */
+static void NN_Redraw(void) {
+    if (vga.draw.lines_done < vga.draw.lines_total || !RENDER_StartUpdate()) return;
+    vga.draw.lines_done = 0;
+    vga.draw.address = nn_check_addr;
+    vga.draw.address_line = nn_check_line;
+    VGA_RenderOnDemandComplete();
+    vga_mode_frames_since_time_base--;      /* one frame of time, drawn twice */
+}
+
+/* At vertical retrace: was the frame taken early (or the one that would have been) the picture the game meant? */
+static void NN_Verify(void) {
+    if (!nn_check) return;
+    nn_check = false;
+    if (NN_CurrentStart() != nn_check_start) return;    /* the game is on another page already: nothing to compare */
+    bool more = false;
+    if (NN_CheckMem(nn_check_addr,true)) {
+        if (nn_check_flip) more = true;     /* a game that flips pages draws on the hidden ones */
+        else if (nn_check_newer) more = false;  /* the next whole frame was copied: this one was complete */
+        else if (nn_copy_bands != 0 && nn_copy_ordered && (nn_copy_bands & 3u) != 0)
+            more = false;                       /* a copy from the top is under way: the next frame */
+        else if (nn_check_amount >= 32768u) {
+            /* Something else was drawn after the copy, in a mode where drawing is counted: the next frame with
+             * little changed in it when it was as much as a frame, more of the same frame when it was a little. */
+            more = (vga_nn_writes - nn_check_writes) < nn_check_amount / 2u;
+        }
+        else {
+            /* Not counted (the program writes straight to video memory, in one bank): the next frame with little
+             * changed in it, when the game draws frames at this pace; more of the same frame, when it came much
+             * sooner than this frame came after the drawing before it. */
+            const double after = ((nn_check_next >= 0) ? nn_check_next : PIC_FullIndex()) - nn_check_end;
+            more = nn_check_idle > 2.0 * after + 1.0;
+        }
+    }
+    NN_Verdict(more);
+    if (more && nn_check_shown) NN_Redraw();
 }
 
 static void NN_FramePoll(Bitu /*val*/) {
-    if (!nn_early_frame || vga.draw.lines_done != 0) return;    /* drawn, or being drawn: nothing to bring forward */
+    if (!nn_early_frame) return;
     const uint32_t cur = NN_CurrentStart();
-    /* the same at two polls: every register of the address has been written */
-    if (cur != nn_shown_start && cur == nn_poll_start && NN_IsPageFlip(nn_shown_start,cur)) {
-        NN_TakeStart(cur);
-        VGA_RenderOnDemandComplete();
-        return;
+    if (vga.draw.lines_done == 0) {
+        /* another page, the same at two polls (every register of the address has been written) */
+        if (cur != nn_shown_start && cur != nn_flip_seen && cur == nn_poll_start && NN_IsPageFlip(nn_shown_start,cur)) {
+            NN_TakeStart(cur);
+            nn_flip_seen = cur;
+            nn_pending = false;
+            if (nn_copy_ok) {           /* the pixels looked at are another page's now */
+                nn_copy_addr = vga.draw.address;
+                nn_copy_have = false;
+            }
+            NN_Candidate(true);
+            PIC_AddEvent(NN_FramePoll,nn_poll_ms);
+            return;
+        }
+        nn_poll_start = cur;
     }
-    nn_poll_start = cur;
-    if (nn_copy_ok && cur == (uint32_t)vga.config.real_start && NN_CopyPoll()) {
-        VGA_RenderOnDemandComplete();
-        return;
+    if (nn_copy_ok && cur == (uint32_t)vga.config.real_start) {
+        int what = NN_CopyPoll();
+        const bool drawn = vga.draw.lines_done != 0;
+        if (what == 0 && nn_pending && !drawn && nn_copy_bands == 0) what = 1;  /* copied late in the last refresh */
+        if (what == 1) {
+            if (!drawn) {
+                nn_pending = false;
+                NN_Candidate(false);
+            }
+            else {
+                nn_pending = true;      /* this refresh has its frame: first thing in the next */
+                if (nn_check && !nn_check_flip) nn_check_newer = true;
+            }
+        }
     }
     PIC_AddEvent(NN_FramePoll,nn_poll_ms);
 }
@@ -4512,6 +4729,7 @@ static void VGA_DisplayStartLatch(Bitu /*val*/) {
 #endif
 
     if (!IS_PC98_ARCH) {
+        if (nn_early_frame) NN_Verify();
         if (nn_early_frame && vga.draw.lines_done == 0) NN_TakeStart(NN_CurrentStart());
         OnDemandCompleteFrame();
     }
@@ -7268,6 +7486,7 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 	PIC_RemoveEvents(NN_FramePoll);
 	nn_early_frame = NN_EarlyFrameOK();
 	nn_copy_ok = false;
+	nn_check = false;
 	if (nn_early_frame && REMOTEPLAY_PresentMode() >= 2) {
 		nn_poll_start = NN_CurrentStart();
 		/* a frame copied onto this page can be told by looking at its pixels (NN_CopyPoll) */
@@ -7275,7 +7494,7 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 			(VGA_DrawLine == VGA_Draw_Xlat32_Linear_Line || VGA_DrawLine == VGA_Draw_Xlat32_VGA_CRTC_bmode_Line)) {
 			if (nn_copy_have && nn_copy_addr != vga.draw.address) nn_copy_have = false;  /* another page, or a scroll */
 			nn_copy_addr = vga.draw.address;
-			nn_copy_ok = true;
+			nn_copy_ok = NN_CopySetup();
 		}
 		PIC_AddEvent(NN_FramePoll,nn_poll_ms);
 	}
@@ -7542,6 +7761,7 @@ void ChooseRenderOnDemand(void) {
 	nn_shown_start = 0xFFFFFFFFu;
 	nn_copy_ok = false;
 	nn_copy_have = false;
+	NN_TrustReset();
 
 	if (vga_render_on_demand)
 		vga_render_wait_for_changes = vga_render_wait_for_changes_user > 0;

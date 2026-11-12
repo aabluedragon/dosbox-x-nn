@@ -56,6 +56,11 @@ static inline void vga_vram_write_trigger_update(void) {
 	vga.draw.must_complete_frame = true;
 }
 
+/* NukemNet remote play host (vga_draw.cpp, NN_Verify): how much has been drawn, to tell a whole frame copied to the
+ * screen (even one that looks the same as the last) from a little drawn on top of one. Bytes in chained 256-colour
+ * modes; in banked SVGA modes, where the program writes straight to memory, a bank's worth for every change of bank. */
+uint32_t vga_nn_writes = 0;
+
 static inline void vga_cg_write_trigger_update(void) {
 	vga.draw.must_complete_frame = true;
 }
@@ -421,6 +426,7 @@ public:
 	}
 	template <typename T=uint8_t> static INLINE void do_write_aligned(const PhysPt a,const T v) {
 		vga_vram_write_trigger_update();
+		vga_nn_writes += (uint32_t)sizeof(T);
 		*((T*)(&vga.mem.linear[a])) = v;
 	}
 	template <typename T=uint8_t> static INLINE void do_write(const PhysPt a,const T v) {
@@ -478,6 +484,7 @@ public:
 	}
 	static INLINE void writeHandler8(PhysPt addr, uint8_t val) {
 		vga_vram_write_trigger_update();
+		vga_nn_writes++;
 		return VGA_Generic_Write_Handler<true/*chained*/>(addr&~3u, addr, (uint8_t)val);
 	}
 
@@ -534,6 +541,7 @@ public:
 	}
 	static INLINE void writeHandler8(PhysPt addr, uint8_t val) {
 		vga_vram_write_trigger_update();
+		vga_nn_writes++;
 		return VGA_Generic_Write_Handler<true/*chained*/>(addr>>2u, addr, (uint8_t)val);
 	}
 
@@ -2542,8 +2550,10 @@ void VGA_SetupHandlers(void) {
 		vga.svga.bank_write_full = vga.dosboxig.wbank_offset & (~0xFFFu);
 	}
 	else {
+		const Bitu nn_bank_was = vga.svga.bank_write_full;
 		vga.svga.bank_read_full = vga.svga.bank_read*vga.svga.bank_size;
 		vga.svga.bank_write_full = vga.svga.bank_write*vga.svga.bank_size;
+		if (vga.svga.bank_write_full != nn_bank_was) vga_nn_writes += 65536u;
 	}
 	bool runeten = false;
 	PageHandler *newHandler;

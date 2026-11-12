@@ -87,9 +87,20 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   pixels of the frame are looked at every quarter of a millisecond; bands changing from the top down, most of
   the screen, not to one colour, and then nothing for two polls, is a frame. Measured the same way: 54 ms from
   key to picture became 47 ms, and a copy caught half-way (2 frames in 150 at 3000 cycles) no longer happens.
-  Shadow Warrior at 800x600 is shown on average 6 ms into the 14 ms refresh instead of at its end. Use `retrace`
-  or `scanout` for a game whose picture flickers with `flip` (one that keeps drawing into a page after showing
-  it, or draws its picture onto the screen in two passes).
+  Shadow Warrior at 800x600 is shown on average 6 ms into the 14 ms refresh instead of at its end.
+  Both are guesses at when a frame is complete, and a game may go on drawing: a pointer drawn onto a page after
+  flipping to it, sprites drawn onto the screen after the background was copied. So each video mode has to earn
+  early frames and keeps being checked (`NN_Verify`): the video memory of every such frame is kept and compared
+  at vertical retrace. A page a game flipped to must be unchanged. A copied frame may have been followed by the
+  next one (a game that draws faster than the display shows): that is another whole copy, or at least a frame's
+  worth of writing (`vga_nn_writes` counts bytes in chained 256-colour modes and banks switched in banked SVGA
+  modes, so a frame copied again counts even when it looks the same; where nothing is counted, timing decides).
+  A mode starts with frames at retrace and only the checks; early frames begin after 20 checks with the last 16
+  clean, stop after 3 failures in 12 (a failed frame is drawn again at retrace), and are tried again after 140
+  clean checks, twice as many each time. The host log says when a mode changes over. With two test programs
+  that draw late on purpose (a box 2.5 ms after copying a frame, a block 2.5 ms after flipping a page) the
+  players got an incomplete frame on every key press before this and on about one in eight after it, the same as
+  with `present=retrace`. `retrace` and `scanout` remain as manual settings.
 - Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
   `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
   notice, on the surface output), opens it minimized and without the focus, so it never covers the
