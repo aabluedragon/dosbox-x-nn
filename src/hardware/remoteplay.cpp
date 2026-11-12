@@ -119,7 +119,7 @@ const size_t RP_FRAME_HDR = 12;         /* u16 w, u16 h, u8 fmt, u8 key, u16 bac
 const unsigned RP_HISTORY = 16;         /* decoded frames both sides keep as delta bases */
 const size_t RP_HISTORY_BYTES = (size_t)48 << 20;
 const double RP_RATE_MAX = 28.0e6;      /* video bytes/s: the fixed rate for older viewers */
-const double RP_RATE_START = 1.5e6;     /* adaptive pacing starts here... */
+const double RP_RATE_START = 1.5e6;     /* pacing, once loss turns it on, starts at least here... */
 const double RP_RATE_MIN = 96.0e3;      /* ...and never goes below this */
 const unsigned RP_MAX_EVENTS = 48;      /* input events per datagram */
 
@@ -264,6 +264,7 @@ double send_budget = 0;                         /* bytes that may go out now */
 double send_rate = RP_RATE_MAX;                 /* video bytes/s */
 double rate_delivered = 0;                      /* the most video bytes/s a viewer has received lately */
 bool rate_adaptive = false;
+bool rate_limited = false;                      /* a viewer reported loss: video is paced from then on */
 
 /* 32-bit frames of 256-colour modes: DOSBox-X draws SVGA 8-bit modes (Shadow Warrior's 800x600, for one) as 32-bit
  * pixels, a quarter of which would do. Such frames go out as palette + indices; a colour keeps its index from frame
@@ -433,8 +434,9 @@ void Host_UpdateRateMode(void) {
     const bool adaptive = Host_RefsMode();
     if (adaptive == rate_adaptive) return;
     rate_adaptive = adaptive;
-    send_rate = adaptive ? RP_RATE_START : RP_RATE_MAX;
+    send_rate = RP_RATE_MAX;
     rate_delivered = 0;
+    rate_limited = false;
     rate_cut_ms = SDL_GetTicks();
 }
 
@@ -452,24 +454,26 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
     if (de == 0 || de > 0x7fffffffu) return;
     const double loss = dg < de ? (double)(de - dg) / (double)de : 0.0;
 
-    /* What actually got through, remembered for a while (halving in about half a minute) so a pause in the action does
-     * not forget what the link carries. The rate stays within twice that: with only small or occasional frames to send
-     * (a still picture, a key frame now and then) it would otherwise creep up unchecked, and the next burst of motion
-     * would go out far faster than the link takes it and lose whole frames until the cuts caught up. */
-    rate_delivered = std::max(rate_delivered * pow(0.98,secs),(double)dg * RP_FRAG / secs);
-    const double ceiling = std::max(RP_RATE_START,rate_delivered * 2.0);
+    /* Video goes out as fast as it comes (no pacing, no added latency) until a viewer reports loss: a 320x200 game,
+     * or any game on a link that takes it all, is never paced. Loss turns pacing on, at what actually got through, and
+     * from then on the rate follows the link: down on loss, up while video waits for it and none is lost, and never
+     * above twice what viewers have received lately (remembered for a while, halving in about half a minute), so a
+     * still picture does not let it creep up and the next burst of motion is not sent far faster than the link takes. */
+    const double delivered_now = (double)dg * RP_FRAG / secs;
+    rate_delivered = std::max(rate_delivered * pow(0.98,secs),delivered_now);
     if (loss > 0.03) {
         /* Loss reports lag a round trip behind: cut again only once the last cut could show. */
         if (now - rate_cut_ms >= 400) {
-            send_rate = std::max(RP_RATE_MIN,send_rate * 0.75);
+            if (!rate_limited) send_rate = std::min(send_rate,std::max(RP_RATE_START,delivered_now));
+            else send_rate = std::max(RP_RATE_MIN,send_rate * 0.75);
+            rate_limited = true;
             rate_cut_ms = now;
         }
     }
-    else if (loss < 0.01 && now - rate_cut_ms >= 400 && now - send_backlog_ms < 300) {
-        /* Video is waiting for the rate: raise it, quickly, since the ceiling keeps it near what gets through. */
-        send_rate = std::min(send_rate * 1.2,ceiling);
+    else if (rate_limited && loss < 0.01 && now - rate_cut_ms >= 400 && now - send_backlog_ms < 300) {
+        send_rate = std::min(send_rate * 1.2,RP_RATE_MAX);
     }
-    send_rate = std::min(std::min(send_rate,ceiling),RP_RATE_MAX);
+    if (rate_limited) send_rate = std::min(send_rate,std::max(RP_RATE_START,rate_delivered * 2.0));
     if (now - rate_log_ms >= 5000) {
         static uint32_t last_frames = 0;
         static uint64_t last_bytes = 0;
@@ -691,10 +695,11 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
 void Host_FlushQueue(void) {
     const uint32_t now = SDL_GetTicks();
     if (now != send_lastms) {
-        /* send_rate spread over each millisecond (at most 4 ms worth at once), so a big key frame does not overflow
-         * the receiver's socket buffer or a router's queue in one burst. */
-        const uint32_t elapsed = std::min<uint32_t>(now - send_lastms,4);
-        const double burst = std::max(send_rate * 0.004,8.0 * (double)RP_PACKET_MAX);
+        /* send_rate spread over each millisecond, so a big key frame does not overflow the receiver's socket buffer or
+         * a router's queue in one burst. Up to 32 KB (or 4 ms worth) may still go at once: an ordinary frame of a
+         * 320x200 game fits, and goes out without waiting for the pacing. */
+        const uint32_t elapsed = now - send_lastms;
+        const double burst = std::max(send_rate * 0.004,32.0 * 1024.0);
         send_budget = std::min(send_budget + send_rate * (double)elapsed / 1000.0,burst);
         send_lastms = now;
     }
