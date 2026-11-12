@@ -950,4 +950,21 @@ NETClientSocket *NamedPipeServerSocket::Accept()
 	return new NamedPipeClientSocket(c);
 }
 
+/* Remote play (src/hardware/remoteplay.cpp): bigger kernel buffers for an SDL_net UDP socket. SDL_net gives no way to
+ * the native socket, but both SDL_net 1.2 and 2 keep it right after the "ready" field of struct _UDPsocket. An 800x600
+ * frame is a burst of a hundred datagrams and more; the default buffers (64 KB on Windows, 208 KB on Linux) dropped part
+ * of it whenever the receiver was busy for a few milliseconds, and loss makes the host pace its video. */
+#ifdef NATIVESOCKETS
+void NetWrapper_WidenUdpBuffers(UDPsocket sock, int bytes)
+{
+	if (!sock) return;
+	struct UdpSocketPrefix { int ready; SOCKET channel; };
+	const SOCKET fd = ((UdpSocketPrefix *)sock)->channel;
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *)&bytes, sizeof(bytes));
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&bytes, sizeof(bytes));
+}
+#else
+void NetWrapper_WidenUdpBuffers(UDPsocket, int) { }
+#endif
+
 #endif // #if C_MODEM

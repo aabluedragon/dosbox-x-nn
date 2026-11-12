@@ -31,6 +31,7 @@ void REMOTEPLAY_Configure(Section_prop *section);
 bool REMOTEPLAY_StartServer(uint16_t port);
 void REMOTEPLAY_StopServer(const char *reason);
 bool REMOTEPLAY_ServerRunning(void);
+int REMOTEPLAY_PresentMode(void);   /* how a host's frames are timed: 0 scanout, 1 retrace, 2 flip; 0 without a server */
 void REMOTEPLAY_Status(Program *prog);
 void REMOTEPLAY_Poll(void);
 void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pitch,

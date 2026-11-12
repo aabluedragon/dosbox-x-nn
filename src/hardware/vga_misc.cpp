@@ -39,6 +39,7 @@ extern bool DISP2_Active(void);
 
 extern bool vga_render_on_demand;
 void VGA_RenderOnDemandUpTo(void);
+int REMOTEPLAY_PresentMode(void);   /* not 0: a remote play host takes frames early (vga_draw.cpp, NN_EarlyFrameOK) */
 
 /* allow the user to specify that undefined bits in 3DA/3BA be set to some nonzero value.
  * this is needed for "JOOP #2" by Europe demo, which has some weird retrace tracking code
@@ -63,7 +64,11 @@ Bitu vga_read_p3da(Bitu port,Bitu iolen) {
 	// If the game or demo is wasting time in a loop polling this register (not merely reading to
 	// clear the port 3C0h flip/flop) then now is as good a time as any to render the VGA raster
 	// up to the current point.
-	if (vga_render_on_demand && !vga_render_wait_for_changes && !vga.attr.disabled/*screen not disabled*/ && !vga.internal.attrindex/*attribute controller flipflop clear*/) VGA_RenderOnDemandUpTo();
+	//
+	// NukemNet remote play host: not then. Reading the port changes nothing on screen, and a frame partly drawn
+	// here (the VESA BIOS reads it with every page flip, games poll it for retrace) could not take a newer page.
+	if (vga_render_on_demand && !vga_render_wait_for_changes && !vga.attr.disabled/*screen not disabled*/ && !vga.internal.attrindex/*attribute controller flipflop clear*/ &&
+		REMOTEPLAY_PresentMode() == 0) VGA_RenderOnDemandUpTo();
 
 	vga.internal.attrindex=false;
 	vga.tandy.pcjr_flipflop=false;

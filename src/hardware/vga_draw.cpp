@@ -3920,6 +3920,9 @@ void VGA_FreeBiosLogo(void) {
 	BIOSlogo.free();
 }
 
+/* NukemNet remote play host (see NN_EarlyFrameOK): the start address the last frame was drawn from */
+static uint32_t nn_shown_start = 0xFFFFFFFFu;
+
 static void VGA_DrawSingleLine(Bitu /*blah*/) {
     unsigned int lines = 0;
     bool skiprender;
@@ -4118,6 +4121,7 @@ again:
         if (!is_vga_rendering_on_demand)
             PIC_AddEvent(VGA_DrawSingleLine,vga.draw.delay.singleline_delay);
     } else {
+        nn_shown_start = (uint32_t)vga.config.real_start;
         vga.draw.must_complete_frame = false;
         vga_mode_frames_since_time_base++;
         RENDER_EndUpdate(false);
@@ -4301,6 +4305,88 @@ static void OnDemandCompleteFrame(void) {
     vga.draw.must_draw_again = false;
 }
 
+/* NukemNet remote play host: frames without the display's delay.
+ * A VGA takes a new start address at the start of vertical retrace and then spends a whole refresh showing that page.
+ * The emulation did the same and handed the frame over when its last line was drawn, so a page a game flipped to
+ * reached the remote players 14 to 28 ms later at 70 Hz (measured: 12 to 21 ms in Shadow Warrior at 800x600, which
+ * had drawn one or two newer frames by then). While a remote play server runs ([inputnet] present):
+ *  - 256-colour VGA modes are rendered on demand, as SVGA modes already are (ChooseRenderOnDemand): the frame is
+ *    drawn at the start of vertical retrace from what video memory holds then, so a game that copies its frame to
+ *    the screen is seen one refresh earlier and whole. Palette and register changes still draw up to the beam first.
+ *  - A frame not drawn yet takes the start address the game has set by now, not the one latched a refresh ago.
+ *  - present=flip: when the start address moves to another page, the frame is drawn at once (the game has finished
+ *    that page), not at the next retrace.
+ * Scrolling with pixel panning or a split screen needs the address and the panning to change in the same frame, so a
+ * mode that uses either keeps the VGA's own timing until the next mode change. */
+int REMOTEPLAY_PresentMode(void);           /* remoteplay.cpp: 0 scanout, 1 retrace, 2 flip; 0 while no server runs */
+static bool nn_early_frame = false;         /* the frame being shown may take a newer start address */
+static bool nn_early_blocked = false;       /* panning or a split screen was used in this mode */
+static uint32_t nn_poll_start = 0xFFFFFFFFu;    /* the start address at the last poll: taken once it has settled */
+static const float nn_poll_ms = 0.25f;
+
+static inline uint32_t NN_CurrentStart(void) {
+    return (uint32_t)(vga.config.display_start & vga.mem.memmask);
+}
+
+static bool NN_EarlyFrameOK(void) {
+    if (REMOTEPLAY_PresentMode() == 0 || !is_vga_rendering_on_demand) return false;
+    if (!IS_VGA_ARCH || IS_PC98_ARCH || vga.dosboxig.svga || vga.overopts.enable) return false;
+    if (svgaCard != SVGA_S3Trio && svgaCard != SVGA_None) return false;
+    if (vga.draw.mode != DRAWLINE) return false;
+    switch (vga.mode) {
+        case M_VGA: case M_LIN8: case M_LIN15: case M_LIN16: case M_LIN24: case M_LIN32: break;
+        default: return false;
+    }
+    /* the S3 streams processor takes the address from its own registers */
+    if (svgaCard == SVGA_S3Trio && (s3Card >= S3_ViRGE || s3Card == S3_Trio64V) && ((vga.s3.misc_control_2 >> 2u) & 3u) == 3u)
+        return false;
+    if (vga.config.pel_panning != 0 || vga.draw.panning != 0 || vga.config.bytes_skip != 0 || vga.draw.bytes_skip != 0 ||
+        vga.config.hlines_skip != 0 || vga.draw.vblank_skip != 0 || vga.draw.split_line < vga.draw.lines_total)
+        nn_early_blocked = true;
+    return !nn_early_blocked;
+}
+
+/* What VGA_VerticalTimer made of the start address (see its M_VGA and M_LIN cases), in vga.draw.address units. */
+static inline Bitu NN_StartToAddress(uint32_t start) {
+    Bitu a = start;
+    if (vga.mode == M_VGA) a <<= (Bitu)vga.config.addr_shift;
+    return a * vga.draw.byte_panning_shift;
+}
+
+/* The frame has not been drawn yet: draw it from this start address. */
+static void NN_TakeStart(uint32_t start) {
+    const uint32_t old = (uint32_t)vga.config.real_start;
+    if (start == old) return;
+    vga.draw.address += NN_StartToAddress(start) - NN_StartToAddress(old);
+    vga.config.real_start = start;
+}
+
+/* Another page: the two screens do not overlap in video memory (scrolling moves the address a little at a time). */
+static bool NN_IsPageFlip(uint32_t from,uint32_t to) {
+    if (from == 0xFFFFFFFFu) return false;
+    const Bitu a = NN_StartToAddress(from), b = NN_StartToAddress(to), mask = vga.draw.linear_mask;
+    Bitu d = (b - a) & mask;
+    const Bitu back = (a - b) & mask;
+    if (back < d) d = back;
+    const Bitu rows = vga.draw.lines_total / (vga.draw.address_line_total ? vga.draw.address_line_total : 1u);
+    return d >= vga.draw.address_add * rows;
+}
+
+void VGA_RenderOnDemandComplete(void);
+
+static void NN_FramePoll(Bitu /*val*/) {
+    if (!nn_early_frame || vga.draw.lines_done != 0) return;    /* drawn, or being drawn: nothing to bring forward */
+    const uint32_t cur = NN_CurrentStart();
+    /* the same at two polls: every register of the address has been written */
+    if (cur != nn_shown_start && cur == nn_poll_start && NN_IsPageFlip(nn_shown_start,cur)) {
+        NN_TakeStart(cur);
+        VGA_RenderOnDemandComplete();
+        return;
+    }
+    nn_poll_start = cur;
+    PIC_AddEvent(NN_FramePoll,nn_poll_ms);
+}
+
 static void VGA_VertInterrupt(Bitu /*val*/) {
     if (IS_PC98_ARCH) {
         if (GDC_vsync_interrupt) {
@@ -4328,7 +4414,10 @@ static void VGA_DisplayStartLatch(Bitu /*val*/) {
     if ((vga.config.display_start & vga.mem.memmask) != old_start) emw_flip_count++;
 #endif
 
-    if (!IS_PC98_ARCH) OnDemandCompleteFrame();
+    if (!IS_PC98_ARCH) {
+        if (nn_early_frame && vga.draw.lines_done == 0) NN_TakeStart(NN_CurrentStart());
+        OnDemandCompleteFrame();
+    }
 
     /* hretrace fx support: store the hretrace value at start of picture so we have
      * a point of reference how far to displace the scanline when wavy effects are
@@ -6468,6 +6557,7 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 	}
 	RENDER_EndUpdate(renderAbort);
 	vga.draw.lines_done = 0;
+	nn_early_frame = false;
 
 #if C_DIRECT3D && defined(C_SDL2)
     if(sdl.desktop.type == SCREEN_DIRECT3D11) {
@@ -7077,6 +7167,14 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 	}
 #endif
 
+	/* NukemNet remote play host: this frame may be drawn early, from a newer start address (NN_EarlyFrameOK) */
+	PIC_RemoveEvents(NN_FramePoll);
+	nn_early_frame = NN_EarlyFrameOK();
+	if (nn_early_frame && REMOTEPLAY_PresentMode() >= 2) {
+		nn_poll_start = NN_CurrentStart();
+		PIC_AddEvent(NN_FramePoll,nn_poll_ms);
+	}
+
 	// add the draw event
 	switch (vga.draw.mode) {
 		case DRAWLINE:
@@ -7329,8 +7427,14 @@ void ChooseRenderOnDemand(void) {
 		vga_render_on_demand = true;
 	else if (vga_render_wait_for_changes > 0) /* NTS: Wait for changes requires render on demand. Only if explicitly enabled. */
 		vga_render_on_demand = true;
+	else if (IS_VGA_ARCH && vga.mode == M_VGA && REMOTEPLAY_PresentMode() != 0) /* NukemNet remote play host: see NN_EarlyFrameOK */
+		vga_render_on_demand = true;
 	else
 		vga_render_on_demand = false;
+
+	nn_early_frame = false;
+	nn_early_blocked = false;
+	nn_shown_start = 0xFFFFFFFFu;
 
 	if (vga_render_on_demand)
 		vga_render_wait_for_changes = vga_render_wait_for_changes_user > 0;

@@ -39,6 +39,7 @@ bool remoteplay_screen_hidden = false;
 #include <string.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <string>
@@ -70,6 +71,9 @@ bool remoteplay_screen_hidden = false;
 #endif
 
 extern bool SDLNetInited;
+#if C_MODEM
+void NetWrapper_WidenUdpBuffers(UDPsocket sock, int bytes);    /* src/hardware/serialport/misc_util.cpp */
+#endif
 extern bool dos_kernel_disabled;
 extern uint16_t shell_psp;
 bool PROGRAMS_IsRunningInternalPSP(uint16_t psp);
@@ -96,12 +100,16 @@ enum {
     RP_INPUTACK = 7,    /* host -> viewer: highest input event applied */
     RP_KEYREQ   = 8,    /* viewer -> host: please send a key frame */
     RP_BYE      = 9,    /* either way: leaving (reason) */
-    RP_FRAMEACK = 10    /* viewer -> host: session, u8 flags (1: has a frame), newest decoded frame,
+    RP_FRAMEACK = 10,   /* viewer -> host: session, u8 flags (1: has a frame), newest decoded frame,
                            video fragments expected and received (cumulative) */
+    RP_FRAMEINFO = 11   /* host -> viewer (RP_FEAT_TIMING): frame id, newest input event applied before the frame was
+                           taken, microseconds from applying it to taking the frame, microseconds encoding the frame */
 };
 
 /* Viewer features (u32 after the session id in RP_HELLO; older viewers send none) */
 const uint32_t RP_FEAT_REFS = 1;        /* decodes against the frame a frame names, sends RP_FRAMEACK */
+const uint32_t RP_FEAT_TIMING = 2;      /* reads RP_FRAMEINFO to measure how long input takes to reach its screen */
+const uint32_t RP_FEAT_PIECES = 4;      /* reads the piece table of a frame compressed in pieces and inflates them at once */
 
 enum {
     RPEV_KEY     = 1,   /* u16 KBD_KEYS, u8 pressed */
@@ -114,7 +122,10 @@ const size_t RP_PACKET_MAX = 1400;      /* receive/send buffer size */
 const size_t RP_FRAG = 1180;            /* video payload per datagram */
 const unsigned RP_MAX_VIEWERS = 7;
 const unsigned RP_AUDIO_FRAMES = 256;   /* stereo samples per sound packet */
-const size_t RP_FRAME_HDR = 12;         /* u16 w, u16 h, u8 fmt, u8 key, u16 back, u32 rawsize */
+const size_t RP_FRAME_HDR = 12;         /* u16 w, u16 h, u8 fmt, u8 flags, u16 back, u32 rawsize */
+                                        /* flags: 1 key frame; 2 (only when every viewer has RP_FEAT_PIECES): a piece table
+                                           comes before the zlib stream: u8 n, then n times u32, each piece's compressed size */
+const unsigned RP_PIECES_MAX = 8;
                                         /* back: frames between this one and its base (0: the previous frame) */
 const unsigned RP_HISTORY = 16;         /* decoded frames both sides keep as delta bases */
 const size_t RP_HISTORY_BYTES = (size_t)48 << 20;
@@ -198,6 +209,33 @@ unsigned RP_BytesPerPixel(unsigned fmt) {
     }
 }
 
+/* Microseconds on a clock that only goes forward (SDL 1.2 has no high resolution counter). */
+uint64_t RP_Micros(void) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+unsigned RP_CpuCount(void) {
+#if SDL_VERSION_ATLEAST(2,0,0)
+    const int n = SDL_GetCPUCount();
+#else
+    const char *e = getenv("NUMBER_OF_PROCESSORS");     /* Windows sets it; elsewhere SDL 1.2 hosts encode on one thread */
+    const int n = e ? atoi(e) : 1;
+#endif
+    return n > 0 ? (unsigned)n : 1u;
+}
+
+uint32_t RP_ClampU32(uint64_t v) { return v > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)v; }
+
+/* Room for a whole burst of video (a big frame, or several) while the other end is busy. */
+void RP_WidenSocket(UDPsocket sock) {
+#if C_MODEM
+    NetWrapper_WidenUdpBuffers(sock,4 << 20);
+#else
+    (void)sock;
+#endif
+}
+
 bool RP_OpenNet(void) {
     if (!SDLNetInited) {
         if (SDLNet_Init() == -1) {
@@ -220,6 +258,7 @@ struct Viewer {
     uint32_t session = 0;               /* random per viewer start: a restart from the same address is a new player */
     uint32_t lastheard = 0;
     uint32_t applied = 0;               /* highest input event applied */
+    uint64_t applied_us = 0;            /* when it was applied (RP_Micros) */
     bool keydown[KBD_LAST];
     uint32_t buttons = 0;
     uint32_t features = 0;              /* RP_FEAT_* from its HELLO */
@@ -237,8 +276,12 @@ bool host_running = false;
  * nothing and gave up after the timeout ("The connection to the host was lost"), and hiding the screen from the Video
  * menu broke the stream. While the main loop has not polled for a while, this thread answers the viewers that are
  * already in, so they stay connected (the picture waits); their input is left for the main loop (viewers send it
- * again until it is acknowledged). host_lock guards the socket, its packets and the viewer list. */
+ * again until it is acknowledged). host_lock guards the socket's packets and the viewer list, and what the video
+ * encoder thread shares with the main loop (see Capture below). */
 SDL_mutex *host_lock = NULL;
+inline void Host_Lock(void) { if (host_lock) SDL_LockMutex(host_lock); }
+inline void Host_Unlock(void) { if (host_lock) SDL_UnlockMutex(host_lock); }
+SDL_mutex *send_lock = NULL;        /* one thread at a time sends queued video, so it leaves in the order queued */
 SDL_Thread *host_keepalive = NULL;
 volatile int host_keepalive_stop = 0;
 volatile uint32_t host_lastpoll = 0;
@@ -246,12 +289,13 @@ uint16_t host_port = 0;
 Viewer viewers[RP_MAX_VIEWERS];
 unsigned cfg_timeout = 10000;
 unsigned cfg_maxfps = 0;
+int cfg_present = 2;            /* [inputnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
 
 /* Video encoder state */
 struct EncFrame { uint32_t id = 0; std::vector<uint8_t> raw; };
-std::vector<uint8_t> enc_raw, enc_work, enc_comp;
-std::vector<uint8_t> enc_lastin;                /* the last 32-bit picture offered, as given */
-unsigned enc_inw = 0, enc_inh = 0;
+std::vector<uint8_t> enc_raw, enc_work, enc_comp, enc_alt;
+std::vector<uint32_t> enc_pieces, enc_altpieces;
+unsigned enc_plain_streak = 0;                  /* frames in a row that were smaller compressed alone than as a difference */
 std::deque<EncFrame> enc_hist;                  /* the newest frames sent, oldest first */
 EncFrame enc_key;                               /* the last key frame (kept even when older than enc_hist) */
 unsigned enc_w = 0, enc_h = 0, enc_fmt = 0;
@@ -266,6 +310,34 @@ double rate_delivered = 0;                      /* the most video bytes/s a view
 bool rate_adaptive = false;
 bool rate_limited = false;                      /* a viewer reported loss: video is paced from then on */
 
+/* The video encoder thread. REMOTEPLAY_AddFrame runs on the emulation thread, in the middle of the game's own frame:
+ * indexing, comparing and compressing the picture there took the game 3 to 6 ms a frame at 800x600, a tenth to a
+ * quarter of its time. It now only copies the picture into a Capture and hands it over; the encoder thread encodes
+ * and sends it. One capture can wait: a newer picture replaces one the encoder has not started on, so viewers get the
+ * newest. Three buffers are enough (one being encoded, one waiting, one being filled); only the emulation thread
+ * writes them and the encoder reads the one it took.
+ * host_lock guards the capture slots, the requests (enc_needkey, enc_haveprev, enc_keyreq), enc_frameid and the times
+ * beside it, the send queue and its rate, and the statistics. The frames kept as bases (enc_hist, enc_key) and the
+ * work buffers belong to the encoder alone. With one processor there is no encoder thread and the emulation thread
+ * encodes as before. */
+struct Capture {
+    std::vector<uint8_t> px;            /* the rows, without padding */
+    uint8_t pal[1024];
+    unsigned w = 0, h = 0, bpp = 0;
+    uint64_t taken_us = 0;
+    uint32_t session[RP_MAX_VIEWERS];   /* per viewer: who it was, and its newest input applied when this was taken */
+    uint32_t applied[RP_MAX_VIEWERS];
+    uint64_t applied_us[RP_MAX_VIEWERS];
+};
+Capture caps[3];
+int cap_last = -1;                              /* the newest picture handed over (the next one is compared with it) */
+int cap_waiting = -1, cap_encoding = -1;
+SDL_Thread *enc_thread = NULL;
+SDL_sem *enc_go = NULL;
+volatile int enc_stop = 0;
+void Enc_Start(void);
+void Enc_Stop(void);
+
 /* 32-bit frames of 256-colour modes: DOSBox-X draws SVGA 8-bit modes (Shadow Warrior's 800x600, for one) as 32-bit
  * pixels, a quarter of which would do. Such frames go out as palette + indices; a colour keeps its index from frame
  * to frame (deltas stay small) until more than 256 have been seen, and then the palette starts over. */
@@ -275,6 +347,14 @@ struct PaletteMap {
     uint32_t keys[1024];
     uint16_t vals[1024];                /* index + 1; 0: free */
     void clear(void) { count = 0; memset(vals,0,sizeof(vals)); }
+    int find(uint32_t c) const {        /* a known colour's index, or -1: changes nothing, so threads can share it */
+        unsigned h = (unsigned)((c * 2654435761u) >> 22);
+        while (vals[h] != 0) {
+            if (keys[h] == c) return vals[h] - 1;
+            h = (h + 1) & 1023u;
+        }
+        return -1;
+    }
     int lookup(uint32_t c) {
         unsigned h = (unsigned)((c * 2654435761u) >> 22);
         while (vals[h] != 0) {
@@ -291,11 +371,15 @@ struct PaletteMap {
 PaletteMap enc_palmap;
 bool enc_palmap_init = false;
 
+bool RP_IndexParallel(const uint8_t *px,size_t pixels,uint8_t *idx);
+
 /* Writes palette + indices for a 32-bit frame into out, or returns false when it has more than 256 colours. */
 bool RP_IndexFrame(unsigned width,unsigned height,unsigned pitch,const uint8_t *data,std::vector<uint8_t> &out) {
     if (!enc_palmap_init) { enc_palmap.clear(); enc_palmap_init = true; }
     out.resize(768 + (size_t)width * height);
-    for (unsigned attempt=0;attempt < 2;attempt++) {
+    /* Nearly every frame has only colours seen before: those are looked up on all the encoder's threads at once. */
+    bool done = (pitch == width * 4) && RP_IndexParallel(data,(size_t)width * height,out.data() + 768);
+    for (unsigned attempt=0;attempt < 2 && !done;attempt++) {
         uint8_t *o = out.data() + 768;
         bool ok = true;
         uint32_t lastc = 0xFFFFFFFFu;
@@ -314,17 +398,250 @@ bool RP_IndexFrame(unsigned width,unsigned height,unsigned pitch,const uint8_t *
                 *o++ = (uint8_t)lasti;
             }
         }
-        if (ok) {
-            uint8_t *pal = out.data();
-            for (unsigned i=0;i < 256;i++) {
-                const uint32_t c = i < enc_palmap.count ? enc_palmap.colors[i] : 0;
-                pal[i*3+0] = (uint8_t)(c >> 16); pal[i*3+1] = (uint8_t)(c >> 8); pal[i*3+2] = (uint8_t)c;
-            }
-            return true;
-        }
-        enc_palmap.clear();     /* new colours (a fade, another screen): start the palette over */
+        if (ok) done = true;
+        else enc_palmap.clear();    /* new colours (a fade, another screen): start the palette over */
     }
-    return false;
+    if (!done) return false;
+    uint8_t *pal = out.data();
+    for (unsigned i=0;i < 256;i++) {
+        const uint32_t c = i < enc_palmap.count ? enc_palmap.colors[i] : 0;
+        pal[i*3+0] = (uint8_t)(c >> 16); pal[i*3+1] = (uint8_t)(c >> 8); pal[i*3+2] = (uint8_t)c;
+    }
+    return true;
+}
+
+/* Parallel zlib, as pigz does it: a big frame is cut into pieces deflated at the same time (worker threads take all but
+ * the last, which this thread does). Each piece ends on a byte boundary (Z_SYNC_FLUSH) and the last one ends the stream,
+ * so the pieces joined after a zlib header, with the combined Adler-32 after them, are one ordinary zlib stream: every
+ * viewer, older ones too, inflates it as before. Encoding a frame took the emulation several milliseconds at 800x600,
+ * which was latency for the players and frames the game did not draw. */
+struct ZJob {
+    int kind = 0;                       /* 0: deflate. 1: palette indices for len pixels at src into idx.
+                                           2: inflate len bytes at src into want bytes at idx (a viewer's frame piece) */
+    uint8_t *idx = NULL;
+    size_t want = 0;
+    bool iinit = false;
+    z_stream zi;
+    const uint8_t *src = NULL;
+    size_t len = 0, outlen = 0;
+    bool last = false, ok = false, zinit = false;
+    uLong adler = 1;
+    std::vector<uint8_t> out;
+    z_stream zs;
+};
+const unsigned RP_ZWORKERS_MAX = 3;
+const size_t RP_ZPARALLEL_MIN = (size_t)128 << 10;   /* smaller frames (320x200 ones) are not worth splitting */
+ZJob zjobs[RP_ZWORKERS_MAX + 1];
+SDL_Thread *zthreads[RP_ZWORKERS_MAX];
+SDL_sem *zgo[RP_ZWORKERS_MAX], *zdone[RP_ZWORKERS_MAX];
+unsigned zworkers = 0;
+bool zstarted = false;
+volatile int zstop = 0;
+
+void RP_ZRun(ZJob &j) {
+    j.ok = false;
+    if (j.kind == 2) {
+        if (!j.iinit) {
+            memset(&j.zi,0,sizeof(j.zi));
+            if (inflateInit2(&j.zi,-15) != Z_OK) return;
+            j.iinit = true;
+        }
+        else if (inflateReset(&j.zi) != Z_OK) return;
+        j.zi.next_in = (Bytef*)j.src;
+        j.zi.avail_in = (uInt)j.len;
+        j.zi.next_out = j.idx;
+        j.zi.avail_out = (uInt)j.want;
+        const int r = inflate(&j.zi,Z_SYNC_FLUSH);
+        /* all but the last piece end at a flush point, not at the end of a stream */
+        j.ok = j.zi.avail_in == 0 && j.zi.total_out == j.want && (j.last ? r == Z_STREAM_END : (r == Z_OK || r == Z_BUF_ERROR));
+        if (j.ok) j.adler = adler32(adler32(0L,Z_NULL,0),j.idx,(uInt)j.want);
+        return;
+    }
+    if (j.kind == 1) {
+        uint32_t lastc = 0xFFFFFFFFu;
+        int lasti = 0;
+        for (size_t i=0;i < j.len;i++) {
+            uint32_t c;
+            memcpy(&c,j.src + i * 4,4);
+            c &= 0xFFFFFFu;
+            if (c != lastc) {
+                lasti = enc_palmap.find(c);
+                if (lasti < 0) return;      /* a new colour: the caller indexes the frame alone, adding colours */
+                lastc = c;
+            }
+            j.idx[i] = (uint8_t)lasti;
+        }
+        j.ok = true;
+        return;
+    }
+    if (!j.zinit) {
+        memset(&j.zs,0,sizeof(j.zs));
+        if (deflateInit2(&j.zs,1,Z_DEFLATED,-15,8,Z_DEFAULT_STRATEGY) != Z_OK) return;
+        j.zinit = true;
+    }
+    else if (deflateReset(&j.zs) != Z_OK) return;
+    const size_t bound = (size_t)deflateBound(&j.zs,(uLong)j.len) + 16;
+    if (j.out.size() < bound) j.out.resize(bound);
+    j.zs.next_in = (Bytef*)j.src;
+    j.zs.avail_in = (uInt)j.len;
+    j.zs.next_out = j.out.data();
+    j.zs.avail_out = (uInt)j.out.size();
+    const int r = deflate(&j.zs,j.last ? Z_FINISH : Z_SYNC_FLUSH);
+    j.ok = j.zs.avail_in == 0 && (j.last ? r == Z_STREAM_END : r == Z_OK);
+    j.outlen = j.out.size() - j.zs.avail_out;
+    j.adler = adler32(adler32(0L,Z_NULL,0),j.src,(uInt)j.len);
+}
+
+int RP_ZThread(void *arg) {
+    const unsigned i = (unsigned)(uintptr_t)arg;
+    for (;;) {
+        SDL_SemWait(zgo[i]);
+        if (zstop) break;
+        RP_ZRun(zjobs[i]);
+        SDL_SemPost(zdone[i]);
+    }
+    return 0;
+}
+
+void RP_ZStart(void) {
+    if (zstarted) return;
+    zstarted = true;
+    zstop = 0;
+    /* The emulation keeps a processor to itself, and so does the encoder thread, which takes a piece too. */
+    const unsigned cpus = RP_CpuCount(), busy = (enc_thread != NULL) ? 2u : 1u;
+    const unsigned want = std::min(cpus > busy ? cpus - busy : 0u,RP_ZWORKERS_MAX);
+    zworkers = 0;
+    for (unsigned i=0;i < want;i++) {
+        zgo[i] = SDL_CreateSemaphore(0);
+        zdone[i] = SDL_CreateSemaphore(0);
+        if (zgo[i] == NULL || zdone[i] == NULL) break;
+#if SDL_VERSION_ATLEAST(2,0,0)
+        zthreads[i] = SDL_CreateThread(RP_ZThread,"INPUTNET encoder",(void*)(uintptr_t)i);
+#else
+        zthreads[i] = SDL_CreateThread(RP_ZThread,(void*)(uintptr_t)i);
+#endif
+        if (zthreads[i] == NULL) break;
+        zworkers++;
+    }
+}
+
+void RP_ZStop(void) {
+    if (!zstarted) return;
+    zstop = 1;
+    for (unsigned i=0;i < zworkers;i++) SDL_SemPost(zgo[i]);
+    for (unsigned i=0;i < zworkers;i++) SDL_WaitThread(zthreads[i],NULL);
+    for (unsigned i=0;i < zworkers;i++) { SDL_DestroySemaphore(zgo[i]); SDL_DestroySemaphore(zdone[i]); }
+    for (unsigned i=0;i <= RP_ZWORKERS_MAX;i++) {
+        if (zjobs[i].zinit) { deflateEnd(&zjobs[i].zs); zjobs[i].zinit = false; }
+        if (zjobs[i].iinit) { inflateEnd(&zjobs[i].zi); zjobs[i].iinit = false; }
+    }
+    zworkers = 0;
+    zstarted = false;
+}
+
+/* Compresses len bytes at src into out from offset at (out grows as needed); clen gets the compressed size, and pieces
+ * each piece's (none when the frame went in one). */
+bool RP_Compress(const uint8_t *src,size_t len,std::vector<uint8_t> &out,size_t at,size_t &clen,std::vector<uint32_t> &pieces) {
+    RP_ZStart();
+    pieces.clear();
+    const unsigned parts = (len >= RP_ZPARALLEL_MIN) ? zworkers + 1 : 1;
+    if (parts == 1) {
+        uLongf n = compressBound((uLong)len);
+        out.resize(at + n);
+        if (compress2(out.data() + at,&n,src,(uLong)len,1) != Z_OK) return false;
+        clen = n;
+        return true;
+    }
+    const size_t piece = len / parts;
+    for (unsigned k=0;k < parts;k++) {
+        ZJob &j = zjobs[k];
+        j.kind = 0;
+        j.src = src + (size_t)k * piece;
+        j.len = (k + 1 == parts) ? len - (size_t)k * piece : piece;
+        j.last = (k + 1 == parts);
+    }
+    for (unsigned k=0;k + 1 < parts;k++) SDL_SemPost(zgo[k]);
+    RP_ZRun(zjobs[parts - 1]);
+    for (unsigned k=0;k + 1 < parts;k++) SDL_SemWait(zdone[k]);
+    size_t total = 2 + 4;
+    for (unsigned k=0;k < parts;k++) {
+        if (!zjobs[k].ok) return false;
+        total += zjobs[k].outlen;
+    }
+    out.resize(at + total);
+    uint8_t *o = out.data() + at;
+    *o++ = 0x78; *o++ = 0x01;   /* zlib header: deflate, 32K window, fastest */
+    uLong adler = zjobs[0].adler;
+    for (unsigned k=0;k < parts;k++) {
+        memcpy(o,zjobs[k].out.data(),zjobs[k].outlen);
+        o += zjobs[k].outlen;
+        pieces.push_back((uint32_t)zjobs[k].outlen);
+        if (k) adler = adler32_combine(adler,zjobs[k].adler,(z_off_t)zjobs[k].len);
+    }
+    *o++ = (uint8_t)(adler >> 24); *o++ = (uint8_t)(adler >> 16); *o++ = (uint8_t)(adler >> 8); *o++ = (uint8_t)adler;
+    clen = total;
+    return true;
+}
+
+bool RP_IndexParallel(const uint8_t *px,size_t pixels,uint8_t *idx) {
+    RP_ZStart();
+    const unsigned parts = zworkers + 1;
+    if (parts == 1 || pixels * 4 < RP_ZPARALLEL_MIN || enc_palmap.count == 0) return false;
+    const size_t piece = pixels / parts;
+    for (unsigned k=0;k < parts;k++) {
+        ZJob &j = zjobs[k];
+        j.kind = 1;
+        j.src = px + (size_t)k * piece * 4;
+        j.idx = idx + (size_t)k * piece;
+        j.len = (k + 1 == parts) ? pixels - (size_t)k * piece : piece;
+    }
+    for (unsigned k=0;k + 1 < parts;k++) SDL_SemPost(zgo[k]);
+    RP_ZRun(zjobs[parts - 1]);
+    for (unsigned k=0;k + 1 < parts;k++) SDL_SemWait(zdone[k]);
+    bool ok = true;
+    for (unsigned k=0;k < parts;k++) ok = ok && zjobs[k].ok;
+    return ok;
+}
+
+/* A viewer's side of a frame compressed in pieces: stream is the whole zlib stream (2 byte header, the pieces, the
+ * Adler-32), lens each piece's size in it. The pieces are inflated at the same time, straight into out. False when
+ * anything is off; the caller then inflates the stream the ordinary way. */
+bool RP_InflatePieces(const uint8_t *stream,size_t slen,const uint32_t *lens,unsigned n,uint8_t *out,size_t rawsize) {
+    if (n < 2 || n > RP_PIECES_MAX || slen < 6) return false;
+    size_t sum = 0;
+    for (unsigned k=0;k < n;k++) sum += lens[k];
+    if (sum + 6 != slen) return false;
+    RP_ZStart();
+    const unsigned wave = zworkers + 1;
+    const size_t piece = rawsize / n;
+    uLong adlers[RP_PIECES_MAX];
+    size_t in_at = 2;
+    for (unsigned base=0;base < n;base += wave) {
+        const unsigned m = std::min(wave,n - base);
+        for (unsigned i=0;i < m;i++) {
+            const unsigned k = base + i;
+            ZJob &j = zjobs[i];
+            j.kind = 2;
+            j.src = stream + in_at;
+            j.len = lens[k];
+            j.idx = out + (size_t)k * piece;
+            j.want = (k + 1 == n) ? rawsize - (size_t)k * piece : piece;
+            j.last = (k + 1 == n);
+            in_at += lens[k];
+        }
+        for (unsigned i=0;i + 1 < m;i++) SDL_SemPost(zgo[i]);
+        RP_ZRun(zjobs[m - 1]);
+        for (unsigned i=0;i + 1 < m;i++) SDL_SemWait(zdone[i]);
+        for (unsigned i=0;i < m;i++) {
+            if (!zjobs[i].ok) return false;
+            adlers[base + i] = zjobs[i].adler;
+        }
+    }
+    uLong adler = adlers[0];
+    for (unsigned k=1;k < n;k++)
+        adler = adler32_combine(adler,adlers[k],(z_off_t)((k + 1 == n) ? rawsize - (size_t)k * piece : piece));
+    const uint8_t *t = stream + slen - 4;
+    return adler == (((uLong)t[0] << 24) | ((uLong)t[1] << 16) | ((uLong)t[2] << 8) | (uLong)t[3]);
 }
 
 /* Sound */
@@ -333,8 +650,8 @@ uint32_t aud_seq = 0;
 unsigned aud_rate = 0;
 
 /* Statistics */
-uint64_t stat_bytes = 0;
-uint32_t stat_frames = 0, stat_keys = 0, stat_offered = 0, stat_skipped = 0;
+uint64_t stat_bytes = 0, stat_enc_us = 0, stat_index_us = 0, stat_cap_us = 0;
+uint32_t stat_frames = 0, stat_keys = 0, stat_offered = 0, stat_skipped = 0, stat_replaced = 0;
 
 /* Remote input guard. Viewers must never be able to type DOS commands on the
  * host (DEL, FORMAT, MOUNT, ... on host folders mounted as drives), so their
@@ -418,6 +735,19 @@ void Host_SendAll(const uint8_t *data,size_t len) {
         if (viewers[i].active) Host_SendTo(viewers[i].addr,data,len);
 }
 
+/* A datagram sent from the caller's own memory, without host_lock: sending on a socket another thread receives or
+ * sends on is fine, and SDL_net only reads the packet structure it is given. */
+void Host_SendDirect(const IPaddress &addr,const uint8_t *data,size_t len) {
+    if (host_sock == NULL) return;
+    UDPpacket p;
+    memset(&p,0,sizeof(p));
+    p.channel = -1;
+    p.data = (Uint8*)data;
+    p.len = p.maxlen = (int)len;
+    p.address = addr;
+    SDLNet_UDP_Send(host_sock,-1,&p);
+}
+
 /* Every viewer decodes against named frames and reports what arrives: frames go against a frame they all have and the
  * video rate follows the link. One older viewer keeps everyone on the previous behaviour. */
 bool Host_RefsMode(void) {
@@ -425,6 +755,17 @@ bool Host_RefsMode(void) {
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
         if (!viewers[i].active) continue;
         if (!(viewers[i].features & RP_FEAT_REFS)) return false;
+        any = true;
+    }
+    return any;
+}
+
+/* Every viewer reads a frame's piece table. */
+bool Host_PiecesMode(void) {
+    bool any = false;
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        if (!viewers[i].active) continue;
+        if (!(viewers[i].features & RP_FEAT_PIECES)) return false;
         any = true;
     }
     return any;
@@ -480,10 +821,19 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
         const double secs = rate_log_ms ? (now - rate_log_ms) / 1000.0 : 5.0;
         const uint32_t frames = stat_frames - last_frames;
         static uint32_t last_offered = 0, last_skipped = 0;
-        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link), %.1f%% of fragments lost; CPU %ld cycles",
+        static uint32_t last_replaced = 0;
+        static uint64_t last_enc_us = 0, last_index_us = 0, last_cap_us = 0;
+        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder), %.1f%% of fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; CPU %ld cycles",
             (unsigned)(send_rate / 1024.0),(unsigned)((stat_bytes - last_bytes) / 1024.0 / secs),frames / secs,
-            (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,loss * 100.0,(long)CPU_CycleMax);
+            (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,
+            (stat_replaced - last_replaced) / secs,loss * 100.0,
+            frames ? (stat_enc_us - last_enc_us) / 1000.0 / frames : 0.0,
+            frames ? (stat_index_us - last_index_us) / 1000.0 / frames : 0.0,zworkers + 1,
+            frames ? (stat_cap_us - last_cap_us) / 1000.0 / frames : 0.0,
+            enc_thread != NULL ? "" : " (no encoder thread)",(long)CPU_CycleMax);
         last_frames = stat_frames; last_bytes = stat_bytes; last_offered = stat_offered; last_skipped = stat_skipped;
+        last_replaced = stat_replaced;
+        last_enc_us = stat_enc_us; last_index_us = stat_index_us; last_cap_us = stat_cap_us;
         rate_log_ms = now;
     }
 }
@@ -613,6 +963,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             v->name = name;
             v->session = session;
             v->applied = 0;
+            v->applied_us = 0;
             v->buttons = 0;
             v->features = features;
             v->hasack = false;
@@ -643,7 +994,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
                 const uint32_t seq = first + i;
                 if (seq == v->applied + 1) {
                     Host_ApplyEvent(*v,r);
-                    if (r.ok) v->applied = seq;
+                    if (r.ok) { v->applied = seq; v->applied_us = RP_Micros(); }
                 }
                 else {
                     /* Already applied (a repeat): parse it to skip over it. */
@@ -692,7 +1043,28 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
     }
 }
 
-void Host_FlushQueue(void) {
+/* Sends the video the rate allows now. The encoder thread and the main loop both come here: what may go is taken off
+ * the queue under host_lock and sent after it, so input and sound are not held up while a whole frame is sent.
+ * send_lock keeps the two from sending at once (a frame's fragments overtaken by the next frame's would be thrown
+ * away by the viewer). The main loop does not wait for it (wait false): the encoder is sending already, and what the
+ * rate holds back goes with the next poll. */
+void Host_FlushQueue(bool wait) {
+    std::vector<std::vector<uint8_t> > out;
+    IPaddress to[RP_MAX_VIEWERS];
+    unsigned nto = 0;
+
+    if (send_lock != NULL) {
+#if SDL_VERSION_ATLEAST(2,0,0)
+        if (!wait) {
+            if (SDL_TryLockMutex(send_lock) != 0) return;
+        }
+        else
+#else
+        (void)wait;
+#endif
+        SDL_LockMutex(send_lock);
+    }
+    Host_Lock();
     const uint32_t now = SDL_GetTicks();
     if (now != send_lastms) {
         /* send_rate spread over each millisecond, so a big key frame does not overflow the receiver's socket buffer or
@@ -703,15 +1075,27 @@ void Host_FlushQueue(void) {
         send_budget = std::min(send_budget + send_rate * (double)elapsed / 1000.0,burst);
         send_lastms = now;
     }
+    size_t bytes = 0;
     while (!send_queue.empty() && send_budget >= (double)send_queue.front().size()) {
-        const std::vector<uint8_t> &p = send_queue.front();
-        Host_SendAll(p.data(),p.size());
-        send_budget -= (double)p.size();
-        send_queued -= std::min(send_queued,p.size());
+        const size_t n = send_queue.front().size();
+        send_budget -= (double)n;
+        send_queued -= std::min(send_queued,n);
+        bytes += n;
+        out.push_back(std::move(send_queue.front()));
         send_queue.pop_front();
     }
     /* Video waits for the rate, not the other way round: only then is a higher rate worth trying. */
     if (!send_queue.empty()) send_backlog_ms = now;
+    if (!out.empty()) {
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
+            if (viewers[i].active) to[nto++] = viewers[i].addr;
+        stat_bytes += (uint64_t)bytes * nto;
+    }
+    Host_Unlock();
+
+    for (size_t k=0;k < out.size();k++)
+        for (unsigned i=0;i < nto;i++) Host_SendDirect(to[i],out[k].data(),out[k].size());
+    if (send_lock != NULL) SDL_UnlockMutex(send_lock);
 }
 
 int Host_KeepaliveThread(void *) {
@@ -750,6 +1134,12 @@ void REMOTEPLAY_Configure(Section_prop *section) {
     cfg_timeout = (unsigned)((v >= 250 && v <= 600000) ? v : 10000);
     v = section->Get_int("stream fps");
     cfg_maxfps = (unsigned)((v >= 0 && v <= 240) ? v : 0);
+    const std::string present = section->Get_string("present");
+    cfg_present = (present == "scanout") ? 0 : (present == "retrace") ? 1 : 2;
+}
+
+int REMOTEPLAY_PresentMode(void) {
+    return host_running ? cfg_present : 0;
 }
 
 bool REMOTEPLAY_StartServer(uint16_t port) {
@@ -764,12 +1154,14 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
         LOG_MSG("INPUTNET: unable to open UDP port %u: %s",(unsigned)port,SDLNet_GetError());
         return false;
     }
+    RP_WidenSocket(host_sock);
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) viewers[i].active = false;
     host_running = true;
     host_port = port;
     /* The window may have lost focus already, which stops cycles=max from guessing: a host keeps guessing without it. */
     CPU_Disable_SkipAutoAdjust();
     if (host_lock == NULL) host_lock = SDL_CreateMutex();
+    if (send_lock == NULL) send_lock = SDL_CreateMutex();
     host_lastpoll = SDL_GetTicks();
     host_keepalive_stop = 0;
     if (host_lock != NULL && host_keepalive == NULL)
@@ -778,6 +1170,8 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
 #else
         host_keepalive = SDL_CreateThread(Host_KeepaliveThread,NULL);
 #endif
+    Enc_Start();
+    RP_ZStart();
     enc_needkey = true;
     enc_haveprev = false;
     guard_state = -1;
@@ -794,12 +1188,15 @@ void REMOTEPLAY_StopServer(const char *reason) {
         SDL_WaitThread(host_keepalive,NULL);
         host_keepalive = NULL;
     }
+    Enc_Stop();     /* before the socket goes: it sends on it */
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) Host_DropViewer(viewers[i],reason ? reason : "the host stopped",true);
     SDLNet_UDP_Close(host_sock);
     host_sock = NULL;
     host_running = false;
     remoteplay_streaming = false;
     send_queue.clear();
+    send_queued = 0;
+    RP_ZStop();
     LOG_MSG("INPUTNET: remote play server stopped");
     REMOTEPLAY_UpdateMenu();
 }
@@ -853,18 +1250,21 @@ void REMOTEPLAY_Status(Program *prog) {
         n++;
     }
     if (n == 0) prog->WriteOut("No players connected.\n");
-    prog->WriteOut("Sent %u frames (%u key frames), %u KB.\n",(unsigned)stat_frames,(unsigned)stat_keys,
-        (unsigned)(stat_bytes / 1024u));
+    Host_Lock();
+    const unsigned frames = (unsigned)stat_frames, keys = (unsigned)stat_keys, kb = (unsigned)(stat_bytes / 1024u);
+    Host_Unlock();
+    prog->WriteOut("Sent %u frames (%u key frames), %u KB.\n",frames,keys,kb);
 }
 
 void REMOTEPLAY_Poll(void) {
     if (!host_running) return;
 
     /* GFX_Events runs very often; the socket only needs a look once a
-     * millisecond, unless paced video is waiting to go out. */
+     * millisecond (the video rate allows more once a millisecond too, and
+     * whoever queues video sends what may go at once). */
     static uint32_t lastpoll = 0;
     const uint32_t now = SDL_GetTicks();
-    if (now == lastpoll && (send_queue.empty() || send_budget < (double)send_queue.front().size())) return;
+    if (now == lastpoll) return;
     lastpoll = now;
 
     /* Releases what viewers hold as soon as a game has ended, even when no
@@ -895,54 +1295,45 @@ void REMOTEPLAY_Poll(void) {
         if (host_lock) SDL_UnlockMutex(host_lock);
     }
 
-    Host_FlushQueue();
+    Host_FlushQueue(false);
 }
 
-void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pitch,
-    const uint8_t *data,const uint8_t *pal) {
-    if (!host_running || !remoteplay_streaming || data == NULL || TTF_using()) return;
+namespace {
 
-    const unsigned bytespp = RP_BytesPerPixel(bpp);
-    if (bytespp == 0 || width == 0 || height == 0 || width > 4096 || height > 4096) return;
-    const size_t rowbytes = (size_t)width * bytespp;
-    if (rowbytes > pitch) return;
-
-    const uint32_t now = SDL_GetTicks();
-    if (cfg_maxfps != 0 && !enc_needkey && (now - enc_lastsend) * cfg_maxfps < 1000u) return;
-    stat_offered++;
-
-    /* Frames come faster than the link takes them: skip this one. With named bases the next frame is encoded against
-     * what the viewers have; otherwise against the last frame sent, so skipping costs nothing either way. */
-    if (!send_queue.empty() && (double)send_queued > std::max(send_rate * 0.06,64.0 * 1024.0)) {
-        stat_skipped++;
-        if (send_queued > ((size_t)16 << 20)) {     /* nobody takes anything: start over */
-            send_queue.clear();
-            send_queued = 0;
-            enc_needkey = true;
-        }
-        Host_FlushQueue();
-        return;
-    }
-
-    /* The same 32-bit picture as the last one: nothing to index or send. That is most refreshes while a game draws fewer
-     * frames than the display shows (Shadow Warrior at 800x600), and indexing it every time costs the game emulation. */
-    if (bpp == 32) {
-        if (width == enc_inw && height == enc_inh && enc_haveprev && !enc_needkey && !enc_keyreq && (now - enc_lastsend) < 250) {
-            bool same = true;
-            for (unsigned y=0;y < height && same;y++)
-                same = memcmp(enc_lastin.data() + (size_t)y * rowbytes,data + (size_t)y * pitch,rowbytes) == 0;
-            if (same) return;
-        }
-        enc_lastin.resize(rowbytes * height);
-        for (unsigned y=0;y < height;y++) memcpy(enc_lastin.data() + (size_t)y * rowbytes,data + (size_t)y * pitch,rowbytes);
-        enc_inw = width; enc_inh = height;
-    }
+/* Encodes one picture and queues it for the viewers: on the encoder thread, or on the emulation thread when there is
+ * none. */
+void Enc_Frame(const Capture &c) {
+    const unsigned width = c.w, height = c.h, bpp = c.bpp;
+    const size_t rowbytes = (size_t)width * RP_BytesPerPixel(bpp);
 
     /* 32-bit pixels of at most 256 colours go out as an 8-bit frame (any viewer decodes it). */
-    const bool indexed = (bpp == 32) && RP_IndexFrame(width,height,pitch,data,enc_raw);
+    const uint64_t index_start = RP_Micros();
+    const bool indexed = (bpp == 32) && RP_IndexFrame(width,height,(unsigned)rowbytes,c.px.data(),enc_raw);
+    const uint64_t index_us = (bpp == 32) ? RP_Micros() - index_start : 0;
     const unsigned fmt = indexed ? 8 : bpp;
     const size_t palbytes = (fmt == 8) ? 768 : 0;
     const size_t rawsize = palbytes + (size_t)width * RP_BytesPerPixel(fmt) * height;
+    if (!indexed) {
+        enc_raw.resize(rawsize);
+        uint8_t *o = enc_raw.data();
+        if (palbytes) {
+            for (unsigned i=0;i < 256;i++) {
+                *o++ = c.pal[i*4+0];
+                *o++ = c.pal[i*4+1];
+                *o++ = c.pal[i*4+2];
+            }
+        }
+        memcpy(o,c.px.data(),rowbytes * height);
+    }
+    /* Only this thread changes the frames kept as bases; when they are out of date a key frame is due and this is
+     * not looked at. */
+    const bool unchanged = !enc_hist.empty() && enc_hist.back().raw.size() == rawsize
+        && memcmp(enc_raw.data(),enc_hist.back().raw.data(),rawsize) == 0;
+
+    /* What to send. */
+    Host_Lock();
+    const uint32_t now = SDL_GetTicks();
+    stat_index_us += index_us;
     if (width != enc_w || height != enc_h || fmt != enc_fmt) {
         enc_w = width; enc_h = height; enc_fmt = fmt;
         enc_haveprev = false;
@@ -953,28 +1344,14 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
         enc_haskey = false;
         enc_key.raw.clear();
     }
-
-    if (!indexed) {
-        enc_raw.resize(rawsize);
-        uint8_t *o = enc_raw.data();
-        if (palbytes) {
-            for (unsigned i=0;i < 256;i++) {
-                *o++ = pal[i*4+0];
-                *o++ = pal[i*4+1];
-                *o++ = pal[i*4+2];
-            }
-        }
-        for (unsigned y=0;y < height;y++) {
-            memcpy(o,data + (size_t)y * pitch,rowbytes);
-            o += rowbytes;
-        }
-    }
-
     const bool refs = rate_adaptive;
-    bool key = enc_needkey || enc_hist.empty() || (now - enc_lastkey) >= (refs ? 10000u : 5000u)
+    const bool forced = enc_needkey;
+    bool key = forced || enc_hist.empty() || (now - enc_lastkey) >= (refs ? 10000u : 5000u)
         || (enc_keyreq && now - enc_lastkey >= 300);
-    if (!key && memcmp(enc_raw.data(),enc_hist.back().raw.data(),rawsize) == 0 && (now - enc_lastsend) < 250)
+    if (!key && unchanged && (now - enc_lastsend) < 250) {
+        Host_Unlock();
         return; /* nothing changed; still send now and then so the viewer knows we are alive */
+    }
 
     /* The base: the previous frame sent, or with named bases the oldest of each viewer's newest decoded frame (the last
      * key frame for a viewer that has decoded none we still have). */
@@ -997,11 +1374,30 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
             }
             if (base != NULL && enc_frameid + 1 - base->id > 65535u) key = true;
         }
-        if (base == NULL) key = true;
+        if (base == NULL || base->raw.size() != rawsize) key = true;
     }
     /* With named bases a key frame goes out at most every 300 ms unless the picture itself changed shape: a viewer that
      * lost the last one asks again, and back to back key frames would only fill the link. */
-    if (key && refs && !enc_needkey && enc_haskey && now - enc_lastkey < 300) return;
+    if (key && refs && !forced && enc_haskey && now - enc_lastkey < 300) {
+        Host_Unlock();
+        return;
+    }
+    /* The requests are taken here, before the slow part: one that comes while this frame is being encoded is for the
+     * next frame. */
+    const uint32_t id = enc_frameid + 1;
+    enc_needkey = false;
+    enc_haveprev = true;
+    enc_lastsend = now;
+    if (key) { enc_lastkey = now; enc_keyreq = false; }
+    const bool table = Host_PiecesMode();
+    const bool limited = rate_limited;
+    Host_Unlock();
+
+    /* While the picture keeps moving a lot, the frame alone has been the smaller one every time: three frames in four
+     * then go out alone without compressing the difference as well, which is half the work. Not on a link that
+     * limits the video: there every byte counts more than a millisecond. */
+    bool turned_key = false;
+    if (!key && !limited && enc_plain_streak >= 3 && (id & 3u) != 0) key = turned_key = true;
 
     const uint8_t *src = enc_raw.data();
     if (!key) {
@@ -1019,44 +1415,66 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
         src = enc_work.data();
     }
 
-    const uint32_t id = enc_frameid + 1;
-    uLongf clen = compressBound((uLong)rawsize);
-    enc_comp.resize(RP_FRAME_HDR + clen);
-    uint8_t *h = enc_comp.data();
-    if (compress2(h + RP_FRAME_HDR,&clen,src,(uLong)rawsize,1) != Z_OK) return;
+    size_t clen = 0;
+    bool ok = RP_Compress(src,rawsize,enc_comp,RP_FRAME_HDR,clen,enc_pieces);
     /* Much motion (turning in a 3D game): the frame alone often compresses better than its difference. Such a frame
      * goes out as a key frame, which every viewer decodes, whatever it has. */
-    if (!key && clen > rawsize / 16) {
-        uLongf ilen = compressBound((uLong)rawsize);
-        enc_work.resize(ilen);
-        if (compress2(enc_work.data(),&ilen,enc_raw.data(),(uLong)rawsize,1) == Z_OK && ilen < clen) {
-            memcpy(h + RP_FRAME_HDR,enc_work.data(),ilen);
-            clen = ilen;
-            key = true;
+    if (ok && !key) {
+        bool alone = false;
+        if (clen > rawsize / 16) {
+            size_t ilen = 0;
+            if (RP_Compress(enc_raw.data(),rawsize,enc_alt,0,ilen,enc_altpieces) && ilen < clen) {
+                enc_comp.resize(RP_FRAME_HDR + ilen);
+                memcpy(enc_comp.data() + RP_FRAME_HDR,enc_alt.data(),ilen);
+                clen = ilen;
+                enc_pieces.swap(enc_altpieces);
+                key = turned_key = alone = true;
+            }
+        }
+        enc_plain_streak = alone ? enc_plain_streak + 1 : 0;
+    }
+    /* The piece table, for viewers that inflate the pieces at the same time. */
+    size_t tbytes = 0;
+    if (ok && table && enc_pieces.size() >= 2 && enc_pieces.size() <= RP_PIECES_MAX) {
+        tbytes = 1 + 4 * enc_pieces.size();
+        enc_comp.resize(RP_FRAME_HDR + tbytes + clen);
+        uint8_t *t = enc_comp.data() + RP_FRAME_HDR;
+        memmove(t + tbytes,t,clen);
+        *t++ = (uint8_t)enc_pieces.size();
+        for (size_t k=0;k < enc_pieces.size();k++) {
+            const uint32_t v = enc_pieces[k];
+            *t++ = (uint8_t)v; *t++ = (uint8_t)(v >> 8); *t++ = (uint8_t)(v >> 16); *t++ = (uint8_t)(v >> 24);
         }
     }
+    const size_t total = RP_FRAME_HDR + tbytes + clen;
+    const size_t count = (total + RP_FRAG - 1) / RP_FRAG;
+    if (!ok || count > 65535) {
+        Host_Lock();
+        enc_needkey = true;     /* nothing went out: start again from a key frame */
+        Host_Unlock();
+        return;
+    }
+    uint8_t *h = enc_comp.data();
     const unsigned back = (!key && refs) ? (unsigned)(id - base->id) : 0;
     h[0] = (uint8_t)width; h[1] = (uint8_t)(width >> 8);
     h[2] = (uint8_t)height; h[3] = (uint8_t)(height >> 8);
-    h[4] = (uint8_t)fmt; h[5] = key ? 1 : 0;
+    h[4] = (uint8_t)fmt; h[5] = (uint8_t)((key ? 1 : 0) | (tbytes ? 2 : 0));
     h[6] = (uint8_t)back; h[7] = (uint8_t)(back >> 8);
     h[8] = (uint8_t)rawsize; h[9] = (uint8_t)(rawsize >> 8); h[10] = (uint8_t)(rawsize >> 16); h[11] = (uint8_t)(rawsize >> 24);
 
-    const size_t total = RP_FRAME_HDR + clen;
-    const size_t count = (total + RP_FRAG - 1) / RP_FRAG;
-    if (count > 65535) return;
-
-    enc_frameid = id;
+    std::vector<std::vector<uint8_t> > frags;
+    frags.reserve(count);
+    size_t fragbytes = 0;
     for (size_t i=0;i < count;i++) {
         const size_t off = i * RP_FRAG;
         const size_t n = std::min(RP_FRAG,total - off);
         Writer w(RP_VIDEO);
-        w.u32(enc_frameid);
+        w.u32(id);
         w.u16((uint16_t)i);
         w.u16((uint16_t)count);
         w.bytes(enc_comp.data() + off,n);
-        send_queue.push_back(std::vector<uint8_t>(w.buf,w.buf + w.len));
-        send_queued += w.len;
+        frags.push_back(std::vector<uint8_t>(w.buf,w.buf + w.len));
+        fragbytes += w.len;
     }
 
     /* Keep it as a base for later frames. */
@@ -1072,13 +1490,175 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
     while (enc_hist.size() > 1 && (enc_hist.size() > RP_HISTORY || enc_hist.size() * rawsize > RP_HISTORY_BYTES))
         enc_hist.pop_front();
 
-    enc_haveprev = true;
-    enc_needkey = false;
-    enc_lastsend = now;
+    const uint64_t encoded_us = RP_Micros();
+    Host_Lock();
+    enc_frameid = id;
+    for (size_t i=0;i < frags.size();i++) send_queue.push_back(std::move(frags[i]));
+    send_queued += fragbytes;
     stat_frames++;
-    if (key) { enc_lastkey = now; enc_keyreq = false; stat_keys++; }
+    if (key) stat_keys++;
+    if (turned_key) { enc_lastkey = SDL_GetTicks(); enc_keyreq = false; }
+    stat_enc_us += encoded_us - std::min(encoded_us,c.taken_us);
+    /* Ahead of the frame itself, so viewers that measure latency know which of their input it shows: what had been
+     * applied when the picture was taken, not what has come in since. */
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        const Viewer &v = viewers[i];
+        if (!v.active || !(v.features & RP_FEAT_TIMING) || v.session != c.session[i] || c.applied[i] == 0) continue;
+        Writer w(RP_FRAMEINFO);
+        w.u32(id);
+        w.u32(c.applied[i]);
+        w.u32(RP_ClampU32(c.taken_us - std::min(c.taken_us,c.applied_us[i])));
+        w.u32(RP_ClampU32(encoded_us - std::min(encoded_us,c.taken_us)));
+        Host_SendTo(v.addr,w.buf,w.len);
+    }
+    Host_Unlock();
 
-    Host_FlushQueue();
+    Host_FlushQueue(true);
+}
+
+int Enc_Thread(void *) {
+    for (;;) {
+        SDL_SemWait(enc_go);
+        if (enc_stop) break;
+        Host_Lock();
+        const int slot = cap_waiting;
+        cap_waiting = -1;
+        cap_encoding = slot;
+        Host_Unlock();
+        if (slot < 0) continue;     /* a newer picture replaced that one and was taken in its place */
+        Enc_Frame(caps[slot]);
+        Host_Lock();
+        cap_encoding = -1;
+        Host_Unlock();
+    }
+    return 0;
+}
+
+void Enc_Start(void) {
+    cap_last = cap_waiting = cap_encoding = -1;
+    if (enc_thread != NULL || host_lock == NULL || RP_CpuCount() < 2) return;
+    enc_stop = 0;
+    enc_go = SDL_CreateSemaphore(0);
+    if (enc_go == NULL) return;
+#if SDL_VERSION_ATLEAST(2,0,0)
+    enc_thread = SDL_CreateThread(Enc_Thread,"INPUTNET video",NULL);
+#else
+    enc_thread = SDL_CreateThread(Enc_Thread,NULL);
+#endif
+    if (enc_thread == NULL) {
+        SDL_DestroySemaphore(enc_go);
+        enc_go = NULL;
+    }
+}
+
+void Enc_Stop(void) {
+    if (enc_thread != NULL) {
+        enc_stop = 1;
+        SDL_SemPost(enc_go);
+        SDL_WaitThread(enc_thread,NULL);
+        enc_thread = NULL;
+        SDL_DestroySemaphore(enc_go);
+        enc_go = NULL;
+    }
+    cap_last = cap_waiting = cap_encoding = -1;
+}
+
+} /* namespace */
+
+void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pitch,
+    const uint8_t *data,const uint8_t *pal) {
+    if (!host_running || !remoteplay_streaming || data == NULL || TTF_using()) return;
+
+    const unsigned bytespp = RP_BytesPerPixel(bpp);
+    if (bytespp == 0 || width == 0 || height == 0 || width > 4096 || height > 4096) return;
+    const size_t rowbytes = (size_t)width * bytespp;
+    if (rowbytes > pitch) return;
+
+    const uint32_t now = SDL_GetTicks();
+    const uint64_t taken_us = RP_Micros();  /* the frame is complete: input applied before now is in it */
+    uint32_t v_session[RP_MAX_VIEWERS], v_applied[RP_MAX_VIEWERS];
+    uint64_t v_applied_us[RP_MAX_VIEWERS];
+
+    Host_Lock();
+    if (cfg_maxfps != 0 && !enc_needkey && (now - enc_lastsend) * cfg_maxfps < 1000u) {
+        Host_Unlock();
+        return;
+    }
+    stat_offered++;
+
+    /* Frames come faster than the link takes them: skip this one. With named bases the next frame is encoded against
+     * what the viewers have; otherwise against the last frame sent, so skipping costs nothing either way. */
+    if (!send_queue.empty() && (double)send_queued > std::max(send_rate * 0.06,64.0 * 1024.0)) {
+        stat_skipped++;
+        if (send_queued > ((size_t)16 << 20)) {     /* nobody takes anything: start over */
+            send_queue.clear();
+            send_queued = 0;
+            enc_needkey = true;
+        }
+        Host_Unlock();
+        Host_FlushQueue(false);
+        return;
+    }
+    const bool maybe_same = enc_haveprev && !enc_needkey && !enc_keyreq && (now - enc_lastsend) < 250;
+    const int last = cap_last;
+    int slot = 0;
+    while (slot == cap_waiting || slot == cap_encoding) slot++;
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        const Viewer &v = viewers[i];
+        v_session[i] = v.active ? v.session : 0;
+        v_applied[i] = v.active ? v.applied : 0;
+        v_applied_us[i] = v.applied_us;
+    }
+    Host_Unlock();
+
+    /* The same 32-bit picture as the last one: nothing to index or send. That is most refreshes while a game draws fewer
+     * frames than the display shows (Shadow Warrior at 800x600). */
+    if (bpp == 32 && maybe_same && last >= 0 && caps[last].w == width && caps[last].h == height && caps[last].bpp == bpp) {
+        const uint8_t *prev = caps[last].px.data();
+        bool same = true;
+        for (unsigned y=0;y < height && same;y++)
+            same = memcmp(prev + (size_t)y * rowbytes,data + (size_t)y * pitch,rowbytes) == 0;
+        if (same) {
+            const uint64_t spent = RP_Micros() - taken_us;
+            Host_Lock();
+            stat_cap_us += spent;
+            Host_Unlock();
+            return;
+        }
+    }
+
+    /* This thread only takes the picture; the rest is the encoder's. */
+    Capture &c = caps[slot];
+    c.w = width; c.h = height; c.bpp = bpp;
+    c.taken_us = taken_us;
+    c.px.resize(rowbytes * height);
+    if (pitch == rowbytes) memcpy(c.px.data(),data,rowbytes * height);
+    else for (unsigned y=0;y < height;y++) memcpy(c.px.data() + (size_t)y * rowbytes,data + (size_t)y * pitch,rowbytes);
+    if (bpp == 8) {
+        if (pal != NULL) memcpy(c.pal,pal,sizeof(c.pal));
+        else memset(c.pal,0,sizeof(c.pal));
+    }
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        c.session[i] = v_session[i];
+        c.applied[i] = v_applied[i];
+        c.applied_us[i] = v_applied_us[i];
+    }
+
+    Host_Lock();
+    cap_last = slot;
+    const bool threaded = enc_thread != NULL;
+    if (threaded) {
+        if (cap_waiting >= 0) stat_replaced++;  /* the encoder had not started on the one before */
+        cap_waiting = slot;
+    }
+    Host_Unlock();
+    if (threaded) SDL_SemPost(enc_go);
+    else Enc_Frame(c);
+
+    const uint64_t spent = RP_Micros() - taken_us;
+    Host_Lock();
+    stat_cap_us += spent;
+    Host_Unlock();
 }
 
 void REMOTEPLAY_AddAudio(unsigned rate,unsigned frames,const int16_t *samples) {
@@ -1175,6 +1755,14 @@ struct PendingEvent {
     std::vector<uint8_t> bytes;
 };
 
+/* Latency measurement: when each input event was made and first sent, and what the host said about each frame. */
+struct InputTime { uint32_t seq = 0; uint64_t made = 0, sent = 0; };
+struct FrameInfo { uint32_t id = 0, seq = 0, wait_us = 0, enc_us = 0; uint64_t at = 0; };
+struct LatencySums {
+    unsigned n = 0, rtt_n = 0;
+    double total = 0, most = 0, local = 0, net = 0, wait = 0, enc = 0, xfer = 0, draw = 0, rtt = 0;
+};
+
 class ViewerSession {
 public:
     std::string target;
@@ -1222,6 +1810,16 @@ public:
     bool keydown[KBD_LAST];
     uint32_t buttons = 0;
 
+    /* latency (Ctrl+F11 shows it in the title; the log gets it every 5 seconds) */
+    InputTime times[1024];
+    FrameInfo infos[32];
+    uint64_t motion_made = 0, frame_done = 0;
+    uint32_t lat_seq = 0, lat_ack = 0, lat_log = 0;
+    bool newframe = false, show_latency = false;
+    unsigned pieces_logged = 0;
+    LatencySums lat;
+    std::string latency_text;
+
     ViewerSession() { memset(keydown,0,sizeof(keydown)); }
 
     void send(const Writer &w) {
@@ -1238,7 +1836,7 @@ public:
         if (user == NULL) user = getenv("USER");
         w.str(user ? user : "player");
         w.u32(session);
-        w.u32(RP_FEAT_REFS);
+        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES);
         send(w);
         lasthello = SDL_GetTicks();
     }
@@ -1259,17 +1857,22 @@ public:
         std::string t = "DOSBox-X-NN remote play"; /* the host's address stays private */
         if (!welcomed) t += " (connecting...)";
         else if (captured) t += " - Ctrl+F10 releases the mouse";
+        if (show_latency && welcomed) t += " - " + (latency_text.empty() ? std::string("measuring latency...") : latency_text);
         SDL_SetWindowTitle(window,t.c_str());
     }
 
     /* ---- input ---- */
 
-    void pushEvent(const uint8_t *bytes,size_t n) {
+    void pushEvent(const uint8_t *bytes,size_t n,uint64_t made = 0) {
         PendingEvent ev;
         ev.seq = nextseq++;
         ev.bytes.assign(bytes,bytes + n);
         pending.push_back(ev);
         input_dirty = true;
+        InputTime &t = times[ev.seq & 1023u];
+        t.seq = ev.seq;
+        t.made = made ? made : RP_Micros();
+        t.sent = 0;
     }
 
     void keyEvent(KBD_KEYS k,bool pressed) {
@@ -1294,7 +1897,8 @@ public:
         tmp.u8(RPEV_MMOVE);
         tmp.f32(acc_xrel); tmp.f32(acc_yrel); tmp.f32(last_x); tmp.f32(last_y);
         tmp.u8(captured ? 1 : 0);
-        pushEvent(tmp.buf + start,tmp.len - start);
+        pushEvent(tmp.buf + start,tmp.len - start,motion_made);
+        motion_made = 0;
         acc_xrel = acc_yrel = 0;
         lastmove = SDL_GetTicks();
     }
@@ -1322,6 +1926,11 @@ public:
         }
         w.buf[countpos] = (uint8_t)n;
         send(w);
+        const uint64_t sent = RP_Micros();
+        for (unsigned i=0;i < n;i++) {
+            InputTime &t = times[pending[i].seq & 1023u];
+            if (t.seq == pending[i].seq && t.sent == 0) t.sent = sent;
+        }
         lastinput = SDL_GetTicks();
         input_dirty = false;
     }
@@ -1371,6 +1980,12 @@ public:
                     setCapture(false);
                     break;
                 }
+                if (e.key.keysym.scancode == SDL_SCANCODE_F11 && (mod & KMOD_CTRL)) {
+                    show_latency = !show_latency;
+                    LOG_MSG("INPUTNET: latency in the window title %s",show_latency ? "on" : "off");
+                    updateTitle();
+                    break;
+                }
                 keyEvent(RP_MapScancode(e.key.keysym.scancode),true);
                 break;
             }
@@ -1379,6 +1994,7 @@ public:
                 break;
             case SDL_MOUSEMOTION:
                 if (captured) {
+                    if (acc_xrel == 0 && acc_yrel == 0 && motion_made == 0) motion_made = RP_Micros();
                     acc_xrel += (float)e.motion.xrel;
                     acc_yrel += (float)e.motion.yrel;
                     const SDL_Rect r = displayRect();
@@ -1421,7 +2037,7 @@ public:
         const unsigned w = data[0] | (data[1] << 8);
         const unsigned h = data[2] | (data[3] << 8);
         const unsigned fmt = data[4];
-        const bool key = data[5] != 0;
+        const bool key = (data[5] & 1) != 0;
         const size_t rawsize = (size_t)data[8] | ((size_t)data[9] << 8) | ((size_t)data[10] << 16) | ((size_t)data[11] << 24);
         const unsigned bytespp = RP_BytesPerPixel(fmt);
         if (bytespp == 0 || w == 0 || h == 0 || w > 4096 || h > 4096) return;
@@ -1443,11 +2059,34 @@ public:
             }
         }
 
+        /* The zlib stream, after the piece table when there is one. */
+        const uint8_t *stream = data + RP_FRAME_HDR;
+        size_t slen = len - RP_FRAME_HDR;
+        uint32_t lens[RP_PIECES_MAX];
+        unsigned pieces = 0;
+        if (data[5] & 2) {
+            if (slen < 1) return;
+            pieces = stream[0];
+            if (pieces < 2 || pieces > RP_PIECES_MAX || slen < 1 + 4 * (size_t)pieces) return;
+            for (unsigned k=0;k < pieces;k++) {
+                const uint8_t *q = stream + 1 + 4 * (size_t)k;
+                lens[k] = (uint32_t)q[0] | ((uint32_t)q[1] << 8) | ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+            }
+            stream += 1 + 4 * (size_t)pieces;
+            slen -= 1 + 4 * (size_t)pieces;
+        }
         scratch.resize(rawsize);
-        uLongf outlen = (uLongf)rawsize;
-        if (uncompress(scratch.data(),&outlen,data + RP_FRAME_HDR,(uLong)(len - RP_FRAME_HDR)) != Z_OK || outlen != rawsize) {
-            needkey = true;
-            return;
+        const bool together = pieces != 0 && RP_InflatePieces(stream,slen,lens,pieces,scratch.data(),rawsize);
+        if (together && pieces != pieces_logged) {
+            pieces_logged = pieces;
+            LOG_MSG("INPUTNET: frames come compressed in %u pieces, inflated on %u threads",pieces,std::min(pieces,zworkers + 1));
+        }
+        if (!together) {
+            uLongf outlen = (uLongf)rawsize;
+            if (uncompress(scratch.data(),&outlen,stream,(uLong)slen) != Z_OK || outlen != rawsize) {
+                needkey = true;
+                return;
+            }
         }
 
         if (key) {
@@ -1469,7 +2108,58 @@ public:
         lastid = id;
         haveframe = true;
         needkey = false;
-        present();
+        newframe = true;    /* drawn as soon as the packets that arrived together are handled */
+    }
+
+    /* Input to screen for the newest input event this frame is the first to show (the host says which), split into
+     * where the time went. It does not include the game's own reaction (the frames a game takes to draw the result of
+     * what it read), only what remote play adds. */
+    void measureShown(void) {
+        const uint64_t shown = RP_Micros();
+        const FrameInfo &f = infos[lastid & 31u];
+        if (f.id != lastid || f.seq == 0 || (int32_t)(f.seq - lat_seq) <= 0) return;
+        lat_seq = f.seq;
+        const InputTime &t = times[f.seq & 1023u];
+        if (t.seq != f.seq || t.sent == 0 || shown < t.made) return;
+        const double total = (shown - t.made) / 1000.0;
+        if (total > 5000.0) return;
+        const double local = (t.sent - t.made) / 1000.0;
+        const double wait = f.wait_us / 1000.0, enc = f.enc_us / 1000.0;
+        const double xfer = frame_done > f.at ? (frame_done - f.at) / 1000.0 : 0.0;
+        const double draw = shown > frame_done ? (shown - frame_done) / 1000.0 : 0.0;
+        lat.n++;
+        lat.total += total;
+        lat.most = std::max(lat.most,total);
+        lat.local += local;
+        lat.wait += wait;
+        lat.enc += enc;
+        lat.xfer += xfer;
+        lat.draw += draw;
+        lat.net += std::max(0.0,total - local - wait - enc - xfer - draw);
+    }
+
+    void reportLatency(void) {
+        const uint32_t now = SDL_GetTicks();
+        if (now - lat_log < 5000) return;
+        lat_log = now;
+        const double rtt = lat.rtt_n ? lat.rtt / lat.rtt_n : -1.0;
+        if (lat.n) {
+            const double n = lat.n;
+            LOG_MSG("INPUTNET: input to screen %.1f ms on average (at most %.1f) over %u inputs: viewer %.1f, network %.1f (ping %.1f), "
+                "host waiting for the next frame %.1f, encoding %.1f, rest of the frame arriving %.1f, decoding and drawing %.1f; "
+                "the game's own reaction comes on top",
+                lat.total / n,lat.most,lat.n,lat.local / n,lat.net / n,rtt,lat.wait / n,lat.enc / n,lat.xfer / n,lat.draw / n);
+            char tmp[96];
+            snprintf(tmp,sizeof(tmp),"%.0f ms input to screen, ping %.0f ms",lat.total / n,rtt);
+            latency_text = tmp;
+        }
+        else if (rtt >= 0) {
+            char tmp[64];
+            snprintf(tmp,sizeof(tmp),"ping %.0f ms",rtt);
+            latency_text = tmp;
+        }
+        lat = LatencySums();
+        if (show_latency) updateTitle();
     }
 
     void present(void) {
@@ -1479,34 +2169,48 @@ public:
                 texture = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,(int)frame_w,(int)frame_h);
                 tex_w = frame_w; tex_h = frame_h;
             }
-            const size_t pixels = (size_t)frame_w * frame_h;
-            argb.resize(pixels);
+            /* Converted straight into the texture (one copy less), or through argb when it cannot be locked. */
+            void *dst = NULL;
+            int dpitch = 0;
+            const bool locked = texture != NULL && SDL_LockTexture(texture,NULL,&dst,&dpitch) == 0;
+            if (!locked) {
+                argb.resize((size_t)frame_w * frame_h);
+                dst = argb.data();
+                dpitch = (int)(frame_w * 4);
+            }
             const uint8_t *p = frame.data();
-            if (frame_fmt == 8) {
-                uint32_t lut[256];
+            uint32_t lut[256];
+            if (frame_fmt == 8)
                 for (unsigned i=0;i < 256;i++)
                     lut[i] = 0xFF000000u | ((uint32_t)p[i*3] << 16) | ((uint32_t)p[i*3+1] << 8) | p[i*3+2];
-                const uint8_t *s = p + 768;
-                for (size_t i=0;i < pixels;i++) argb[i] = lut[s[i]];
-            }
-            else if (frame_fmt == 15 || frame_fmt == 16) {
-                for (size_t i=0;i < pixels;i++) {
-                    const unsigned v = p[i*2] | (p[i*2+1] << 8);
-                    unsigned r, g, b;
-                    if (frame_fmt == 15) { r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); }
-                    else { r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); }
-                    b = (b << 3) | (b >> 2);
-                    argb[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            for (unsigned y=0;y < frame_h;y++) {
+                uint32_t *o = (uint32_t*)((uint8_t*)dst + (size_t)y * (size_t)dpitch);
+                if (frame_fmt == 8) {
+                    const uint8_t *s = p + 768 + (size_t)y * frame_w;
+                    for (unsigned x=0;x < frame_w;x++) o[x] = lut[s[x]];
+                }
+                else if (frame_fmt == 15 || frame_fmt == 16) {
+                    const uint8_t *s = p + (size_t)y * frame_w * 2;
+                    for (unsigned x=0;x < frame_w;x++) {
+                        const unsigned v = s[x*2] | (s[x*2+1] << 8);
+                        unsigned r, g, b;
+                        if (frame_fmt == 15) { r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); }
+                        else { r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); }
+                        b = (b << 3) | (b >> 2);
+                        o[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                    }
+                }
+                else {
+                    const uint8_t *s = p + (size_t)y * frame_w * 4;
+                    for (unsigned x=0;x < frame_w;x++) {
+                        uint32_t v;
+                        memcpy(&v,s + x*4,4);
+                        o[x] = 0xFF000000u | (v & 0xFFFFFFu);
+                    }
                 }
             }
-            else {
-                for (size_t i=0;i < pixels;i++) {
-                    uint32_t v;
-                    memcpy(&v,p + i*4,4);
-                    argb[i] = 0xFF000000u | (v & 0xFFFFFFu);
-                }
-            }
-            if (texture) SDL_UpdateTexture(texture,NULL,argb.data(),(int)(frame_w * 4));
+            if (locked) SDL_UnlockTexture(texture);
+            else if (texture) SDL_UpdateTexture(texture,NULL,argb.data(),(int)(frame_w * 4));
         }
         SDL_SetRenderDrawColor(renderer,0,0,0,255);
         SDL_RenderClear(renderer);
@@ -1560,6 +2264,7 @@ public:
             }
         a->used = false;
         frags_exp += a->count; frags_got += a->got;
+        frame_done = RP_Micros();
         const uint32_t before = lastid;
         const bool had = haveframe;
         decodeFrame(id,a->data.data(),a->total);
@@ -1643,9 +2348,29 @@ public:
             case RP_AUDIO:
                 handleAudio(r);
                 break;
+            case RP_FRAMEINFO: {
+                FrameInfo f;
+                f.id = r.u32();
+                f.seq = r.u32();
+                f.wait_us = r.u32();
+                f.enc_us = r.u32();
+                if (!r.ok) break;
+                f.at = RP_Micros();
+                infos[f.id & 31u] = f;
+                break;
+            }
             case RP_INPUTACK: {
                 const uint32_t ack = r.u32();
                 if (!r.ok) break;
+                if ((int32_t)(ack - lat_ack) > 0) {
+                    const InputTime &t = times[ack & 1023u];
+                    const uint64_t now_us = RP_Micros();
+                    if (t.seq == ack && t.sent != 0 && now_us - t.sent < 2000000u) {
+                        lat.rtt += (now_us - t.sent) / 1000.0;
+                        lat.rtt_n++;
+                    }
+                    lat_ack = ack;
+                }
                 while (!pending.empty() && (int32_t)(pending.front().seq - ack) <= 0) pending.pop_front();
                 break;
             }
@@ -1680,9 +2405,11 @@ public:
         out = SDLNet_AllocPacket((int)RP_PACKET_MAX);
         set = SDLNet_AllocSocketSet(1);
         if (sock == NULL || in == NULL || out == NULL || set == NULL) { error = "Unable to open a UDP socket"; return false; }
+        RP_WidenSocket(sock);
         SDLNet_UDP_AddSocket(set,sock);
 
         SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"nearest");
+        SDL_SetHint(SDL_HINT_RENDER_VSYNC,"0");     /* each frame shows the moment it arrives, never waiting for the display */
         window = SDL_CreateWindow("DOSBox-X-NN remote play",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
             960,720,SDL_WINDOW_RESIZABLE);
         if (window == NULL) { error = std::string("Unable to open a window: ") + SDL_GetError(); return false; }
@@ -1700,10 +2427,16 @@ public:
         if (session == 0) session = 1;
         sendHello();
         while (running) {
-            SDLNet_CheckSockets(set,2);
+            SDLNet_CheckSockets(set,1);
             while (SDLNet_UDP_Recv(sock,in) > 0) {
                 if (RP_SameAddr(in->address,server)) handlePacket(in->data,(size_t)in->len);
                 if (!running) break;
+            }
+            /* Only the newest of the frames that arrived together is drawn, right away. */
+            if (newframe) {
+                newframe = false;
+                present();
+                measureShown();
             }
 
             SDL_Event e;
@@ -1721,6 +2454,7 @@ public:
             }
             pumpAudio();
             if (redraw) present();
+            reportLatency();
 
             /* Until the host answers, keep trying: its DOSBox-X may still be starting.
              * The window title says "connecting..." and closing it gives up. */
@@ -1763,6 +2497,7 @@ int REMOTEPLAY_RunViewer(const std::string &address) {
     s.target = address;
     if (s.open()) s.loop();
     s.close();
+    RP_ZStop();
     if (!s.error.empty()) {
         LOG_MSG("INPUTNET: %s",s.error.c_str());
         fprintf(stderr,"%s\n",s.error.c_str());
@@ -1794,6 +2529,7 @@ bool REMOTEPLAY_ViewerRequested(std::string &address) {
 #else /* !C_INPUTNET */
 
 void REMOTEPLAY_Configure(Section_prop *) { }
+int REMOTEPLAY_PresentMode(void) { return 0; }
 void REMOTEPLAY_Init(void) { }
 void REMOTEPLAY_ProcessEnded(void) { }
 bool REMOTEPLAY_HostRequested(void) { return false; }

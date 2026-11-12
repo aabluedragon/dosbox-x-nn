@@ -5370,6 +5370,7 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->SetBasic(true);
 
     const char* inputnetmodes[] = { "remote", "lockstep", 0 };
+    const char* inputnetpresent[] = { "flip", "retrace", "scanout", nullptr };
     Pstring = secprop->Add_string("mode",Property::Changeable::WhenIdle, "remote");
     Pstring->Set_values(inputnetmodes);
     Pstring->Set_help("How the players share the game.\n"
@@ -5385,6 +5386,16 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("stream fps",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("Remote play: the most frames per second the host sends. 0 sends every frame the\n"
                    "game draws. Lower it to save upload bandwidth.");
+
+    Pstring = secprop->Add_string("present",Property::Changeable::WhenIdle, "flip");
+    Pstring->Set_values(inputnetpresent);
+    Pstring->Set_help("Remote play host: when a frame is taken for the players (and for this screen).\n"
+                      "  flip:    as soon as the game shows another page of video memory, and otherwise\n"
+                      "           at the start of vertical retrace (the least delay).\n"
+                      "  retrace: at the start of vertical retrace only, with the page the game has chosen\n"
+                      "           by then.\n"
+                      "  scanout: as the emulated display draws it, one refresh later (as without remote play).\n"
+                      "Use retrace or scanout for a game whose picture flickers or tears with flip.");
 
     Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"

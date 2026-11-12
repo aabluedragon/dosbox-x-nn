@@ -29,6 +29,7 @@ extern bool dbg_event_color_plane_enable;
 extern bool dbg_event_color_select;
 extern bool vga_render_on_demand;
 void VGA_RenderOnDemandUpTo(void);
+int REMOTEPLAY_PresentMode(void);   /* not 0: a remote play host takes frames early (vga_draw.cpp, NN_EarlyFrameOK) */
 
 #define attr(blah) vga.attr.blah
 
@@ -208,12 +209,16 @@ void write_p3c0(Bitu /*port*/,Bitu val,Bitu iolen) {
 		 *          very timing dependent tricks, but will render most DOS games with better performance
 		 *          which for most casual users of DOSBox and DOSBox-X is just fine. Just don't expect
 		 *          this performance enhancement to handle all the tricks of the Demoscene. --J.C. */
-		if (vga_render_on_demand && !(attr(disabled)&1)/*screen not yet disabled*/) VGA_RenderOnDemandUpTo();
+		/* NukemNet remote play host: the index alone changes nothing on screen, only the screen enable bit does.
+		 * The VESA BIOS writes the panning register with every page flip (VESA_SetDisplayStart): drawing part of the
+		 * frame for that would keep it from taking the new page (NN_EarlyFrameOK). */
+		const bool nn_same = REMOTEPLAY_PresentMode() != 0 && ((val & 0x20) != 0) == ((attr(disabled) & 1) == 0);
+		if (vga_render_on_demand && !nn_same && !(attr(disabled)&1)/*screen not yet disabled*/) VGA_RenderOnDemandUpTo();
 		attr(index)=val & 0x1F;
 		vga.internal.attrindex=true;
 		if (val & 0x20) attr(disabled) &= ~1;
 		else attr(disabled) |= 1;
-		if (vga_render_on_demand && !(attr(disabled)&1)/*screen not yet disabled*/) VGA_RenderOnDemandUpTo();
+		if (vga_render_on_demand && !nn_same && !(attr(disabled)&1)/*screen not yet disabled*/) VGA_RenderOnDemandUpTo();
 		/* 
 		   0-4	Address of data register to write to port 3C0h or read from port 3C1h
 		   5	If set screen output is enabled and the palette can not be modified,
@@ -232,7 +237,9 @@ void write_p3c0(Bitu /*port*/,Bitu val,Bitu iolen) {
 		 */
 		return;
 	} else {
-		if (vga_render_on_demand && !(attr(disabled)&1)/*screen not disabled*/) VGA_RenderOnDemandUpTo();
+		/* NukemNet remote play host: the panning it already has (see above) */
+		const bool nn_same = REMOTEPLAY_PresentMode() != 0 && attr(index) == 0x13 && attr(horizontal_pel_panning) == (val & 0xF);
+		if (vga_render_on_demand && !nn_same && !(attr(disabled)&1)/*screen not disabled*/) VGA_RenderOnDemandUpTo();
 		vga.internal.attrindex=false;
 		switch (attr(index)) {
 			/* Palette */

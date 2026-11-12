@@ -50,6 +50,39 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   Warrior's 800x600 that way) go out as palette and indices, and a frame that compresses better alone
   than as a difference goes out as a key frame. Viewers and hosts without it keep working together with
   it, as before. Before, an 800x600 game froze the viewer's picture after its first frames.
+- Remote play latency: the viewer measures how long its input takes to reach its screen (the host tells it
+  which input each frame is the first to show, in `RP_FRAMEINFO`) and writes the average to the log every
+  5 seconds, split into viewer, network, the host waiting for the game's next frame, encoding, the frame
+  arriving, and decoding and drawing. Ctrl+F11 in the viewer shows it in the window title. The game's own
+  reaction time is not part of it. Big frames (128 KB and more, so 800x600 ones) are compressed on up to four
+  threads into one ordinary zlib stream that older viewers read as before, which takes about half the time.
+  Frames are encoded and sent on a thread of their own (`Enc_Thread`; hosts with one processor encode on the
+  emulation thread as before): the emulation thread only copies the picture, about 0.3 ms a frame at 800x600
+  where encoding took it 3 to 6 ms, and a newer picture replaces one the encoder has not started on. The
+  host's 5 second log line shows the encoding time and what the game's thread gives. `host_lock` guards what
+  the two threads share and `send_lock` keeps queued video leaving in order. While the picture keeps moving a
+  lot (the frame alone was smaller than its difference three times in a row) three frames in four are compressed
+  alone only, not both ways, unless the link limits the video. When every viewer says it can
+  (`RP_FEAT_PIECES`), a frame carries a table of its compressed pieces and the viewer inflates them on several
+  threads; other viewers get the plain stream. The viewer draws a frame the
+  moment it is complete (no vsync, straight into the texture) and looks for input every millisecond. The host's
+  and the viewer's UDP sockets ask for 4 MB kernel buffers (`NetWrapper_WidenUdpBuffers`): with the defaults (64 KB
+  on Windows) part of a big frame's burst was dropped whenever the receiver was busy, and the loss made the host
+  pace its video, which delayed every frame.
+- Remote play frame timing (`[inputnet] present = flip | retrace | scanout`, default `flip`; only while a remote
+  play server runs): a VGA takes a new start address at the start of vertical retrace and then spends a refresh
+  showing that page, and the emulation handed the frame over when its last line was drawn, so a page a game
+  flipped to reached the players 14 to 28 ms later at 70 Hz. A host now renders 256-colour VGA modes on demand
+  (as SVGA modes already were), a frame not drawn yet takes the start address the game has set by then
+  (`retrace`), and with `flip` the frame is drawn the moment the start address moves to another page
+  (`NN_EarlyFrameOK`, `NN_FramePoll` in `vga_draw.cpp`). Measured with test programs that change the screen on
+  a key press, through a 42 ms link: 64 ms from key to picture became 45 ms for a page flip (CRTC start address
+  as DOS Doom does it, or VBE 4F07h), 51 ms with `retrace`; a game that copies its frame to the screen is shown
+  whole one refresh earlier. A mode that uses pixel panning, a split screen or a preset row scan keeps the VGA's
+  own timing until the next mode change (the address and the panning must change together there). On a host,
+  reading port 3DAh and rewriting an unchanged panning value no longer draw part of the frame (the VESA BIOS
+  does both with every page flip). Use `retrace` or `scanout` for a game whose picture flickers with `flip`
+  (one that keeps drawing into a page after showing it).
 - Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
   `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
   notice, on the surface output), opens it minimized and without the focus, so it never covers the
