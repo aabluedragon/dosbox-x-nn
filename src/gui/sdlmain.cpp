@@ -6490,8 +6490,11 @@ void GFX_Events() {
 
                 GFX_DrawSDLMenu(mainMenu,mainMenu.display_list);
 #endif
-                SetPriority(sdl.priority.nofocus);
                 GFX_LosingFocus();
+                /* A remote play host plays for players elsewhere: its window's focus (it never has any while hidden)
+                 * must not lower its priority, halve its emulated CPU or stop cycles=max from guessing. */
+                if (REMOTEPLAY_ServerRunning()) break;
+                SetPriority(sdl.priority.nofocus);
                 if( sdl.priority.nofocus != PRIORITY_LEVEL_PAUSE ) {
                     CPU_Enable_SkipAutoAdjust();
                 }
@@ -6922,11 +6925,14 @@ void GFX_Events() {
                         GFX_SDLMenuTrackHilight(mainMenu,DOSBoxMenu::unassigned_item_handle);
 #endif
 
-                        SetPriority(sdl.priority.nofocus);
                         GFX_LosingFocus();
 
-                        if( sdl.priority.nofocus != PRIORITY_LEVEL_PAUSE ) {
-                            CPU_Enable_SkipAutoAdjust();
+                        /* A remote play host keeps its speed without focus (see the SDL2 handler). */
+                        if (!REMOTEPLAY_ServerRunning()) {
+                            SetPriority(sdl.priority.nofocus);
+                            if( sdl.priority.nofocus != PRIORITY_LEVEL_PAUSE ) {
+                                CPU_Enable_SkipAutoAdjust();
+                            }
                         }
                     }
                 }

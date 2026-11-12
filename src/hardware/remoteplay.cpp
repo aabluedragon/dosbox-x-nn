@@ -39,6 +39,7 @@ bool remoteplay_screen_hidden = false;
 #include <string.h>
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <string>
 #include <vector>
@@ -48,6 +49,7 @@ bool remoteplay_screen_hidden = false;
 #include "SDL.h"
 #include "bios.h"
 #include "control.h"
+#include "cpu.h"
 #include "dos_inc.h"
 #include "keyboard.h"
 #include "mem.h"
@@ -248,6 +250,8 @@ unsigned cfg_maxfps = 0;
 /* Video encoder state */
 struct EncFrame { uint32_t id = 0; std::vector<uint8_t> raw; };
 std::vector<uint8_t> enc_raw, enc_work, enc_comp;
+std::vector<uint8_t> enc_lastin;                /* the last 32-bit picture offered, as given */
+unsigned enc_inw = 0, enc_inh = 0;
 std::deque<EncFrame> enc_hist;                  /* the newest frames sent, oldest first */
 EncFrame enc_key;                               /* the last key frame (kept even when older than enc_hist) */
 unsigned enc_w = 0, enc_h = 0, enc_fmt = 0;
@@ -258,6 +262,7 @@ size_t send_queued = 0;                         /* bytes in send_queue */
 uint32_t send_lastms = 0, send_backlog_ms = 0, rate_cut_ms = 0, rate_log_ms = 0;
 double send_budget = 0;                         /* bytes that may go out now */
 double send_rate = RP_RATE_MAX;                 /* video bytes/s */
+double rate_delivered = 0;                      /* the most video bytes/s a viewer has received lately */
 bool rate_adaptive = false;
 
 /* 32-bit frames of 256-colour modes: DOSBox-X draws SVGA 8-bit modes (Shadow Warrior's 800x600, for one) as 32-bit
@@ -429,6 +434,7 @@ void Host_UpdateRateMode(void) {
     if (adaptive == rate_adaptive) return;
     rate_adaptive = adaptive;
     send_rate = adaptive ? RP_RATE_START : RP_RATE_MAX;
+    rate_delivered = 0;
     rate_cut_ms = SDL_GetTicks();
 }
 
@@ -441,9 +447,17 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
     if (now - v.loss_ms < 200) return;
     const uint32_t de = exp - v.loss_exp, dg = got - v.loss_got;
     if (de < 24 && now - v.loss_ms < 1000) return;  /* too few to judge yet */
+    const double secs = (now - v.loss_ms) / 1000.0;
     v.loss_exp = exp; v.loss_got = got; v.loss_ms = now;
     if (de == 0 || de > 0x7fffffffu) return;
     const double loss = dg < de ? (double)(de - dg) / (double)de : 0.0;
+
+    /* What actually got through, remembered for a while (halving in about half a minute) so a pause in the action does
+     * not forget what the link carries. The rate stays within twice that: with only small or occasional frames to send
+     * (a still picture, a key frame now and then) it would otherwise creep up unchecked, and the next burst of motion
+     * would go out far faster than the link takes it and lose whole frames until the cuts caught up. */
+    rate_delivered = std::max(rate_delivered * pow(0.98,secs),(double)dg * RP_FRAG / secs);
+    const double ceiling = std::max(RP_RATE_START,rate_delivered * 2.0);
     if (loss > 0.03) {
         /* Loss reports lag a round trip behind: cut again only once the last cut could show. */
         if (now - rate_cut_ms >= 400) {
@@ -452,17 +466,19 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
         }
     }
     else if (loss < 0.01 && now - rate_cut_ms >= 400 && now - send_backlog_ms < 300) {
-        send_rate = std::min(RP_RATE_MAX,send_rate * 1.1);
+        /* Video is waiting for the rate: raise it, quickly, since the ceiling keeps it near what gets through. */
+        send_rate = std::min(send_rate * 1.2,ceiling);
     }
+    send_rate = std::min(std::min(send_rate,ceiling),RP_RATE_MAX);
     if (now - rate_log_ms >= 5000) {
         static uint32_t last_frames = 0;
         static uint64_t last_bytes = 0;
         const double secs = rate_log_ms ? (now - rate_log_ms) / 1000.0 : 5.0;
         const uint32_t frames = stat_frames - last_frames;
         static uint32_t last_offered = 0, last_skipped = 0;
-        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link), %.1f%% of fragments lost",
+        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link), %.1f%% of fragments lost; CPU %ld cycles",
             (unsigned)(send_rate / 1024.0),(unsigned)((stat_bytes - last_bytes) / 1024.0 / secs),frames / secs,
-            (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,loss * 100.0);
+            (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,loss * 100.0,(long)CPU_CycleMax);
         last_frames = stat_frames; last_bytes = stat_bytes; last_offered = stat_offered; last_skipped = stat_skipped;
         rate_log_ms = now;
     }
@@ -746,6 +762,8 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) viewers[i].active = false;
     host_running = true;
     host_port = port;
+    /* The window may have lost focus already, which stops cycles=max from guessing: a host keeps guessing without it. */
+    CPU_Disable_SkipAutoAdjust();
     if (host_lock == NULL) host_lock = SDL_CreateMutex();
     host_lastpoll = SDL_GetTicks();
     host_keepalive_stop = 0;
@@ -899,6 +917,20 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
         }
         Host_FlushQueue();
         return;
+    }
+
+    /* The same 32-bit picture as the last one: nothing to index or send. That is most refreshes while a game draws fewer
+     * frames than the display shows (Shadow Warrior at 800x600), and indexing it every time costs the game emulation. */
+    if (bpp == 32) {
+        if (width == enc_inw && height == enc_inh && enc_haveprev && !enc_needkey && !enc_keyreq && (now - enc_lastsend) < 250) {
+            bool same = true;
+            for (unsigned y=0;y < height && same;y++)
+                same = memcmp(enc_lastin.data() + (size_t)y * rowbytes,data + (size_t)y * pitch,rowbytes) == 0;
+            if (same) return;
+        }
+        enc_lastin.resize(rowbytes * height);
+        for (unsigned y=0;y < height;y++) memcpy(enc_lastin.data() + (size_t)y * rowbytes,data + (size_t)y * pitch,rowbytes);
+        enc_inw = width; enc_inh = height;
     }
 
     /* 32-bit pixels of at most 256 colours go out as an 8-bit frame (any viewer decodes it). */
