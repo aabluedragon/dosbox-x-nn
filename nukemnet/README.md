@@ -81,8 +81,15 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   whole one refresh earlier. A mode that uses pixel panning, a split screen or a preset row scan keeps the VGA's
   own timing until the next mode change (the address and the panning must change together there). On a host,
   reading port 3DAh and rewriting an unchanged panning value no longer draw part of the frame (the VESA BIOS
-  does both with every page flip). Use `retrace` or `scanout` for a game whose picture flickers with `flip`
-  (one that keeps drawing into a page after showing it).
+  does both with every page flip). With `flip` a host also shows a frame as soon as a game has copied one onto
+  the page shown (`NN_CopyPoll`): NukemNet starts the Build games with `machine=vesa_nolfb`, where they copy
+  every frame and never flip, and most 320x200 games copy too. Nothing tells the card a copy is complete, so 256
+  pixels of the frame are looked at every quarter of a millisecond; bands changing from the top down, most of
+  the screen, not to one colour, and then nothing for two polls, is a frame. Measured the same way: 54 ms from
+  key to picture became 47 ms, and a copy caught half-way (2 frames in 150 at 3000 cycles) no longer happens.
+  Shadow Warrior at 800x600 is shown on average 6 ms into the 14 ms refresh instead of at its end. Use `retrace`
+  or `scanout` for a game whose picture flickers with `flip` (one that keeps drawing into a page after showing
+  it, or draws its picture onto the screen in two passes).
 - Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
   `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
   notice, on the surface output), opens it minimized and without the focus, so it never covers the
