@@ -74,7 +74,7 @@ Bitu vga_read_p3da(Bitu port,Bitu iolen) {
 	vga.tandy.pcjr_flipflop=false;
 
 	// 3DAh (R):  Status Register
-	// bit   0  Horizontal or Vertical blanking
+	// bit   0  Display disabled (inverted display enable)
 	//       3  Vertical sync
 
 	if (timeInFrame >= vga.draw.delay.vdend) {
@@ -90,8 +90,12 @@ Bitu vga_read_p3da(Bitu port,Bitu iolen) {
 			htotal_inv = (htotal_cached > 0.0) ? (1.0 / htotal_cached) : 0.0;
 		}
 		const double timeInLine = timeInFrame - htotal_cached * (double)(int32_t)(timeInFrame * htotal_inv);
-		if (timeInLine >= vga.draw.delay.hblkstart && timeInLine <= vga.draw.delay.hblkend)
-			retval |= 1; // horizontal blanking
+		/* Input Status 1 bit 0 is the inverted display-enable signal, not
+		 * the blanking-register pulse. The display stays disabled through
+		 * the back porch until the next line; reporting it active again at
+		 * HBlank End breaks software that distinguishes HBlank from VBlank. */
+		if (timeInLine >= vga.draw.delay.hdend)
+			retval |= 1; // horizontal display disabled
 	}
 
 	if (timeInFrame >= vga.draw.delay.vrstart && timeInFrame <= vga.draw.delay.vrend)

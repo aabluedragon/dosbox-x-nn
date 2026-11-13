@@ -23,6 +23,7 @@
 
 #include "dos_files_tests.cpp"
 #include "drives_tests.cpp"
+#include "vga_status_tests.cpp"
 #include "shell_cmds_tests.cpp"
 #include "shell_redirection_tests.cpp"
 #include "agent/agent_architecture_tests.cpp"

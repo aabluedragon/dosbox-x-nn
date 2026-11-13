@@ -8146,7 +8146,6 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 				oscclock = clock * 8;
 				break;
 		}
-		vga.draw.delay.hdend = hdend*1000.0/clock; //in milliseconds
 	}
 #if C_DEBUG
 	LOG(LOG_VGA,LOG_NORMAL)("h total %3d end %3d blank (%3d/%3d) retrace (%3d/%3d)",
@@ -8183,6 +8182,8 @@ void VGA_SetupDrawing(Bitu /*val*/) {
 		vdend = vtotal;
 	}
 
+	// Display-enable timing is also used by Input Status 1 on EGA/VGA.
+	vga.draw.delay.hdend = hdend*1000.0/clock; //in milliseconds
 	// Horizontal total (that's how long a line takes with whistles and bells)
 	vga.draw.delay.htotal = htotal*1000.0/clock; //in milliseconds
 	// Start and End of horizontal blanking
