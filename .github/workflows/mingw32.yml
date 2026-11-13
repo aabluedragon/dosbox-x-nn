@@ -23,33 +23,27 @@ jobs:
           access_token: ${{ github.token }}
       - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MINGW32
           update: true
-          install: git make base-devel mingw-w64-i686-toolchain mingw-w64-i686-libtool autoconf automake mingw-w64-i686-ncurses mingw-w64-i686-binutils
-      - name: Install libslirp
-        # MSYS2 keeps dropping i686 packages (glib2 in November 2026). Without libslirp the build just leaves it out.
-        continue-on-error: true
+          install: git make mingw-w64-i686-libtool autoconf automake p7zip
+      - name: Export env parameters
         run: |
-          # Run this job when MinGW drops 32-bit library support (Other libraries can be built as well)
+          echo "MSYS2_LOCATION=${{ steps.msys2.outputs.msys2-location }}" >> $GITHUB_ENV
+          echo "MSYSTEM_PREFIX=${{ steps.msys2.outputs.msys2-location }}/mingw32" >> $GITHUB_ENV
+          echo "mingw32 is installed at: $MSYSTEM_PREFIX"
+      - name: setup MinGW32 build environment
+        run: |
           top=`pwd`
-          # Packages no longer in the i686 repository: the newest archived build, without its build-time-only
-          # dependencies (glib2's Python tools are not needed to link libslirp).
-          for p in glib2 libffi pcre2 gettext-runtime; do
-            if ! pacman -Si mingw-w64-i686-$p >/dev/null 2>&1; then
-              f=$(curl -s https://repo.msys2.org/mingw/mingw32/ | grep -oE "mingw-w64-i686-$p-[0-9][^\"<]*-any\.pkg\.tar\.zst" | sort -uV | tail -1)
-              [ -n "$f" ] && pacman --noconfirm -U -dd "https://repo.msys2.org/mingw/mingw32/$f"
-            fi
-          done
-          mkdir pkg
-          cd pkg
-          git clone https://github.com/msys2/MINGW-packages.git
-          pwd
-          cd MINGW-packages
-          cd mingw-w64-libslirp
-          sed -i -e "s/^mingw_arch=\(.*\)/mingw_arch=(\'mingw32\')/" PKGBUILD
-          MINGW_ARCH=MINGW32 makepkg-mingw -sCLf --noconfirm
-          pacman --noconfirm -U mingw-w64-*-any.pkg.tar.zst
+          echo "${top}"
+          echo "path=$PATH"
+          cd ${MSYSTEM_PREFIX}/..
+          rm -rf mingw32
+          wget https://github.com/maron2000/MinGW32/releases/download/mingw32-2026.10.31/mingw32-toolchain.tar.xz
+          tar -xJf mingw32-toolchain.tar.xz
+          echo "MSYSTEM_PREFIX=${MSYSTEM_PREFIX}"
+          find "${MSYSTEM_PREFIX}" -type f -iname "*.exe" -exec chmod +x {} \;
       - name: Update build info
         shell: bash
         run: |
@@ -101,6 +95,13 @@ jobs:
         run: |
           top=`pwd`
           export "MSYSTEM_PREFIX=/d/a/_temp/msys64/mingw32"
+          echo "Compiling our internal SDL 2.x"
+          (cd vs/sdl2 && ./build-dosbox.sh) || exit 1
+          new="-I${top}/vs/sdl2/linux-host/include "
+          nld="-L${top}/vs/sdl2/linux-host/lib "
+          LDFLAGS="${nld}${LDFLAGS}"
+          CPPFLAGS="${new}${CPPFLAGS}"
+          export LDFLAGS CPPFLAGS
           ./build-mingw-sdl2
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW32 SDL2
@@ -165,6 +166,7 @@ jobs:
           access_token: ${{ github.token }}
       - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MINGW32
           update: true
@@ -298,6 +300,7 @@ jobs:
           access_token: ${{ github.token }}
       - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: MINGW32
           update: true

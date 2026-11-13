@@ -1332,7 +1332,6 @@ static Bitu DOS_21Handler(void) {
                         uint8_t page = real_readb(BIOSMEM_SEG, BIOSMEM_CURRENT_PAGE);
                         uint8_t col = CURSOR_POS_COL(page);
                         uint8_t row = CURSOR_POS_ROW(page);
-                        BIOS_NCOLS;
                         DOS_WriteFile(STDOUT, &bell, &n);
                         if(CURSOR_POS_COL(page) > col)
                             INT10_SetCursorPos(row, col, page); // stay where we were
@@ -2964,8 +2963,14 @@ static Bitu DOS_21Handler(void) {
             /* Weird call to increase amount of file handles needs to allocate memory if >20 */
             {
                 DOS_PSP psp(dos.psp());
-                psp.SetNumFiles(reg_bx);
-                CALLBACK_SCF(false);
+                auto err = psp.SetNumFiles(reg_bx);
+                if (err) {
+                    reg_ax = err;
+                    CALLBACK_SCF(true);
+                }
+                else {
+                    CALLBACK_SCF(false);
+                }
                 break;
             }
         case 0x68:                  /* FFLUSH Commit file */
@@ -4565,6 +4570,9 @@ public:
 
 		DOS_IHSEG = DOS_GetMemory(1,"DOS_IHSEG");
 
+		// Keep CON separate from and below the information block.
+		DOS_CONDRV_SEG = DOS_GetMemory(0x04,"DOS_CONDRV_SEG");
+
 		/* DOS_INFOBLOCK_SEG contains the entire List of Lists, though the INT 21h call returns seg:offset with offset nonzero */
 		/* NTS: DOS_GetMemory() allocation sizes are in PARAGRAPHS (16-byte units) not bytes */
 		/* NTS: DOS_INFOBLOCK_SEG must be 0x32 paragraphs. SDA_SEG must be located at INFOBLOCK_SEG+0x32, so that the current PSP
@@ -4584,8 +4592,6 @@ public:
 		DOS_SDA_SEG = DOS_GetMemory(DOS_SDA_SEG_SIZE>>4,"DOS_SDA_SEG");		// was 0xB2  (0xB2 + 0x56 = 0x108)
 		DOS_SDA_OFS = 0;
 
-		/* 2024/06/02: Keep the CON driver away from the clusterfuck of the INFOBLOCK and SFT mess */
-		DOS_CONDRV_SEG = DOS_GetMemory(0x04,"DOS_CONDRV_SEG");		// was 0xA0
 		DOS_CDS_SEG = DOS_GetMemory(0x10,"DOS_CDA_SEG");		// was 0x108
 
 		LOG(LOG_DOSMISC,LOG_DEBUG)("DOS kernel alloc:");
@@ -5092,7 +5098,7 @@ void DOS_EnableDriveMenu(char drv) {
 		if (dos_kernel_disabled || RunningProgram == "LOADLIN") {
 			bool found = false;
 			for (int i=0; i<MAX_DISK_IMAGES; i++)
-				if (imageDiskList[i] && imageDiskList[i]->ffdd && imageDiskList[i]->drvnum == drv-'A') {
+				if (imageDiskList[i] && imageDiskList[i]->ffdd && imageDiskList[i]->drvnum == (unsigned int)(drv-'A')) {
 					found = true;
 					break;
 				}

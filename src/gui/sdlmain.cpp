@@ -6285,6 +6285,7 @@ bool gfx_in_mapper = false;
 #define DB_POLLSKIP 1
 #endif
 
+
 void GFX_Events() {
     REMOTEPLAY_Poll();
 #if C_EMSCRIPTEN
@@ -6329,6 +6330,11 @@ void GFX_Events() {
             MAPPER_UpdateJoysticks();
         }
     }
+#endif
+
+#if C_MONITOR
+	extern std::atomic< void(*)() > Monitor_RunProgram;
+	if( auto monitor_command= Monitor_RunProgram.load() ) monitor_command();
 #endif
 
 #if C_GAMELINK
