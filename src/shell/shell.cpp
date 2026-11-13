@@ -1975,6 +1975,8 @@ void SHELL_MessagesInit() {
 			"                          The drive must be a mounted local directory and\n"
 			"                          the directory must already exist.\n"
 			"  hostfile                The file on the host system to map there.\n"
+			"                          May be archive.zip/path/to/file or\n"
+			"                          app.asar/path/to/file (temporary copy).\n"
 			"  /D                      Removes a mapping (the host file is not touched).\n\n"
 			"The file appears in the DOS directory as if it were there, even though it\n"
 			"does not exist at that location on the host file system. A real file with\n"

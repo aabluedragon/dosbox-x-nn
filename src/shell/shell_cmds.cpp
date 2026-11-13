@@ -59,6 +59,7 @@
 #include "menudef.h"
 #include "build_timestamp.h"
 #include "version_string.h"
+#include "unzip.h"
 
 #include <output/output_ttf.h>
 
@@ -3684,7 +3685,7 @@ bool AsarReadEntry(AsarJson &j,AsarEntry &e) {
 	}
 }
 
-std::vector<std::string> AsarSplit(const std::string &inner) {
+std::vector<std::string> FileMountArchiveSplit(const std::string &inner) {
 	std::vector<std::string> parts;
 	std::string cur;
 	for (size_t k = 0;k <= inner.size();k++) {
@@ -3698,23 +3699,23 @@ std::vector<std::string> AsarSplit(const std::string &inner) {
 	return parts;
 }
 
-std::vector<std::string> asar_temp_files;
-std::string asar_temp_dir;
+std::vector<std::string> filemount_temp_files;
+std::string filemount_temp_dir;
 
-void AsarCleanup(void) {
-	for (const auto &f : asar_temp_files) remove(f.c_str());
-	asar_temp_files.clear();
-	if (!asar_temp_dir.empty()) {
+void FileMountCleanup(void) {
+	for (const auto &f : filemount_temp_files) remove(f.c_str());
+	filemount_temp_files.clear();
+	if (!filemount_temp_dir.empty()) {
 #if defined(WIN32)
-		_rmdir(asar_temp_dir.c_str());
+		_rmdir(filemount_temp_dir.c_str());
 #else
-		rmdir(asar_temp_dir.c_str());
+		rmdir(filemount_temp_dir.c_str());
 #endif
 	}
 }
 
-std::string AsarTempDir(void) {
-	if (!asar_temp_dir.empty()) return asar_temp_dir;
+std::string FileMountTempDir(void) {
+	if (!filemount_temp_dir.empty()) return filemount_temp_dir;
 #if defined(WIN32)
 	const char *base = getenv("TEMP");
 	if (base == NULL || !*base) base = getenv("TMP");
@@ -3725,14 +3726,14 @@ std::string AsarTempDir(void) {
 #endif
 	char name[64];
 	srand((unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)&name);
-	snprintf(name,sizeof(name),"dosbox-x-nn-asar-%08x%04x",(unsigned int)time(NULL),(unsigned int)(rand() & 0xFFFF));
+	snprintf(name,sizeof(name),"dosbox-x-nn-filemount-%08x%04x",(unsigned int)time(NULL),(unsigned int)(rand() & 0xFFFF));
 	std::string dir = std::string(base) + CROSS_FILESPLIT + name;
 	Cross::CreateDir(dir);
 	struct stat st;
 	if (stat(dir.c_str(),&st) != 0 || !(st.st_mode & S_IFDIR)) return "";
-	asar_temp_dir = dir;
-	atexit(AsarCleanup);
-	return asar_temp_dir;
+	filemount_temp_dir = dir;
+	atexit(FileMountCleanup);
+	return filemount_temp_dir;
 }
 
 /* The host file to map for `path` when it lies inside an asar archive: true with `host` set (or false with `error`
@@ -3763,7 +3764,7 @@ bool AsarResolve(const std::string &path,std::string &host,std::string &error) {
 		if (fread(&json[0],1,json_size,f) != json_size) { fclose(f); error = "cannot read " + archive; return false; }
 		const unsigned long long data_start = 8ull + header_size;
 
-		std::vector<std::string> parts = AsarSplit(path.substr(end + 1));
+		std::vector<std::string> parts = FileMountArchiveSplit(path.substr(end + 1));
 		AsarEntry entry;
 		bool found = false;
 		for (int hops = 0;hops < 16 && !found;hops++) {
@@ -3776,7 +3777,7 @@ bool AsarResolve(const std::string &path,std::string &host,std::string &error) {
 				if (!AsarReadEntry(j,e)) { ok = false; break; }
 				if (e.haslink) {
 					/* a link points at another path inside the archive (relative to its root) */
-					std::vector<std::string> next = AsarSplit(e.link);
+					std::vector<std::string> next = FileMountArchiveSplit(e.link);
 					next.insert(next.end(),parts.begin() + (long)n + 1,parts.end());
 					parts = next;
 					relinked = true;
@@ -3801,14 +3802,14 @@ bool AsarResolve(const std::string &path,std::string &host,std::string &error) {
 			return true;
 		}
 
-		const std::string dir = AsarTempDir();
+		const std::string dir = FileMountTempDir();
 		if (dir.empty()) { fclose(f); error = "cannot create a temporary folder"; return false; }
 		char prefix[16];
-		snprintf(prefix,sizeof(prefix),"%u-",(unsigned int)asar_temp_files.size());
+		snprintf(prefix,sizeof(prefix),"%u-",(unsigned int)filemount_temp_files.size());
 		const std::string out = dir + CROSS_FILESPLIT + prefix + parts.back();
 		FILE *o = fopen(out.c_str(),"wb");
 		if (o == NULL) { fclose(f); error = "cannot create " + out; return false; }
-		asar_temp_files.push_back(out);
+		filemount_temp_files.push_back(out);
 		bool good = fseeko64(f,(fseek_ofs_t)(data_start + strtoull(entry.offset.c_str(),NULL,10)),SEEK_SET) == 0;
 		unsigned long long left = entry.size;
 		char buf[65536];
@@ -3820,6 +3821,91 @@ bool AsarResolve(const std::string &path,std::string &host,std::string &error) {
 		}
 		fclose(o);
 		fclose(f);
+		if (!good) { remove(out.c_str()); error = "cannot read " + inner + " from " + archive; return false; }
+		host = out;
+		return true;
+	}
+	return false;
+}
+
+/* Resolve archive.zip/path/to/file using the same temporary-copy lifetime as ASAR.
+ * Only the selected entry is streamed out; archive paths never become output paths. */
+bool ZipResolve(const std::string &path,std::string &host,std::string &error) {
+	error.clear();
+	std::string lower = path;
+	for (auto &c : lower) c = (char)tolower((unsigned char)c);
+	size_t pos = 0;
+	while ((pos = lower.find(".zip",pos)) != std::string::npos) {
+		const size_t end = pos + 4;
+		pos = end;
+		if (end >= path.size() || (path[end] != '/' && path[end] != '\\')) continue;
+		const std::string archive = path.substr(0,end);
+		struct stat ast;
+		if (stat(archive.c_str(),&ast) != 0 || !(ast.st_mode & S_IFREG)) continue;
+
+		unzFile z = unzOpen64(archive.c_str());
+		if (z == NULL) { error = "cannot open ZIP archive " + archive; return false; }
+		const auto parts = FileMountArchiveSplit(path.substr(end + 1));
+		if (parts.empty() || path.back() == '/' || path.back() == '\\') {
+			unzClose(z); error = "a directory in " + archive; return false;
+		}
+		std::string inner;
+		for (const auto &part : parts) inner += (inner.empty() ? "" : "/") + part;
+
+		/* unzLocateFile has a 256-byte filename limit in the bundled minizip.
+		 * Read names at their actual length so deeply nested paths also work. */
+		unz_file_info64 info = {};
+		int status = unzGoToFirstFile(z);
+		bool found = false, directory = false;
+		while (status == UNZ_OK) {
+			status = unzGetCurrentFileInfo64(z,&info,NULL,0,NULL,0,NULL,0);
+			if (status != UNZ_OK) break;
+			std::vector<char> name(info.size_filename + 1,0);
+			status = unzGetCurrentFileInfo64(z,&info,name.data(),(uLong)name.size(),NULL,0,NULL,0);
+			if (status != UNZ_OK) break;
+			const std::string entry(name.data(),info.size_filename);
+			if (entry == inner || entry == inner + "/") {
+				found = true;
+				directory = entry.back() == '/' || (info.external_fa & 0x10) != 0 ||
+				            ((info.external_fa >> 16) & 0170000) == 0040000;
+				break;
+			}
+			status = unzGoToNextFile(z);
+		}
+		if (!found || directory || (info.flag & 1) != 0) {
+			unzClose(z);
+			error = (directory ? "a directory in " : found ? "encrypted entry in " :
+			         status == UNZ_END_OF_LIST_OF_FILE ? "not found in " : "cannot read directory of ") + archive;
+			return false;
+		}
+		if (unzOpenCurrentFile(z) != UNZ_OK) {
+			unzClose(z); error = "cannot open " + inner + " in " + archive; return false;
+		}
+
+		const std::string dir = FileMountTempDir();
+		if (dir.empty()) {
+			unzCloseCurrentFile(z); unzClose(z); error = "cannot create a temporary folder"; return false;
+		}
+		/* A numeric name also handles ZIP names that are not valid host filenames. */
+		const std::string out = dir + CROSS_FILESPLIT + std::to_string(filemount_temp_files.size()) + "-zip";
+		FILE *o = fopen(out.c_str(),"wb");
+		if (o == NULL) {
+			unzCloseCurrentFile(z); unzClose(z); error = "cannot create " + out; return false;
+		}
+		filemount_temp_files.push_back(out);
+		char buf[65536];
+		ZPOS64_T total = 0;
+		int got;
+		bool good = true;
+		while ((got = unzReadCurrentFile(z,buf,sizeof(buf))) > 0) {
+			total += (unsigned int)got;
+			if (fwrite(buf,1,(size_t)got,o) != (size_t)got) { good = false; break; }
+		}
+		if (got < 0 || total != info.uncompressed_size) good = false;
+		/* Closing verifies the CRC after a complete read. Do not expose corrupt data. */
+		if (unzCloseCurrentFile(z) != UNZ_OK) good = false;
+		unzClose(z);
+		if (fclose(o) != 0) good = false;
 		if (!good) { remove(out.c_str()); error = "cannot read " + inner + " from " + archive; return false; }
 		host = out;
 		return true;
@@ -3888,10 +3974,12 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 	command.FindCommand(2,arg2);
 	struct stat st;
 	if (stat(arg2.c_str(),&st) != 0) {
-		/* a file inside an asar archive is mapped from a temporary copy (or app.asar.unpacked) */
-		std::string asar_host, asar_error;
-		if (AsarResolve(arg2,asar_host,asar_error)) arg2 = asar_host;
-		else if (!asar_error.empty()) LOG_MSG("FILEMOUNT: %s: %s",arg2.c_str(),asar_error.c_str());
+		/* Archive entries are mapped from a temporary copy (or app.asar.unpacked). */
+		std::string archive_host, archive_error;
+		bool resolved = AsarResolve(arg2,archive_host,archive_error);
+		if (!resolved && archive_error.empty()) resolved = ZipResolve(arg2,archive_host,archive_error);
+		if (resolved) arg2 = archive_host;
+		else if (!archive_error.empty()) LOG_MSG("FILEMOUNT: %s: %s",arg2.c_str(),archive_error.c_str());
 	}
 	if (stat(arg2.c_str(),&st) != 0 || (st.st_mode & S_IFDIR)) {
 		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_HOST_NOT_FOUND"),arg2.c_str());
