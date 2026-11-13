@@ -181,7 +181,9 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   - the lens: how much more the sides of a view in perspective move than its middle, from 8 strips of the picture
     (a 2D view moves as one piece), learned only from movement the player's input made;
   - what each held key does to the view by how long it has been held, per combination of Shift, Ctrl and Alt;
-  - the view's rectangle (not the status bar, a border or a side panel) and the pixels in it that never move with it;
+  - the view's rectangle (not the status bar, a border or a side panel) and the pixels in it that never move with it
+    (a weapon, a crosshair, text on the screen): 1-pixel strokes count as a whole, and a weapon that bobs or fires
+    keeps counting for two seconds unless the world is seen moving through its pixels;
   - layers: bands of the view that an engine scrolls evenly at a rate of its own (`VP_Bands`). Build's sky does:
     measured in Duke Nukem 3D at 1.24 times the ground's movement in the middle of the view, the same in every
     column, where the lens moves the sides 1.8 times as far. Each of 6 bands is tried both ways against a frame a
