@@ -181,8 +181,12 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   - the lens: how much more the sides of a view in perspective move than its middle, from 8 strips of the picture
     (a 2D view moves as one piece), learned only from movement the player's input made;
   - what each held key does to the view by how long it has been held, per combination of Shift, Ctrl and Alt;
-  - the view's rectangle (not the status bar, a border or a side panel) and the pixels in it that never move with it
-    (a weapon, a crosshair, text on the screen; see below);
+  - the view's rectangle (not the status bar, a border or a side panel): the rows and columns that change when the
+    view moves, some of it explained by the movement, and where most pixels do not stay. A status bar whose numbers
+    change while the player turns, or that a flash of colour changes all over, used to count as view; its numbers
+    then slid across their panels (Duke Nukem 3D, November 2026);
+  - the pixels in it that never move with it (a weapon, a crosshair, text on the screen), which are left out of
+    measuring (see below);
   - layers: bands of the view that an engine scrolls evenly at a rate of its own (`VP_Bands`). Build's sky does:
     measured in Duke Nukem 3D at 1.24 times the ground's movement in the middle of the view, the same in every
     column, where the lens moves the sides 1.8 times as far. Each of 6 bands is tried both ways against a frame a
@@ -204,9 +208,10 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   (of 320) from where the hand had turned it on average, against 19.6 without prediction; slow aiming is followed
   closely (Duke Nukem 3D looking around: 10.8 without prediction, 5.6 with). A turn in perspective moves the sides a
   little further than the middle; that is left to the next frame.
-  Only small things that stay are held in place (the strokes of a crosshair, the letters of a message, at most 16 x 16
-  pixels of a 320 x 200 picture, or a bar across nearly the whole view); under them the pixel beside them is drawn. A
-  weapon moves with the view until the next frame: held, it uncovered the world it hid.
+  Everything inside the view moves with it, the weapon, the crosshair and messages too, so every pixel on the screen
+  is a pixel of the frame. Small things that stay (a crosshair, the letters of a message) used to be held in place,
+  with the pixel beside them drawn where they had been and where their moved copy would land; players saw marks
+  between the letters ("AMMO=FOR_SHOTGUN") and took it out (November 2026).
   What stays in place (a weapon, a crosshair, text on the screen) is learned only from pixels of the world: a
   pixel compared with one that stays proves nothing (one arm of a crosshair, moved by its size, looked like the
   world bringing the other; the plain pixels beside it looked as if they stayed). 1-pixel strokes count as a whole,

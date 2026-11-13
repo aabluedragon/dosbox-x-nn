@@ -2274,8 +2274,8 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
  *  - the lens: how much more the sides move than the middle (a view in perspective), or all alike (a 2D view);
  *  - what a held key does to the view, by how long it has been held (turn keys), per combination of Shift, Ctrl
  *    and Alt;
- *  - the view itself: the rows and columns that change when it moves (not a status bar, a border, a side panel),
- *    and inside it the pixels that stay (a weapon held still, a crosshair): they are left in place;
+ *  - the view itself: the rows and columns whose pixels its movement explains (not a status bar, a border, a side
+ *    panel), and inside it the pixels that stay (a weapon held still, a crosshair), which are left out of measuring;
  *  - layers (VP_Bands, learnLayers): bands of the view that the engine scrolls evenly at a rate of their own instead
  *    of turning them with the lens (Build's sky: 1.24 times the ground's movement in the middle of the view, the
  *    same in every column). Each of 6 bands is tried both ways against a frame a few frames back; a band that an
@@ -2285,11 +2285,11 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
  * in a menu, a pause or a cutscene the picture does not follow the mouse, and prediction stops after two stretches
  * of frames that say so. Escape, Tab and the function keys close the gates at once, since they open menus.
  * Ctrl+F12 turns prediction off and on; [inputnet] predict = false keeps it off.
- * What a turn brings into view at the edge is not in the frame, and neither is what a weapon held still hides of the
- * world: the nearest pixel the frame does have is drawn longer there (a smear, which reads as motion). Inventing it
- * was tried and taken out again: the view mirrored at the edge and pictures kept by direction both put copies of the
- * weapon and the crosshair into the world, which players saw at once (Duke Nukem 3D, November 2026). Things that move
- * by themselves keep their own lag.
+ * Nothing is drawn that the frame does not have: the view is shown slightly larger and moved as one piece, by whole
+ * pixels, within that margin (see ViewPredict::warp), with everything in it, the crosshair and messages included.
+ * Mirroring the edge, pictures kept by direction, a smear, a stretch, and holding what stays in place with guesses
+ * for what it hid were each tried and taken out after a player saw them (Duke Nukem 3D, November 2026). Things that
+ * move by themselves keep their own lag.
  * A game that draws a pointer of its own where the DOS mouse driver has it (strategy games, adventures, menus) gets
  * a dot instead of a moved picture: the host reports the driver's pointer and how far a count moves it with every
  * frame, the viewer adds the motion the host had not applied and draws the dot at once (pointerAt, from the newest
@@ -2427,8 +2427,7 @@ void VP_BuildPlane(VPPlane &pl,const uint8_t *raw,unsigned w,unsigned h,unsigned
 struct VPScratch {
     std::vector<uint8_t> mask[VP_LEVELS], maskc, stillnow;
     std::vector<float> vals, sorted;
-    std::vector<int32_t> srcx, rowk;
-    std::vector<int32_t> label, stack, members;
+    std::vector<int32_t> srcx, rowk, colw;
 };
 
 /* How unlike the picture cur is to the earlier one moved by (d,e), in the window of columns [x0,x1) and rows [y0,y1),
@@ -2834,16 +2833,6 @@ const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
     20, 40, 60, 90, 130                                                 /* let go: 0-20, ... 90-130 */
 };
 
-/* What a held pixel (a stroke of a crosshair or of text, see ViewPredict::cleanStill) hides of the world, at column
- * xi of row srow (held row hrow, n columns), seen from column x: the first pixel past it on the side of x, which is
- * what it covered. False when the stroke goes on further than reach. */
-static inline bool VP_Behind(const uint32_t *srow,const uint8_t *hrow,int n,int xi,int x,int reach,uint32_t &out) {
-    const int step = x >= xi ? 1 : -1;
-    for (int k=xi + step, d=1;k >= 0 && k < n && d <= reach;k += step, d++) if (!hrow[k]) { out = srow[k]; return true; }
-    for (int k=xi - step, d=1;k >= 0 && k < n && d <= reach;k -= step, d++) if (!hrow[k]) { out = srow[k]; return true; }
-    return false;
-}
-
 class ViewPredict {
 public:
     bool enabled = true;        /* the player's switch */
@@ -2864,7 +2853,8 @@ public:
         still_at.assign((size_t)w * h,0);
         world_at.assign((size_t)w * h,0);
         still_dirty = true;
-        rowch.clear(); colch.clear(); view_frames = 0;
+        rowch.clear(); colch.clear(); rowcg.clear(); colcg.clear(); view_frames = 0;
+        cand_x0 = cand_x1 = cand_y0 = cand_y1 = -1; cand_n = 0; zoom_on = false;
         vx0 = vy0 = 0; vx1 = (int)w; vy1 = (int)h;
         memset(band_score,0,sizeof(band_score));
         lens_clean = cells_done = 0;
@@ -3149,7 +3139,12 @@ public:
 
     /* Whether the view is shown larger (see warp), and its rectangle: once the view is known to turn in perspective
      * (a first-person game), from then on, so that it does not change size when prediction comes and goes. */
-    bool zoomed(void) const { return enabled && lens.known && lens.persp && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4; }
+    bool zoomed(void) const {
+        /* Once on it stays on for the video mode: a lens measured again the other way, or a moment without one, would
+         * otherwise switch the enlargement off and on, which is a jump of the whole picture. */
+        if (enabled && lens.known && lens.persp) zoom_on = true;
+        return enabled && zoom_on && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4;
+    }
     void viewBox(int &x0,int &y0,int &x1,int &y1) const { x0 = vx0; y0 = vy0; x1 = vx1; y1 = vy1; }
     void margins(int &mx,int &my) const {
         mx = std::max(1,(int)floorf(VP_MARGIN * (float)(vx1 - vx0)));
@@ -3162,43 +3157,25 @@ public:
      * up to that much uncovers nothing on the screen. (Filling an uncovered edge with the view mirrored, with pictures
      * kept by direction or with a smear, and moving the sides less than the middle, were each tried and taken out
      * after a player saw them; a turn in perspective moves the sides a little further than the middle, which this
-     * leaves to the next frame.) What stays on the screen and is small (a crosshair, the letters of a message) is held
-     * in place; under it the pixel beside it is drawn. Anything larger that stays (a weapon) moves with the view until
-     * the next frame: held, it uncovered the world it hid. */
+     * leaves to the next frame.) Everything inside the view moves with it, the crosshair, the letters of a message
+     * and the weapon too: holding what stays in place uncovered what it had hidden and drew its copy in the moved
+     * picture, and the pixels guessed for both made marks between the letters of a message (Duke Nukem 3D,
+     * November 2026). So every pixel shown is a pixel of the frame, moved as one piece with all the others. */
     void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
         const uint64_t t0 = RP_Micros();
         const int iw = (int)w, ih = (int)h;
-        if (still_dirty || stay.size() != (size_t)w * h || hold.size() != (size_t)w * h) cleanStill();
         int mx, my;
         margins(mx,my);
         const int sx = std::max(-mx,std::min(mx,(int)lroundf(px))), sy = std::max(-my,std::min(my,(int)lroundf(py)));
-        const uint8_t *hd = hold.data();
-        const int reach = std::max(2,(int)lroundf(16.0f * unitx)) + 1, reachy = std::max(2,(int)lroundf(16.0f * unity)) + 1;
         for (int y=0;y < ih;y++) {
             uint32_t *o = (uint32_t*)(dst + (size_t)y * (size_t)pitch);
             const uint32_t *in = src + (size_t)y * w;
             if (y < vy0 || y >= vy1 || (sx == 0 && sy == 0)) { memcpy(o,in,(size_t)w * 4); continue; }
-            const uint8_t *hr = hd + (size_t)y * w;
             if (vx0 > 0) memcpy(o,in,(size_t)vx0 * 4);
             if (vx1 < iw) memcpy(o + vx1,in + vx1,(size_t)(iw - vx1) * 4);
-            const int ys = std::max(vy0,std::min(vy1 - 1,y - sy));     /* (outside the view only in the margin) */
-            const uint32_t *srow = src + (size_t)ys * w;
-            const uint8_t *shr = hd + (size_t)ys * w;
-            for (int x=vx0;x < vx1;x++) {
-                if (hr[x]) { o[x] = in[x]; continue; }
-                const int xs = std::max(vx0,std::min(vx1 - 1,x - sx));
-                if (!shr[xs]) { o[x] = srow[xs]; continue; }
-                uint32_t c;
-                if (VP_Behind(srow,shr,iw,xs,x,reach,c)) { o[x] = c; continue; }
-                /* a stroke that runs on sideways: the pixel above or below it */
-                bool found = false;
-                for (int d=1;d <= reachy && !found;d++) {
-                    const int ya = ys - d, yb = ys + d;
-                    if (ya >= vy0 && !hd[(size_t)ya * w + (size_t)xs]) { c = src[(size_t)ya * w + (size_t)xs]; found = true; }
-                    else if (yb < vy1 && !hd[(size_t)yb * w + (size_t)xs]) { c = src[(size_t)yb * w + (size_t)xs]; found = true; }
-                }
-                o[x] = found ? c : srow[xs];
-            }
+            /* (the clamping reaches only the margin, which the viewer leaves off the screen: see zoomCrop) */
+            const uint32_t *srow = src + (size_t)std::max(vy0,std::min(vy1 - 1,y - sy)) * w;
+            for (int x=vx0;x < vx1;x++) o[x] = srow[std::max(vx0,std::min(vx1 - 1,x - sx))];
         }
         st_warps++;
         st_warp_us += RP_Micros() - t0;
@@ -3276,7 +3253,6 @@ private:
     std::vector<uint32_t> still_at;     /* ...when it last counted as staying (ms, 0: not lately), see markStill */
     std::vector<uint32_t> world_at;     /* ...when the world was last seen moving through it (ms, 0: not lately) */
     std::vector<uint8_t> stay;          /* ...and whether it counts as staying (see cleanStill) */
-    std::vector<uint8_t> hold;          /* ...and whether warp holds it in place (see cleanStill) */
     bool still_dirty = true;
     VPPointer told_ptr;                 /* the newest report of the driver's pointer the host has sent... */
     uint32_t told_id = 0, told_seq = 0; /* ...its frame, and the newest input the host had applied then */
@@ -3296,9 +3272,13 @@ private:
     unsigned lens_clean = 0;            /* frames the lens was learned from (none with layers in view) */
     unsigned cells_done = 0;            /* times the cells were measured */
     uint64_t layers_at = 0;             /* when layers were last in view */
-    std::vector<float> rowch, colch;    /* how much of each row and column changes when the view moves (a fading mean) */
+    std::vector<float> rowch, colch;    /* how much of each row and column the view's movement explains (a fading mean) */
+    std::vector<float> rowcg, colcg;    /* ...and how much of it changes */
     unsigned view_frames = 0;
     int vx0 = 0, vx1 = 0, vy0 = 0, vy1 = 0;    /* the view: columns [vx0,vx1), rows [vy0,vy1) of the picture */
+    int cand_x0 = -1, cand_x1 = -1, cand_y0 = -1, cand_y1 = -1;  /* ...one measured differently (see markStill) */
+    unsigned cand_n = 0;                        /* ...and how many times in a row */
+    mutable bool zoom_on = false;               /* the view is shown larger (see zoomed) */
     float unitx = 1, unity = 1;         /* a pixel of a 320x200 picture, in this picture's pixels */
     std::deque<VPSample> samples;
     uint64_t block_end[2] = { 0, 0 };   /* where the last stretch of frames learned from ended, per direction */
@@ -3968,7 +3948,8 @@ private:
         if (world_at.size() != still.size()) world_at.assign(still.size(),0);
         tmp.srcx.resize(w);
         tmp.rowk.assign(w,0);       /* per column: the pixels that changed */
-        if (rowch.size() != h || colch.size() != w) { rowch.assign(h,0.0f); colch.assign(w,0.0f); view_frames = 0; }
+        tmp.colw.assign(w,0);       /* ...and of them, those the view's movement explains (the world) */
+        if (rowch.size() != h || colch.size() != w) { rowch.assign(h,0.0f); colch.assign(w,0.0f); rowcg.assign(h,0.0f); colcg.assign(w,0.0f); view_frames = 0; }
         for (int x=0;x < iw;x++) tmp.srcx[(size_t)x] = (int32_t)lroundf(VP_SourceX(lens,(float)x,mo.sx));
         for (int y=0;y < ih;y++) {
             const int ys = y - dy;
@@ -3978,7 +3959,7 @@ private:
             uint8_t *st = still.data() + (size_t)y * w;
             uint32_t *sa = still_at.data() + (size_t)y * w;
             uint32_t *wa = world_at.data() + (size_t)y * w;
-            int changed = 0;
+            int changed = 0, worldn = 0;
             float even = 0, rate = 1;
             if (layered) rowLayer(y,nowus,even,rate);
             const int flat = (int)lroundf(rate * mo.sx);
@@ -4001,7 +3982,7 @@ private:
                      * that changes its shade, a weapon that bobs or fires: halved, and against a known world
                      * still not the world, so whether it stays is kept fresh) */
                     changed++; tmp.rowk[(size_t)x]++;
-                    if (world) { st[x] = 0; sa[x] = 0; wa[x] = nowms; }
+                    if (world) { st[x] = 0; sa[x] = 0; wa[x] = nowms; worldn++; tmp.colw[(size_t)x]++; }
                     else {
                         st[x] /= 2;
                         if (sa[x] != 0 && nowms - sa[x] <= 2000u) sa[x] = nowms;
@@ -4016,20 +3997,54 @@ private:
                 if (st[x] < 255) st[x]++;
                 if (st[x] >= VP_STILL) sa[x] = nowms;
             }
-            rowch[(size_t)y] += 0.1f * ((float)changed / (float)iw - rowch[(size_t)y]);
+            rowch[(size_t)y] += 0.1f * ((float)worldn / (float)iw - rowch[(size_t)y]);
+            rowcg[(size_t)y] += 0.1f * ((float)changed / (float)iw - rowcg[(size_t)y]);
         }
-        for (int x=0;x < iw;x++) colch[(size_t)x] += 0.1f * ((float)tmp.rowk[(size_t)x] / (float)ih - colch[(size_t)x]);
+        for (int x=0;x < iw;x++) {
+            colch[(size_t)x] += 0.1f * ((float)tmp.colw[(size_t)x] / (float)ih - colch[(size_t)x]);
+            colcg[(size_t)x] += 0.1f * ((float)tmp.rowk[(size_t)x] / (float)ih - colcg[(size_t)x]);
+        }
         still_dirty = true;
-        /* The view: the rows and columns where the picture changes when the view moves. A status bar below it, a
-         * border around it, a panel beside it are outside, and nothing there is moved or moved in from. */
+        /* The view: the rows and columns that change when the view moves, its movement explaining some of it (the
+         * world brought there from beside), and where most pixels do not stay. A status bar whose numbers change
+         * while the player turns (health, ammunition), or that a flash of colour changes all over, counted as view
+         * and was moved with it, its numbers sliding across their panels (Duke Nukem 3D, November 2026); its panel
+         * stays, so it is outside. The world alone is not enough at the edges: where a turn, or looking up, brings
+         * new picture in, nothing explains it, and a long turn one way wore the edge columns out of the view. A
+         * status bar below it, a border around it, a panel beside it are outside, and nothing there is moved or
+         * moved in from. */
         if (++view_frames >= 6) {
-            const float bar = 0.06f * std::min(1.0f,(float)view_frames / 20.0f + 0.3f);
+            const float ramp = std::min(1.0f,(float)view_frames / 20.0f + 0.3f);
+            const float wbar = 0.02f * ramp, cbar = 0.06f * ramp;
+            const uint8_t *stl = still.data();
+            const uint32_t *sat = still_at.data();
+            auto stays = [&](size_t i) { return stl[i] >= VP_STILL || (sat[i] != 0 && nowms - sat[i] <= 2000u); };
+            auto rowIn = [&](int y) {
+                if (rowch[(size_t)y] < wbar && rowcg[(size_t)y] < cbar) return false;
+                int n = 0;
+                for (int x=0;x < iw;x++) n += stays((size_t)y * w + (size_t)x);
+                return n * 2 < iw;
+            };
+            auto colIn = [&](int x,int a,int b) {
+                if (colch[(size_t)x] < wbar && colcg[(size_t)x] < cbar) return false;
+                int n = 0;
+                for (int y=a;y < b;y++) n += stays((size_t)y * w + (size_t)x);
+                return n * 2 < b - a;
+            };
             int a = 0, b = ih, c0 = 0, c1 = iw;
-            while (a < ih && rowch[(size_t)a] < bar) a++;
-            while (b > a && rowch[(size_t)(b - 1)] < bar) b--;
-            while (c0 < iw && colch[(size_t)c0] < bar) c0++;
-            while (c1 > c0 && colch[(size_t)(c1 - 1)] < bar) c1--;
-            if (b - a >= ih / 4 && c1 - c0 >= iw / 4) { vy0 = a; vy1 = b; vx0 = c0; vx1 = c1; }
+            while (a < ih && !rowIn(a)) a++;
+            while (b > a && !rowIn(b - 1)) b--;
+            while (c0 < iw && !colIn(c0,a,b)) c0++;
+            while (c1 > c0 && !colIn(c1 - 1,a,b)) c1--;
+            /* A new rectangle is taken when it is measured the same (to a pixel) several times in a row; once the view
+             * is shown larger, every change of it moves and scales the picture, so then only one that stays measured
+             * for about three seconds of moving (the game's view made larger or smaller). */
+            if (b - a >= ih / 4 && c1 - c0 >= iw / 4) {
+                if (abs(a - cand_y0) <= 1 && abs(b - cand_y1) <= 1 && abs(c0 - cand_x0) <= 1 && abs(c1 - cand_x1) <= 1) cand_n++;
+                else { cand_y0 = a; cand_y1 = b; cand_x0 = c0; cand_x1 = c1; cand_n = 1; }
+                const bool differs = abs(cand_y0 - vy0) > 1 || abs(cand_y1 - vy1) > 1 || abs(cand_x0 - vx0) > 1 || abs(cand_x1 - vx1) > 1;
+                if (differs && cand_n >= (zoom_on ? 120u : 3u)) { vy0 = cand_y0; vy1 = cand_y1; vx0 = cand_x0; vx1 = cand_x1; }
+            }
         }
     }
 
@@ -4092,46 +4107,6 @@ private:
                 if (!u) continue;
                 for (int k=1;k <= reachy && !d && y + k < ih;k++) d = sv[i + (size_t)k * w] != 0;
                 if (d) stay[i] = 1;
-            }
-        }
-        /* What warp holds in place: each piece of what stays (8-connected) that is small, at most 16 x 16 pixels of a
-         * 320 x 200 picture (the strokes of a crosshair, the letters of a message), or that runs across nearly the
-         * whole view (a bar of names, which uncovers nothing when it is held). A weapon is neither: it moves with the
-         * view until the next frame. */
-        hold.assign((size_t)w * h,0);
-        tmp.label.assign((size_t)w * h,0);
-        int32_t *lab = tmp.label.data();
-        std::vector<int32_t> &stack = tmp.stack;
-        std::vector<int32_t> &members = tmp.members;
-        const int smallx = (int)lroundf(16.0f * unitx), smally = (int)lroundf(16.0f * unity), widex = (vx1 - vx0) * 9 / 10;
-        int32_t next = 0;
-        for (int y=vy0;y < vy1;y++) {
-            for (int x=vx0;x < vx1;x++) {
-                const size_t i0 = (size_t)y * w + (size_t)x;
-                if (!stay[i0] || lab[i0]) continue;
-                next++;
-                int bx0 = x, bx1 = x, by0 = y, by1 = y;
-                stack.clear(); members.clear();
-                stack.push_back((int32_t)i0); lab[i0] = next;
-                while (!stack.empty()) {
-                    const int32_t i = stack.back(); stack.pop_back();
-                    members.push_back(i);
-                    const int cx = i % (int)w, cy = i / (int)w;
-                    bx0 = std::min(bx0,cx); bx1 = std::max(bx1,cx); by0 = std::min(by0,cy); by1 = std::max(by1,cy);
-                    for (int dy=-1;dy <= 1;dy++) {
-                        const int ny = cy + dy;
-                        if (ny < vy0 || ny >= vy1) continue;
-                        for (int dx=-1;dx <= 1;dx++) {
-                            const int nx = cx + dx;
-                            if (nx < vx0 || nx >= vx1) continue;
-                            const size_t j = (size_t)ny * w + (size_t)nx;
-                            if (stay[j] && !lab[j]) { lab[j] = next; stack.push_back((int32_t)j); }
-                        }
-                    }
-                }
-                const bool small = bx1 - bx0 < smallx && by1 - by0 < smally;
-                const bool across = bx1 - bx0 >= widex;
-                if (small || across) for (size_t k=0;k < members.size();k++) hold[(size_t)members[k]] = 1;
             }
         }
     }
@@ -4249,7 +4224,7 @@ public:
     int zoom_w = 0, zoom_h = 0;
     bool dot_on = false;            /* the pointer dot is on the screen, at dot_px, dot_py of the window */
     int dot_px = 0, dot_py = 0;
-    std::string shot_dir;           /* NN_RP_PREDICTSHOT=<folder>: the first pictures moved far, before and after, as PPM */
+    std::string shot_dir;           /* NN_RP_PREDICTSHOT=<folder>: the first 24 pictures moved 2 to 8 pixels (of 320), before and after, as PPM */
     unsigned shots = 0;
     uint64_t arrive_est = 0;        /* how long after that moment a frame usually arrives, microseconds */
     uint32_t off_cur = 0, off_prev = 0;     /* the host's clock against this one: the least of the last seconds */
@@ -4895,7 +4870,7 @@ public:
             if (moved) vp.warp(pix.data(),(uint8_t*)dst,dpitch,px,py);
             else for (unsigned y=0;y < frame_h;y++)
                 memcpy((uint8_t*)dst + (size_t)y * (size_t)dpitch,pix.data() + (size_t)y * frame_w,(size_t)frame_w * 4);
-            if (moved && !shot_dir.empty() && shots < 12 && fabsf(px) >= (float)(8 + 8 * (shots % 4)) * (float)frame_w / 320.0f) {
+            if (moved && !shot_dir.empty() && shots < 24 && fabsf(px) >= (float)(2 + 2 * (shots % 4)) * (float)frame_w / 320.0f) {
                 for (int k=0;k < 2;k++) {
                     char name[64];
                     snprintf(name,sizeof(name),"/shot%02u-%s.ppm",shots,k ? "moved" : "frame");
@@ -5044,7 +5019,11 @@ public:
             { "pgup", KBD_pageup }, { "pgdn", KBD_pagedown }, { "home", KBD_home }, { "end", KBD_end },
             { "a", KBD_a }, { "d", KBD_d }, { "w", KBD_w }, { "s", KBD_s }, { "u", KBD_u }, { "y", KBD_y }, { "n", KBD_n },
             { "f1", KBD_f1 }, { "f2", KBD_f2 }, { "kp4", KBD_kp4 }, { "kp6", KBD_kp6 }, { "kp8", KBD_kp8 }, { "kp2", KBD_kp2 },
-            { "1", KBD_1 }, { "2", KBD_2 }, { "3", KBD_3 }, { "ins", KBD_insert }, { "del", KBD_delete }, { "click", KBD_NONE }
+            { "1", KBD_1 }, { "2", KBD_2 }, { "3", KBD_3 }, { "4", KBD_4 }, { "5", KBD_5 }, { "6", KBD_6 }, { "7", KBD_7 },
+            { "8", KBD_8 }, { "9", KBD_9 }, { "0", KBD_0 }, { "b", KBD_b }, { "c", KBD_c }, { "e", KBD_e }, { "f", KBD_f },
+            { "g", KBD_g }, { "h", KBD_h }, { "i", KBD_i }, { "j", KBD_j }, { "k", KBD_k }, { "l", KBD_l }, { "m", KBD_m },
+            { "o", KBD_o }, { "p", KBD_p }, { "q", KBD_q }, { "r", KBD_r }, { "t", KBD_t }, { "v", KBD_v }, { "x", KBD_x },
+            { "z", KBD_z }, { "ins", KBD_insert }, { "del", KBD_delete }, { "click", KBD_NONE }
         };
         std::string text = spec;
         size_t pos = 0;
