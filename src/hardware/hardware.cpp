@@ -25,6 +25,7 @@
 
 #include "bitmapinfoheader.h"
 #include "dosbox.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include "control.h"
 #include "hardware.h"
 #include "logging.h"
@@ -573,6 +574,7 @@ std::string GetCaptureFilePath(const char * type,const char * ext) {
 }
 
 FILE * OpenCaptureFile(const char * type,const char * ext) {
+    if (NN_Lockdown()) return nullptr; /* a copy that plays for a remote player writes no captures on the host */
     if (!strcmp(type, "Raw Midi")) pathmid = "";
     if (!strcmp(type, "Raw Opl")) pathopl = "";
     if (!strcmp(type, "Screenshot")) pathscr = "";
@@ -656,6 +658,7 @@ void ttf_switch_on(bool ss=true), ttf_switch_off(bool ss=true);
 
 #if (C_SSHOT)
 void CAPTURE_VideoEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 	if (CaptureState & CAPTURE_VIDEO) {
@@ -1633,6 +1636,7 @@ skip_video:
 
 #if (C_SSHOT)
 void CAPTURE_ScreenShotEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 #if !defined(C_EMSCRIPTEN)
@@ -1645,6 +1649,7 @@ void CAPTURE_ScreenShotEvent(bool pressed) {
 }
 
 void CAPTURE_RawScreenShotEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 #if !defined(C_EMSCRIPTEN)
@@ -1948,6 +1953,7 @@ void CAPTURE_AddWave(uint32_t freq, uint32_t len, int16_t * data) {
 }
 
 void CAPTURE_MTWaveEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 
@@ -1974,6 +1980,7 @@ void CAPTURE_MTWaveEvent(bool pressed) {
 }
 
 void CAPTURE_NetworkEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 
@@ -1992,6 +1999,7 @@ void CAPTURE_NetworkEvent(bool pressed) {
 }
 
 void CAPTURE_WaveEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 
@@ -2069,6 +2077,7 @@ void CAPTURE_AddMidi(bool sysex, Bitu len, uint8_t * data) {
 }
 
 void CAPTURE_MidiEvent(bool pressed) {
+    if (NN_Lockdown()) return;
 	if (!pressed)
 		return;
 	/* Check for previously opened wave file */

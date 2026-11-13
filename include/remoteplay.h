@@ -41,6 +41,15 @@ void REMOTEPLAY_AddAudio(unsigned rate,unsigned frames,const int16_t *samples);
 /* True when the configuration or command line makes this DOSBox-X a remote
  * play host, and whether it starts with the local screen hidden. */
 bool REMOTEPLAY_HostRequested(void);
+
+/* -inputnet-lockdown: this emulator runs a copy of a game for a remote player (NukemNet's IPX/NullModem-over-InputNet
+ * with a Windows guest), who controls the guest completely and could run anything inside it. Such a copy may not
+ * change the host's files: folders are mounted read-only, a disk image is writable only through a disk layer
+ * (IMGMOUNT -nnlayer, a private file the launcher deletes afterwards) and is read-only otherwise, nothing is captured
+ * or saved (screenshots, video, sound, MIDI, save states; also not when the guest asks through the integration
+ * device), and from the moment the guest boots the emulator is in secure mode: no MOUNT, IMGMOUNT or BOOT ever again,
+ * no access to the host's clipboard. Compiled in with or without remote play. */
+bool NN_Lockdown(void);
 bool REMOTEPLAY_HideScreenRequested(void);
 
 /* Shows or hides the local picture of a remote play host (sdlmain.cpp). */

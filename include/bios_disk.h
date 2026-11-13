@@ -153,7 +153,20 @@ class imageDisk {
 		uint64_t image_base = 0;
 		uint64_t image_length = 0;
 
+	public:
+		/* NukemNet disk layer (IMGMOUNT ... -nnlayer <file>): the image file is only read and every sector written
+		 * goes to the layer file, so several emulators can run from one image at the same time and the image can be
+		 * brought up to date afterwards (or the layer thrown away). See NN_LayerAttach in bios_disk.cpp. */
+		bool NN_LayerAttach(const char *path);
+		bool NN_LayerActive(void) const { return nn_layer != NULL; }
+
 	private:
+		FILE *nn_layer = NULL;
+		std::vector<uint32_t> nn_layer_index;   /* per sector: its record's number + 1, 0 while only the image has it */
+		uint32_t nn_layer_records = 0;
+		bool NN_LayerRead(uint32_t sectnum, void *data);
+		bool NN_LayerWrite(uint32_t sectnum, const void *data);
+
 		volatile int refcount = 0;
 		std::vector<bool> partition_in_use; /* used by FAT driver to prevent mounting a partition twice */
 		uint64_t current_fpos = 0;

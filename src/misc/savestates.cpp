@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include "SDL.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include "menu.h"
 #include "shell.h"
 #include "cross.h"
@@ -173,6 +174,7 @@ namespace
 
 	void SaveGameState(bool pressed) {
 		if (!pressed) return;
+		if (NN_Lockdown()) return; /* a copy that plays for a remote player saves nothing on the host */
 
 		GFX_LosingFocus();
 
@@ -193,6 +195,7 @@ namespace
 
 
 	void LoadGameState(bool pressed) {
+		if (NN_Lockdown()) return;
 		if (!pressed) return;
 
 		//    if (SaveState::instance().isEmpty(currentSlot))

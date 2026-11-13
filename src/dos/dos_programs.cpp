@@ -23,6 +23,7 @@
  */
 
 #include "dosbox.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include <stdlib.h>
 #include <string.h>
 #include <regex>
@@ -1350,6 +1351,8 @@ public:
             readonly = true;
         if (cmd->FindExist("-rw",true))
             readonly = false;
+        if (NN_Lockdown())
+            readonly = true; /* a copy that plays for a remote player never writes to a folder of the host */
 
         std::string type="dir";
         cmd->FindString("-t",type,true);
@@ -5984,6 +5987,16 @@ class IMGMOUNT : public Program {
 					options.push_back(s);
 			}
 
+			//NukemNet disk layer: -nnlayer <host file> (hard disk images in raw format; see NN_LayerAttach in bios_disk.cpp)
+			{
+				std::string s;
+
+				if (cmd->FindString("-nnlayer", s, true)) {
+					while (s.size() >= 2 && s.front() == '"' && s.back() == '"') s = s.substr(1, s.size() - 2);
+					if (!s.empty()) options.push_back("nnlayer=" + s);
+				}
+			}
+
 			//look for -replace
 			if (cmd->FindExist("-replace",true))
 				opt_replace = true;
@@ -6932,7 +6945,7 @@ class IMGMOUNT : public Program {
 							else if (!strcasecmp(ext, ".vhd")) {
 								ro=wpcolon&&paths[i].length()>1&&paths[i].c_str()[0]==':';
 								//load the file with imageDiskVHD, which supports fixed/dynamic/differential disks
-								imageDiskVHD::ErrorCodes ret = imageDiskVHD::Open(ro?paths[i].c_str()+1:paths[i].c_str(), ro||roflag, &vhdImage);
+								imageDiskVHD::ErrorCodes ret = imageDiskVHD::Open(ro?paths[i].c_str()+1:paths[i].c_str(), ro||roflag||NN_Lockdown(), &vhdImage);
 								switch (ret) {
 									case imageDiskVHD::UNSUPPORTED_WRITE:
 										options.emplace_back("readonly");
@@ -7713,7 +7726,7 @@ class IMGMOUNT : public Program {
 				if (ext != NULL) {
 					if (!strcasecmp(ext, ".vhd")) {
 						bool ro=wpcolon&&strlen(fileName)>1&&fileName[0]==':';
-						imageDiskVHD::ErrorCodes ret = imageDiskVHD::Open(ro?fileName+1:fileName, ro||roflag, &newImage);
+						imageDiskVHD::ErrorCodes ret = imageDiskVHD::Open(ro?fileName+1:fileName, ro||roflag||NN_Lockdown(), &newImage);
 						switch (ret) {
 							case imageDiskVHD::ERROR_OPENING: WriteOut(MSG_Get("VHD_ERROR_OPENING")); break;
 							case imageDiskVHD::INVALID_DATA: WriteOut(MSG_Get("VHD_INVALID_DATA")); break;

@@ -18,6 +18,7 @@
 
 
 #include "dosbox.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include "logging.h"
 #include "pic.h"
 #include "setup.h"
@@ -172,7 +173,7 @@ void CSerialFile::transmitByte(uint8_t val, bool first) {
 
 	lastUsedTick = PIC_Ticks;
 	if(timeout != 0) setEvent(SERIAL_TX_EVENT, (float)(timeout + 1));
-    if (fp == NULL) {
+    if (fp == NULL && !NN_Lockdown()) { /* a copy that plays for a remote player writes no files on the host */
         fp = fopen(filename.c_str(),"wb");
         if (fp != NULL) setbuf(fp,NULL); // disable buffering
     }

@@ -75,6 +75,9 @@ extern bool SDLNetInited;
 void NetWrapper_WidenUdpBuffers(UDPsocket sock, int bytes);    /* src/hardware/serialport/misc_util.cpp */
 #endif
 extern bool dos_kernel_disabled;
+extern unsigned int mouse_notify_mode;                      /* src/ints/bios.cpp: not 0 when the guest's pointer driver asks where the pointer is */
+extern bool nn_remote_cursor, nn_remote_cursor_locked;      /* src/ints/bios.cpp: a viewer's pointer for such a guest */
+extern uint16_t nn_remote_cursor_x, nn_remote_cursor_y;
 extern uint16_t shell_psp;
 bool PROGRAMS_IsRunningInternalPSP(uint16_t psp);
 bool TTF_using(void);
@@ -110,6 +113,7 @@ enum {
 const uint32_t RP_FEAT_REFS = 1;        /* decodes against the frame a frame names, sends RP_FRAMEACK */
 const uint32_t RP_FEAT_TIMING = 2;      /* reads RP_FRAMEINFO to measure how long input takes to reach its screen */
 const uint32_t RP_FEAT_PIECES = 4;      /* reads the piece table of a frame compressed in pieces and inflates them at once */
+const uint32_t RP_FEAT_SHIFT = 8;       /* reads the shift table of a frame predicted from a moved base (scrolling), see RP_ShiftXor */
 
 enum {
     RPEV_KEY     = 1,   /* u16 KBD_KEYS, u8 pressed */
@@ -124,7 +128,19 @@ const unsigned RP_MAX_VIEWERS = 7;
 const unsigned RP_AUDIO_FRAMES = 256;   /* stereo samples per sound packet */
 const size_t RP_FRAME_HDR = 12;         /* u16 w, u16 h, u8 fmt, u8 flags, u16 back, u32 rawsize */
                                         /* flags: 1 key frame; 2 (only when every viewer has RP_FEAT_PIECES): a piece table
-                                           comes before the zlib stream: u8 n, then n times u32, each piece's compressed size */
+                                           comes before the zlib stream: u8 n, then n times u32, each piece's compressed size;
+                                           4: the guest takes the pointer's place on the screen (a Windows guest with a
+                                           pointer integration driver): the viewer sends where its pointer is in the
+                                           picture and does not capture its mouse (older viewers do not look at this);
+                                           8 (only when every viewer has RP_FEAT_SHIFT, never on a key frame): a shift table
+                                           comes right after the header, before the piece table: u8 k (1...3 distances),
+                                           k times s8 dx, s8 dy, then u8 log2 of the block size, u16 n and n bytes with
+                                           two bits per block: 0 the base as it is, 1...k that distance (see RP_ShiftXor) */
+const unsigned RP_SHIFT_BLOCK = 3;      /* scroll prediction works on blocks of 8x8 pixels... */
+const int RP_SHIFT_RANGE = 24;          /* ...looked for up to this many pixels each way from one frame to the next... */
+const int RP_SHIFT_LIMIT = 127;         /* ...and named up to this far when the base is several frames old (an s8)... */
+const unsigned RP_SHIFT_MAX = 3;        /* ...by one of up to three distances a frame (layers that scroll at different speeds) */
+struct ShiftVec { int dx, dy; };        /* pixel (x,y) of the frame comes from the base's pixel (x-dx,y-dy) */
 const unsigned RP_PIECES_MAX = 8;
                                         /* back: frames between this one and its base (0: the previous frame) */
 const unsigned RP_HISTORY = 16;         /* decoded frames both sides keep as delta bases */
@@ -265,6 +281,10 @@ struct Viewer {
     bool hasack = false;
     uint32_t acked = 0;                 /* newest frame it decoded */
     uint32_t loss_exp = 0, loss_got = 0, loss_ms = 0;  /* fragment counters at the last rate decision */
+    /* How long a frame takes from leaving here to this viewer saying it has decoded it (see Host_DelayFeedback) */
+    double delay_now = 0;               /* lately, ms (smoothed) */
+    uint32_t delay_base = 0, delay_base_prev = 0, delay_bucket_ms = 0;  /* the shortest of this and the previous 10 seconds */
+    bool delay_late = false, delay_raised = false;      /* well above the shortest; somewhat above it */
 };
 
 UDPsocket host_sock = NULL;
@@ -292,8 +312,18 @@ unsigned cfg_maxfps = 0;
 int cfg_present = 2;            /* [inputnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
 
 /* Video encoder state */
-struct EncFrame { uint32_t id = 0; std::vector<uint8_t> raw; };
+struct EncFrame {
+    uint32_t id = 0;
+    std::vector<uint8_t> raw;
+    ShiftVec step[RP_SHIFT_MAX];    /* how far its parts had moved since the frame encoded before it (scroll prediction) */
+    unsigned nstep = 0;
+};
 std::vector<uint8_t> enc_raw, enc_work, enc_comp, enc_alt;
+std::vector<uint8_t> enc_shiftbits, enc_shiftcheck;     /* scroll prediction: one bit per block; the check under NN_RP_SHIFTCHECK */
+ShiftVec enc_shift_vec[RP_SHIFT_MAX];                   /* the distances this frame's parts have moved since its base */
+unsigned enc_shift_n = 0;
+ShiftVec enc_step_vec[RP_SHIFT_MAX];                    /* ...and since the frame encoded before it */
+unsigned enc_step_n = 0;
 std::vector<uint32_t> enc_pieces, enc_altpieces;
 unsigned enc_plain_streak = 0;                  /* frames in a row that were smaller compressed alone than as a difference */
 std::deque<EncFrame> enc_hist;                  /* the newest frames sent, oldest first */
@@ -306,6 +336,7 @@ size_t send_queued = 0;                         /* bytes in send_queue */
 uint32_t send_lastms = 0, send_backlog_ms = 0, rate_cut_ms = 0, rate_log_ms = 0;
 double send_budget = 0;                         /* bytes that may go out now */
 double send_rate = RP_RATE_MAX;                 /* video bytes/s */
+uint32_t frame_sent_id[64], frame_sent_ms[64];  /* when the last fragment of each of the newest frames left (SDL ticks) */
 double rate_delivered = 0;                      /* the most video bytes/s a viewer has received lately */
 bool rate_adaptive = false;
 bool rate_limited = false;                      /* a viewer reported loss: video is paced from then on */
@@ -370,6 +401,239 @@ struct PaletteMap {
 };
 PaletteMap enc_palmap;
 bool enc_palmap_init = false;
+
+/* ------------------------------------------------------------------------- */
+/* Scrolling                                                                  */
+/* ------------------------------------------------------------------------- */
+
+/* A scrolling picture differs from the one before in nearly every pixel, so its difference compresses no better than
+ * the frame alone (a 640x480 game sent about 130 KB a frame while it scrolled). When parts of the picture have moved
+ * as a whole (the playfield of a 2D game, often in layers at different speeds; its status bar has not), the frame
+ * goes out as the difference against a prediction: for every block of 8x8 pixels two bits say whether the block is
+ * predicted from the base as it is (0) or from the base moved by one of up to three distances (1...3), that is pixel
+ * (x,y) from the base's pixel (x-dx,y-dy). Pixels whose moved source would lie outside the picture are predicted from
+ * the base as it is. Nothing is lost: the viewer makes the same prediction from the same base. The palette in front
+ * of an 8-bit frame is never moved. */
+struct ShiftGeom {
+    unsigned w, h, bpp;     /* pixels, bytes per pixel */
+    size_t pal;             /* bytes in front of the pixels */
+};
+
+inline unsigned RP_ShiftBitmapBytes(const ShiftGeom &g) {
+    const unsigned bs = 1u << RP_SHIFT_BLOCK;
+    return (((g.w + bs - 1) >> RP_SHIFT_BLOCK) * ((g.h + bs - 1) >> RP_SHIFT_BLOCK) + 3u) / 4u;
+}
+
+inline unsigned RP_ShiftChoice(const uint8_t *bits,unsigned idx) {
+    return (bits[idx >> 2] >> ((idx & 3u) * 2u)) & 3u;
+}
+
+/* The pixels x0...x1 of row y of a moved block that have a source in the base: a...b (empty when a >= b). */
+inline void RP_ShiftSpan(const ShiftGeom &g,unsigned y,unsigned x0,unsigned x1,int dx,int dy,long &a,long &b) {
+    const long sy = (long)y - dy;
+    if (sy < 0 || sy >= (long)g.h) { a = b = (long)x0; return; }
+    a = std::max<long>((long)x0,(long)dx);
+    b = std::min<long>((long)x1,(long)g.w + dx);
+    if (a >= b) a = b = (long)x0;
+}
+
+/* out = in ^ prediction, for the whole frame (frame ^ prediction is what is sent; that ^ prediction is the frame).
+ * A choice above `nvec` counts as 0. */
+void RP_ShiftXor(uint8_t *out,const uint8_t *in,const uint8_t *base,const ShiftGeom &g,const ShiftVec *vec,unsigned nvec,const uint8_t *bits) {
+    const unsigned bs = 1u << RP_SHIFT_BLOCK;
+    const unsigned bw = (g.w + bs - 1) >> RP_SHIFT_BLOCK;
+    const size_t row = (size_t)g.w * g.bpp;
+    for (size_t i=0;i < g.pal;i++) out[i] = in[i] ^ base[i];
+    for (unsigned y=0;y < g.h;y++) {
+        const uint8_t *ip = in + g.pal + (size_t)y * row, *bp = base + g.pal + (size_t)y * row;
+        uint8_t *op = out + g.pal + (size_t)y * row;
+        const unsigned by = y >> RP_SHIFT_BLOCK;
+        for (unsigned bx=0;bx < bw;bx++) {
+            const unsigned x0 = bx << RP_SHIFT_BLOCK, x1 = std::min(g.w,x0 + bs);
+            const unsigned c = RP_ShiftChoice(bits,by * bw + bx);
+            long a = x0, b = x0;
+            const uint8_t *mp = bp;
+            if (c != 0 && c <= nvec) {
+                const ShiftVec &v = vec[c - 1];
+                RP_ShiftSpan(g,y,x0,x1,v.dx,v.dy,a,b);
+                if (a < b) mp = base + g.pal + (size_t)((long)y - v.dy) * row - (ptrdiff_t)v.dx * (ptrdiff_t)g.bpp;  /* only read inside a...b */
+            }
+            size_t i = (size_t)x0 * g.bpp;
+            const size_t ia = (size_t)a * g.bpp, ib = (size_t)b * g.bpp, ie = (size_t)x1 * g.bpp;
+            for (;i < ia;i++) op[i] = ip[i] ^ bp[i];
+            for (;i < ib;i++) op[i] = ip[i] ^ mp[i];
+            for (;i < ie;i++) op[i] = ip[i] ^ bp[i];
+        }
+    }
+}
+
+/* Whether the pixels x0...x1 of row y of the frame are what the prediction says (`v` NULL: the base as it is). */
+inline bool RP_ShiftRowSame(const uint8_t *cur,const uint8_t *base,const ShiftGeom &g,unsigned y,unsigned x0,unsigned x1,const ShiftVec *v) {
+    const size_t row = (size_t)g.w * g.bpp;
+    const uint8_t *cp = cur + g.pal + (size_t)y * row, *bp = base + g.pal + (size_t)y * row;
+    long a = x0, b = x0;
+    if (v != NULL) RP_ShiftSpan(g,y,x0,x1,v->dx,v->dy,a,b);
+    if (a < b) {
+        const uint8_t *mp = base + g.pal + (size_t)((long)y - v->dy) * row - (ptrdiff_t)v->dx * (ptrdiff_t)g.bpp;
+        if (memcmp(cp + (size_t)a * g.bpp,mp + (size_t)a * g.bpp,(size_t)(b - a) * g.bpp) != 0) return false;
+        if ((long)x0 < a && memcmp(cp + (size_t)x0 * g.bpp,bp + (size_t)x0 * g.bpp,(size_t)(a - (long)x0) * g.bpp) != 0) return false;
+        if (b < (long)x1 && memcmp(cp + (size_t)b * g.bpp,bp + (size_t)b * g.bpp,(size_t)((long)x1 - b) * g.bpp) != 0) return false;
+        return true;
+    }
+    return memcmp(cp + (size_t)x0 * g.bpp,bp + (size_t)x0 * g.bpp,(size_t)(x1 - x0) * g.bpp) == 0;
+}
+
+/* Blocks of 16x16 pixels spread over the frame, to be looked for in the base. Blocks that have not changed since the
+ * base and plain ones say nothing about movement and are left out. */
+struct ShiftProbes {
+    enum { P = 16, NX = 10, NY = 8 };
+    const uint8_t *cp, *bp;
+    ShiftGeom g;
+    size_t row, pb;
+    unsigned n;
+    struct { unsigned x, y; } p[NX * NY];
+
+    ShiftProbes(const uint8_t *cur,const uint8_t *base,const ShiftGeom &geom) : cp(cur + geom.pal), bp(base + geom.pal), g(geom),
+        row((size_t)geom.w * geom.bpp), pb((size_t)P * geom.bpp), n(0) {
+        if (g.w < 4u * P + 2u * (unsigned)RP_SHIFT_RANGE || g.h < 4u * P + 2u * (unsigned)RP_SHIFT_RANGE) return;
+        for (unsigned j=0;j < NY;j++) {
+            for (unsigned i=0;i < NX;i++) {
+                const unsigned x = (g.w - P) * (2 * i + 1) / (2 * NX), y = (g.h - P) * (2 * j + 1) / (2 * NY);
+                const uint8_t *c = cp + (size_t)y * row + (size_t)x * g.bpp, *b = bp + (size_t)y * row + (size_t)x * g.bpp;
+                bool same = true, plain = true;
+                for (unsigned r=0;r < P;r++) {
+                    if (same && memcmp(c + r * row,b + r * row,pb) != 0) same = false;
+                    if (plain) {
+                        for (size_t k=g.bpp;k < pb;k++) if (c[r * row + k] != c[k % g.bpp]) { plain = false; break; }
+                    }
+                }
+                if (same || plain) continue;
+                p[n].x = x; p[n].y = y; n++;
+            }
+        }
+    }
+    /* Whether block k of the frame is in the base, (vx,vy) back */
+    bool found(unsigned k,int vx,int vy) const {
+        const long sx = (long)p[k].x - vx, sy = (long)p[k].y - vy;
+        if (sx < 0 || sy < 0 || sx + (long)P > (long)g.w || sy + (long)P > (long)g.h) return false;
+        const uint8_t *c = cp + (size_t)p[k].y * row + (size_t)p[k].x * g.bpp, *b = bp + (size_t)sy * row + (size_t)sx * g.bpp;
+        for (unsigned r=0;r < P;r++) if (memcmp(c + r * row,b + r * row,pb) != 0) return false;
+        return true;
+    }
+    unsigned votes(int vx,int vy) const {
+        unsigned v = 0;
+        for (unsigned k=0;k < n;k++) if (found(k,vx,vy)) v++;
+        return v;
+    }
+};
+
+/* How far the parts of the picture have moved since the base, one frame earlier: each block votes for the distances
+ * at which it is found (up to 24 pixels each way), and the up to three distances with the most votes win (at least
+ * three blocks each). Blocks found in too many places say nothing. `vec` comes in with the distances of the frame
+ * before (`nvec` of them), which are tried first: a block found at one of them is not looked for elsewhere. Returns
+ * how many distances it found. */
+unsigned RP_FindShift(const uint8_t *cur,const uint8_t *base,const ShiftGeom &g,ShiftVec *vec,unsigned nvec) {
+    const int R = RP_SHIFT_RANGE;
+    const ShiftProbes probes(cur,base,g);
+    const unsigned n = probes.n;
+    if (n < 3) return 0;
+    const unsigned span = 2 * (unsigned)R + 1;
+    static thread_local std::vector<uint16_t> votes;
+    votes.assign((size_t)span * span,0);
+    for (unsigned k=0;k < n;k++) {
+        /* the distances of the frame before, while the picture keeps scrolling the same way */
+        bool known = false;
+        for (unsigned h=0;h < nvec;h++) {
+            if (vec[h].dx < -R || vec[h].dx > R || vec[h].dy < -R || vec[h].dy > R || (vec[h].dx == 0 && vec[h].dy == 0)) continue;
+            if (probes.found(k,vec[h].dx,vec[h].dy)) {
+                votes[(size_t)(vec[h].dy + R) * span + (size_t)(vec[h].dx + R)]++;
+                known = true;
+            }
+        }
+        if (known) continue;
+        int hits[8][2];
+        unsigned nh = 0;
+        bool many = false;
+        for (int vy=-R;vy <= R && !many;vy++) {
+            for (int vx=-R;vx <= R;vx++) {
+                if (vx == 0 && vy == 0) continue;
+                if (!probes.found(k,vx,vy)) continue;
+                if (nh == 8) { many = true; break; }
+                hits[nh][0] = vx; hits[nh][1] = vy; nh++;
+            }
+        }
+        if (many) continue;
+        for (unsigned h=0;h < nh;h++) votes[(size_t)(hits[h][1] + R) * span + (size_t)(hits[h][0] + R)]++;
+    }
+    unsigned out = 0;
+    while (out < RP_SHIFT_MAX) {
+        unsigned best = 0;
+        size_t at = 0;
+        for (size_t i=0;i < votes.size();i++) if (votes[i] > best) { best = votes[i]; at = i; }
+        if (best < 3) break;
+        votes[at] = 0;
+        vec[out].dx = (int)(at % span) - R;
+        vec[out].dy = (int)(at / span) - R;
+        out++;
+    }
+    return out;
+}
+
+/* The same against a base several frames old (over a real link the newest frame a viewer is known to have is two to
+ * four frames back): the picture has moved too far to look everywhere. `guess` holds where each part should be by
+ * now (the distances it moved from frame to frame, added up); around each guess the place with the most blocks is
+ * looked for, a few pixels each way. Returns how many distances stood (at least three blocks each), in `vec`. */
+unsigned RP_FollowShift(const uint8_t *cur,const uint8_t *base,const ShiftGeom &g,const ShiftVec *guess,unsigned nguess,ShiftVec *vec) {
+    const ShiftProbes probes(cur,base,g);
+    if (probes.n < 3) return 0;
+    unsigned out = 0;
+    for (unsigned q=0;q < nguess && out < RP_SHIFT_MAX;q++) {
+        unsigned best = 0;
+        int bx = 0, by = 0;
+        for (int oy=-3;oy <= 3;oy++) {
+            for (int ox=-3;ox <= 3;ox++) {
+                const int vx = guess[q].dx + ox, vy = guess[q].dy + oy;
+                if (vx < -RP_SHIFT_LIMIT || vx > RP_SHIFT_LIMIT || vy < -RP_SHIFT_LIMIT || vy > RP_SHIFT_LIMIT || (vx == 0 && vy == 0)) continue;
+                const unsigned v = probes.votes(vx,vy);
+                if (v > best || (v == best && v != 0 && abs(ox) + abs(oy) < abs(bx - guess[q].dx) + abs(by - guess[q].dy))) { best = v; bx = vx; by = vy; }
+            }
+        }
+        if (best < 3) continue;
+        bool twice = false;
+        for (unsigned k=0;k < out;k++) if (vec[k].dx == bx && vec[k].dy == by) twice = true;
+        if (twice) continue;
+        vec[out].dx = bx; vec[out].dy = by; out++;
+    }
+    return out;
+}
+
+/* For every block the prediction with the fewest rows that differ (the base as it is on a tie). False when no block
+ * is better off moved. */
+bool RP_ShiftBlocks(const uint8_t *cur,const uint8_t *base,const ShiftGeom &g,const ShiftVec *vec,unsigned nvec,std::vector<uint8_t> &bits) {
+    const unsigned bs = 1u << RP_SHIFT_BLOCK;
+    const unsigned bw = (g.w + bs - 1) >> RP_SHIFT_BLOCK, bh = (g.h + bs - 1) >> RP_SHIFT_BLOCK;
+    bits.assign(RP_ShiftBitmapBytes(g),0);
+    unsigned moved = 0;
+    for (unsigned by=0;by < bh;by++) {
+        const unsigned y0 = by << RP_SHIFT_BLOCK, y1 = std::min(g.h,y0 + bs);
+        for (unsigned bx=0;bx < bw;bx++) {
+            const unsigned x0 = bx << RP_SHIFT_BLOCK, x1 = std::min(g.w,x0 + bs);
+            unsigned best = 0, choice = 0;
+            for (unsigned y=y0;y < y1;y++) if (!RP_ShiftRowSame(cur,base,g,y,x0,x1,NULL)) best++;
+            for (unsigned k=0;k < nvec && best != 0;k++) {
+                unsigned differ = 0;
+                for (unsigned y=y0;y < y1 && differ < best;y++) if (!RP_ShiftRowSame(cur,base,g,y,x0,x1,&vec[k])) differ++;
+                if (differ < best) { best = differ; choice = k + 1; }
+            }
+            if (choice != 0) {
+                const unsigned idx = by * bw + bx;
+                bits[idx >> 2] |= (uint8_t)(choice << ((idx & 3u) * 2u));
+                moved++;
+            }
+        }
+    }
+    return moved != 0;
+}
 
 bool RP_IndexParallel(const uint8_t *px,size_t pixels,uint8_t *idx);
 
@@ -652,6 +916,7 @@ unsigned aud_rate = 0;
 /* Statistics */
 uint64_t stat_bytes = 0, stat_enc_us = 0, stat_index_us = 0, stat_cap_us = 0;
 uint32_t stat_frames = 0, stat_keys = 0, stat_offered = 0, stat_skipped = 0, stat_replaced = 0;
+uint32_t stat_shifted = 0;                      /* frames sent with scroll prediction */
 
 /* Remote input guard. Viewers must never be able to type DOS commands on the
  * host (DEL, FORMAT, MOUNT, ... on host folders mounted as drives), so their
@@ -771,6 +1036,17 @@ bool Host_PiecesMode(void) {
     return any;
 }
 
+/* Scroll prediction only when every viewer undoes it. */
+bool Host_ShiftMode(void) {
+    bool any = false;
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        if (!viewers[i].active) continue;
+        if (!(viewers[i].features & RP_FEAT_SHIFT)) return false;
+        any = true;
+    }
+    return any;
+}
+
 void Host_UpdateRateMode(void) {
     const bool adaptive = Host_RefsMode();
     if (adaptive == rate_adaptive) return;
@@ -783,6 +1059,28 @@ void Host_UpdateRateMode(void) {
 
 /* A viewer's fragment counters (cumulative, from RP_FRAMEACK): less on loss, more while the link takes everything and
  * video is waiting for it. */
+/* The time from a frame leaving here to its viewer saying it has decoded it (viewers say so at once): the way there
+ * and back, plus whatever waits in a queue on the way. Loss is not the only sign of sending more than the way takes:
+ * the buffer of a slow link, or a program that forwards the packets and cannot keep up, loses nothing for a long time
+ * and makes the picture seconds late instead (three 640x480 streams through one NukemNet tunnel did, with pings above
+ * a second). The shortest time of the last 10 to 20 seconds is taken for the way itself; a time well above it means
+ * a queue is growing, and the rate is cut as it is on loss (Host_RateFeedback). */
+void Host_DelayFeedback(Viewer &v,uint32_t id,uint32_t now) {
+    if (!rate_adaptive || frame_sent_id[id & 63u] != id) return;
+    const uint32_t d = now - frame_sent_ms[id & 63u];
+    if (d > 20000u) return;
+    if (v.delay_bucket_ms == 0 || now - v.delay_bucket_ms >= 10000u) {
+        v.delay_base_prev = v.delay_bucket_ms ? v.delay_base : d;
+        v.delay_base = d;
+        v.delay_bucket_ms = now ? now : 1u;
+    }
+    else if (d < v.delay_base) v.delay_base = d;
+    const double base = (double)std::min(v.delay_base,v.delay_base_prev);
+    v.delay_now = (v.delay_now <= 0) ? (double)d : v.delay_now * 0.5 + (double)d * 0.5;
+    v.delay_late = v.delay_now > base + std::max(60.0,base);
+    v.delay_raised = v.delay_now > base + std::max(30.0,base * 0.5);
+}
+
 void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
     if (!rate_adaptive) return;
     const uint32_t now = SDL_GetTicks();
@@ -811,7 +1109,17 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
             rate_cut_ms = now;
         }
     }
-    else if (rate_limited && loss < 0.01 && now - rate_cut_ms >= 400 && now - send_backlog_ms < 300) {
+    else if (v.delay_late) {
+        /* Frames arrive late: a queue stands somewhere on the way (Host_DelayFeedback). While it does, what arrives
+         * is what the way takes: a little below that, so the queue empties. The rate is never cut step after step
+         * while the queue empties (that took it down to almost nothing on a link that carried 700 KB/s). */
+        if (now - rate_cut_ms >= 400) {
+            send_rate = std::min(send_rate,std::max(4.0 * RP_RATE_MIN,delivered_now * 0.85));
+            rate_limited = true;
+            rate_cut_ms = now;
+        }
+    }
+    else if (rate_limited && loss < 0.01 && !v.delay_raised && now - rate_cut_ms >= 400 && now - send_backlog_ms < 300) {
         send_rate = std::min(send_rate * 1.2,RP_RATE_MAX);
     }
     if (rate_limited) send_rate = std::min(send_rate,std::max(RP_RATE_START,rate_delivered * 2.0));
@@ -821,16 +1129,19 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
         const double secs = rate_log_ms ? (now - rate_log_ms) / 1000.0 : 5.0;
         const uint32_t frames = stat_frames - last_frames;
         static uint32_t last_offered = 0, last_skipped = 0;
-        static uint32_t last_replaced = 0;
+        static uint32_t last_replaced = 0, last_shifted = 0;
         static uint64_t last_enc_us = 0, last_index_us = 0, last_cap_us = 0;
-        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder), %.1f%% of fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; CPU %ld cycles",
+        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder), %.1f%% of fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; scroll prediction in %u%% of the frames; frames acknowledged after %.0f ms (%u at best)%s; CPU %ld cycles",
             (unsigned)(send_rate / 1024.0),(unsigned)((stat_bytes - last_bytes) / 1024.0 / secs),frames / secs,
             (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,
             (stat_replaced - last_replaced) / secs,loss * 100.0,
             frames ? (stat_enc_us - last_enc_us) / 1000.0 / frames : 0.0,
             frames ? (stat_index_us - last_index_us) / 1000.0 / frames : 0.0,zworkers + 1,
             frames ? (stat_cap_us - last_cap_us) / 1000.0 / frames : 0.0,
-            enc_thread != NULL ? "" : " (no encoder thread)",(long)CPU_CycleMax);
+            enc_thread != NULL ? "" : " (no encoder thread)",
+            frames ? (unsigned)((stat_shifted - last_shifted) * 100u / frames) : 0u,
+            v.delay_now,(unsigned)std::min(v.delay_base,v.delay_base_prev),v.delay_late ? ", late" : "",(long)CPU_CycleMax);
+        last_shifted = stat_shifted;
         last_frames = stat_frames; last_bytes = stat_bytes; last_offered = stat_offered; last_skipped = stat_skipped;
         last_replaced = stat_replaced;
         last_enc_us = stat_enc_us; last_index_us = stat_index_us; last_cap_us = stat_cap_us;
@@ -865,6 +1176,7 @@ void Host_ReleaseInput(Viewer &v) {
         if (v.buttons & (1u << b)) Mouse_ButtonReleasedRaw((uint8_t)b);
     }
     v.buttons = 0;
+    nn_remote_cursor_locked = false;    /* a viewer that left with its mouse captured must not leave the guest's pointer driver in relative mode */
 }
 
 void Host_DropViewer(Viewer &v,const char *reason,bool notify) {
@@ -909,6 +1221,19 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
             const bool emulate = r.u8() != 0;
             if (!r.ok || !Guard_Allows()) return;
+            if (mouse_notify_mode != 0) {
+                /* The guest's pointer driver asks the integration device where the pointer is (bios.cpp): for this
+                 * player that is the place in the viewer's picture. A viewer that captured its mouse gives relative
+                 * motion, as a captured host does; otherwise the motion packet only tells the driver to look. */
+                const float cx = (x >= 0.0f) ? std::min(x,1.0f) : 0.0f, cy = (y >= 0.0f) ? std::min(y,1.0f) : 0.0f;
+                nn_remote_cursor_x = (uint16_t)(cx * 65535.0f + 0.5f);
+                nn_remote_cursor_y = (uint16_t)(cy * 65535.0f + 0.5f);
+                nn_remote_cursor_locked = emulate;
+                nn_remote_cursor = true;
+                if (emulate) Mouse_CursorMovedRaw(xrel,yrel,x,y,true);
+                else Mouse_CursorMovedRaw(0.0f,0.0f,0.0f,0.0f,false);
+                break;
+            }
             /* the viewer captured its mouse: relative motion, also for the INT 33h motion counters */
             mouse_motion_is_relative = emulate;
             Mouse_CursorMovedRaw(xrel,yrel,x,y,emulate);
@@ -1031,6 +1356,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             if ((flags & 1) && (!v->hasack || (int32_t)(id - v->acked) > 0) && (int32_t)(enc_frameid - id) >= 0) {
                 v->acked = id;
                 v->hasack = true;
+                Host_DelayFeedback(*v,id,SDL_GetTicks());
             }
             Host_RateFeedback(*v,exp,got);
             break;
@@ -1078,6 +1404,15 @@ void Host_FlushQueue(bool wait) {
     size_t bytes = 0;
     while (!send_queue.empty() && send_budget >= (double)send_queue.front().size()) {
         const size_t n = send_queue.front().size();
+        {
+            /* "NNRP", version, type, u32 frame, u16 fragment, u16 fragments: the frame's last fragment leaves now */
+            const std::vector<uint8_t> &f = send_queue.front();
+            if (n >= 14 && f[5] == RP_VIDEO && ((unsigned)f[10] | ((unsigned)f[11] << 8)) + 1u == ((unsigned)f[12] | ((unsigned)f[13] << 8))) {
+                const uint32_t fid = (uint32_t)f[6] | ((uint32_t)f[7] << 8) | ((uint32_t)f[8] << 16) | ((uint32_t)f[9] << 24);
+                frame_sent_id[fid & 63u] = fid;
+                frame_sent_ms[fid & 63u] = now;
+            }
+        }
         send_budget -= (double)n;
         send_queued -= std::min(send_queued,n);
         bytes += n;
@@ -1211,6 +1546,12 @@ void REMOTEPLAY_ProcessEnded(void) {
 
 static void REMOTEPLAY_GuestBoot(Section *) {
     guard_guest_os = true;
+    /* A locked down copy (remoteplay.h): the guest now runs whatever the remote player makes it run. Secure mode
+     * cannot be left again, so even a guest that resets the machine never reaches MOUNT, IMGMOUNT or BOOT. */
+    if (NN_Lockdown() && !control->SecureMode()) {
+        control->SwitchToSecureMode();
+        LOG_MSG("INPUTNET: locked down copy: secure mode from here on");
+    }
 }
 
 static void REMOTEPLAY_DOSBoot(Section *) {
@@ -1390,6 +1731,7 @@ void Enc_Frame(const Capture &c) {
     enc_lastsend = now;
     if (key) { enc_lastkey = now; enc_keyreq = false; }
     const bool table = Host_PiecesMode();
+    const bool shiftmode = Host_ShiftMode();
     const bool limited = rate_limited;
     Host_Unlock();
 
@@ -1397,21 +1739,74 @@ void Enc_Frame(const Capture &c) {
      * then go out alone without compressing the difference as well, which is half the work. Not on a link that
      * limits the video: there every byte counts more than a millisecond. */
     bool turned_key = false;
-    if (!key && !limited && enc_plain_streak >= 3 && (id & 3u) != 0) key = turned_key = true;
+    /* A picture that scrolled is predicted from the base moved the same way (see RP_ShiftXor), which beats the frame
+     * alone: such a frame is never one of those three. */
+    ShiftGeom geom;
+    geom.w = width; geom.h = height; geom.bpp = RP_BytesPerPixel(fmt); geom.pal = palbytes;
+    bool shifted = false;
+    enc_step_n = 0;
+    if (!key && shiftmode && !enc_hist.empty() && enc_hist.back().raw.size() == rawsize) {
+        /* How far the picture has moved since the frame before, starting from how far that one had moved. */
+        const EncFrame &prev = enc_hist.back();
+        for (unsigned k=0;k < prev.nstep;k++) enc_step_vec[k] = prev.step[k];
+        enc_step_n = RP_FindShift(enc_raw.data(),prev.raw.data(),geom,enc_step_vec,prev.nstep);
+        if (base == &prev) {
+            enc_shift_n = enc_step_n;
+            for (unsigned k=0;k < enc_step_n;k++) enc_shift_vec[k] = enc_step_vec[k];
+        }
+        else {
+            /* An older base: each part's steps added up over the frames since it (in every frame the step nearest
+             * to the part's last one is taken for the same part), then looked for near there. */
+            ShiftVec guess[RP_SHIFT_MAX];
+            for (unsigned q=0;q < enc_step_n;q++) {
+                ShiftVec total = enc_step_vec[q], last = enc_step_vec[q];
+                for (size_t i=enc_hist.size();i-- > 0;) {
+                    const EncFrame &f = enc_hist[i];
+                    if ((int32_t)(f.id - base->id) <= 0) break;
+                    if (f.nstep == 0) continue;     /* stood still, or unknown */
+                    unsigned nearest = 0;
+                    int least = 0x7fffffff;     /* ("far" and "near" are macros in the Windows headers) */
+                    for (unsigned k=0;k < f.nstep;k++) {
+                        const int d = abs(f.step[k].dx - last.dx) + abs(f.step[k].dy - last.dy);
+                        if (d < least) { least = d; nearest = k; }
+                    }
+                    last = f.step[nearest];
+                    total.dx += last.dx; total.dy += last.dy;
+                }
+                guess[q] = total;
+            }
+            enc_shift_n = RP_FollowShift(enc_raw.data(),base->raw.data(),geom,guess,enc_step_n,enc_shift_vec);
+            /* nothing there (or the picture stood still since the frame before): look near, as from one frame to the next */
+            if (enc_shift_n == 0) enc_shift_n = RP_FindShift(enc_raw.data(),base->raw.data(),geom,enc_shift_vec,0);
+        }
+        shifted = enc_shift_n != 0 && RP_ShiftBlocks(enc_raw.data(),base->raw.data(),geom,enc_shift_vec,enc_shift_n,enc_shiftbits);
+    }
+    if (!key && !shifted && !limited && enc_plain_streak >= 3 && (id & 3u) != 0) key = turned_key = true;
 
     const uint8_t *src = enc_raw.data();
     if (!key) {
         enc_work.resize(rawsize);
         const uint8_t *a = enc_raw.data(), *b = base->raw.data();
         uint8_t *d = enc_work.data();
-        size_t i = 0;
-        for (;i + 8 <= rawsize;i += 8) {
-            uint64_t x, y;
-            memcpy(&x,a + i,8); memcpy(&y,b + i,8);
-            x ^= y;
-            memcpy(d + i,&x,8);
+        if (shifted) {
+            RP_ShiftXor(d,a,b,geom,enc_shift_vec,enc_shift_n,enc_shiftbits.data());
+            static const bool check = getenv("NN_RP_SHIFTCHECK") != NULL;
+            if (check) {
+                enc_shiftcheck.resize(rawsize);
+                RP_ShiftXor(enc_shiftcheck.data(),d,b,geom,enc_shift_vec,enc_shift_n,enc_shiftbits.data());
+                if (memcmp(enc_shiftcheck.data(),a,rawsize) != 0) LOG_MSG("INPUTNET: scroll prediction does not give the frame back");
+            }
         }
-        for (;i < rawsize;i++) d[i] = a[i] ^ b[i];
+        else {
+            size_t i = 0;
+            for (;i + 8 <= rawsize;i += 8) {
+                uint64_t x, y;
+                memcpy(&x,a + i,8); memcpy(&y,b + i,8);
+                x ^= y;
+                memcpy(d + i,&x,8);
+            }
+            for (;i < rawsize;i++) d[i] = a[i] ^ b[i];
+        }
         src = enc_work.data();
     }
 
@@ -1429,21 +1824,38 @@ void Enc_Frame(const Capture &c) {
                 clen = ilen;
                 enc_pieces.swap(enc_altpieces);
                 key = turned_key = alone = true;
+                shifted = false;
             }
         }
         enc_plain_streak = alone ? enc_plain_streak + 1 : 0;
     }
-    /* The piece table, for viewers that inflate the pieces at the same time. */
-    size_t tbytes = 0;
-    if (ok && table && enc_pieces.size() >= 2 && enc_pieces.size() <= RP_PIECES_MAX) {
-        tbytes = 1 + 4 * enc_pieces.size();
+    /* In front of the compressed frame: the shift table of a frame with scroll prediction, then the piece table, for
+     * viewers that inflate the pieces at the same time. */
+    const size_t sbytes = (ok && shifted) ? 1 + 2 * enc_shift_n + 3 + enc_shiftbits.size() : 0;
+    const bool pieces_table = ok && table && enc_pieces.size() >= 2 && enc_pieces.size() <= RP_PIECES_MAX;
+    const size_t ptbytes = pieces_table ? 1 + 4 * enc_pieces.size() : 0;
+    const size_t tbytes = sbytes + ptbytes;
+    if (tbytes) {
         enc_comp.resize(RP_FRAME_HDR + tbytes + clen);
         uint8_t *t = enc_comp.data() + RP_FRAME_HDR;
         memmove(t + tbytes,t,clen);
-        *t++ = (uint8_t)enc_pieces.size();
-        for (size_t k=0;k < enc_pieces.size();k++) {
-            const uint32_t v = enc_pieces[k];
-            *t++ = (uint8_t)v; *t++ = (uint8_t)(v >> 8); *t++ = (uint8_t)(v >> 16); *t++ = (uint8_t)(v >> 24);
+        if (sbytes) {
+            *t++ = (uint8_t)enc_shift_n;
+            for (unsigned k=0;k < enc_shift_n;k++) {
+                *t++ = (uint8_t)(int8_t)enc_shift_vec[k].dx;
+                *t++ = (uint8_t)(int8_t)enc_shift_vec[k].dy;
+            }
+            *t++ = (uint8_t)RP_SHIFT_BLOCK;
+            *t++ = (uint8_t)enc_shiftbits.size(); *t++ = (uint8_t)(enc_shiftbits.size() >> 8);
+            memcpy(t,enc_shiftbits.data(),enc_shiftbits.size());
+            t += enc_shiftbits.size();
+        }
+        if (ptbytes) {
+            *t++ = (uint8_t)enc_pieces.size();
+            for (size_t k=0;k < enc_pieces.size();k++) {
+                const uint32_t v = enc_pieces[k];
+                *t++ = (uint8_t)v; *t++ = (uint8_t)(v >> 8); *t++ = (uint8_t)(v >> 16); *t++ = (uint8_t)(v >> 24);
+            }
         }
     }
     const size_t total = RP_FRAME_HDR + tbytes + clen;
@@ -1458,7 +1870,7 @@ void Enc_Frame(const Capture &c) {
     const unsigned back = (!key && refs) ? (unsigned)(id - base->id) : 0;
     h[0] = (uint8_t)width; h[1] = (uint8_t)(width >> 8);
     h[2] = (uint8_t)height; h[3] = (uint8_t)(height >> 8);
-    h[4] = (uint8_t)fmt; h[5] = (uint8_t)((key ? 1 : 0) | (tbytes ? 2 : 0));
+    h[4] = (uint8_t)fmt; h[5] = (uint8_t)((key ? 1 : 0) | (ptbytes ? 2 : 0) | (mouse_notify_mode != 0 ? 4 : 0) | (sbytes ? 8 : 0));
     h[6] = (uint8_t)back; h[7] = (uint8_t)(back >> 8);
     h[8] = (uint8_t)rawsize; h[9] = (uint8_t)(rawsize >> 8); h[10] = (uint8_t)(rawsize >> 16); h[11] = (uint8_t)(rawsize >> 24);
 
@@ -1486,6 +1898,8 @@ void Enc_Frame(const Capture &c) {
     EncFrame f;
     f.id = id;
     f.raw.swap(enc_raw);
+    f.nstep = enc_step_n;
+    for (unsigned k=0;k < enc_step_n;k++) f.step[k] = enc_step_vec[k];
     enc_hist.push_back(std::move(f));
     while (enc_hist.size() > 1 && (enc_hist.size() > RP_HISTORY || enc_hist.size() * rawsize > RP_HISTORY_BYTES))
         enc_hist.pop_front();
@@ -1497,6 +1911,7 @@ void Enc_Frame(const Capture &c) {
     send_queued += fragbytes;
     stat_frames++;
     if (key) stat_keys++;
+    if (sbytes) stat_shifted++;
     if (turned_key) { enc_lastkey = SDL_GetTicks(); enc_keyreq = false; }
     stat_enc_us += encoded_us - std::min(encoded_us,c.taken_us);
     /* Ahead of the frame itself, so viewers that measure latency know which of their input it shows: what had been
@@ -1785,6 +2200,9 @@ public:
     /* video */
     Assembly asm_slots[4];
     std::vector<uint8_t> frame, scratch;
+    std::vector<uint8_t> shiftbase;     /* the base of a frame with scroll prediction, copied aside */
+    uint32_t frames_decoded = 0, frames_shifted = 0, pic_log = 0;   /* since the last picture report */
+    uint64_t bytes_decoded = 0;
     unsigned frame_w = 0, frame_h = 0, frame_fmt = 0;
     uint32_t lastid = 0;
     bool haveframe = false, needkey = true, redraw = true;
@@ -1807,6 +2225,10 @@ public:
     uint32_t lastinput = 0, lastmove = 0;
     bool input_dirty = false;
     float acc_xrel = 0, acc_yrel = 0, last_x = 0, last_y = 0;
+    bool abs_pointer = false;   /* the host's guest takes the pointer's place in the picture: no capture needed */
+    bool motion_dirty = false;  /* the place changed (or has to be sent again) without relative motion */
+    SDL_Cursor *dot_cursor = NULL;  /* this window's pointer over such a picture: a small dot, see pointerLook() */
+    bool dot_shown = false;
     bool keydown[KBD_LAST];
     uint32_t buttons = 0;
 
@@ -1836,7 +2258,7 @@ public:
         if (user == NULL) user = getenv("USER");
         w.str(user ? user : "player");
         w.u32(session);
-        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES);
+        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES | RP_FEAT_SHIFT);
         send(w);
         lasthello = SDL_GetTicks();
     }
@@ -1857,6 +2279,7 @@ public:
         std::string t = "DOSBox-X-NN remote play"; /* the host's address stays private */
         if (!welcomed) t += " (connecting...)";
         else if (captured) t += " - Ctrl+F10 releases the mouse";
+        else if (abs_pointer) t += " - Ctrl+F10 captures the mouse";
         if (show_latency && welcomed) t += " - " + (latency_text.empty() ? std::string("measuring latency...") : latency_text);
         SDL_SetWindowTitle(window,t.c_str());
     }
@@ -1891,7 +2314,8 @@ public:
     }
 
     void flushMotion(void) {
-        if (acc_xrel == 0 && acc_yrel == 0) return;
+        if (acc_xrel == 0 && acc_yrel == 0 && !motion_dirty) return;
+        motion_dirty = false;
         Writer tmp(0);
         const size_t start = tmp.len;
         tmp.u8(RPEV_MMOVE);
@@ -1940,7 +2364,48 @@ public:
         if (!on) releaseAll();
         captured = on;
         SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE);
+        if (!on) { dot_shown = true; pointerLook(false); }
         updateTitle();
+    }
+
+    /* Over the picture of a guest that takes the pointer's place, this window's pointer is a small dot: it shows at
+     * once where the pointer is going, and the guest's own pointer (drawn in the picture, one round trip later) settles
+     * under it. Anywhere else the system's pointer. */
+    void pointerLook(bool dot) {
+        if (dot == dot_shown) return;
+        dot_shown = dot;
+        if (dot && dot_cursor == NULL) {
+            /* 8x8: a white 3x3 square in a black ring; SDL: mask 1 and data 1 is black, mask 1 and data 0 white */
+            static const Uint8 data[8] = { 0x00, 0x38, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00 };
+            static const Uint8 mask[8] = { 0x00, 0x38, 0x7C, 0x7C, 0x7C, 0x38, 0x00, 0x00 };
+            dot_cursor = SDL_CreateCursor(data,mask,8,8,3,3);
+        }
+        SDL_SetCursor((dot && dot_cursor != NULL) ? dot_cursor : SDL_GetDefaultCursor());
+        SDL_ShowCursor(SDL_ENABLE);
+    }
+
+    /* The host says whether its guest takes the pointer's place (frame flag 4). Then the pointer works without
+     * capturing the mouse; Ctrl+F10 still captures it for games that turn with the mouse. */
+    void setAbsPointer(bool on) {
+        if (abs_pointer == on) return;
+        abs_pointer = on;
+        if (on) setCapture(false);
+        else pointerLook(false);
+        LOG_MSG("INPUTNET: the pointer %s",on ? "follows this window's pointer (no capture needed)" : "needs the mouse captured again");
+        updateTitle();
+    }
+
+    bool inPicture(int x,int y) {
+        const SDL_Rect r = displayRect();
+        return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+    }
+
+    void pointerAt(int x,int y) {
+        const SDL_Rect r = displayRect();
+        if (r.w > 1 && r.h > 1) {
+            last_x = std::min(1.0f,std::max(0.0f,(float)(x - r.x) / (float)(r.w - 1)));
+            last_y = std::min(1.0f,std::max(0.0f,(float)(y - r.y) / (float)(r.h - 1)));
+        }
     }
 
     SDL_Rect displayRect(void) {
@@ -1965,6 +2430,8 @@ public:
                     releaseAll();
                     setCapture(false);
                 }
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || e.window.event == SDL_WINDOWEVENT_LEAVE)
+                    pointerLook(false);
                 redraw = true;
                 break;
             case SDL_KEYDOWN: {
@@ -1977,7 +2444,7 @@ public:
                     break;
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F10 && (mod & KMOD_CTRL)) {
-                    setCapture(false);
+                    setCapture(abs_pointer ? !captured : false);
                     break;
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 && (mod & KMOD_CTRL)) {
@@ -1997,10 +2464,17 @@ public:
                     if (acc_xrel == 0 && acc_yrel == 0 && motion_made == 0) motion_made = RP_Micros();
                     acc_xrel += (float)e.motion.xrel;
                     acc_yrel += (float)e.motion.yrel;
-                    const SDL_Rect r = displayRect();
-                    if (r.w > 1 && r.h > 1) {
-                        last_x = std::min(1.0f,std::max(0.0f,(float)(e.motion.x - r.x) / (float)(r.w - 1)));
-                        last_y = std::min(1.0f,std::max(0.0f,(float)(e.motion.y - r.y) / (float)(r.h - 1)));
+                    pointerAt(e.motion.x,e.motion.y);
+                }
+                else if (abs_pointer) {
+                    /* The guest draws its pointer where this window's pointer is (see pointerLook). While a button
+                     * is held the pointer keeps counting outside the picture (dragging to an edge). */
+                    const bool inside = inPicture(e.motion.x,e.motion.y);
+                    pointerLook(inside);
+                    if (inside || buttons != 0) {
+                        if (!motion_dirty && motion_made == 0) motion_made = RP_Micros();
+                        pointerAt(e.motion.x,e.motion.y);
+                        motion_dirty = true;
                     }
                 }
                 break;
@@ -2008,8 +2482,14 @@ public:
             case SDL_MOUSEBUTTONUP: {
                 const bool pressed = (e.type == SDL_MOUSEBUTTONDOWN);
                 if (!captured) {
-                    if (pressed && e.button.button == SDL_BUTTON_LEFT) setCapture(true);
-                    break;
+                    if (!abs_pointer) {
+                        if (pressed && e.button.button == SDL_BUTTON_LEFT) setCapture(true);
+                        break;
+                    }
+                    /* a press counts in the picture only; every button event carries the pointer's place */
+                    if (pressed && !inPicture(e.button.x,e.button.y)) break;
+                    pointerAt(e.button.x,e.button.y);
+                    motion_dirty = true;
                 }
                 flushMotion();
                 if (e.button.button == SDL_BUTTON_LEFT) buttonEvent(0,pressed);
@@ -2018,7 +2498,7 @@ public:
                 break;
             }
             case SDL_MOUSEWHEEL:
-                if (captured && e.wheel.y != 0) {
+                if ((captured || abs_pointer) && e.wheel.y != 0) {
                     const int amount = (e.wheel.direction == SDL_MOUSEWHEEL_NORMAL) ? -e.wheel.y : e.wheel.y;
                     const int16_t a = (int16_t)std::max(-32767,std::min(32767,amount));
                     uint8_t b[3] = { RPEV_WHEEL, (uint8_t)a, (uint8_t)((uint16_t)a >> 8) };
@@ -2038,6 +2518,7 @@ public:
         const unsigned h = data[2] | (data[3] << 8);
         const unsigned fmt = data[4];
         const bool key = (data[5] & 1) != 0;
+        setAbsPointer((data[5] & 4) != 0);
         const size_t rawsize = (size_t)data[8] | ((size_t)data[9] << 8) | ((size_t)data[10] << 16) | ((size_t)data[11] << 24);
         const unsigned bytespp = RP_BytesPerPixel(fmt);
         if (bytespp == 0 || w == 0 || h == 0 || w > 4096 || h > 4096) return;
@@ -2062,6 +2543,30 @@ public:
         /* The zlib stream, after the piece table when there is one. */
         const uint8_t *stream = data + RP_FRAME_HDR;
         size_t slen = len - RP_FRAME_HDR;
+        /* The shift table of a frame with scroll prediction (see RP_ShiftXor). */
+        const uint8_t *shiftbits = NULL;
+        ShiftVec shiftvec[RP_SHIFT_MAX];
+        unsigned shiftn = 0;
+        ShiftGeom geom;
+        geom.w = w; geom.h = h; geom.bpp = bytespp; geom.pal = (fmt == 8) ? 768u : 0u;
+        if (data[5] & 8) {
+            if (key || slen < 1) return;
+            shiftn = stream[0];
+            if (shiftn < 1 || shiftn > RP_SHIFT_MAX || slen < 1 + 2 * (size_t)shiftn + 3) { needkey = true; return; }
+            bool fine = true;
+            for (unsigned k=0;k < shiftn;k++) {
+                shiftvec[k].dx = (int8_t)stream[1 + 2 * k];
+                shiftvec[k].dy = (int8_t)stream[2 + 2 * k];
+                if (shiftvec[k].dx < -RP_SHIFT_LIMIT || shiftvec[k].dx > RP_SHIFT_LIMIT || shiftvec[k].dy < -RP_SHIFT_LIMIT || shiftvec[k].dy > RP_SHIFT_LIMIT) fine = false;
+            }
+            const uint8_t *q = stream + 1 + 2 * (size_t)shiftn;
+            const size_t n = (size_t)q[1] | ((size_t)q[2] << 8);
+            const size_t used = 1 + 2 * (size_t)shiftn + 3 + n;
+            if (!fine || q[0] != RP_SHIFT_BLOCK || n != RP_ShiftBitmapBytes(geom) || slen < used) { needkey = true; return; }
+            shiftbits = q + 3;
+            stream += used;
+            slen -= used;
+        }
         uint32_t lens[RP_PIECES_MAX];
         unsigned pieces = 0;
         if (data[5] & 2) {
@@ -2095,12 +2600,20 @@ public:
             keyid = id;
             havekey = true;
         }
+        else if (shiftbits != NULL) {
+            shiftbase = *base;      /* the base may be the very frame that is replaced */
+            frame.resize(rawsize);
+            RP_ShiftXor(frame.data(),scratch.data(),shiftbase.data(),geom,shiftvec,shiftn,shiftbits);
+            frames_shifted++;
+        }
         else {
             if (base != &frame) frame = *base;
             uint8_t *d = frame.data();
             const uint8_t *s = scratch.data();
             for (size_t i=0;i < rawsize;i++) d[i] ^= s[i];
         }
+        frames_decoded++;
+        bytes_decoded += len;
         if (!hist.empty() && hist.back().second.size() != rawsize) hist.clear();
         hist.push_back(std::make_pair(id,frame));
         while (hist.size() > 1 && (hist.size() > RP_HISTORY || hist.size() * rawsize > RP_HISTORY_BYTES)) hist.pop_front();
@@ -2141,6 +2654,15 @@ public:
     void reportLatency(void) {
         const uint32_t now = SDL_GetTicks();
         if (now - lat_log < 5000) return;
+        if (frames_decoded != 0) {
+            const double secs = pic_log ? (now - pic_log) / 1000.0 : 5.0;
+            LOG_MSG("INPUTNET: picture %.1f frames/s, %u KB/s (%u KB a frame), %u%% of the frames with scroll prediction",
+                frames_decoded / secs,(unsigned)(bytes_decoded / 1024.0 / secs),(unsigned)(bytes_decoded / 1024u / frames_decoded),
+                (unsigned)(frames_shifted * 100u / frames_decoded));
+        }
+        pic_log = now;
+        frames_decoded = frames_shifted = 0;
+        bytes_decoded = 0;
         lat_log = now;
         const double rtt = lat.rtt_n ? lat.rtt / lat.rtt_n : -1.0;
         if (lat.n) {
@@ -2444,7 +2966,7 @@ public:
 
             const uint32_t now = SDL_GetTicks();
             if (now - lasthello >= (welcomed ? 1000u : 500u)) sendHello();
-            if ((acc_xrel != 0 || acc_yrel != 0) && now - lastmove >= 4) flushMotion();
+            if ((acc_xrel != 0 || acc_yrel != 0 || motion_dirty) && now - lastmove >= 4) flushMotion();
             if (!pending.empty() && (input_dirty || now - lastinput >= 30)) sendInput();
             if (welcomed && now - lastack >= 100) sendAck();   /* also reports loss when no frame completes */
             if (welcomed && needkey && now - lastkeyreq >= 150) {
@@ -2475,6 +2997,7 @@ public:
         if (captured) SDL_SetRelativeMouseMode(SDL_FALSE);
         if (audio) SDL_CloseAudioDevice(audio);
         if (texture) SDL_DestroyTexture(texture);
+        if (dot_cursor) { SDL_SetCursor(SDL_GetDefaultCursor()); SDL_FreeCursor(dot_cursor); dot_cursor = NULL; }
         if (renderer) SDL_DestroyRenderer(renderer);
         /* The viewer window goes first: on some window managers (labwc, for one) a message box for it opened behind
          * it, and the player only saw the last frame (or black) and a viewer that no longer reacted. */
@@ -2551,4 +3074,9 @@ void REMOTEPLAY_UpdateMenu(void) {
     if (!mainMenu.item_exists("mapper_rpscreen")) return;
     const bool host = remoteplay_screen_hidden || REMOTEPLAY_ServerRunning() || REMOTEPLAY_HostRequested();
     mainMenu.get_item("mapper_rpscreen").hide(!host).check(!remoteplay_screen_hidden).refresh_item(mainMenu);
+}
+
+/* See remoteplay.h. */
+bool NN_Lockdown(void) {
+    return control != NULL && control->opt_inputnet_lockdown;
 }

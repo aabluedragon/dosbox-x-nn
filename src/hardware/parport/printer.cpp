@@ -17,6 +17,7 @@
  */
 
 #include "printer.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 
 #if C_PRINTER
 
@@ -2039,6 +2040,8 @@ void CPrinter::doAction(const char *fname) {
 void CPrinter::outputPage() 
 {
 	char fname[512];
+
+	if (NN_Lockdown()) return; /* a copy that plays for a remote player prints nothing and writes no files on the host */
 
 	if (strcasecmp(output, "printer") == 0)
 	{

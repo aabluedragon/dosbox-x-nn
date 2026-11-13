@@ -5224,6 +5224,11 @@ static void HandleMouseMotion(SDL_MouseMotionEvent * motion) {
     user_cursor_y      = motion->y - sdl.clip.y;
     user_cursor_locked = sdl.mouse.locked;
     user_cursor_emulation = sdl.mouse.emulation;
+    {
+        /* NukemNet remote play: the host's own pointer moved, so it is the pointer again (see bios.cpp) */
+        extern bool nn_remote_cursor;
+        nn_remote_cursor = false;
+    }
 
     UpdateUserCursorScreenDimensions();
 
@@ -7847,6 +7852,7 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -inputnet-server <port>                 Host a shared keyboard/mouse session on this UDP port\n");
             fprintf(stderr,"  -inputnet-connect <address[:port]>      Join the shared keyboard/mouse session hosted there\n");
             fprintf(stderr,"  -inputnet-hidescreen                    Remote play host: do not show the picture on this machine\n");
+            fprintf(stderr,"  -inputnet-lockdown                      This copy plays for a remote player: nothing it does may change files here\n");
             fprintf(stderr,"  -savedir <path>                         Set path for the save slots\n");
             fprintf(stderr,"  -defaultdir <path>                      Set the default working path for DOSBox-X\n");
             fprintf(stderr,"  -defaultconf                            Use the default config settings for DOSBox-X\n");
@@ -7959,6 +7965,9 @@ bool DOSBOX_parse_argv() {
         }
         else if (optname == "inputnet-hidescreen") {
             control->opt_inputnet_hidescreen = true;
+        }
+        else if (optname == "inputnet-lockdown") {
+            control->opt_inputnet_lockdown = true;
         }
         else if (optname == "time-limit") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;

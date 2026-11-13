@@ -68,6 +68,8 @@ public:
     std::string opt_inputnet_connect="";    /* -inputnet-connect <host[:port]> */
     int opt_inputnet_server = -1;           /* -inputnet-server [port], -1 = not requested */
     bool opt_inputnet_hidescreen = false;   /* -inputnet-hidescreen: [inputnet] hostscreen=false */
+    bool opt_inputnet_lockdown = false;     /* -inputnet-lockdown: this copy plays for a remote player and may not change
+                                               anything on the host (see NN_Lockdown in src/hardware/remoteplay.cpp) */
 #if defined(C_DOSBOX_AGENT)
     std::string opt_agent_config;
     bool opt_agent_self_test = false;

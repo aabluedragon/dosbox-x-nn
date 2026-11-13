@@ -110,9 +110,65 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   NukemNet uses it for the copies that play for remote players. Restore it from the taskbar for
   *Video > Show screen (remote play)* (mapper event `rpscreen`, no default key), which shows or hides
   the picture at any time.
+- Remote play pointer for Windows guests (capability `inputnetPointer`): Windows 3.x/9x with DOSBox-X's pointer
+  integration driver (DBOXMPI) asks the integration device where the pointer is, which was the host's own pointer over
+  the host's window only: a viewer's mouse never moved the Windows pointer (it sat in the top-left corner). The host
+  now answers with the place of the viewer's pointer in its picture (`nn_remote_cursor*` in `bios.cpp`; the host's own
+  pointer takes over again when it moves), and tells viewers in each frame header (flag 4) that the guest takes the
+  pointer's place. Such a viewer does not capture the mouse: its pointer works over the picture as in any window,
+  drawn as a small dot that shows at once where it is going while the guest's own pointer follows in the picture.
+  Ctrl+F10 still captures the mouse (relative motion) for games that turn with it. Older viewers and hosts keep
+  working together with it as before.
+- Disk layers (capability `diskLayer`): `IMGMOUNT C image.img -size ... -nnlayer <file>` opens a raw hard disk image
+  for reading only, without the lock that keeps other emulators out, and writes every sector the guest writes to the
+  layer file (`NN_LayerAttach` in `bios_disk.cpp`, which documents the format). Several emulators can then run from
+  one image at the same time, each with a layer of its own, and the image stays as it was until a launcher writes a
+  layer into it (NukemNet does: `app/src/lib/win95-layer.ts`) or throws it away. A sector is stored once, so a layer
+  never grows beyond the size of the image; an existing layer of the same image is taken up again; without its
+  layer the image is not mounted at all. (The differencing VHDs DOSBox-X already has were no option: `VHDMAKE -link`
+  crashes on Linux with a double free and stores parent paths as ASCII.)
+- Locked down copies (capability `inputnetLockdown`): `-inputnet-lockdown` is for an emulator that runs a copy of a
+  game for a remote player (NukemNet's IPX/NullModem-over-InputNet with a Windows guest), who controls that guest
+  completely and could run anything inside it. Such a copy may not change the host's files: `MOUNT` is always
+  read-only; a disk image is written only through a disk layer and is read-only otherwise (raw, VHD and QCOW2);
+  nothing is captured, printed or saved (screenshots, video, sound, MIDI, parallel and serial port files, printer
+  pages, save states; also not when the guest asks through the integration device's capture register); and from the
+  moment the guest boots the emulator is in DOSBox-X's secure mode, which cannot be left again: no `MOUNT`,
+  `IMGMOUNT` or `BOOT` even after a guest reset, no DOS clipboard access. Checked with a DOS session that copies a
+  file to a mounted folder, asks the integration device for captures and writes to an image: with the switch none of
+  the three changed anything on the host; a locked Windows 95 copy held only its layer and its log open for writing.
+- Remote play scroll prediction: a scrolling picture differs from the one before in nearly every pixel, so its
+  difference compressed no better than the frame alone (Fire Fight at 640x480 in Windows 95 sent about 130 KB a
+  frame while it scrolled, 3.5 to 4.5 MB/s). When parts of the picture have moved as a whole, the frame now goes out
+  as the difference against a prediction: for every block of 8x8 pixels two bits say whether the block is predicted
+  from the base as it is or from the base moved by one of up to three distances (layers that scroll at different
+  speeds), each at most 24 pixels either way (`RP_FindShift`, `RP_ShiftBlocks`, `RP_ShiftXor` in `remoteplay.cpp`).
+  Nothing is lost: the viewer makes the same prediction from the same base (`NN_RP_SHIFTCHECK=1` makes the host check
+  every such frame). Used only when every viewer undoes it (viewer feature `RP_FEAT_SHIFT`), so older viewers get
+  frames as before. Over a real link the base is not the frame before: the newest frame a viewer is known to have is
+  two to four frames back, and the picture has moved further than can be searched. So every frame also notes how far
+  its parts moved since the frame before it (`EncFrame::step`); for an older base these steps are added up, part by
+  part, and the result is looked for a few pixels around there (`RP_FollowShift`, up to 127 pixels either way).
+  Measured with Fire Fight: on one PC 1.2 to 1.5 MB/s at the same 32 frames a second (about a third), encoding 4.7
+  instead of 3.2 ms a frame; between two computers 73 ms apart 1.5 to 2.6 MB/s instead of 4.4 to 4.6, prediction in
+  79 to 94% of the frames (23 to 50% before the steps were added up). DOS Jazz Jackrabbit: 4 to 9 KB a frame while it
+  scrolls. The host's log line says in how many frames it was used, and the viewer logs its picture every 5 seconds
+  (frames/s, KB/s, KB a frame).
+- Remote play rate follows delay, not only loss: viewers acknowledge each frame as soon as they have decoded it, and
+  the host times that from the moment the frame's last fragment left (`Host_DelayFeedback`). The shortest time of the
+  last 10 to 20 seconds is the way there and back; a time well above it (twice, and at least 60 ms more) means a
+  queue stands somewhere on the way: the buffer of a slow link, or a program that forwards the packets and cannot
+  keep up, which loses nothing for a long time and makes the picture seconds late instead. The rate is then set a
+  little below what arrives, so the queue empties, and is not raised while frames still come back late. Before,
+  only loss cut the rate: on a 700 KB/s link with a 3 MB queue, Shadow Warrior at 800x600 filled the queue until
+  it overflowed (13,000 packets dropped in 24 s); now nothing is dropped and frames are acknowledged after about
+  45 ms again. The host's log line shows the acknowledgement time, the shortest lately, and "late" while it is cut.
+  With both, a Windows 95 game hosted for four players (three 640x480 streams from one computer through NukemNet's
+  IPv6 tunnel, 73 ms away) plays at the game's full 30 to 34 frames a second for each viewer with the ping at the
+  route's own; before, the tunnel's queue grew until pings passed a second and viewers got a few frames a second.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

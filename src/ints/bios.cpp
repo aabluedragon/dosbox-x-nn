@@ -691,6 +691,14 @@ bool dosbox_int_discard_save_state(void) {
 extern bool user_cursor_locked;
 extern int user_cursor_x,user_cursor_y;
 extern int user_cursor_sw,user_cursor_sh;
+
+/* NukemNet remote play: a viewer's pointer for a guest with a pointer integration driver (Windows 3.x/9x with
+ * DBOXMPI). The driver asks this device where the pointer is; for a remote player that is the place in the viewer's
+ * picture, not the host's own pointer over the host's window. The host's own pointer takes over again when it moves
+ * (sdlmain.cpp). */
+bool nn_remote_cursor = false;          /* the last pointer motion came from a viewer */
+bool nn_remote_cursor_locked = false;   /* ...which has captured its mouse (relative motion) */
+uint16_t nn_remote_cursor_x = 0, nn_remote_cursor_y = 0;    /* 0...65535 across the picture */
 extern int master_cascade_irq,bootdrive;
 extern bool enable_slave_pic;
 extern bool bootguest, use_quick_reboot;
@@ -853,16 +861,30 @@ void dosbox_integration_trigger_read() {
 			break;
 
 		case DOSBOX_ID_REG_USER_MOUSE_STATUS: /* read user mouse status */
+			if (nn_remote_cursor) {
+				dosbox_int_register = nn_remote_cursor_locked ? 3UL : 0UL;
+				break;
+			}
 			dosbox_int_register =
 				(user_cursor_locked        ? (1UL << 0UL) : 0UL) |    /* bit 0 = mouse capture lock */
 				(sdl.mouse.locked          ? (1UL << 1UL) : 0UL);     /* bit 1 = mouse captured */
 			break;
 
 		case DOSBOX_ID_REG_USER_MOUSE_CURSOR: /* read user mouse cursor position */
+			if (nn_remote_cursor) {
+				const uint32_t x = ((uint32_t)nn_remote_cursor_x * (uint32_t)(user_cursor_sw > 1 ? user_cursor_sw-1 : 1)) / 65535u;
+				const uint32_t y = ((uint32_t)nn_remote_cursor_y * (uint32_t)(user_cursor_sh > 1 ? user_cursor_sh-1 : 1)) / 65535u;
+				dosbox_int_register = ((y & 0xFFFFUL) << 16UL) | (x & 0xFFFFUL);
+				break;
+			}
 			dosbox_int_register = (uint32_t((uint16_t)user_cursor_y & 0xFFFFUL) << 16UL) | uint32_t((uint16_t)user_cursor_x & 0xFFFFUL);
 			break;
 
 		case DOSBOX_ID_REG_USER_MOUSE_CURSOR_NORMALIZED:
+			if (nn_remote_cursor) {
+				dosbox_int_register = ((uint32_t)nn_remote_cursor_y << 16UL) | (uint32_t)nn_remote_cursor_x;
+				break;
+			}
 			{ /* read user mouse cursor position (normalized for Windows 1.x/2.x/3.x/95/98/ME mouse driver interface) */
 				signed long long x = ((signed long long)user_cursor_x << 16LL) / (signed long long)(user_cursor_sw-1);
 				signed long long y = ((signed long long)user_cursor_y << 16LL) / (signed long long)(user_cursor_sh-1);

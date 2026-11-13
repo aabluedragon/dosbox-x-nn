@@ -18,6 +18,7 @@
 
 
 #include "dosbox.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 
 #include "parport.h"
 #include "filelpt.h"
@@ -217,6 +218,7 @@ CFileLPT::~CFileLPT () {
 }
 
 bool CFileLPT::OpenFile() {
+	if (NN_Lockdown()) return false; /* a copy that plays for a remote player writes no files on the host */
 	switch(filetype) {
 	case FILE_DEV:
 		file = fopen(name.c_str(),"wb");

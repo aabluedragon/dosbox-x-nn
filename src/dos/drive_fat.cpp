@@ -53,6 +53,7 @@
 
 #include "dos_system.h"
 #include "dosbox.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include "dos_inc.h"
 #include "drives.h"
 #include "support.h"
@@ -1514,10 +1515,23 @@ fatDrive::fatDrive(const char* sysFilename, uint32_t bytesector, uint32_t cylsec
 		imgDTA    = new DOS_DTA(imgDTAPtr);
 	}
 
-	const bool roflag = std::find(options.begin(), options.end(), "readonly") != options.end();
+	/* NukemNet disk layer option, looked up first: a locked down copy (remoteplay.h) may write an image only through one */
+	bool nn_has_layer = false;
+	for (const auto &o : options) if (o.compare(0,8,"nnlayer=") == 0 && o.size() > 8) nn_has_layer = true;
+	const bool roflag = std::find(options.begin(), options.end(), "readonly") != options.end() || (NN_Lockdown() && !nn_has_layer);
 	readonly = wpcolon && strlen(sysFilename) > 1 && sysFilename[0] == ':';
 	const char *fname = readonly ? sysFilename + 1 : sysFilename;
-	FILE *diskfile = fopen_lock(fname, readonly || roflag ? "rb" : "rb+", readonly);
+	/* NukemNet disk layer (IMGMOUNT -nnlayer <file>): the image is opened for reading only, without the lock that
+	 * keeps other emulators out, and stays writable for the guest: what it writes goes to the layer (bios_disk.cpp). */
+	std::string nn_layer_path;
+	for (const auto &o : options) if (o.compare(0,8,"nnlayer=") == 0) nn_layer_path = o.substr(8);
+	FILE *diskfile;
+	if (!nn_layer_path.empty() && !readonly && !roflag) {
+		bool ro = false;
+		diskfile = fopen_lock(fname, "rb", ro);
+	}
+	else
+		diskfile = fopen_lock(fname, readonly || roflag ? "rb" : "rb+", readonly);
 	if (!diskfile) {created_successfully = false;return;}
 
 	opts.bytesector = bytesector;
@@ -1583,6 +1597,18 @@ fatDrive::fatDrive(const char* sysFilename, uint32_t bytesector, uint32_t cylsec
 			loadedDisk = new imageDiskNFD(diskfile, fname, (uint32_t)filesize, false, 1);
 		else
 			loadedDisk = new imageDisk(diskfile, fname, rawsize, (is_hdd | (rawsize > 2880 * 1024)));
+	}
+
+	if (!nn_layer_path.empty() && !readonly && !roflag) {
+		/* without its layer the image could not be written at all: do not mount it then */
+		if (bytesector != 0) loadedDisk->sector_size = bytesector;
+		if (!loadedDisk->NN_LayerAttach(nn_layer_path.c_str())) {
+			LOG_MSG("NukemNet disk layer: %s cannot be used with %s",nn_layer_path.c_str(),fname);
+			delete loadedDisk;
+			loadedDisk = NULL;
+			created_successfully = false;
+			return;
+		}
 	}
 
 	fatDriveInit(sysFilename, bytesector, cylsector, headscyl, cylinders, filesize, options);

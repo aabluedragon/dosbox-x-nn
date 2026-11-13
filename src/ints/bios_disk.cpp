@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "dosbox.h"
+bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include "callback.h"
 #include "bios.h"
 #include "bios_disk.h"
@@ -1450,6 +1451,114 @@ Int13Status imageDisk::Read_Sector(uint32_t head,uint32_t cylinder,uint32_t sect
     return Read_AbsoluteSector(sectnum, data);
 }
 
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* NukemNet disk layer. File format, little endian:                                                                    */
+/*   64 bytes: "NNDISKLAYER1" and four zero bytes, u32 sector size, u32 0, u64 size of the image in bytes, zeros        */
+/*   then records of 8 + sector size bytes: u32 sector number, u32 the same number inverted, the sector's bytes.        */
+/* A sector written again is rewritten in its record, so the file never holds a sector twice and grows only with the    */
+/* number of different sectors written. Bringing the image up to date is: write each record's bytes at its sector;      */
+/* an unfinished last record (the emulator was stopped while writing) is ignored. NukemNet does that itself             */
+/* (app/src/lib/win95-layer.ts).                                                                                        */
+/* ------------------------------------------------------------------------------------------------------------------ */
+host_cnv_char_t *CodePageGuestToHost(const char *s);     /* src/dos/drive_local.cpp */
+
+static const char nn_layer_magic[16] = { 'N','N','D','I','S','K','L','A','Y','E','R','1',0,0,0,0 };
+static const uint64_t nn_layer_header = 64;
+
+static FILE *NN_LayerOpen(const char *name,const char *mode) {
+    FILE *f = fopen64(name,mode);
+#if defined(WIN32)
+    if (f == NULL) {
+        const host_cnv_char_t* host_name = CodePageGuestToHost(name);
+        if (host_name != NULL) {
+            wchar_t wmode[8];
+            mbstowcs(wmode,mode,8);
+            f = _wfopen(host_name,wmode);
+        }
+    }
+#endif
+    return f;
+}
+
+bool imageDisk::NN_LayerAttach(const char *path) {
+    if (nn_layer != NULL || path == NULL || *path == 0 || diskimg == NULL || ffdd != NULL || class_id != ID_BASE) return false;
+    if (sector_size < 256 || sector_size > 4096 || image_length < sector_size || (image_length / sector_size) > 0xFFFFFFF0ull) return false;
+    const uint32_t total = (uint32_t)(image_length / sector_size);
+    const size_t recsize = 8u + sector_size;
+
+    FILE *f = NN_LayerOpen(path,"rb+");
+    uint32_t records = 0;
+    std::vector<uint32_t> index(total,0u);
+    if (f != NULL) {
+        /* an existing layer of this image: take what it holds */
+        uint8_t h[64];
+        bool ok = fread(h,1,sizeof(h),f) == sizeof(h) && memcmp(h,nn_layer_magic,sizeof(nn_layer_magic)) == 0 &&
+            host_readd(h+16) == sector_size && host_readq(h+24) == image_length;
+        if (ok) {
+            std::vector<uint8_t> rec(recsize);
+            while (fread(rec.data(),1,recsize,f) == recsize) {
+                const uint32_t sect = host_readd(rec.data()), inv = host_readd(rec.data()+4);
+                if (inv != ~sect || sect >= total) break;
+                index[sect] = ++records;
+            }
+        }
+        else {
+            fclose(f);
+            f = NULL;
+            LOG_MSG("NukemNet disk layer: %s is not a layer of this image, starting a new one",path);
+        }
+    }
+    if (f == NULL) {
+        f = NN_LayerOpen(path,"wb+");
+        if (f == NULL) {
+            LOG_MSG("NukemNet disk layer: cannot create %s",path);
+            return false;
+        }
+        uint8_t h[64];
+        memset(h,0,sizeof(h));
+        memcpy(h,nn_layer_magic,sizeof(nn_layer_magic));
+        host_writed(h+16,sector_size);
+        host_writeq(h+24,image_length);
+        if (fwrite(h,1,sizeof(h),f) != sizeof(h) || fflush(f) != 0) {
+            LOG_MSG("NukemNet disk layer: cannot write %s",path);
+            fclose(f);
+            return false;
+        }
+        records = 0;
+        std::fill(index.begin(),index.end(),0u);
+    }
+    setbuf(f,NULL);     /* like the image itself: nothing may wait in a buffer when the emulator is stopped */
+    nn_layer = f;
+    nn_layer_index.swap(index);
+    nn_layer_records = records;
+    LOG_MSG("NukemNet disk layer: %s, %u sectors in it",path,(unsigned int)records);
+    return true;
+}
+
+bool imageDisk::NN_LayerRead(uint32_t sectnum, void *data) {
+    const uint64_t at = nn_layer_header + (uint64_t)(nn_layer_index[sectnum] - 1u) * (8u + sector_size) + 8u;
+    fseeko64(nn_layer,(fseek_ofs_t)at,SEEK_SET);
+    return fread(data,1,sector_size,nn_layer) == sector_size;
+}
+
+bool imageDisk::NN_LayerWrite(uint32_t sectnum, const void *data) {
+    uint32_t rec = nn_layer_index[sectnum];
+    const bool fresh = (rec == 0);
+    if (fresh) rec = nn_layer_records + 1u;
+    uint8_t buf[8 + 4096];
+    host_writed(buf,sectnum);
+    host_writed(buf+4,~sectnum);
+    memcpy(buf+8,data,sector_size);
+    const uint64_t at = nn_layer_header + (uint64_t)(rec - 1u) * (8u + sector_size);
+    fseeko64(nn_layer,(fseek_ofs_t)at,SEEK_SET);
+    if (fwrite(buf,1,8u + sector_size,nn_layer) != 8u + sector_size) return false;
+    if (fresh) {
+        nn_layer_index[sectnum] = rec;
+        nn_layer_records = rec;
+    }
+    return true;
+}
+
 Int13Status imageDisk::Read_AbsoluteSector(uint32_t sectnum, void * data) {
 	if (ffdd) return ffdd->ReadSector(sectnum, data);
 
@@ -1461,6 +1570,8 @@ Int13Status imageDisk::Read_AbsoluteSector(uint32_t sectnum, void * data) {
         LOG_MSG("Attempt to read invalid sector in Read_AbsoluteSector for sector %lu.\n", (unsigned long)sectnum);
         return Int13Status::SectorNotFound;
     }
+    if (nn_layer != NULL && sectnum < nn_layer_index.size() && nn_layer_index[sectnum] != 0)
+        return NN_LayerRead(sectnum,data) ? Int13Status::NoError : Int13Status::ControllerFailure;
     bytenum += image_base;
 
     //LOG_MSG("Reading sectors %ld at bytenum %I64d", sectnum, bytenum);
@@ -1507,6 +1618,10 @@ Int13Status imageDisk::Write_AbsoluteSector(uint32_t sectnum, const void *data) 
         LOG_MSG("Attempt to read invalid sector in Write_AbsoluteSector for sector %lu.\n", (unsigned long)sectnum);
         return Int13Status::SectorNotFound;
     }
+    if (nn_layer != NULL)
+        return (sectnum < nn_layer_index.size() && NN_LayerWrite(sectnum,data)) ? Int13Status::NoError : Int13Status::ControllerFailure;
+    if (NN_Lockdown())
+        return Int13Status::WriteProtected; /* a copy that plays for a remote player: an image without a layer is never written */
     bytenum += image_base;
 
     //LOG_MSG("Writing sectors to %ld at bytenum %d", sectnum, bytenum);
@@ -1797,6 +1912,10 @@ imageDisk::imageDisk(class DOS_Drive *useDrive, unsigned int letter, uint32_t fr
 
 imageDisk::~imageDisk()
 {
+    if(nn_layer != NULL) {
+        fclose(nn_layer);
+        nn_layer=NULL;
+    }
     if(diskimg != NULL) {
         fclose(diskimg);
         diskimg=NULL;
