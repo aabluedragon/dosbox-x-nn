@@ -2424,7 +2424,7 @@ void VP_BuildPlane(VPPlane &pl,const uint8_t *raw,unsigned w,unsigned h,unsigned
 }
 
 struct VPScratch {
-    std::vector<uint8_t> mask[VP_LEVELS], maskc;
+    std::vector<uint8_t> mask[VP_LEVELS], maskc, stillnow;
     std::vector<float> vals, sorted;
     std::vector<int32_t> srcx, rowk;
     std::vector<float> reach;
@@ -2858,6 +2858,7 @@ public:
         samples.clear();
         if (samesize) return;   /* only the colours changed: what was learned still holds */
         still.assign((size_t)w * h,0);
+        still_at.assign((size_t)w * h,0);
         still_dirty = true;
         rowch.clear(); colch.clear(); view_frames = 0;
         vx0 = vy0 = 0; vx1 = (int)w; vy1 = (int)h;
@@ -3278,6 +3279,7 @@ private:
     unsigned chain = 1;
     VPScratch tmp;
     std::vector<uint8_t> still;         /* per pixel: how often it stayed the same while the view moved */
+    std::vector<uint32_t> still_at;     /* ...when it last counted as staying (ms, 0: not lately), see markStill */
     std::vector<uint8_t> stay;          /* ...and whether it counts as staying (see cleanStill) */
     bool still_dirty = true;
     VPPointer told_ptr;                 /* the newest report of the driver's pointer the host has sent... */
@@ -3953,7 +3955,9 @@ private:
 
     /* The pixels that stay while the view moves: the same as a frame ago in their place, and not what the view's
      * movement would have brought there (nor its neighbours: the movement is only known to about a pixel). A pixel
-     * that changes in place starts over. */
+     * that changes in place starts over, but one that counted as staying lately keeps counting for two seconds
+     * unless what changed it is the world moving through it: a weapon that bobs while the player walks, or fires,
+     * changes its pixels all the time and is still no part of the world (moved with it, it came apart). */
     void markStill(const uint8_t *raw,const uint8_t *prevraw,const VPMotion &mo) {
         if (!mo.okx) return;
         const bool movedy = mo.oky && fabsf(mo.sy) >= 1.5f * unity;
@@ -3961,7 +3965,9 @@ private:
         const size_t bpp = RP_BytesPerPixel(fmt), pal = (fmt == 8) ? 768 : 0;
         const int iw = (int)w, ih = (int)h, dy = mo.oky ? (int)lroundf(mo.sy) : 0;
         const uint64_t nowus = RP_Micros();
+        const uint32_t nowms = (uint32_t)(nowus / 1000u) | 1u;
         const bool layered = anyLayer(nowus);
+        if (still_at.size() != still.size()) still_at.assign(still.size(),0);
         tmp.srcx.resize(w);
         tmp.rowk.assign(w,0);       /* per column: the pixels that changed */
         if (rowch.size() != h || colch.size() != w) { rowch.assign(h,0.0f); colch.assign(w,0.0f); view_frames = 0; }
@@ -3972,17 +3978,30 @@ private:
             const uint8_t *c = raw + pal + (size_t)y * w * bpp, *p = prevraw + pal + (size_t)y * w * bpp;
             const uint8_t *ps = prevraw + pal + (size_t)(rowok ? ys : 0) * w * bpp;
             uint8_t *st = still.data() + (size_t)y * w;
+            uint32_t *sa = still_at.data() + (size_t)y * w;
             int changed = 0;
             float even = 0, rate = 1;
             if (layered) rowLayer(y,nowus,even,rate);
             const int flat = (int)lroundf(rate * mo.sx);
             for (int x=0;x < iw;x++) {
                 const uint8_t *cp = c + (size_t)x * bpp;
-                if (!samePixel(cp,p + (size_t)x * bpp,bpp)) { st[x] = 0; changed++; tmp.rowk[(size_t)x]++; continue; }
                 const int xs = even > 0.5f ? x - flat : tmp.srcx[(size_t)x];
-                if (!rowok || xs < 1 || xs >= iw - 1) continue;
-                const uint8_t *sp = ps + (size_t)xs * bpp;
-                if (!samePixel(cp,sp,bpp) && !samePixel(cp,sp - bpp,bpp) && !samePixel(cp,sp + bpp,bpp) && st[x] < 255) st[x]++;
+                const bool known = rowok && xs >= 1 && xs < iw - 1;
+                const uint8_t *sp = ps + (size_t)(known ? xs : 0) * bpp;
+                /* what the view's movement brings there; a pixel that stays itself (or did lately) proves nothing:
+                 * the arms of a crosshair have one colour, and moved by about its size one arm "brought" the other */
+                const size_t si = (size_t)(rowok ? ys : 0) * w + (size_t)(known ? xs : 1);
+                auto moves = [&](size_t i) { return still[i] < VP_STILL && (still_at[i] == 0 || nowms - still_at[i] > 2000u); };
+                const bool world = known && ((samePixel(cp,sp,bpp) && moves(si)) || (samePixel(cp,sp - bpp,bpp) && moves(si - 1))
+                    || (samePixel(cp,sp + bpp,bpp) && moves(si + 1)));
+                if (!samePixel(cp,p + (size_t)x * bpp,bpp)) {
+                    st[x] = 0; changed++; tmp.rowk[(size_t)x]++;
+                    if (world) sa[x] = 0;
+                    continue;
+                }
+                if (!known || world) continue;
+                if (st[x] < 255) st[x]++;
+                if (st[x] >= VP_STILL) sa[x] = nowms;
             }
             rowch[(size_t)y] += 0.1f * ((float)changed / (float)iw - rowch[(size_t)y]);
         }
@@ -4005,25 +4024,37 @@ private:
         return bpp == 1 ? *a == *b : (bpp == 2 ? same<uint16_t>(a,b) : same<uint32_t>(a,b));
     }
 
-    /* What the picture is moved by: a pixel counts as staying when most of the 3 x 3 around it do, so that single
-     * pixels of the world that happened to pass (or of a status bar that did not) make no specks or holes. */
+    /* What the picture is moved by. A pixel counts as staying when it stays (or did in the last two seconds, see
+     * markStill) and one of the 8 around it does too: a single pixel of the world that happened to pass makes no
+     * speck, and the 1-pixel strokes of a crosshair or of text on the screen stay whole to their ends (a majority of
+     * the 3 x 3 broke them, and their pieces were moved with the world). A pixel with 6 of its 8 around it staying
+     * counts as staying too (no holes). */
     void cleanStill(void) {
         still_dirty = false;
         const int iw = (int)w, ih = (int)h;
+        const uint32_t nowms = (uint32_t)(RP_Micros() / 1000u) | 1u;
+        if (still_at.size() != still.size()) still_at.assign(still.size(),0);
+        tmp.stillnow.resize((size_t)w * h);
+        uint8_t *is = tmp.stillnow.data();
+        for (size_t i=0;i < still.size();i++)
+            is[i] = (uint8_t)(still[i] >= VP_STILL || (still_at[i] != 0 && nowms - still_at[i] <= 2000u));
         stay.assign((size_t)w * h,0);
         tmp.rowk.assign((size_t)w * 3,0);      /* three rows of sums of three */
         int32_t *rows[3] = { tmp.rowk.data(), tmp.rowk.data() + w, tmp.rowk.data() + 2 * (size_t)w };
         auto sumrow = [&](int y,int32_t *out) {
             if (y < 0 || y >= ih) { for (int x=0;x < iw;x++) out[x] = 0; return; }
-            const uint8_t *st = still.data() + (size_t)y * w;
-            for (int x=0;x < iw;x++)
-                out[x] = (x > 0 && st[x-1] >= VP_STILL) + (st[x] >= VP_STILL) + (x + 1 < iw && st[x+1] >= VP_STILL);
+            const uint8_t *r = is + (size_t)y * w;
+            for (int x=0;x < iw;x++) out[x] = (x > 0 && r[x-1]) + r[x] + (x + 1 < iw && r[x+1]);
         };
         sumrow(-1,rows[0]); sumrow(0,rows[1]);
         for (int y=0;y < ih;y++) {
             sumrow(y + 1,rows[2]);
             uint8_t *o = stay.data() + (size_t)y * w;
-            for (int x=0;x < iw;x++) o[x] = (uint8_t)((rows[0][x] + rows[1][x] + rows[2][x]) >= 5);
+            const uint8_t *r = is + (size_t)y * w;
+            for (int x=0;x < iw;x++) {
+                const int n = rows[0][x] + rows[1][x] + rows[2][x];     /* (itself included) */
+                o[x] = (uint8_t)(r[x] ? n >= 2 : n >= 6);
+            }
             int32_t *first = rows[0];
             rows[0] = rows[1]; rows[1] = rows[2]; rows[2] = first;
         }
