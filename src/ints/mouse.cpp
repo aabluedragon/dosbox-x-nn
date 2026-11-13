@@ -1055,6 +1055,26 @@ void Mouse_CursorMovedRaw(float xrel,float yrel,float x,float y,bool emulate) {
     Mouse_AddEvent(MOUSE_HAS_MOVED);
 }
 
+/* For remote play (remoteplay.cpp): where the INT 33h driver has the pointer, as parts of its range, and how far one
+ * count of mouse motion moves it there: (gx1,gy1) for a motion of a single count, (gxs,gys) for a larger one (the
+ * driver's sensitivity applies to those, see Mouse_CursorMovedRaw). False while mouse motion does not move the
+ * driver's pointer (a PS/2 mouse read directly) or the pointer has no range. */
+bool Mouse_NNPointer(float &x,float &y,float &gx1,float &gy1,float &gxs,float &gys) {
+    extern bool Mouse_Vertical;
+    if (!IS_PC98_ARCH && KEYBOARD_AUX_Active()) return false;
+    if (mouse.max_x <= mouse.min_x || mouse.max_y <= mouse.min_y) return false;
+    const float rx = (float)(mouse.max_x - mouse.min_x), ry = (float)(mouse.max_y - mouse.min_y);
+    x = ((float)mouse.x - (float)mouse.min_x) / rx;
+    y = ((float)mouse.y - (float)mouse.min_y) / ry;
+    gx1 = (float)mouse.pixelPerMickey_x / rx;
+    gy1 = (Mouse_Vertical ? -1.0f : 1.0f) * (float)mouse.pixelPerMickey_y / ry;
+    gxs = gx1 * (float)mouse.senv_x;
+    gys = gy1 * (float)mouse.senv_y;
+    if (mouse.senv_x < 1.0) gx1 = gxs;
+    if (mouse.senv_y < 1.0) gy1 = gys;
+    return true;
+}
+
 uint8_t Mouse_GetButtonState(void) {
     return mouse.buttons;
 }

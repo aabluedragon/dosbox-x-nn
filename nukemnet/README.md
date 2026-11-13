@@ -166,9 +166,101 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   With both, a Windows 95 game hosted for four players (three 640x480 streams from one computer through NukemNet's
   IPv6 tunnel, 73 ms away) plays at the game's full 30 to 34 frames a second for each viewer with the ping at the
   route's own; before, the tunnel's queue grew until pings passed a second and viewers got a few frames a second.
+- Remote play view prediction (capability `inputnetPredict`, viewer side, `[inputnet] predict = true`, Ctrl+F12
+  turns it off and on): what a player feels as lag in a streamed first-person game is the view, which turns one round
+  trip and the game's own reaction after the hand. The viewer shows the newest frame already moved by the input that
+  frame does not show yet, and draws it again between frames whenever that changes, so the view follows the mouse
+  and the turn keys at once and the frames that arrive later land where the picture already is. Nothing about a game
+  is configured; the viewer learns from the stream while it is played (`ViewPredict` in `remoteplay.cpp`):
+  - how far the picture moved between two frames: the pixels that changed, matched against the frame before, first
+    in a small copy of the picture, then to a fraction of a pixel (`VP_Measure`; a status bar, a border and a weapon
+    held still do not change and so do not count);
+  - which input each frame shows: the host says which input event it had applied when it took the frame, and now
+    also when (`RP_FRAMEINFO`);
+  - the picture's movement per mouse count and the game's own delay (a regression over delays of 0 to 200 ms);
+  - the lens: how much more the sides of a view in perspective move than its middle, from 8 strips of the picture
+    (a 2D view moves as one piece), learned only from movement the player's input made;
+  - what each held key does to the view by how long it has been held, per combination of Shift, Ctrl and Alt;
+  - the view's rectangle (not the status bar, a border or a side panel) and the pixels in it that never move with it;
+  - layers: bands of the view that an engine scrolls evenly at a rate of its own (`VP_Bands`). Build's sky does:
+    measured in Duke Nukem 3D at 1.24 times the ground's movement in the middle of the view, the same in every
+    column, where the lens moves the sides 1.8 times as far. Each of 6 bands is tried both ways against a frame a
+    few frames back, and a band that an even scroll explains clearly better is moved at its own rate and left out
+    of the view's own measurement; while layers are in view the lens is not learned (low in the view the strips
+    mislead) and is taken to be the usual 90 degrees if no other frames have taught it.
+  A prediction is shown only while arriving frames keep agreeing with what was predicted for them, so it switches
+  itself off in menus, pauses and cutscenes and on again in the game; Escape, Tab and the function keys switch it off
+  at once. Only turning and looking are predicted: walking, other players and shots keep the connection's delay.
+  What a turn brings into view at the edge: every frame is also written into a picture of all directions around the
+  player (a column per pixel of turn, by height on a cylinder; `seenStore`), and the edge of a moved picture, and what
+  a weapon held still hides, is filled from there when it was seen in the last four seconds and the player has not
+  walked since (aiming goes back and forth: in the tests 94 to 97% of the edge was filled that way in Duke Nukem 3D
+  with mouse turns, 36 to 56% in Doom, where the test also holds a turn key for a second at a time); otherwise the
+  view mirrored there, dimmed, stands in.
+  Measured (November 2026) with scripted mouse and key input in the viewer. One PC, 50 ms added each way (112 ms
+  from input to screen): Doom follows the mouse after 7 ms; the picture was 6 to 9 pixels (of 320) behind the hand
+  without prediction and 0.4 to 0.7 off with it; arrow-key turns 23 to 26 behind without, 1 to 3 off with; lens found
+  as 90 degrees in a 288-pixel view (f 144 to 146; Doom's is 144), learned within about two seconds of turning. Duke
+  Nukem 3D outdoors: 0.50 pixels a count after the game's own 43 to 49 ms, 9 behind without, 1.0 to 1.7 off with;
+  two of six bands found to scroll evenly at 1.24. Between two computers 70 ms apart (a Windows host with Doom in an
+  IPX-over-InputNet room, 88 to 96 ms from input to screen plus the net game's own 47 ms): the view followed the mouse
+  after 7 ms, 0.4 off where it had moved 4 to 7, key turns 2.2 off where it had moved 34; while frames arrived 200 to
+  340 ms late for a moment the view still followed the mouse to within 3 pixels. A menu opened with Escape: off at
+  once, on again two stretches of frames after the game answers the mouse. Cost in the viewer: about 1 ms a frame to
+  learn and 0.5 to 0.8 ms to move the picture at 320x200, 2.5 ms a frame to learn at 800x600. The mean difference in
+  brightness between what was on the screen and the frame the game later drew for that moment: Doom 11.9 as
+  received, 6.2 as shown; at the sides of the view 12.3 and 6.9.
+  Not verified in a game: looking up and down (measured and moved the same way, tested with synthetic pictures
+  only). A game that changes how the mouse turns (sensitivity, a zoom) is learned again after about a second.
+  A 2D side-scroller gains nothing: in Jazz Jackrabbit the view is recognised as one that moves as one piece, but
+  its scrolling follows the character's momentum, not the keys held, so the predictions keep failing their check
+  and the picture is shown as received (prediction was on in 0 to 8% of the stretches); what was seen is kept for
+  such flat views too, which only synthetic pictures have tested.
+- Remote play pointer dot for DOS games (viewer, with a host from this release on): a game that draws its own
+  pointer (a strategy game, an adventure, a menu) shows it one round trip late like everything else. The host now
+  reports with every frame where the DOS mouse driver has its pointer and how far a count of motion moves it
+  (`Mouse_NNPointer`, sent in `RP_FRAMEINFO`); the viewer adds the motion the host had not applied yet and draws a
+  small dot there at once, as it does over a Windows guest, and the game's pointer follows it. Whether a game shows
+  a pointer at the driver's place at all is found out by looking: when the place moves, the picture has to change
+  around the old and the new place and hardly anywhere else (`judgePointer`); the dot shows after three such moves.
+  It starts from the newest report the host has sent, whichever frame is on the screen (`pointerTold`): a report is
+  a datagram of its own, and tied to the frame on the screen every lost one switched the dot off for three moves
+  (with 3% of the host's datagrams dropped on one PC the dot was off at 3 of 8 checks that way, and on all of the
+  time this way).
+  Tested with a DOS test program that draws its own pointer and with Bonus (a mouse-only game), on one PC with
+  50 ms added each way and between two computers 70 ms apart (a Windows host in a NukemNet Inputnet room, 77 to
+  88 ms from input to screen): the game's pointer was where the driver has it in every move of nearly every
+  five-second stretch (19 of 19, 31 of 31, 34 of 34; 21 of 33 in one of them on one PC), the dot led the game's
+  arrow, and it was on all of the time once it had come on. In Doom, which turns with the mouse, 1 of 73 moves on
+  one PC and none of 51 between the two computers, and no dot. The viewer also checks its own arithmetic: every
+  report is compared with where the one before it and the motion sent since said the pointer would be. Between the
+  two computers that was the same place (0.00 pixels apart) in 1,253 of 1,254 reports, and 15 pixels apart once,
+  when the game moved its pointer by itself at the start; on one PC also with wide sweeps into the edges of the
+  screen, where the driver stops its pointer at every step and so does the dot. The viewer's log says "pointer dot
+  on/off", for how much of the time it was shown and how far the pointer came to be from it.
+- Remote play encoding takes a fifth of the time: where the encoder's time went is now in the host's log
+  ("encoding a frame: ..."). For a 320x200 game it was mostly wasted: 2 of 5 ms looking for a scroll in every frame
+  of a view that turns in perspective and never has one (now every 8th or 16th frame after four without); 1 ms
+  compressing the frame alone as well as its difference to send the smaller (now one of them, chosen by how much of
+  the frame is as in its base: over Doom and Duke Nukem 3D streams the difference was smaller every time with three
+  tenths or more unchanged, the frame alone nearly every time with less; a link that limits the video still gets
+  both tried); and frames from 48 KB on are now compressed in pieces on all threads (128 KB before, just above a
+  320x200 picture with its lines doubled). Doom on one Linux PC: 4.8 to 5.2 ms a frame before, 1.4 to 1.7 after, the
+  same bytes per second.
+- A Windows remote play host is no longer slowed down for not being in front: Windows 11 puts a process whose window
+  is minimized or hidden on its slow cores and takes its one-millisecond timers away, which is exactly what a copy
+  that plays for a remote player is. The host now asks to be left out (`Host_NoThrottle`:
+  `SetProcessInformation(ProcessPowerThrottling)`, looked up at run time). On the test laptop (Core i7-13700H) a
+  hidden host with Doom ran at 184,000 to 271,000 cycles and took 5.8 to 7.0 ms to encode a frame before; with this
+  and the encoder changes 820,000 to 853,000 cycles and 0.9 to 1.1 ms. Over the real link to that laptop the viewer
+  measured 1.0 to 1.5 ms of encoding in the input-to-screen time where it had measured 7.2 to 7.7.
+- Remote play sound no longer drifts late: the viewer's queue of sound not yet played grew with every burst of
+  packets and only emptied at a quarter of a second (thrown away). Above 70 ms it is now played 3% faster (8% above
+  130 ms), by interpolation, until it is back at 45 ms; the viewer's log says how long sound waits on average (over
+  the real link: 127 ms after a hiccup, back to 49 ms within seconds).
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true,"inputnetPredict":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

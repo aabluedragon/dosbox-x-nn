@@ -66,6 +66,13 @@ bool remoteplay_screen_hidden = false;
 # include "SDL_net.h"
 #endif
 
+#if defined(WIN32)
+# ifndef NOMINMAX
+#  define NOMINMAX
+# endif
+# include <windows.h>
+#endif
+
 #ifndef SDLNet_GetError
 # define SDLNet_GetError SDL_GetError
 #endif
@@ -80,6 +87,7 @@ extern bool nn_remote_cursor, nn_remote_cursor_locked;      /* src/ints/bios.cpp
 extern uint16_t nn_remote_cursor_x, nn_remote_cursor_y;
 extern uint16_t shell_psp;
 bool PROGRAMS_IsRunningInternalPSP(uint16_t psp);
+bool Mouse_NNPointer(float &x,float &y,float &gx1,float &gy1,float &gxs,float &gys);   /* src/ints/mouse.cpp */
 bool TTF_using(void);
 #if defined(USE_TTF)
 void ttf_switch_off(bool ss);
@@ -106,7 +114,11 @@ enum {
     RP_FRAMEACK = 10,   /* viewer -> host: session, u8 flags (1: has a frame), newest decoded frame,
                            video fragments expected and received (cumulative) */
     RP_FRAMEINFO = 11   /* host -> viewer (RP_FEAT_TIMING): frame id, newest input event applied before the frame was
-                           taken, microseconds from applying it to taking the frame, microseconds encoding the frame */
+                           taken, microseconds from applying it to taking the frame, microseconds encoding the frame,
+                           and (hosts with view prediction) when it was taken: the host's clock in microseconds, its
+                           low 32 bits; then u8 1 when the DOS mouse driver's pointer follows: u16 x, u16 y (its
+                           place as parts of its range, 65535 = the far end) and four f32: how far one count of
+                           mouse motion moves it, x and y, for a motion of one count and for a larger one */
 };
 
 /* Viewer features (u32 after the session id in RP_HELLO; older viewers send none) */
@@ -326,6 +338,8 @@ ShiftVec enc_step_vec[RP_SHIFT_MAX];                    /* ...and since the fram
 unsigned enc_step_n = 0;
 std::vector<uint32_t> enc_pieces, enc_altpieces;
 unsigned enc_plain_streak = 0;                  /* frames in a row that were smaller compressed alone than as a difference */
+float enc_same = -1.0f;                         /* the part of the frame (in groups of 8 bytes) that is as in its base; -1: not known */
+unsigned enc_noscroll = 0;                      /* frames looked at in a row in which nothing had scrolled */
 std::deque<EncFrame> enc_hist;                  /* the newest frames sent, oldest first */
 EncFrame enc_key;                               /* the last key frame (kept even when older than enc_hist) */
 unsigned enc_w = 0, enc_h = 0, enc_fmt = 0;
@@ -352,6 +366,8 @@ bool rate_limited = false;                      /* a viewer reported loss: video
  * work buffers belong to the encoder alone. With one processor there is no encoder thread and the emulation thread
  * encodes as before. */
 struct Capture {
+    bool ptr = false;                   /* where the mouse driver had its pointer when the picture was taken... */
+    float ptr_v[6];                     /* ...and how far a count moves it (Mouse_NNPointer) */
     std::vector<uint8_t> px;            /* the rows, without padding */
     uint8_t pal[1024];
     unsigned w = 0, h = 0, bpp = 0;
@@ -694,7 +710,8 @@ struct ZJob {
     z_stream zs;
 };
 const unsigned RP_ZWORKERS_MAX = 3;
-const size_t RP_ZPARALLEL_MIN = (size_t)128 << 10;   /* smaller frames (320x200 ones) are not worth splitting */
+const size_t RP_ZPARALLEL_MIN = (size_t)48 << 10;    /* smaller frames are not worth splitting (a 320x200 picture is 64 KB,
+                                                         or 128 KB with every line twice) */
 ZJob zjobs[RP_ZWORKERS_MAX + 1];
 SDL_Thread *zthreads[RP_ZWORKERS_MAX];
 SDL_sem *zgo[RP_ZWORKERS_MAX], *zdone[RP_ZWORKERS_MAX];
@@ -915,6 +932,9 @@ unsigned aud_rate = 0;
 
 /* Statistics */
 uint64_t stat_bytes = 0, stat_enc_us = 0, stat_index_us = 0, stat_cap_us = 0;
+/* where the encoder's time goes: waiting for its thread to start on the picture, looking for a scroll, the difference,
+ * compressing it, compressing the frame alone as well */
+uint64_t stat_part_us[5] = { 0, 0, 0, 0, 0 };
 uint32_t stat_frames = 0, stat_keys = 0, stat_offered = 0, stat_skipped = 0, stat_replaced = 0;
 uint32_t stat_shifted = 0;                      /* frames sent with scroll prediction */
 
@@ -1141,6 +1161,15 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
             enc_thread != NULL ? "" : " (no encoder thread)",
             frames ? (unsigned)((stat_shifted - last_shifted) * 100u / frames) : 0u,
             v.delay_now,(unsigned)std::min(v.delay_base,v.delay_base_prev),v.delay_late ? ", late" : "",(long)CPU_CycleMax);
+        {
+            static uint64_t last_part[5] = { 0, 0, 0, 0, 0 };
+            if (frames)
+                LOG_MSG("INPUTNET: encoding a frame: %.2f ms until the encoder starts on it, %.2f looking for a scroll, %.2f for the difference, %.2f compressing it, %.2f compressing the frame alone too",
+                    (stat_part_us[0] - last_part[0]) / 1000.0 / frames,(stat_part_us[1] - last_part[1]) / 1000.0 / frames,
+                    (stat_part_us[2] - last_part[2]) / 1000.0 / frames,(stat_part_us[3] - last_part[3]) / 1000.0 / frames,
+                    (stat_part_us[4] - last_part[4]) / 1000.0 / frames);
+            for (unsigned k=0;k < 5;k++) last_part[k] = stat_part_us[k];
+        }
         last_shifted = stat_shifted;
         last_frames = stat_frames; last_bytes = stat_bytes; last_offered = stat_offered; last_skipped = stat_skipped;
         last_replaced = stat_replaced;
@@ -1477,6 +1506,27 @@ int REMOTEPLAY_PresentMode(void) {
     return host_running ? cfg_present : 0;
 }
 
+#if defined(WIN32)
+/* Windows 11 slows down a process whose window is minimized or hidden ("efficiency mode": its threads are put on
+ * the slow cores and its timers lose their one-millisecond steps). That is exactly what a copy that plays for a
+ * remote player is, and it showed: the same frame took the encoder more than twice as long on a Windows host as on
+ * a Linux one. A remote play host therefore asks to be left out of both (SetProcessInformation with
+ * ProcessPowerThrottling; looked up at run time, older Windows has no such call or only the first of the two). */
+static void Host_NoThrottle(void) {
+    typedef BOOL (WINAPI *SetInfo)(HANDLE,int,LPVOID,DWORD);
+    const HMODULE k = GetModuleHandleA("kernel32.dll");
+    const SetInfo set = k ? (SetInfo)(void*)GetProcAddress(k,"SetProcessInformation") : NULL;
+    if (set == NULL) return;
+    struct { ULONG Version, ControlMask, StateMask; } st = { 1, 0x1 | 0x4, 0 };    /* execution speed, timer resolution: never throttled */
+    bool ok = set(GetCurrentProcess(),4 /* ProcessPowerThrottling */,&st,sizeof(st)) != 0;
+    if (!ok) {
+        st.ControlMask = 0x1;
+        ok = set(GetCurrentProcess(),4,&st,sizeof(st)) != 0;
+    }
+    LOG_MSG("INPUTNET: remote play host %s of Windows' slowing down of windows that are not in front",ok ? "is left out" : "could not be left out");
+}
+#endif
+
 bool REMOTEPLAY_StartServer(uint16_t port) {
     if (host_running) return false;
     if (!RP_OpenNet()) return false;
@@ -1512,6 +1562,9 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     guard_state = -1;
     guard_typed = false;
     LOG_MSG("INPUTNET: remote play: waiting for players on UDP port %u",(unsigned)port);
+#if defined(WIN32)
+    Host_NoThrottle();
+#endif
     REMOTEPLAY_UpdateMenu();
     return true;
 }
@@ -1644,6 +1697,8 @@ namespace {
 /* Encodes one picture and queues it for the viewers: on the encoder thread, or on the emulation thread when there is
  * none. */
 void Enc_Frame(const Capture &c) {
+    uint64_t part[5] = { 0, 0, 0, 0, 0 }, mark = RP_Micros();
+    part[0] = mark - std::min(mark,c.taken_us);
     const unsigned width = c.w, height = c.h, bpp = c.bpp;
     const size_t rowbytes = (size_t)width * RP_BytesPerPixel(bpp);
 
@@ -1745,7 +1800,12 @@ void Enc_Frame(const Capture &c) {
     geom.w = width; geom.h = height; geom.bpp = RP_BytesPerPixel(fmt); geom.pal = palbytes;
     bool shifted = false;
     enc_step_n = 0;
-    if (!key && shiftmode && !enc_hist.empty() && enc_hist.back().raw.size() == rawsize) {
+    mark = RP_Micros();
+    /* Looking for a scroll costs more than everything else together (2 of 5 ms a frame at 320x200), and a view that
+     * turns in perspective never has one: after four frames without, only every eighth frame is looked at, after
+     * thirty-two every sixteenth, until one is found again. */
+    const bool look = enc_noscroll < 4 || (id & (enc_noscroll < 32 ? 7u : 15u)) == 0;
+    if (!key && shiftmode && look && !enc_hist.empty() && enc_hist.back().raw.size() == rawsize) {
         /* How far the picture has moved since the frame before, starting from how far that one had moved. */
         const EncFrame &prev = enc_hist.back();
         for (unsigned k=0;k < prev.nstep;k++) enc_step_vec[k] = prev.step[k];
@@ -1780,10 +1840,13 @@ void Enc_Frame(const Capture &c) {
             if (enc_shift_n == 0) enc_shift_n = RP_FindShift(enc_raw.data(),base->raw.data(),geom,enc_shift_vec,0);
         }
         shifted = enc_shift_n != 0 && RP_ShiftBlocks(enc_raw.data(),base->raw.data(),geom,enc_shift_vec,enc_shift_n,enc_shiftbits);
+        if (shifted) enc_noscroll = 0;
+        else if (enc_noscroll < 1000) enc_noscroll++;
     }
-    if (!key && !shifted && !limited && enc_plain_streak >= 3 && (id & 3u) != 0) key = turned_key = true;
+    { const uint64_t t = RP_Micros(); part[1] = t - mark; mark = t; }
 
     const uint8_t *src = enc_raw.data();
+    enc_same = -1.0f;
     if (!key) {
         enc_work.resize(rawsize);
         const uint8_t *a = enc_raw.data(), *b = base->raw.data();
@@ -1798,25 +1861,40 @@ void Enc_Frame(const Capture &c) {
             }
         }
         else {
-            size_t i = 0;
+            size_t i = 0, same = 0;
             for (;i + 8 <= rawsize;i += 8) {
                 uint64_t x, y;
                 memcpy(&x,a + i,8); memcpy(&y,b + i,8);
                 x ^= y;
+                same += x == 0;
                 memcpy(d + i,&x,8);
             }
             for (;i < rawsize;i++) d[i] = a[i] ^ b[i];
+            enc_same = rawsize >= 64 ? (float)(same * 8) / (float)rawsize : 1.0f;
         }
         src = enc_work.data();
+        /* Much motion (turning in a 3D game): the frame alone compresses better than its difference, and goes out
+         * as a key frame, which every viewer decodes whatever it has. Which of the two is smaller follows from how
+         * much of the frame is as in its base: measured over Doom and Duke Nukem 3D streams, with three tenths or
+         * more the difference was the smaller one every time, with less the frame alone nearly every time (by a
+         * tenth). So only one of them is compressed, not both to compare; a link that limits the video still gets
+         * both tried (below), there every byte counts more than a millisecond. */
+        if (!shifted && !limited && enc_same >= 0 && enc_same < 0.3f) {
+            key = turned_key = true;
+            src = enc_raw.data();
+        }
     }
+    { const uint64_t t = RP_Micros(); part[2] = t - mark; mark = t; }
 
     size_t clen = 0;
     bool ok = RP_Compress(src,rawsize,enc_comp,RP_FRAME_HDR,clen,enc_pieces);
+    { const uint64_t t = RP_Micros(); part[3] = t - mark; mark = t; }
     /* Much motion (turning in a 3D game): the frame alone often compresses better than its difference. Such a frame
      * goes out as a key frame, which every viewer decodes, whatever it has. */
     if (ok && !key) {
         bool alone = false;
-        if (clen > rawsize / 16) {
+        const size_t dlen = clen;
+        if (clen > rawsize / 16 && (limited || shifted)) {
             size_t ilen = 0;
             if (RP_Compress(enc_raw.data(),rawsize,enc_alt,0,ilen,enc_altpieces) && ilen < clen) {
                 enc_comp.resize(RP_FRAME_HDR + ilen);
@@ -1828,7 +1906,16 @@ void Enc_Frame(const Capture &c) {
             }
         }
         enc_plain_streak = alone ? enc_plain_streak + 1 : 0;
+        static const bool encstats = getenv("NN_RP_ENCSTATS") != NULL && getenv("NN_RP_ENCSTATS")[0] != 0;
+        if (encstats && enc_same >= 0) {
+            size_t ilen = 0;
+            std::vector<uint8_t> t1; std::vector<uint32_t> t2;
+            RP_Compress(enc_work.size() == rawsize && alone ? enc_raw.data() : enc_raw.data(),rawsize,t1,0,ilen,t2);
+            LOG_MSG("INPUTNET: encstats same %.3f difference %u alone %u",(double)enc_same,(unsigned)dlen,(unsigned)ilen);
+        }
+        (void)dlen;
     }
+    { const uint64_t t = RP_Micros(); part[4] = t - mark; mark = t; }
     /* In front of the compressed frame: the shift table of a frame with scroll prediction, then the piece table, for
      * viewers that inflate the pieces at the same time. */
     const size_t sbytes = (ok && shifted) ? 1 + 2 * enc_shift_n + 3 + enc_shiftbits.size() : 0;
@@ -1914,6 +2001,7 @@ void Enc_Frame(const Capture &c) {
     if (sbytes) stat_shifted++;
     if (turned_key) { enc_lastkey = SDL_GetTicks(); enc_keyreq = false; }
     stat_enc_us += encoded_us - std::min(encoded_us,c.taken_us);
+    for (unsigned k=0;k < 5;k++) stat_part_us[k] += part[k];
     /* Ahead of the frame itself, so viewers that measure latency know which of their input it shows: what had been
      * applied when the picture was taken, not what has come in since. */
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
@@ -1924,6 +2012,14 @@ void Enc_Frame(const Capture &c) {
         w.u32(c.applied[i]);
         w.u32(RP_ClampU32(c.taken_us - std::min(c.taken_us,c.applied_us[i])));
         w.u32(RP_ClampU32(encoded_us - std::min(encoded_us,c.taken_us)));
+        w.u32((uint32_t)c.taken_us);    /* for view prediction: older viewers stop reading before it */
+        /* ...and the mouse driver's pointer, for the viewer's pointer dot */
+        w.u8(c.ptr ? 1 : 0);
+        if (c.ptr) {
+            w.u16((uint16_t)(std::max(0.0f,std::min(1.0f,c.ptr_v[0])) * 65535.0f + 0.5f));
+            w.u16((uint16_t)(std::max(0.0f,std::min(1.0f,c.ptr_v[1])) * 65535.0f + 0.5f));
+            for (unsigned k=2;k < 6;k++) w.f32(c.ptr_v[k]);
+        }
         Host_SendTo(v.addr,w.buf,w.len);
     }
     Host_Unlock();
@@ -2058,6 +2154,8 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
         c.applied[i] = v_applied[i];
         c.applied_us[i] = v_applied_us[i];
     }
+    /* (a Windows guest's pointer goes another way: see RPEV_MMOVE) */
+    c.ptr = mouse_notify_mode == 0 && Mouse_NNPointer(c.ptr_v[0],c.ptr_v[1],c.ptr_v[2],c.ptr_v[3],c.ptr_v[4],c.ptr_v[5]);
 
     Host_Lock();
     cap_last = slot;
@@ -2156,6 +2254,1989 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* View prediction (viewer)                                                   */
+/* ------------------------------------------------------------------------- */
+
+/* Most of what a player feels as lag in a streamed game is the view: the mouse moves, and the picture turns one round
+ * trip and the game's own reaction later. A turn is a simple change of the picture: it moves the whole view sideways
+ * by an amount that depends on the column only, never on how far away things are (looking up and down moves it
+ * vertically). So the viewer shows the newest frame already moved by the input that frame does not show yet; the
+ * frames that follow arrive where the picture already is. Between frames the picture is drawn again whenever the
+ * prediction has changed, so the view also follows the hand while the link stalls for a moment.
+ *
+ * Nothing is known about a game beforehand. All of it is learned from the stream while it is played:
+ *  - how far the picture moved from one frame to the next (VP_Measure: the place where the pixels that changed
+ *    fit the frame before, for the middle of the view and for 8 strips of it);
+ *  - which input a frame shows (RP_FRAMEINFO: the newest input applied when the host took it, and when);
+ *  - how far the picture moves per mouse count, and how long the game itself takes to show it (a regression of the
+ *    picture's movement on the mouse's, for every candidate delay);
+ *  - the lens: how much more the sides move than the middle (a view in perspective), or all alike (a 2D view);
+ *  - what a held key does to the view, by how long it has been held (turn keys), per combination of Shift, Ctrl
+ *    and Alt;
+ *  - the view itself: the rows and columns that change when it moves (not a status bar, a border, a side panel),
+ *    and inside it the pixels that stay (a weapon held still, a crosshair): they are left in place;
+ *  - layers (VP_Bands, learnLayers): bands of the view that the engine scrolls evenly at a rate of their own instead
+ *    of turning them with the lens (Build's sky: 1.24 times the ground's movement in the middle of the view, the
+ *    same in every column). Each of 6 bands is tried both ways against a frame a few frames back; a band that an
+ *    even scroll explains clearly better is moved at its own rate and left out of the view's own measurement, and
+ *    while layers are in view the lens is not learned (taken to be 90 degrees wide if nothing else has taught it).
+ * A prediction is shown only while the frames that arrive agree with what had been predicted for them (the gate):
+ * in a menu, a pause or a cutscene the picture does not follow the mouse, and prediction stops after two stretches
+ * of frames that say so. Escape, Tab and the function keys close the gates at once, since they open menus.
+ * Ctrl+F12 turns prediction off and on; [inputnet] predict = false keeps it off.
+ * What a turn brings into view at the edge is not in the frame. Every frame is therefore also written into a picture
+ * of all directions around the player (seenStore: a column per pixel of turn, on a cylinder for a view in
+ * perspective), placed by the movement measured since; the edge of a moved picture, and what a pixel that stays
+ * hides of the world, is filled from there when it was seen in the last four seconds. The memory starts over when
+ * the picture changes in a way that is not the view turning (the player walks: everything is seen from another place
+ * then) and when the lens or the view's rectangle is found to be another (seenFits). Where it has nothing, the view
+ * mirrored there, dimmed, stands in. Things that move by themselves keep their own lag.
+ * A game that draws a pointer of its own where the DOS mouse driver has it (strategy games, adventures, menus) gets
+ * a dot instead of a moved picture: the host reports the driver's pointer and how far a count moves it with every
+ * frame, the viewer adds the motion the host had not applied and draws the dot at once (pointerAt, from the newest
+ * report whichever frame is on the screen), after seeing in the picture that something is drawn there and moves with
+ * it (judgePointer).
+ * Everything happens in the viewer; a host that says when it took each frame makes the timing exact, an older one
+ * is followed as well as its frame information allows (and gets no pointer dot).
+ *
+ * For tests (environment): NN_RP_PREDICT=0|1, NN_RP_PREDICTLOG=1|2 (what was learned; every frame),
+ * NN_RP_RECORD=<folder> (frames and input, to learn from again offline), NN_RP_PREDICTSHOT=<folder> (pictures moved
+ * far, before and after), NN_RP_TESTINPUT=mouse|look|keys|mix|walk|walkkeys|none with NN_RP_TESTSCALE,
+ * NN_RP_TESTSCALEY, NN_RP_TESTSTART and NN_RP_TESTKEYS (a mouse and keys that move by themselves; "t:key:secs", the
+ * key "click" is the left mouse button). Host: NN_RP_ENCSTATS=1 logs what each frame's compression chose. */
+
+const unsigned VP_STRIPS = 8;           /* the picture is measured in its middle and in 8 strips side by side */
+const unsigned VP_LAGS = 26;            /* the game's own delay is looked for among 0, 8 ... 200 ms */
+const uint64_t VP_LAG_STEP = 8000;      /* microseconds */
+const uint8_t VP_STILL = 4;             /* a pixel that stayed this often while the view moved does not move with it */
+const unsigned VP_KEYBINS = 16;         /* what a key does to the view is learned for 11 stretches of the time it has been
+                                           held and 5 of the time since it was let go */
+const unsigned VP_KEYCTX = 8;           /* ...separately with and without Shift, Ctrl and Alt held */
+const unsigned VP_KEYHIST = 6;          /* presses and releases remembered per key */
+
+/* The DOS mouse driver's pointer as the host reports it with a frame: its place (0 ... 1 of its range each way)
+ * and how far one count of mouse motion moves it (a single count; a larger motion, per count). */
+struct VPPointer {
+    bool told = false;      /* the host's information for the frame arrived (a datagram of its own: it can get lost) */
+    bool has = false;       /* ...and says that the mouse driver has a pointer, and where */
+    float x = 0, y = 0, gx1 = 0, gy1 = 0, gxs = 0, gys = 0;
+};
+
+struct VPLens {
+    bool known = false;     /* decided: enough turns have been seen */
+    bool assumed = false;   /* ...or taken to be 90 degrees, until frames that can tell say otherwise */
+    bool persp = false;     /* a view in perspective: the sides move more than the middle; false: all alike */
+    float f = 0, cx = 0;    /* focal length and the middle column, in pixels */
+};
+
+/* The column the content shown at column xo comes from, when the middle of the picture has moved p pixels right. */
+inline float VP_SourceX(const VPLens &l,float xo,float p) {
+    if (!l.persp) return xo - p;
+    const float u = xo - l.cx;
+    const float den = 1.0f + u * p / (l.f * l.f);
+    return l.cx + (u - p) / (den > 0.25f ? den : 0.25f);
+}
+
+/* ...and how much less tall it is where it comes from, at column xs (a turn in perspective stretches the side that
+ * leaves the view): its distance from the middle row there, over the distance here. */
+inline float VP_RowScale(const VPLens &l,float xs,float p) {
+    if (!l.persp) return 1.0f;
+    const float k = (l.f * l.f - (xs - l.cx) * p) / (l.f * sqrtf(l.f * l.f + p * p));
+    return k < 0.25f ? 0.25f : (k > 4.0f ? 4.0f : k);
+}
+
+/* How far the middle of the picture moved, when the content now at column xo moved d pixels right. */
+inline bool VP_CentreShift(const VPLens &l,float xo,float d,float &p) {
+    if (!l.persp) { p = d; return true; }
+    const float u = xo - l.cx;
+    const float den = 1.0f + u * (u - d) / (l.f * l.f);
+    if (den < 0.25f) return false;
+    p = d / den;
+    return true;
+}
+
+/* What is kept of a frame to compare the next one with: its brightness, and the same halved in size up to three times
+ * (the smallest about 80 pixels wide: a movement of a quarter of the picture is found there in a few steps). */
+const unsigned VP_LEVELS = 4;
+struct VPPlane {
+    unsigned w = 0, h = 0, levels = 0;
+    unsigned ystep = 1;                 /* 2: every row of the picture comes twice (320x200 sent as 320x400); only one of each is kept here */
+    uint32_t id = 0;
+    bool valid = false, hasc = false;
+    uint64_t c = 0;                     /* the moment (this computer's clock) up to which it shows the input */
+    uint32_t seq = 0xFFFFFFFFu;         /* ...and the newest input the host had applied when it took it, when known */
+    VPPointer ptr;                      /* the DOS mouse driver's pointer when the host took it */
+    double sumx = 0, sumy = 0;          /* all the view's movement up to this frame, while it could be followed... */
+    unsigned chain = 0;                 /* ...since it last could not (frames of one chain can be compared) */
+    std::vector<uint8_t> y[VP_LEVELS];
+    unsigned lw[VP_LEVELS], lh[VP_LEVELS];
+};
+
+void VP_BuildPlane(VPPlane &pl,const uint8_t *raw,unsigned w,unsigned h,unsigned fmt) {
+    const size_t bpp = RP_BytesPerPixel(fmt), pal = (fmt == 8) ? 768 : 0;
+    /* A 200-line mode arrives with every line twice: measuring up and down between two equal lines says nothing,
+     * and half the lines are half the work. */
+    unsigned ystep = 1;
+    if (h >= 2 && (h & 1) == 0) {
+        ystep = 2;
+        for (unsigned y=0;y + 1 < h && ystep == 2;y += 2 * std::max(1u,h / 64))
+            if (memcmp(raw + pal + (size_t)y * w * bpp,raw + pal + (size_t)(y + 1) * w * bpp,(size_t)w * bpp) != 0) ystep = 1;
+    }
+    pl.ystep = ystep;
+    const unsigned ph = h / ystep;
+    pl.w = w; pl.h = ph;
+    pl.lw[0] = w; pl.lh[0] = ph;
+    pl.y[0].resize((size_t)w * ph);
+    uint8_t lut[256];
+    if (fmt == 8)
+        for (unsigned i=0;i < 256;i++) lut[i] = (uint8_t)((raw[i*3] * 77u + raw[i*3+1] * 150u + raw[i*3+2] * 29u) >> 8);
+    for (unsigned y=0;y < ph;y++) {
+        uint8_t *o = pl.y[0].data() + (size_t)y * w;
+        const uint8_t *s = raw + pal + (size_t)(y * ystep) * w * bpp;
+        if (fmt == 8) {
+            for (unsigned x=0;x < w;x++) o[x] = lut[s[x]];
+        }
+        else if (fmt == 15 || fmt == 16) {
+            for (unsigned x=0;x < w;x++) {
+                const unsigned p = s[x*2] | ((unsigned)s[x*2+1] << 8);
+                unsigned r, g;
+                if (fmt == 15) { r = (p >> 10) & 31; g = ((p >> 5) & 31) << 1; }
+                else { r = (p >> 11) & 31; g = (p >> 5) & 63; }
+                o[x] = (uint8_t)((r * 77u * 8u + g * 150u * 4u + (p & 31) * 29u * 8u) >> 8);
+            }
+        }
+        else {
+            for (unsigned x=0;x < w;x++) o[x] = (uint8_t)((s[x*4+2] * 77u + s[x*4+1] * 150u + s[x*4] * 29u) >> 8);
+        }
+    }
+    pl.levels = 1;
+    while (pl.levels < VP_LEVELS && pl.lw[pl.levels-1] > 100 && pl.lh[pl.levels-1] >= 64) {
+        const unsigned l = pl.levels, pw = pl.lw[l-1], nw = pw / 2, nh = pl.lh[l-1] / 2;
+        pl.lw[l] = nw; pl.lh[l] = nh;
+        pl.y[l].resize((size_t)nw * nh);
+        for (unsigned y=0;y < nh;y++) {
+            const uint8_t *a = pl.y[l-1].data() + (size_t)(y * 2) * pw, *b = a + pw;
+            uint8_t *o = pl.y[l].data() + (size_t)y * nw;
+            for (unsigned x=0;x < nw;x++) o[x] = (uint8_t)((a[x*2] + a[x*2+1] + b[x*2] + b[x*2+1] + 2u) >> 2);
+        }
+        pl.levels++;
+    }
+    pl.valid = true;
+}
+
+struct VPScratch {
+    std::vector<uint8_t> mask[VP_LEVELS], maskc, skiprow;
+    std::vector<float> vals, sorted;
+    std::vector<int32_t> srcx, rowk, seenc;
+    std::vector<uint16_t> dim;
+    std::vector<float> reach, seeni;
+};
+
+/* How unlike the picture cur is to the earlier one moved by (d,e), in the window of columns [x0,x1) and rows [y0,y1),
+ * every ystep-th row: the mean difference in brightness over the pixels marked in mask (those that changed in
+ * place: what stays, a status bar, a border, a plain wall, says nothing about a movement). -1 when too little is
+ * left to compare. */
+float VP_Unlike(const uint8_t *cur,const uint8_t *prev,const uint8_t *mask,int w,int h,int x0,int x1,int y0,int y1,int ystep,int d,int e) {
+    const int xa = std::max(x0,d), xb = std::min(x1,w + d);
+    if ((xb - xa) * 10 < (x1 - x0) * 6) return -1.0f;
+    int ya = std::max(y0,e);
+    const int yb = std::min(y1,h + e);
+    if ((yb - ya) * 10 < (y1 - y0) * 6) return -1.0f;
+    ya = y0 + ((ya - y0 + ystep - 1) / ystep) * ystep;
+    uint32_t sum = 0, n = 0, rows = 0;
+    for (int y=ya;y < yb;y += ystep) {
+        const uint8_t *c = cur + (size_t)y * w, *p = prev + (size_t)(y - e) * w - d, *m = mask + (size_t)y * w;
+        uint32_t rs = 0, rn = 0;
+        for (int x=xa;x < xb;x++) {
+            const int df = (int)c[x] - (int)p[x];
+            rs += (uint32_t)(m[x] * (df < 0 ? -df : df));
+            rn += m[x];
+        }
+        sum += rs; n += rn;
+        rows++;
+    }
+    /* a few pixels that changed (a blinking light, a counter) fit many places: one in fifty of the window at least */
+    if (n < 24 || n * 50 < rows * (uint32_t)(xb - xa)) return -1.0f;
+    return (float)sum / (float)n;
+}
+
+/* Where in a run of three the least lies: -0.5 ... 0.5 from the middle one. */
+inline float VP_Vertex(float l,float m,float r) {
+    const float den = l - 2.0f * m + r;
+    if (l < 0 || r < 0 || den <= 1e-6f) return 0;
+    return std::max(-0.5f,std::min(0.5f,0.5f * (l - r) / den));
+}
+
+/* Where between whole pixels the movement lies: the places d - 1, d and d + 1 (sideways; or e - 1, e, e + 1 up and
+ * down when vertical is set) compared over the pixels where the earlier picture has something to tell them apart
+ * by. The pixels that changed in place would not do here: they are picked for not fitting "no movement", which
+ * pulls the answer away from it. Returns -0.5 ... 0.5 to add to d (or e). */
+float VP_Fine(const uint8_t *cur,const uint8_t *prev,int w,int h,int x0,int x1,int y0,int y1,int ystep,int d,int e,bool vertical) {
+    const int mx = vertical ? 0 : 1, my = vertical ? 1 : 0;
+    const int xa = std::max(x0,d + mx), xb = std::min(x1,w + d - mx);
+    int ya = std::max(y0,e + my);
+    const int yb = std::min(y1,h + e - my);
+    if (xb - xa < 8 || yb - ya < 4) return 0;
+    ya = y0 + ((ya - y0 + ystep - 1) / ystep) * ystep;
+    const std::ptrdiff_t step = vertical ? (std::ptrdiff_t)w : 1;
+    uint32_t sl = 0, sm = 0, sr = 0, n = 0;
+    for (int y=ya;y < yb;y += ystep) {
+        const uint8_t *c = cur + (size_t)y * w, *p = prev + (size_t)(y - e) * w - d;
+        for (int x=xa;x < xb;x++) {
+            const int before = p[x + step], at = p[x], after = p[x - step];    /* the earlier picture moved one less, as found, one more */
+            const int g = before - after;
+            if (g <= 4 && g >= -4) continue;
+            const int v = c[x];
+            sl += (uint32_t)abs(v - before); sm += (uint32_t)abs(v - at); sr += (uint32_t)abs(v - after);
+            n++;
+        }
+    }
+    if (n < 24) return 0;
+    return VP_Vertex((float)sl,(float)sm,(float)sr);
+}
+
+const unsigned VP_CELLROWS = 6;         /* the view is also looked at in 6 bands of 8 cells, for what scrolls at a rate of its own */
+
+struct VPView { int x0, x1, y0, y1; };  /* the view: columns [x0,x1), rows [y0,y1) of the picture */
+
+struct VPMotion {
+    bool same = false;          /* the two pictures are the same */
+    bool okx = false, oky = false;
+    float sx = 0, sy = 0;       /* how far the middle of the picture moved right, and the picture down */
+    float whole = 0, wholey = 0;        /* ...as measured in the middle alone */
+    float fit = 0;              /* how well that fits: the difference left, against what other places leave */
+    bool layered = false;       /* part of the view scrolls at a rate of its own and was left out (set by the caller) */
+    bool masked = false;        /* the pixels that changed between the two frames are in the scratch space */
+    float sd[VP_STRIPS];        /* how far each of the 8 strips of the picture moved right */
+    uint8_t sk[VP_STRIPS];      /* 0 not known, 1 measured, 2 it stayed as it was */
+    int bandvote[VP_CELLROWS];  /* for each band of the view: 1 it scrolls evenly, -1 it moves as the lens says, 0 no telling */
+    float bandrate[VP_CELLROWS];        /* ...and at what rate, against the view's middle (see VP_Bands) */
+    bool bands = false;         /* the bands were asked for this frame */
+    unsigned measured = 0, stayed = 0, agreed = 0;
+    bool oneway = false;        /* the strips all moved the way the middle did, whatever the lens: good to learn the lens from */
+    float changed = 0;          /* the part of the picture that changed */
+    int why = 0;                /* 0 measured, 1 the middle fits nowhere, 2 nothing to tell by, 3 the strips disagree */
+    VPMotion() { memset(sd,0,sizeof(sd)); memset(sk,0,sizeof(sk)); memset(bandvote,0,sizeof(bandvote)); memset(bandrate,0,sizeof(bandrate)); }
+};
+
+float VP_Median(float *v,unsigned n) {
+    std::nth_element(v,v + n / 2,v + n);
+    return v[n / 2];
+}
+
+/* How far the middle of rows [y0,y1) of the view moved (there a turn moves everything alike, whatever the lens):
+ * looked for in the smallest copy of the picture, sideways first and up and down too when sideways alone fits badly,
+ * then followed down to the full picture two pixels around, level by level. 0: found; 1: it fits nowhere (the view
+ * changed, and not by moving as one); 2: nothing to tell by. */
+int VP_Middle(const VPPlane &cur,const VPPlane &prev,const VPView &v,int y0,int y1,VPScratch &tmp,float &whole,float &wholey,float &fit) {
+    const unsigned top = cur.levels - 1;
+    const int tw = (int)cur.lw[top], th = (int)cur.lh[top];
+    const int vw = v.x1 - v.x0, cx2 = v.x0 + v.x1;         /* twice the middle column */
+    const int tx0 = (cx2 - vw * 4 / 10) >> (top + 1), tx1 = (cx2 + vw * 4 / 10) >> (top + 1);
+    const int ty0 = y0 >> top, ty1 = std::min(th,(y1 + (1 << top) - 1) >> top);
+    const int D = (vw >> top) / 4, E = std::max(2,(ty1 - ty0) / 6);
+    if (tx1 - tx0 < 6 || ty1 - ty0 < 4 || D < 2) return 2;
+    int bd = 0, be = 0;
+    float bestv = -1.0f;
+    tmp.vals.clear();
+    for (int d=-D;d <= D;d++) {
+        const float val = VP_Unlike(cur.y[top].data(),prev.y[top].data(),tmp.mask[top].data(),tw,th,tx0,tx1,ty0,ty1,1,d,0);
+        if (val < 0) continue;
+        tmp.vals.push_back(val);
+        if (bestv < 0 || val < bestv) { bestv = val; bd = d; }
+    }
+    if (tmp.vals.size() < 8) return 2;
+    tmp.sorted = tmp.vals;
+    float med = VP_Median(tmp.sorted.data(),(unsigned)tmp.sorted.size());
+    if (bestv > 0.35f * med) {
+        for (int e=-E;e <= E;e++) {
+            if (e == 0) continue;
+            for (int d=-D;d <= D;d++) {
+                const float val = VP_Unlike(cur.y[top].data(),prev.y[top].data(),tmp.mask[top].data(),tw,th,tx0,tx1,ty0,ty1,1,d,e);
+                if (val < 0) continue;
+                tmp.vals.push_back(val);
+                if (val < bestv) { bestv = val; bd = d; be = e; }
+            }
+        }
+        tmp.sorted = tmp.vals;
+        med = VP_Median(tmp.sorted.data(),(unsigned)tmp.sorted.size());
+    }
+    fit = med > 0 ? bestv / med : 1.0f;
+    if (med <= 0 || bestv > 0.6f * med) return 1;
+    if (bd <= -D || bd >= D) return 1;      /* at the end of where it was looked for: it may lie beyond */
+    for (unsigned l=top;l-- > 0;) {
+        const int lw = (int)cur.lw[l], lh = (int)cur.lh[l];
+        const int x0 = (cx2 - vw / 4) >> (l + 1), x1 = (cx2 + vw / 4) >> (l + 1);
+        const int ly0 = y0 >> l, ly1 = std::min(lh,(y1 + (1 << l) - 1) >> l), ystep = std::max(1,(ly1 - ly0) / 60);
+        const int cd = bd * 2, ce = be * 2;
+        float bv = -1.0f;
+        for (int e=-2;e <= 2;e++) for (int d=-2;d <= 2;d++) {
+            const float val = VP_Unlike(cur.y[l].data(),prev.y[l].data(),tmp.mask[l].data(),lw,lh,x0,x1,ly0,ly1,ystep,cd + d,ce + e);
+            if (val >= 0 && (bv < 0 || val < bv)) { bv = val; bd = cd + d; be = ce + e; }
+        }
+        if (bv < 0) return 2;
+        if (l == 0) {
+            whole = (float)bd + VP_Fine(cur.y[0].data(),prev.y[0].data(),lw,lh,x0,x1,ly0,ly1,ystep,bd,be,false);
+            wholey = (float)be + VP_Fine(cur.y[0].data(),prev.y[0].data(),lw,lh,x0,x1,ly0,ly1,ystep,bd,be,true);
+        }
+    }
+    if (top == 0) { whole = (float)bd; wholey = (float)be; }
+    return 0;
+}
+
+/* How the picture moved from prev to cur. The middle of the view first (there a turn moves everything alike,
+ * whatever the lens). Then each of 8 strips near where the lens puts it; the movement counts as the view's when
+ * most strips agree. A picture whose strips mostly stayed did not move, whatever a monster or a door did in it.
+ * pview: the view's place in the picture as far as it is known; row0, row1: the rows of it to measure (the caller
+ * leaves out bands known to scroll at a rate of their own); strict: the strips have to fit the lens. */
+void VP_Measure(const VPPlane &cur,const VPPlane &prev,const VPLens &lens,const VPView &pview,int row0,int row1,bool strict,const uint8_t *still,VPMotion &mo,VPScratch &tmp) {
+    const int w = (int)cur.w, h = (int)cur.h;
+    const float unitx = (float)w / 320.0f;
+    if (cur.levels == 0 || cur.levels != prev.levels || cur.ystep != prev.ystep || cur.h != prev.h) { mo.why = 2; return; }
+    VPView v;       /* in rows of the plane (every other row of a picture whose rows come twice) */
+    v.x0 = std::max(0,std::min(w - 8,pview.x0)); v.x1 = std::max(v.x0 + 8,std::min(w,pview.x1));
+    v.y0 = std::max(0,std::min(h - 8,pview.y0 / (int)cur.ystep)); v.y1 = std::max(v.y0 + 8,std::min(h,(pview.y1 + (int)cur.ystep - 1) / (int)cur.ystep));
+    const int r0 = std::max(v.y0,std::min(v.y1 - 8,row0 / (int)cur.ystep)), r1 = std::max(r0 + 8,std::min(v.y1,(row1 + (int)cur.ystep - 1) / (int)cur.ystep));
+
+    /* The pixels that changed, in every size of the picture. */
+    for (unsigned l=0;l < cur.levels;l++) {
+        const size_t n = (size_t)cur.lw[l] * cur.lh[l];
+        tmp.mask[l].resize(n);
+        const uint8_t *a = cur.y[l].data(), *b = prev.y[l].data();
+        uint8_t *m = tmp.mask[l].data();
+        const int tau = l ? 3 : 4;
+        if (l == 0 && still != NULL) {
+            /* (the pixels known to stay are kept for the whole picture, the plane may hold every other row of it) */
+            for (int y=0;y < h;y++) {
+                const uint8_t *st = still + (size_t)(y * (int)cur.ystep) * w;
+                const size_t at = (size_t)y * w;
+                for (int x=0;x < w;x++) {
+                    const int df = (int)a[at + x] - (int)b[at + x];
+                    m[at + x] = (uint8_t)(((df > tau) | (df < -tau)) & (st[x] < VP_STILL));
+                }
+            }
+        }
+        else for (size_t i=0;i < n;i++) { const int df = (int)a[i] - (int)b[i]; m[i] = (uint8_t)((df > tau) | (df < -tau)); }
+    }
+    mo.masked = true;
+    {
+        /* the part of the view that changed: with less than a twentieth the view stayed, whatever moved in it */
+        size_t on = 0;
+        const uint8_t *m0 = tmp.mask[0].data();
+        for (int y=v.y0;y < v.y1;y++) for (int x=v.x0;x < v.x1;x++) on += m0[(size_t)y * w + x];
+        mo.changed = (float)on / (float)((size_t)(v.x1 - v.x0) * (size_t)(v.y1 - v.y0));
+    }
+    if (mo.changed < 0.05f) { mo.okx = mo.oky = true; return; }
+
+    const int rm = VP_Middle(cur,prev,v,r0,r1,tmp,mo.whole,mo.wholey,mo.fit);
+    if (rm != 0) { mo.why = rm; return; }
+
+    /* The strips, in the full picture or (a wide one) the half-size copy. */
+    const unsigned sl = (w >= 512 && cur.levels > 1) ? 1 : 0;
+    const int sw = (int)cur.lw[sl], sh = (int)cur.lh[sl], sc = 1 << sl;
+    const int sx0 = v.x0 >> sl, sx1 = v.x1 >> sl, sy0 = r0 >> sl, sy1 = std::min(sh,(r1 + sc - 1) >> sl), systep = std::max(1,(sy1 - sy0) / 60);
+    const int se = (int)lroundf(mo.wholey / (float)sc);
+    const uint8_t *m = tmp.mask[sl].data();
+    for (unsigned s=0;s < VP_STRIPS;s++) {
+        const int x0 = sx0 + (int)(s * (unsigned)(sx1 - sx0) / VP_STRIPS), x1 = sx0 + (int)((s + 1) * (unsigned)(sx1 - sx0) / VP_STRIPS);
+        unsigned on = 0, all = 0;
+        for (int y=sy0;y < sy1;y += systep) for (int x=x0;x < x1;x++) { on += m[(size_t)y * sw + x]; all++; }
+        if (on * 50 < all) { mo.sk[s] = 2; mo.stayed++; continue; }
+        const float xc = (float)(x0 + x1) * 0.5f * (float)sc - 0.5f;
+        const float want = (lens.persp ? xc - VP_SourceX(lens,xc,mo.whole) : mo.whole) / (float)sc;
+        float lo, hi;
+        if (lens.known) { lo = want - 6.0f; hi = want + 6.0f; }
+        else { lo = std::min(0.8f * want,2.4f * want) - 6.0f; hi = std::max(0.8f * want,2.4f * want) + 6.0f; }
+        const int ilo = std::max(-sw / 2,(int)floorf(lo)), ihi = std::min(sw / 2,(int)ceilf(hi));
+        if (ihi - ilo < 6) continue;
+        tmp.vals.assign((size_t)(ihi - ilo + 1),-1.0f);
+        tmp.sorted.resize(tmp.vals.size());
+        int sb = ilo;
+        float sv = -1.0f;
+        unsigned nv = 0;
+        for (int d=ilo;d <= ihi;d++) {
+            const float val = VP_Unlike(cur.y[sl].data(),prev.y[sl].data(),m,sw,sh,x0,x1,sy0,sy1,systep,d,se);
+            tmp.vals[(size_t)(d - ilo)] = val;
+            if (val < 0) continue;
+            tmp.sorted[nv++] = val;
+            if (sv < 0 || val < sv) { sv = val; sb = d; }
+        }
+        if (nv < 7) continue;
+        const float smed = VP_Median(tmp.sorted.data(),nv);
+        if (smed <= 0 || sv > 0.7f * smed) continue;
+        const float off = VP_Fine(cur.y[sl].data(),prev.y[sl].data(),sw,sh,x0,x1,sy0,sy1,systep,sb,se,false);
+        mo.sd[s] = ((float)sb + off) * (float)sc;
+        mo.sk[s] = 1;
+        mo.measured++;
+    }
+    if (mo.stayed >= 5) { mo.okx = mo.oky = true; mo.whole = mo.wholey = 0; return; }        /* the view stayed; something in it moved */
+    if (mo.measured < 3) { mo.why = 3; return; }
+    double sum = 0;
+    unsigned same = 0;
+    for (unsigned s=0;s < VP_STRIPS;s++) {
+        if (mo.sk[s] != 1) continue;
+        const float xc = (float)v.x0 + ((float)s + 0.5f) * (float)(v.x1 - v.x0) / (float)VP_STRIPS - 0.5f;
+        /* whatever the lens: the same way as the middle, between a little less and three times as far */
+        const bool way = fabsf(mo.sd[s] - mo.whole) <= 1.5f * unitx
+            || (mo.sd[s] * mo.whole > 0 && fabsf(mo.sd[s]) >= 0.6f * fabsf(mo.whole) && fabsf(mo.sd[s]) <= 3.0f * fabsf(mo.whole));
+        if (way) same++;
+        /* (low in the view a turn also moves things up and down, more the further to the side, and a floor's lines
+         * then seem to move less far sideways than they do: where only the ground is left to measure, below a sky,
+         * the strips only have to go the same way, and the middle, where none of that happens, is the answer) */
+        float p = mo.whole;
+        const bool fits = (lens.known && strict) ? (VP_CentreShift(lens,xc,mo.sd[s],p) && fabsf(p - mo.whole) <= std::max(unitx,0.2f * fabsf(mo.whole))) : way;
+        if (fits) { mo.agreed++; sum += p; }
+    }
+    mo.oneway = same * 10 >= mo.measured * 8;
+    if (mo.agreed * 10 < mo.measured * 6) { mo.why = 3; return; }
+    mo.okx = mo.oky = true;
+    mo.sx = (lens.persp && strict) ? 0.5f * (mo.whole + (float)(sum / mo.agreed)) : mo.whole;
+    mo.sy = mo.wholey * (float)cur.ystep;      /* in rows of the picture */
+
+}
+
+/* Which bands of the view (6, one above the other) scroll evenly: a sky or a backdrop that an engine moves by the
+ * same amount in every column, at a rate of its own, where a turn moves the world as the lens says (further at the
+ * sides, and there also up or down). For each band both are tried against an earlier frame, some frames back, in
+ * which the view's middle moved (dx,dy): the lens (lens, or 90 degrees while none is known), and an even scroll at
+ * the rate that fits best between half and twice the middle's. The one that leaves clearly less difference in the
+ * band's 8 cells gets the band's vote; cells in the middle, where the two say the same, count for little by
+ * themselves. vote: 1 even (rate: its rate), -1 lens, 0 no telling. still: the pixels that stay, or NULL. */
+void VP_Bands(const VPPlane &cur,const VPPlane &old,const VPLens &lens,const VPView &pview,float dx,float dy,const uint8_t *still,int *vote,float *rate,VPScratch &tmp) {
+    for (unsigned b=0;b < VP_CELLROWS;b++) { vote[b] = 0; rate[b] = 1; }
+    const int w = (int)cur.w, h = (int)cur.h;
+    if (cur.levels == 0 || cur.levels != old.levels || cur.ystep != old.ystep || cur.h != old.h || cur.w != old.w) return;
+    VPView v;
+    v.x0 = std::max(0,std::min(w - 8,pview.x0)); v.x1 = std::max(v.x0 + 8,std::min(w,pview.x1));
+    v.y0 = std::max(0,std::min(h - 8,pview.y0 / (int)cur.ystep)); v.y1 = std::max(v.y0 + 8,std::min(h,(pview.y1 + (int)cur.ystep - 1) / (int)cur.ystep));
+    VPLens ln = lens;
+    if (!ln.known) { ln.known = ln.persp = true; ln.f = (float)(v.x1 - v.x0) * 0.5f; ln.cx = (float)(v.x0 + v.x1 - 1) * 0.5f; }
+    if (!ln.persp) return;      /* a view that moves as one piece has no layers to tell apart this way */
+    const unsigned sl = (w >= 512 && cur.levels > 1) ? 1 : 0;
+    const int sw = (int)cur.lw[sl], sh = (int)cur.lh[sl], sc = 1 << sl;
+    const int sx0 = v.x0 >> sl, sx1 = v.x1 >> sl;
+    const int ch = (v.y1 - v.y0) / (int)VP_CELLROWS;
+    if (ch < 6) return;
+    /* the pixels that changed between the two */
+    tmp.maskc.resize((size_t)sw * sh);
+    {
+        const uint8_t *a = cur.y[sl].data(), *b = old.y[sl].data();
+        uint8_t *m = tmp.maskc.data();
+        for (int y=0;y < sh;y++) {
+            const uint8_t *st = still ? still + (size_t)(y * sc * (int)cur.ystep) * w : NULL;
+            const size_t at = (size_t)y * sw;
+            for (int x=0;x < sw;x++) {
+                const int df = (int)a[at + x] - (int)b[at + x];
+                m[at + x] = (uint8_t)(((df > 4) | (df < -4)) & (st == NULL || st[x * sc] < VP_STILL));
+            }
+        }
+    }
+    const uint8_t *m = tmp.maskc.data();
+    const float cy = (float)(v.y0 + v.y1 - 1) * 0.5f;      /* rows of the plane */
+    const float ey = dy / (float)cur.ystep;                 /* the view's own movement down, in rows of the plane */
+    const int RATES = 31;                                   /* 0.5, 0.55 ... 2.0 */
+    for (unsigned b=0;b < VP_CELLROWS;b++) {
+        const int by0 = v.y0 + (int)b * ch, by1 = v.y0 + (int)(b + 1) * ch;
+        const int cy0 = by0 >> sl, cy1 = std::min(sh,by1 >> sl), cstep = std::max(1,(cy1 - cy0) / 24);
+        const float yc = (float)(by0 + by1 - 1) * 0.5f;
+        float lensleft[VP_STRIPS], evenleft[VP_STRIPS][31];
+        bool have[VP_STRIPS];
+        unsigned n = 0, outer = 0;
+        for (unsigned s=0;s < VP_STRIPS;s++) {
+            const int x0 = sx0 + (int)(s * (unsigned)(sx1 - sx0) / VP_STRIPS), x1 = sx0 + (int)((s + 1) * (unsigned)(sx1 - sx0) / VP_STRIPS);
+            const float xc = (float)(x0 + x1) * 0.5f * (float)sc - 0.5f;
+            /* as the lens has it: sideways by the column, and up or down by how far the cell is from the middle row */
+            const float xs = VP_SourceX(ln,xc,dx);
+            const float k = VP_RowScale(ln,xs,dx);
+            const float ld = (xc - xs) / (float)sc, le = (yc - (cy + (yc - ey - cy) * k)) / (float)sc;
+            lensleft[s] = VP_Unlike(cur.y[sl].data(),old.y[sl].data(),m,sw,sh,x0,x1,cy0,cy1,cstep,(int)lroundf(ld),(int)lroundf(le));
+            have[s] = lensleft[s] >= 0;
+            for (int r=0;r < RATES && have[s];r++) {
+                const float ed = (0.5f + 0.05f * (float)r) * dx / (float)sc;
+                evenleft[s][r] = VP_Unlike(cur.y[sl].data(),old.y[sl].data(),m,sw,sh,x0,x1,cy0,cy1,cstep,(int)lroundf(ed),(int)lroundf(ey / (float)sc));
+                if (evenleft[s][r] < 0) have[s] = false;
+            }
+            if (!have[s]) continue;
+            n++;
+            if (s < 2 || s >= VP_STRIPS - 2) outer++;
+        }
+        if (n < 4 || outer < 2) continue;      /* (in the middle columns the two say the same) */
+        double byLens = 0, byEven = -1;
+        int bestr = 0;
+        for (unsigned s=0;s < VP_STRIPS;s++) if (have[s]) byLens += lensleft[s];
+        for (int r=0;r < RATES;r++) {
+            double sum = 0;
+            for (unsigned s=0;s < VP_STRIPS;s++) if (have[s]) sum += evenleft[s][r];
+            if (byEven < 0 || sum < byEven) { byEven = sum; bestr = r; }
+        }
+        rate[b] = 0.5f + 0.05f * (float)bestr;
+        /* (an even scroll at the middle's own rate is what a dark ceiling with little in it looks like too: only a
+         * rate that is clearly another one counts) */
+        if (byEven <= 0.7 * byLens && fabsf(rate[b] - 1.0f) >= 0.1f) vote[b] = 1;
+        else if (byLens <= 0.7 * byEven) vote[b] = -1;
+    }
+}
+
+/* One direction (sideways, or up and down): what the mouse does to the picture, learned and checked. */
+struct VPAxis {
+    double a[VP_LAGS], b[VP_LAGS], c;   /* fading sums per candidate delay: movement x counts, counts squared; movement squared */
+    unsigned n, rejected;
+    bool known;                 /* the gain and the delay have been learned */
+    double gain;                /* pixels of picture per mouse count */
+    double delay;               /* the game's own delay, microseconds */
+    unsigned lag;               /* ...and its candidate */
+    float q;                    /* the gate: up with every stretch of frames that agreed with the prediction... */
+    bool open;                  /* ...and open while that is the rule */
+    float strength;             /* how much of the prediction is shown (it fades in and out) */
+    double st_err, st_base;     /* for the log: how far off the prediction was, how far the picture moved */
+    unsigned st_n, st_open;
+
+    VPAxis() { reset(); }
+    void reset(void) {
+        memset(a,0,sizeof(a)); memset(b,0,sizeof(b));
+        c = 0; n = rejected = 0; known = false; gain = delay = 0; lag = 0; q = 0; open = false; strength = 0;
+        st_err = st_base = 0; st_n = st_open = 0;
+    }
+    void gate(bool ok) {
+        q = ok ? std::min(1.0f,q + 0.34f) : std::max(0.0f,q - 0.5f);
+        if (q >= 0.66f) open = true;
+        else if (q < 0.33f) open = false;
+    }
+    void close(void) { q = 0; open = false; }
+};
+
+struct VPSample {               /* a frame against the one analysed before it */
+    uint64_t c0, c1;            /* the moments up to which the two show the input */
+    uint32_t q0, q1;            /* ...and the newest input each had */
+    bool okx, oky;
+    float sx, sy;
+};
+
+struct VPMouseEv { uint64_t t; uint32_t seq; double x, y; };    /* all the mouse counts sent up to and including this input event */
+
+/* What one key does to the view (in one combination of Shift, Ctrl and Alt): pixels of picture per millisecond, by
+ * how long the key has been held (the first 11) or let go (the last 5). A turn key gives a steady value once it is
+ * held, often less at first (games turn slowly, then faster); most keys give nothing. The game's own delay is part
+ * of the curve: nothing in the first stretches, and still something after the key was let go. */
+struct VPKeyModel {
+    float mx, my;               /* while held, whatever for how long: learned within a few frames... */
+    float vx[VP_KEYBINS], vy[VP_KEYBINS];      /* ...and what each stretch adds to that (the first, the ones after) */
+    unsigned n;                 /* frames learned from */
+    float q;                    /* the gate, as for the mouse */
+    bool open;
+};
+struct VPKeyHist {              /* the last presses and releases of a key, oldest first */
+    uint64_t t[VP_KEYHIST];
+    bool down[VP_KEYHIST];
+    unsigned n;
+};
+const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
+    0, 20, 40, 60, 90, 130, 180, 250, 350, 500, 750, 0xFFFFFFFFu,       /* held */
+    20, 40, 60, 90, 130                                                 /* let go: 0-20, ... 90-130 */
+};
+
+class ViewPredict {
+public:
+    bool enabled = true;        /* the player's switch */
+    int debug = 0;              /* NN_RP_PREDICTLOG: 1 what was learned every five seconds, 2 every frame */
+    unsigned dbg_pairs = 0, dbg_same = 0, dbg_okx = 0, dbg_oky = 0, dbg_moved = 0, dbg_regx = 0, dbg_regy = 0;
+    unsigned w = 0, h = 0, fmt = 0;
+    VPLens lens;
+    VPAxis ax, ay;
+
+    void resize(unsigned fw,unsigned fh,unsigned ffmt) {
+        const bool samesize = fw == w && fh == h;
+        w = fw; h = fh; fmt = ffmt;
+        unitx = (float)w / 320.0f; unity = (float)h / 200.0f;
+        for (int i=0;i < VP_KEPT;i++) planes[i].valid = false;
+        samples.clear();
+        if (samesize) return;   /* only the colours changed: what was learned still holds */
+        still.assign((size_t)w * h,0);
+        still_dirty = true;
+        rowch.clear(); colch.clear(); view_frames = 0;
+        vx0 = vy0 = 0; vx1 = (int)w; vy1 = (int)h;
+        memset(band_score,0,sizeof(band_score));
+        lens_clean = cells_done = 0;
+        layers_at = 0;
+        seen_has = false; seen_w = seen_h = 0;
+        ptr_q = 0;
+        lens = VPLens();
+        memset(lens_mean,0,sizeof(lens_mean)); memset(lens_var,0,sizeof(lens_var)); memset(lens_n,0,sizeof(lens_n));
+        lens_frames = 0;
+        ax.reset(); ay.reset();
+    }
+
+    uint32_t prevId(bool &valid) const { valid = planes[cur].valid; return planes[cur].id; }
+    void viewRect(int &x0,int &x1,int &y0,int &y1) const { x0 = vx0; x1 = vx1; y0 = vy0; y1 = vy1; }     /* (for tests) */
+    bool stays(size_t i) const { return i < stay.size() && stay[i] != 0; }
+    bool hasSample(void) const { return !samples.empty(); }
+    const VPSample &lastSample(void) const { return samples.back(); }
+
+    /* Mouse counts sent to the host at t, as input event seq. */
+    void mouse(uint64_t t,uint32_t seq,float dx,float dy) {
+        totx += dx; toty += dy;
+        VPMouseEv e = { t, seq, totx, toty };
+        mlog.push_back(e);
+        while (mlog.size() > 2 && t - mlog.front().t > 3000000) {
+            basex = mlog.front().x; basey = mlog.front().y;
+            mlog_cut = true; mlog_cut_seq = mlog.front().seq;
+            mlog.pop_front();
+        }
+        logEvent(t,seq);
+    }
+
+    /* A key pressed or let go at t, as input event seq. Keys that open menus close the gates: what the mouse and the
+     * keys do there is not what they did in the game. */
+    void key(unsigned k,bool down,uint64_t t,uint32_t seq) {
+        logEvent(t,seq);
+        if (k == 0 || k >= (unsigned)KBD_LAST) return;
+        if (khist.empty()) {
+            khist.resize((size_t)KBD_LAST);
+            for (size_t i=0;i < khist.size();i++) khist[i].n = 0;
+        }
+        VPKeyHist &hst = khist[k];
+        if (hst.n == VP_KEYHIST) {
+            for (unsigned i=1;i < VP_KEYHIST;i++) { hst.t[i-1] = hst.t[i]; hst.down[i-1] = hst.down[i]; }
+            hst.n--;
+        }
+        hst.t[hst.n] = t; hst.down[hst.n] = down; hst.n++;
+        if (!down) return;
+        if (k == (unsigned)KBD_esc || k == (unsigned)KBD_tab || k == (unsigned)KBD_pause || (k >= (unsigned)KBD_f1 && k <= (unsigned)KBD_f12)) {
+            ax.close(); ay.close();
+            for (size_t i=0;i < kmodel.size();i++) { kmodel[i].q = 0; kmodel[i].open = false; }
+        }
+    }
+
+    /* The frame now on the screen: up to when it shows the input (if known), the newest input the host had applied
+     * when it took the frame (0xFFFFFFFF: not known), and when it arrived. */
+    void shown(bool hasc,uint64_t c,uint32_t seq,uint64_t arrival,uint32_t id) {
+        shown_seq = seq;
+        /* What was seen lately is kept by the direction of the frame analysed last; the frame that goes on the screen
+         * now has not been analysed yet: how far it has moved on is taken from what the input is known to do. */
+        seen_lead = false;
+        seen_leadx = seen_leady = 0;
+        if (seen_has && id == seen_id) seen_lead = true;
+        else if (seen_has && hasc && seen_hasc && c > seen_c && c - seen_c < 300000)
+            seen_lead = between(seen_c,seen_seq,c,seq,seen_leadx,seen_leady);
+        if (shown_arrival != 0 && arrival > shown_arrival) {
+            const uint64_t d = std::min<uint64_t>(arrival - shown_arrival,100000);
+            ival = ival ? (ival * 7 + d) / 8 : d;
+        }
+        shown_hasc = hasc; shown_c = c; shown_arrival = arrival;
+        seen_shown_id = id;
+    }
+
+    /* A decoded frame, and the frame analysed before it when that is still at hand. */
+    void frame(uint32_t id,const uint8_t *raw,size_t rawsize,unsigned fw,unsigned fh,unsigned ffmt,const uint8_t *prevraw,bool hasc,uint64_t c,uint32_t seq,const uint32_t *argb,const VPPointer &ptr) {
+        const uint64_t t0 = RP_Micros();
+        if (fw != w || fh != h || ffmt != fmt) { resize(fw,fh,ffmt); prevraw = NULL; }
+        VPPlane &pl = planes[(cur + 1) % VP_KEPT];
+        const VPPlane &prev = planes[cur];
+        VP_BuildPlane(pl,raw,w,h,fmt);
+        pl.id = id; pl.hasc = hasc; pl.c = c; pl.seq = seq;
+        pl.ptr = ptr;
+        pl.sumx = pl.sumy = 0; pl.chain = 0;
+        if (prev.valid && prevraw != NULL) {
+            VPMotion mo;
+            mo.same = memcmp(raw,prevraw,rawsize) == 0;
+            if (mo.same) { mo.okx = mo.oky = true; pl.sumx = prev.sumx; pl.sumy = prev.sumy; pl.chain = prev.chain; }
+            else {
+                const VPView pv = { vx0, vx1, vy0, vy1 };
+                int row0, row1;
+                mo.layered = layerState(t0,row0,row1) == 2;
+                VP_Measure(pl,prev,lens,pv,row0,row1,lens.known && !mo.layered,still.empty() ? NULL : still.data(),mo,tmp);
+                /* The cells, a few times a second: against the frame furthest back that the view could be followed
+                 * from, as long as it has not moved more than a tenth of its width since. */
+                if (!mo.okx) chain++;
+                pl.sumx = prev.sumx + (mo.okx ? mo.sx : 0.0f); pl.sumy = prev.sumy + (mo.okx ? mo.sy : 0.0f);
+                pl.chain = chain;
+                if (mo.okx && prev.chain == chain && t0 > cells_at + 120000) {
+                    const VPPlane *old = NULL;
+                    float dx = 0, dy = 0;
+                    for (int k=1;k < VP_KEPT;k++) {
+                        const VPPlane &q = planes[(cur + 1 + VP_KEPT - k) % VP_KEPT];
+                        if (!q.valid || q.chain != chain || q.h != pl.h || q.w != pl.w) break;
+                        const float qx = (float)(pl.sumx - q.sumx);
+                        if (fabsf(qx) > (float)w / 10.0f) break;
+                        if (fabsf(qx) >= 6.0f * unitx && fabsf(qx) > fabsf(dx)) { old = &q; dx = qx; dy = (float)(pl.sumy - q.sumy); }
+                    }
+                    if (old != NULL) {
+                        VP_Bands(pl,*old,lens,pv,dx,dy,still.empty() ? NULL : still.data(),mo.bandvote,mo.bandrate,tmp);
+                        mo.bands = true;
+                        cells_at = t0;
+                        if (cells_done < 1000) cells_done++;
+                    }
+                }
+                markStill(raw,prevraw,mo);
+            }
+            if (debug >= 2 && mo.bands)
+                LOG_MSG("INPUTNET: vp bands %u: votes %d %d %d %d %d %d rates %.2f %.2f %.2f %.2f %.2f %.2f scores %.0f %.0f %.0f %.0f %.0f %.0f",id,
+                    mo.bandvote[0],mo.bandvote[1],mo.bandvote[2],mo.bandvote[3],mo.bandvote[4],mo.bandvote[5],
+                    mo.bandrate[0],mo.bandrate[1],mo.bandrate[2],mo.bandrate[3],mo.bandrate[4],mo.bandrate[5],
+                    band_score[0],band_score[1],band_score[2],band_score[3],band_score[4],band_score[5]);
+            judgePointer(pl,prev,mo);
+            if (mo.same) dbg_same++;
+            if (mo.okx) dbg_okx++;
+            if (mo.oky) dbg_oky++;
+            if (mo.okx && fabsf(mo.sx) >= 1.5f * unitx) dbg_moved++;
+            dbg_regx += mo.measured; dbg_regy += mo.stayed;
+            dbg_pairs++;
+            if (debug >= 2 && !mo.same)
+                LOG_MSG("INPUTNET: vp frame %u: sx %s%.2f sy %s%.2f c %s%.1f ms after the last; middle %.2f %.2f (lower %s%.2f upper %s%.2f%s) fit %.2f changed %.0f%%; strips %u measured %u stayed %u agreed why %d: %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+                    id,mo.okx ? "" : "?",mo.sx,mo.oky ? "" : "?",mo.sy,
+                    (prev.hasc && hasc) ? "" : "?",(prev.hasc && hasc) ? (double)(int64_t)(c - prev.c) / 1000.0 : 0.0,
+                    mo.whole,mo.wholey,"",0.0,"",0.0,mo.layered ? ", layers" : "",
+                    mo.fit,mo.changed * 100.0f,mo.measured,mo.stayed,mo.agreed,mo.why,
+                    mo.sd[0],mo.sd[1],mo.sd[2],mo.sd[3],mo.sd[4],mo.sd[5],mo.sd[6],mo.sd[7]);
+            if (prev.hasc && hasc && c > prev.c && c - prev.c < 400000) {
+                VPSample s;
+                s.c0 = prev.c; s.c1 = c;
+                s.q0 = prev.seq; s.q1 = seq;
+                /* a stretch without frames has been judged already (see idle) */
+                if (mo.same && idle_c > s.c0 && idle_c < s.c1) s.c0 = idle_c;
+                if (!samples.empty() && samples.back().c1 != s.c0) samples.clear();
+                s.okx = mo.okx; s.oky = mo.oky; s.sx = mo.sx; s.sy = mo.sy;
+                samples.push_back(s);
+                if (samples.size() > 16) samples.pop_front();
+                learn();
+                learnKeys(s);
+                /* The lens: only from movement the player's input made (a screen that shakes, a camera that pans,
+                 * a level that scrolls by itself say nothing about how a turn moves the picture). */
+                if (!mo.same && inputMoved(s)) { learnLens(mo); learnLayers(mo,RP_Micros()); }
+            }
+            else samples.clear();
+        }
+        else samples.clear();
+        cur = (cur + 1) % VP_KEPT;
+        /* What was seen, by direction: this frame's place in it (its measured movement; or, when that could not be
+         * measured, what the input is known to do; or it starts over), and its pixels. */
+        {
+            bool placed = false;
+            if (seen_has && prev.valid && prevraw != NULL && lens.known && seenFits()) {
+                const VPSample *smp = (!samples.empty() && samples.back().c1 == c) ? &samples.back() : NULL;
+                float mx = 0, my = 0;
+                if (smp != NULL && smp->okx) { mx = smp->sx; my = smp->oky ? smp->sy : 0; placed = true; }
+                else if (hasc && seen_hasc && c > seen_c && c - seen_c < 300000 && seen_guessed < 3 && between(seen_c,seen_seq,c,seq,mx,my)) {
+                    placed = true;
+                    seen_guessed++;
+                }
+                if (placed) {
+                    if (smp != NULL && smp->okx) seen_guessed = 0;
+                    seen_dir += lens.persp ? atan((double)mx / lens.f) : (double)mx;
+                    seen_down += my;
+                }
+            }
+            if (!placed) seenReset();
+            seen_has = lens.known;
+            seen_id = id; seen_hasc = hasc; seen_c = c; seen_seq = seq;
+            if (seen_has && argb != NULL) seenStore(argb,RP_Micros());
+            if (id == seen_shown_id) { seen_lead = true; seen_leadx = seen_leady = 0; }
+        }
+        st_frames++;
+        st_analyse_us += RP_Micros() - t0;
+    }
+
+    /* No frame for a while: the host sends none while its picture stays as it is. If the mouse moved meanwhile and
+     * the picture should have followed, the game is not listening to it (a menu, a pause). */
+    void idle(uint64_t now) {
+        if (!shown_hasc || (!ax.known && !ay.known)) return;
+        const uint64_t margin = std::max<uint64_t>(100000,4 * ival);
+        if (now < shown_arrival + margin + 100000) return;
+        const uint64_t c1 = shown_c + (now - shown_arrival - margin);
+        const uint64_t c0 = std::max(shown_c,idle_c);
+        if (c1 < c0 + 100000) return;
+        VPAxis *axes[2] = { &ax, &ay };
+        for (unsigned k=0;k < 2;k++) {
+            VPAxis &a = *axes[k];
+            if (!a.known) continue;
+            double x1, y1, x0, y0;
+            const uint64_t d = (uint64_t)a.delay;
+            cum(c1 - d,x1,y1); cum(c0 - d,x0,y0);
+            if (fabs(a.gain * (k ? y1 - y0 : x1 - x0)) >= 4.0 * (k ? unity : unitx)) a.gate(false);
+        }
+        idle_c = c1;
+    }
+
+    /* ---- The pointer of a game that draws its own (a strategy game, an adventure, a menu) ----
+     * Such a pointer lags like everything else in the picture, and a pointer that lags is hard to aim. The host
+     * reports with every frame where the DOS mouse driver had its pointer and how far a count of motion moves it;
+     * the viewer adds the motion the host had not applied yet and draws a small dot there at once, as it does over
+     * a Windows guest. Whether the game shows a pointer at the driver's place at all is found out by looking: when
+     * the place moves, the picture has to change around the old and the new place and hardly anywhere else. A game
+     * that turns a view with the mouse, or hides its pointer, never passes, and gets no dot.
+     * The dot starts from the newest report the host has sent, whichever frame is on the screen: where the pointer
+     * is going does not depend on the picture. A report that gets lost on the way (it is a datagram of its own)
+     * then only makes the one before it serve a little longer; tied to the frame on the screen, each loss switched
+     * the dot off until three more moves had been seen (found between two computers; with 3% of the host's
+     * datagrams dropped on one PC the dot was off at 3 of 8 checks that way). */
+    void pointerTold(uint32_t id,uint32_t seq,const VPPointer &p) {
+        /* (one that comes out of order is left out; ids that start over are a new session of the host) */
+        if (told_any && (int32_t)(id - told_id) <= 0 && (int32_t)(told_id - id) < 64) return;
+        /* for the log: where the report before this one and the motion sent since said the pointer would be now,
+         * against where it is: how far off the dot is once the game's pointer has caught up with it */
+        if (told_any && told_ptr.has && p.has && (int32_t)(seq - told_seq) > 0 && !(mlog_cut && (int32_t)(mlog_cut_seq - told_seq) > 0)) {
+            double x, y;
+            if (pointerFrom(seq,false,x,y)) {
+                const double e = sqrt((x - p.x) * (x - p.x) * 320.0 * 320.0 + (y - p.y) * (y - p.y) * 200.0 * 200.0);
+                st_ptr_err += e; st_ptr_errn++;
+                st_ptr_errmax = std::max(st_ptr_errmax,e);
+            }
+        }
+        told_any = true; told_id = id; told_seq = seq; told_ptr = p;
+        if (!p.has) ptr_q = 0;
+    }
+
+    /* Where the driver's pointer is after the motion the host had not applied when it made its newest report (what
+     * it had applied is in the reported place): up to input event upto, or all of it. Step by step as the driver
+     * takes it: it keeps its pointer inside its range at every step, so a pointer pushed on against an edge leaves
+     * the edge at once when the hand turns back. False: no motion in between. */
+    bool pointerFrom(uint32_t upto,bool all,double &x,double &y) const {
+        x = told_ptr.x; y = told_ptr.y;
+        size_t first = mlog.size();
+        while (first > 0 && (int32_t)(mlog[first-1].seq - told_seq) > 0) first--;
+        bool any = false;
+        for (size_t i=first;i < mlog.size();i++) {
+            if (!all && (int32_t)(mlog[i].seq - upto) > 0) break;
+            const double dx = mlog[i].x - (i ? mlog[i-1].x : basex), dy = mlog[i].y - (i ? mlog[i-1].y : basey);
+            x = std::max(0.0,std::min(1.0,x + dx * (fabs(dx) > 1.0 ? told_ptr.gxs : told_ptr.gx1)));
+            y = std::max(0.0,std::min(1.0,y + dy * (fabs(dy) > 1.0 ? told_ptr.gys : told_ptr.gy1)));
+            any = true;
+        }
+        return any;
+    }
+
+    /* Where the dot goes now (parts of the picture's width and height); false: no dot. accx, accy: counts not even sent. */
+    bool pointerAt(float accx,float accy,float &nx,float &ny) {
+        const bool on = pointerWhere(accx,accy,nx,ny);
+        /* for the log: how much of the time a pointer the host reports had its dot */
+        const uint64_t now = RP_Micros();
+        if (dot_t != 0 && told_any && told_ptr.has) {
+            const uint64_t dt = std::min<uint64_t>(now - dot_t,100000);
+            st_dot_us += dt;
+            if (dot_was) st_dot_on_us += dt;
+        }
+        dot_t = now; dot_was = on;
+        return on;
+    }
+
+    bool pointerWhere(float accx,float accy,float &nx,float &ny) const {
+        if (!enabled || !told_any || !told_ptr.has || ptr_q < 0.7f) return false;
+        if (mlog_cut && (int32_t)(mlog_cut_seq - told_seq) > 0) return false;     /* (motion since the report is no longer remembered) */
+        double x, y;
+        pointerFrom(0,true,x,y);
+        x += accx * (fabsf(accx) > 1.0f ? told_ptr.gxs : told_ptr.gx1);
+        y += accy * (fabsf(accy) > 1.0f ? told_ptr.gys : told_ptr.gy1);
+        nx = (float)std::max(0.0,std::min(1.0,x));
+        ny = (float)std::max(0.0,std::min(1.0,y));
+        return true;
+    }
+
+    /* How far the picture has to be moved now for the input its frame does not show yet (accx, accy: counts not
+     * even sent). False when there is nothing to move. */
+    bool offset(uint64_t now,float accx,float accy,float &px,float &py) {
+        px = py = 0;
+        const float step = (float)std::min<uint64_t>(now > str_t ? now - str_t : 0,1000000) / 60000.0f;
+        str_t = now;
+        const bool live = enabled && shown_hasc && lens.known && now < shown_arrival + 600000;
+        VPAxis *axes[2] = { &ax, &ay };
+        for (unsigned k=0;k < 2;k++) {
+            VPAxis &a = *axes[k];
+            const float want = (live && a.known && a.open) ? 1.0f : 0.0f;
+            a.strength += std::max(-step,std::min(step,want - a.strength));
+        }
+        if (!shown_hasc) return false;
+        if (ax.strength > 0 && ax.known) {
+            double x, y;
+            cum(bound(shown_c - (uint64_t)ax.delay,shown_seq),x,y);
+            px = (float)(ax.gain * (totx - x + accx)) * ax.strength;
+        }
+        if (ay.strength > 0 && ay.known) {
+            double x, y;
+            cum(bound(shown_c - (uint64_t)ay.delay,shown_seq),x,y);
+            py = (float)(ay.gain * (toty - y + accy)) * ay.strength;
+        }
+        kstrength += std::max(-step,std::min(step,(live ? 1.0f : 0.0f) - kstrength));
+        if (kstrength > 0) {
+            float kx, ky;
+            keyOffset(now,kx,ky);
+            px += kx * kstrength; py += ky * kstrength;
+        }
+        px = std::max(-0.3f * (float)w,std::min(0.3f * (float)w,px));
+        py = std::max(-0.2f * (float)h,std::min(0.2f * (float)h,py));
+        return fabsf(px) >= 0.5f || fabsf(py) >= 0.5f;
+    }
+
+    /* The picture src (w x h pixels) moved by (px,py) into dst; the pixels that never move with the view stay. */
+    void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
+        const uint64_t t0 = RP_Micros();
+        const int iw = (int)w, ih = (int)h;
+        if (still_dirty || stay.size() != (size_t)w * h) cleanStill();
+        tmp.srcx.resize(w);
+        tmp.rowk.resize(w);
+        tmp.dim.resize(w);
+        const bool layered = anyLayer(t0);
+        bool rows = fabsf(py) >= 0.5f;
+        for (int x=vx0;x < vx1;x++) {
+            const float xs = VP_SourceX(lens,(float)x,px);
+            int xi = (int)lroundf(xs);
+            /* what comes into view at the edge is not in the frame: where it was not seen lately either (below), the
+             * view mirrored there stands in for it, darker the further in (it keeps the picture whole and moving,
+             * and does not pass for the real thing) */
+            int past = 0;
+            if (xi < vx0) { past = vx0 - xi; xi = 2 * vx0 - 1 - xi; }
+            if (xi >= vx1) { past = xi - vx1 + 1; xi = 2 * vx1 - 1 - xi; }
+            tmp.srcx[(size_t)x] = std::max(vx0,std::min(vx1 - 1,xi));
+            tmp.dim[(size_t)x] = dimOf(past);
+            const int32_t k = (int32_t)lroundf(VP_RowScale(lens,xs,px) * 65536.0f);
+            tmp.rowk[(size_t)x] = k;
+            if (k != 65536) rows = true;
+        }
+        const float cy = (float)(vy0 + vy1 - 1) * 0.5f;
+        const int64_t cyf = (int64_t)llroundf(cy * 16777216.0f) + (1 << 23);
+        const uint8_t *st = stay.data();
+        const int32_t *sx = tmp.srcx.data(), *rk = tmp.rowk.data();
+        const uint16_t *dm = tmp.dim.data();
+        if (layered) {
+            tmp.reach.resize(w);
+            for (int x=vx0;x < vx1;x++) tmp.reach[(size_t)x] = (float)x - VP_SourceX(lens,(float)x,px);
+        }
+        /* the columns at the edges that show the mirrored view */
+        int dl = vx0, dr = vx1;
+        while (dl < vx1 && dm[dl] != 256) dl++;
+        while (dr > dl && dm[dr - 1] != 256) dr--;
+        /* What was seen lately in the directions the moved picture shows (see seenStore): for its edges, and for what
+         * a part of the picture that stays hides of the world. */
+        const bool useseen = seen_has && seen_lead && seen_w > 0 && seenFits();
+        const uint16_t nowat = seenStamp(t0);
+        const float down = (float)seen_down + seen_leady + py;
+        if (useseen) {
+            const double dir = seen_dir + (lens.persp ? atan((double)seen_leadx / lens.f) + atan((double)px / lens.f) : (double)(seen_leadx + px));
+            tmp.seenc.resize(w); tmp.seeni.resize(w);
+            for (int x=vx0;x < vx1;x++) {
+                float tall;
+                tmp.seenc[(size_t)x] = seenColumn((float)x,dir,tall);
+                tmp.seeni[(size_t)x] = 1.0f / tall;
+            }
+        }
+        const int32_t *sc = tmp.seenc.data();
+        const float *si_ = tmp.seeni.data();
+        const uint32_t *sp = seen.data();
+        const uint16_t *sa = seen_at.data();
+        const int sh2 = seen_h / 2;
+#define VP_FROM_SEEN(X,Y,WAS) (useseen && fromSeen(sp,sa,sc[X],(int)lroundf(((float)(Y) - cy - down) * si_[X]) + sh2,nowat,WAS))
+        for (int y=0;y < ih;y++) {
+            uint32_t *o = (uint32_t*)(dst + (size_t)y * (size_t)pitch);
+            const uint32_t *in = src + (size_t)y * w;
+            if (y < vy0 || y >= vy1) { memcpy(o,in,(size_t)w * 4); continue; }
+            const uint8_t *sr = st + (size_t)y * w;
+            if (vx0 > 0) memcpy(o,in,(size_t)vx0 * 4);
+            if (vx1 < iw) memcpy(o + vx1,in + vx1,(size_t)(iw - vx1) * 4);
+            const int64_t yr = (int64_t)llroundf(((float)y - py - cy) * 256.0f);
+            float even = 0, rate = 1;
+            if (layered) rowLayer(y,t0,even,rate);
+            if (even > 0) {
+                /* a row of what scrolls evenly (or partly so, next to the border of such a band): every column by
+                 * the same, and no taller towards the side it leaves by */
+                const float flat = rate * px * even, part = 1.0f - even;
+                const float *reach = tmp.reach.data();
+                for (int x=vx0;x < vx1;x++) {
+                    if (sr[x]) { o[x] = in[x]; continue; }
+                    int xi = (int)lroundf((float)x - reach[x] * part - flat);
+                    int past = 0;
+                    if (xi < vx0) { past = vx0 - xi; xi = 2 * vx0 - 1 - xi; }
+                    if (xi >= vx1) { past = xi - vx1 + 1; xi = 2 * vx1 - 1 - xi; }
+                    xi = std::max(vx0,std::min(vx1 - 1,xi));
+                    int ys = y;
+                    if (rows) {
+                        ys = (int)((cyf + yr * (65536 + (int64_t)((float)(rk[x] - 65536) * part))) >> 24);
+                        if (ys < vy0) ys = 2 * vy0 - 1 - ys;
+                        if (ys >= vy1) ys = 2 * vy1 - 1 - ys;
+                        ys = std::max(vy0,std::min(vy1 - 1,ys));
+                    }
+                    const size_t si = (size_t)ys * w + (size_t)xi;
+                    uint32_t c = st[si] ? in[x] : src[si];
+                    if (past || st[si]) {
+                        uint32_t was;
+                        if (VP_FROM_SEEN(x,y,was)) c = was;
+                        else if (past) {
+                            const uint32_t k = dimOf(past);
+                            c = 0xFF000000u | ((((c & 0xFF00FFu) * k) >> 8) & 0xFF00FFu) | ((((c & 0x00FF00u) * k) >> 8) & 0x00FF00u);
+                        }
+                    }
+                    o[x] = c;
+                }
+                continue;
+            }
+            if (!rows) {
+                for (int x=vx0;x < vx1;x++) {
+                    const int xi = sx[x];
+                    if (sr[x]) o[x] = in[x];
+                    else if (sr[xi]) { uint32_t was; o[x] = VP_FROM_SEEN(x,y,was) ? was : in[x]; }  /* what the weapon hid */
+                    else o[x] = in[xi];
+                }
+            }
+            else {
+                for (int x=vx0;x < vx1;x++) {
+                    if (sr[x]) { o[x] = in[x]; continue; }
+                    int ys = (int)((cyf + yr * rk[x]) >> 24);
+                    if (ys < vy0) ys = 2 * vy0 - 1 - ys;
+                    if (ys >= vy1) ys = 2 * vy1 - 1 - ys;
+                    ys = std::max(vy0,std::min(vy1 - 1,ys));
+                    const size_t si = (size_t)ys * w + (size_t)sx[x];
+                    if (st[si]) { uint32_t was; o[x] = VP_FROM_SEEN(x,y,was) ? was : in[x]; }
+                    else o[x] = src[si];
+                }
+            }
+            for (int side=0;side < 2;side++) {
+                for (int x=side ? dr : vx0;x < (side ? vx1 : dl);x++) {
+                    if (sr[x]) continue;
+                    uint32_t was;
+                    if (VP_FROM_SEEN(x,y,was)) { o[x] = was; st_seen++; continue; }
+                    st_mirror++;
+                    const uint32_t c = o[x], k = dm[x];
+                    o[x] = 0xFF000000u | ((((c & 0xFF00FFu) * k) >> 8) & 0xFF00FFu) | ((((c & 0x00FF00u) * k) >> 8) & 0x00FF00u);
+                }
+            }
+        }
+#undef VP_FROM_SEEN
+        st_warps++;
+        st_warp_us += RP_Micros() - t0;
+    }
+
+    /* What was seen at row j of column c of the memory, when that is no more than four seconds ago. */
+    inline bool fromSeen(const uint32_t *px,const uint16_t *at,int c,int j,uint16_t nowat,uint32_t &out) const {
+        if (j < 0 || j >= seen_h) return false;
+        const size_t i = (size_t)c * seen_h + (size_t)j;
+        const uint16_t a = at[i];
+        if (a == 0 || (uint16_t)(nowat - a) > 244) return false;
+        out = px[i];
+        return true;
+    }
+
+    /* How dark the mirrored view is drawn, by how many columns past the edge it stands in for (256: as it is). */
+    uint16_t dimOf(int past) const {
+        return past ? (uint16_t)(256 - std::min(120,24 + (int)((float)past * 4.0f / unitx))) : (uint16_t)256;
+    }
+
+    /* Every five seconds, for the log. */
+    void report(void) {
+        if (!enabled || st_frames == 0) return;
+        if (debug) {
+            double best = 0; unsigned bj = 0;
+            for (unsigned j=0;j < VP_LAGS;j++) if (ax.b[j] > 1e-9) { const double e = ax.a[j] * ax.a[j] / ax.b[j]; if (e > best) { best = e; bj = j; } }
+            LOG_MSG("INPUTNET: vp debug: %u frames, %u pairs (%u same, %u with x, %u with y, %u moved; strips measured %.1f stayed %.1f a pair); lens frames %u fit a %.3f b %.3f c %.3f rms %.3f spread %.3f means %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f; "
+                "x: n %u c %.1f best lag %u explains %.2f gain %.4f q %.2f rejected %u; y: n %u c %.1f; mouse total %.0f %.0f",
+                st_frames,dbg_pairs,dbg_same,dbg_okx,dbg_oky,dbg_moved,dbg_pairs ? (double)dbg_regx / dbg_pairs : 0.0,dbg_pairs ? (double)dbg_regy / dbg_pairs : 0.0,
+                lens_frames,lens_fit_a,lens_fit_b,lens_fit_c,lens_fit_rms,lens_fit_spread,
+                lens_mean[0],lens_mean[1],lens_mean[2],lens_mean[3],lens_mean[4],lens_mean[5],lens_mean[6],lens_mean[7],
+                ax.n,ax.c,bj,ax.c > 0 ? best / ax.c : 0.0,ax.b[bj] > 1e-9 ? ax.a[bj] / ax.b[bj] : 0.0,(double)ax.q,ax.rejected,ay.n,ay.c,totx,toty);
+            dbg_pairs = dbg_same = dbg_okx = dbg_oky = dbg_moved = dbg_regx = dbg_regy = 0;
+        }
+        const bool was = said_ready;
+        if (lens.known && (ax.known || kst_open) && !said_ready) said_ready = true;
+        if (st_ptr_hit + st_ptr_miss) {
+            char shownText[48] = "", errText[144] = "";
+            if (st_dot_us >= 500000) snprintf(shownText,sizeof(shownText)," (shown %u%% of the time)",(unsigned)(st_dot_on_us * 100u / st_dot_us));
+            if (st_ptr_errn) snprintf(errText,sizeof(errText),"; the pointer came to be %.2f pixels (of 320x200) from the dot on average, at most %.2f (%u reports)",
+                st_ptr_err / st_ptr_errn,st_ptr_errmax,st_ptr_errn);
+            LOG_MSG("INPUTNET: pointer dot %s%s: the game's pointer was where the mouse driver has it in %u of %u moves%s",
+                ptr_q >= 0.7f ? "on" : "off",shownText,st_ptr_hit,st_ptr_hit + st_ptr_miss,errText);
+        }
+        st_ptr_hit = st_ptr_miss = 0;
+        st_dot_us = st_dot_on_us = 0;
+        st_ptr_err = st_ptr_errmax = 0; st_ptr_errn = 0;
+        if (!lens.known && !ax.known && !ay.known && kst_n == 0) { clearStats(); return; }
+        char lensText[64];
+        if (!lens.known) snprintf(lensText,sizeof(lensText),"not known yet");
+        else if (lens.persp) snprintf(lensText,sizeof(lensText),"%.0f degrees wide%s",2.0 * atan((double)(vx1 - vx0) * 0.5 / lens.f) * 180.0 / 3.14159265358979,lens.assumed ? " (taken to be)" : "");
+        else snprintf(lensText,sizeof(lensText),"flat");
+        char layers[80];
+        layers[0] = 0;
+        {
+            unsigned nb = 0; float rsum = 0;
+            const uint64_t nowus = RP_Micros();
+            for (unsigned b=0;b < VP_CELLROWS;b++) if (evenBand(b,nowus)) { nb++; rsum += band_rate[b]; }
+            if (nb && anyLayer(nowus)) snprintf(layers,sizeof(layers),", %u of 6 bands scroll evenly (at %.2f of the ground's rate)",nb,rsum / nb);
+        }
+        if (still_dirty || stay.size() != still.size()) cleanStill();
+        unsigned stillpx = 0;
+        for (size_t i=0;i < stay.size();i++) stillpx += stay[i];
+        char turn[160], look[160], keys[200];
+        describe(ax,turn,sizeof(turn));
+        describe(ay,look,sizeof(look));
+        unsigned nkeys = 0;
+        for (size_t i=0;i < kmodel.size();i++) if (kmodel[i].open && kmodel[i].n >= 20) {
+            const float most = std::max(fabsf(kmodel[i].mx + kmodel[i].vx[10]),fabsf(kmodel[i].my + kmodel[i].vy[10]));
+            if (most * 1000.0f >= 10.0f * unitx) nkeys++;      /* moves the view by 10 pixels a second or more */
+        }
+        if (kst_n) snprintf(keys,sizeof(keys),"%u keys that move the view (%u stretches, %u%% shown): off by %.1f px where the picture moved %.1f",
+            nkeys,kst_n,kst_open * 100u / kst_n,kst_err / kst_n,kst_base / kst_n);
+        else snprintf(keys,sizeof(keys),"%u keys that move the view",nkeys);
+        char edge[80];
+        edge[0] = 0;
+        if (st_seen + st_mirror) snprintf(edge,sizeof(edge),"; %u%% of what turns came into view was seen just before",(unsigned)((uint64_t)st_seen * 100u / (st_seen + st_mirror)));
+        LOG_MSG("INPUTNET: view prediction%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place%s; "
+            "%.2f ms a frame to learn, %.2f ms to move the picture (%u times)",
+            was ? "" : (said_ready ? " ready" : " learning"),turn,look,keys,lensText,layers,vx1 - vx0,vy1 - vy0,vx0,vy0,
+            still.empty() ? 0u : (unsigned)((uint64_t)stillpx * 100u / still.size()),edge,
+            st_analyse_us / 1000.0 / st_frames,st_warps ? st_warp_us / 1000.0 / st_warps : 0.0,st_warps);
+        clearStats();
+    }
+
+private:
+    static const int VP_KEPT = 6;
+    VPPlane planes[VP_KEPT];
+    int cur = 0;                        /* planes[cur]: the frame analysed last; the ones before it follow backwards */
+    unsigned chain = 1;
+    VPScratch tmp;
+    std::vector<uint8_t> still;         /* per pixel: how often it stayed the same while the view moved */
+    std::vector<uint8_t> stay;          /* ...and whether it counts as staying (see cleanStill) */
+    bool still_dirty = true;
+    /* What was seen lately, by direction (see seenStore): columns all the way round, each twice the view's height. */
+    std::vector<uint32_t> seen;
+    std::vector<uint16_t> seen_at;      /* per pixel: when (units of 16 ms; 0: never) */
+    int seen_w = 0, seen_h = 0;
+    double seen_dir = 0, seen_down = 0; /* where the frame analysed last looks, and how far its content has moved down in all */
+    bool seen_has = false, seen_hasc = false, seen_lead = false, seen_persp = false;
+    uint32_t seen_id = 0, seen_seq = 0xFFFFFFFFu, seen_shown_id = 0;
+    uint64_t seen_c = 0;
+    unsigned seen_guessed = 0;          /* frames in a row placed by what the input does, not by measuring */
+    float seen_leadx = 0, seen_leady = 0, seen_f = 0, seen_cx = 0;
+    VPView seen_view = { 0, 0, 0, 0 };
+    unsigned st_seen = 0, st_mirror = 0;        /* for the log: pixels at the edge filled from memory, and mirrored */
+    VPPointer told_ptr;                 /* the newest report of the driver's pointer the host has sent... */
+    uint32_t told_id = 0, told_seq = 0; /* ...its frame, and the newest input the host had applied then */
+    bool told_any = false;
+    bool mlog_cut = false;              /* the newest input event the log of motion no longer has */
+    uint32_t mlog_cut_seq = 0;
+    uint64_t dot_t = 0, st_dot_us = 0, st_dot_on_us = 0;
+    bool dot_was = false;
+    double st_ptr_err = 0, st_ptr_errmax = 0;   /* for the log: how far the pointer came to be from where the dot was */
+    unsigned st_ptr_errn = 0;
+    float ptr_q = 0;                    /* how sure it is that the game draws its pointer there (the dot shows from 0.7) */
+    unsigned st_ptr_hit = 0, st_ptr_miss = 0;
+    float band_score[VP_CELLROWS] = {}; /* see learnLayers */
+    float band_rate[VP_CELLROWS] = {};
+    uint64_t band_t[VP_CELLROWS] = {};
+    uint64_t cells_at = 0;              /* when the cells were measured last */
+    unsigned lens_clean = 0;            /* frames the lens was learned from (none with layers in view) */
+    unsigned cells_done = 0;            /* times the cells were measured */
+    uint64_t layers_at = 0;             /* when layers were last in view */
+    std::vector<float> rowch, colch;    /* how much of each row and column changes when the view moves (a fading mean) */
+    unsigned view_frames = 0;
+    int vx0 = 0, vx1 = 0, vy0 = 0, vy1 = 0;    /* the view: columns [vx0,vx1), rows [vy0,vy1) of the picture */
+    float unitx = 1, unity = 1;         /* a pixel of a 320x200 picture, in this picture's pixels */
+    std::deque<VPSample> samples;
+    uint64_t block_end[2] = { 0, 0 };   /* where the last stretch of frames learned from ended, per direction */
+    std::deque<VPMouseEv> mlog;
+    std::deque<std::pair<uint32_t,uint64_t> > elog;     /* input events: number, time */
+    double totx = 0, toty = 0, basex = 0, basey = 0;
+    std::vector<VPKeyHist> khist;       /* per key */
+    std::vector<VPKeyModel> kmodel;     /* per key and combination of Shift, Ctrl, Alt */
+    struct KeyFrame { float resx, predx, resy, predy; };
+    struct KeyAct { unsigned k; float ms[VP_KEYBINS]; float held; float px; };
+    std::vector<KeyAct> kact;           /* the keys that count for the frame being learned from */
+    std::deque<KeyFrame> kframes;       /* the last frames: what the keys were to explain, and what they did */
+    float kstrength = 0;                /* how much of the keys' prediction is shown */
+    double kst_err = 0, kst_base = 0;   /* for the log */
+    unsigned kst_n = 0, kst_open = 0;
+    double lens_mean[VP_STRIPS], lens_var[VP_STRIPS];
+    unsigned lens_n[VP_STRIPS], lens_frames = 0;
+    bool shown_hasc = false;
+    uint32_t shown_seq = 0xFFFFFFFFu;
+    uint64_t shown_c = 0, shown_arrival = 0, idle_c = 0, ival = 0, str_t = 0;
+    bool said_ready = false;
+    unsigned st_frames = 0, st_warps = 0;
+    uint64_t st_analyse_us = 0, st_warp_us = 0;
+
+    void clearStats(void) {
+        st_frames = st_warps = 0;
+        st_analyse_us = st_warp_us = 0;
+        ax.st_err = ax.st_base = ay.st_err = ay.st_base = 0;
+        ax.st_n = ax.st_open = ay.st_n = ay.st_open = 0;
+        kst_err = kst_base = 0;
+        kst_n = kst_open = 0;
+        st_seen = st_mirror = 0;
+    }
+
+    void describe(const VPAxis &a,char *out,size_t n) const {
+        if (!a.known) { snprintf(out,n,"not learned (%u samples)",a.n); return; }
+        if (a.st_n == 0) { snprintf(out,n,"%.3f px a count after %.0f ms, %s",a.gain,a.delay / 1000.0,a.open ? "on" : "off"); return; }
+        snprintf(out,n,"%.3f px a count after %.0f ms, %s (%u stretches, %u%% shown): off by %.1f px where the picture moved %.1f",
+            a.gain,a.delay / 1000.0,a.open ? "on" : "off",a.st_n,a.st_open * 100u / a.st_n,a.st_err / a.st_n,a.st_base / a.st_n);
+    }
+
+    /* Every input event's number and time, to tell what a frame shows. */
+    void logEvent(uint64_t t,uint32_t seq) {
+        elog.push_back(std::make_pair(seq,t));
+        while (elog.size() > 2 && t - elog.front().second > 4000000) elog.pop_front();
+    }
+
+    /* Up to which moment a frame shows the input: the moment c its clock gives, but nothing after the newest input
+     * event (seq) the host had applied when it took the frame, however long ago the next one was sent (a datagram
+     * that was late or lost is not in the picture). */
+    uint64_t bound(uint64_t c,uint32_t seq) const {
+        if (seq == 0xFFFFFFFFu || elog.empty()) return c;
+        size_t lo = 0, hi = elog.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if ((int32_t)(elog[mid].first - seq) <= 0) lo = mid + 1; else hi = mid;
+        }
+        if (lo >= elog.size()) return c;
+        return std::min(c,elog[lo].second - 1);
+    }
+
+    /* All the mouse counts sent up to t. */
+    void cum(uint64_t t,double &x,double &y) const {
+        size_t lo = 0, hi = mlog.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (mlog[mid].t <= t) lo = mid + 1; else hi = mid;
+        }
+        if (lo == 0) { x = basex; y = basey; }
+        else { x = mlog[lo-1].x; y = mlog[lo-1].y; }
+    }
+
+    /* Whether the mouse moved, or a key that turns the view was held, for what frame s shows. */
+    bool inputMoved(const VPSample &s) const {
+        const uint64_t b0 = bound(s.c0,s.q0), b1 = bound(s.c1,s.q1);
+        if (b1 <= b0) return false;
+        double x1, y1, x0, y0;
+        cum(b1,x1,y1);
+        cum(b0 > 120000 ? b0 - 120000 : 0,x0,y0);     /* (the game's own delay is not known at first) */
+        if (x1 != x0) return true;
+        if (khist.empty() || kmodel.empty()) return false;
+        const unsigned ctx = contextAt(b1);
+        float ms[VP_KEYBINS];
+        for (unsigned k=1;k < (unsigned)KBD_LAST;k++) {
+            if (!keyNear(k,b0)) continue;
+            const VPKeyModel &m = kmodel[(size_t)k * VP_KEYCTX + ctx];
+            if (m.n < 8 || fabsf(m.mx + m.vx[10]) * 1000.0f < 10.0f * unitx || !keyTime(k,b0,b1,ms)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /* Whether the game draws a pointer where the driver has it (see pointerTold): judged whenever that place moved
+     * between two frames. */
+    void judgePointer(const VPPlane &pl,const VPPlane &prev,const VPMotion &mo) {
+        if (!pl.ptr.told || !prev.ptr.told) return;     /* (lost on the way: nothing to judge by) */
+        if (!pl.ptr.has || !prev.ptr.has) { ptr_q = 0; return; }
+        if (mo.same || !mo.masked || pl.w != prev.w || pl.h != prev.h) return;
+        const int pw = (int)pl.w, ph = (int)pl.h;
+        const float ux = (float)pw / 320.0f, uy = (float)ph / 200.0f;
+        const float ox = prev.ptr.x * (float)(pw - 1), oy = prev.ptr.y * (float)(ph - 1);
+        const float nx = pl.ptr.x * (float)(pw - 1), ny = pl.ptr.y * (float)(ph - 1);
+        if (fabsf(nx - ox) < 3.0f * ux && fabsf(ny - oy) < 3.0f * uy) return;
+        /* around each place: a pointer's picture reaches right and down from it, some are centred on it */
+        int bx0[2], bx1[2], by0[2], by1[2];
+        const float px[2] = { ox, nx }, py[2] = { oy, ny };
+        for (int k=0;k < 2;k++) {
+            bx0[k] = std::max(0,(int)(px[k] - 12.0f * ux)); bx1[k] = std::min(pw,(int)(px[k] + 28.0f * ux));
+            by0[k] = std::max(0,(int)(py[k] - 12.0f * uy)); by1[k] = std::min(ph,(int)(py[k] + 28.0f * uy));
+        }
+        const uint8_t *m = tmp.mask[0].data();
+        size_t total = 0, inside = 0, room = 0;
+        for (int y=0;y < ph;y++) {
+            const bool r0 = y >= by0[0] && y < by1[0], r1 = y >= by0[1] && y < by1[1];
+            const uint8_t *row = m + (size_t)y * pw;
+            for (int x=0;x < pw;x++) {
+                total += row[x];
+                if ((r0 && x >= bx0[0] && x < bx1[0]) || (r1 && x >= bx0[1] && x < bx1[1])) { inside += row[x]; room++; }
+            }
+        }
+        const size_t all = (size_t)pw * ph;
+        /* at least a few pixels there, and four times as dense as in the rest of the picture */
+        const bool hit = inside >= 6 && room < all && inside * (all - room) >= 4 * (total - inside) * room;
+        ptr_q = std::max(0.0f,std::min(1.0f,ptr_q + (hit ? 0.25f : -0.34f)));
+        if (hit) st_ptr_hit++; else st_ptr_miss++;
+    }
+
+    /* How far the view moved between what two frames show, as far as the mouse and the keys are known to move it.
+     * False: not known (the mouse moved and its effect is not learned, or a key is held whose effect is in doubt). */
+    bool between(uint64_t c0,uint32_t q0,uint64_t c1,uint32_t q1,float &mx,float &my) const {
+        mx = my = 0;
+        double x1, y1, x0, y0;
+        cum(bound(c1 - (uint64_t)ax.delay,q1),x1,y1); cum(bound(c0 - (uint64_t)ax.delay,q0),x0,y0);
+        if (x1 != x0) {
+            if (!ax.known || !ax.open) return false;
+            mx += (float)(ax.gain * (x1 - x0));
+        }
+        if (ay.known && ay.open) {
+            cum(bound(c1 - (uint64_t)ay.delay,q1),x1,y1); cum(bound(c0 - (uint64_t)ay.delay,q0),x0,y0);
+            my += (float)(ay.gain * (y1 - y0));
+        }
+        if (khist.empty() || kmodel.empty()) return true;
+        const uint64_t b0 = bound(c0,q0), b1 = bound(c1,q1);
+        if (b1 <= b0) return true;
+        const unsigned ctx = contextAt(b1);
+        float ms[VP_KEYBINS];
+        for (unsigned k=1;k < (unsigned)KBD_LAST;k++) {
+            if (!keyNear(k,b0) || !keyTime(k,b0,b1,ms)) continue;
+            const VPKeyModel &m = kmodel[(size_t)k * VP_KEYCTX + ctx];
+            float kx = 0, ky = 0;
+            for (unsigned b=0;b < VP_KEYBINS;b++) {
+                kx += (m.vx[b] + (b < 11 ? m.mx : 0.0f)) * ms[b];
+                ky += (m.vy[b] + (b < 11 ? m.my : 0.0f)) * ms[b];
+            }
+            if (m.n < 20) return false;                                    /* a key not known yet */
+            if (!m.open && (fabsf(kx) >= unitx || fabsf(ky) >= unity)) return false;   /* ...or in doubt, and said to move the view */
+            if (m.open) { mx += kx; my += ky; }
+        }
+        return true;
+    }
+
+    /* ---- What was seen lately, by direction ----
+     * A turn brings into view at one edge what the frame on the screen does not have. Often the player has just
+     * looked there: aiming goes back and forth. Every analysed frame is therefore written into a picture of all
+     * directions around the player: a column per pixel of turn at the view's middle (2 pi f of them, all the way
+     * round), each holding what was seen in that direction, by height on a cylinder around the player (so that what
+     * the lens stretches towards the sides of a view lands in one place whichever column it was seen in), together
+     * with when. The edge of a moved picture, and what a weapon held still hides of the world, is then filled from
+     * there when it was seen in the last four seconds; otherwise the view mirrored stands in as before. A view
+     * that moves as one piece (no perspective) is kept the same way, flat. What stays in the picture is not written;
+     * neither are bands that scroll at a rate of their own (they would land in the wrong directions). The memory
+     * starts over when the picture changes in a way that is not the view turning (the player walks: everything is
+     * seen from another place then), after three frames at most. */
+    static uint16_t seenStamp(uint64_t us) { const uint16_t v = (uint16_t)(us >> 14); return v ? v : (uint16_t)1; }
+
+    bool seenFits(void) const {
+        return seen_w > 0 && seen_persp == lens.persp && seen_view.x0 == vx0 && seen_view.x1 == vx1 && seen_view.y0 == vy0 && seen_view.y1 == vy1
+            && fabsf(seen_f - lens.f) <= 0.02f * lens.f + 0.01f && fabsf(seen_cx - lens.cx) <= 1.0f;
+    }
+
+    void seenReset(void) {
+        seen_dir = seen_down = 0;
+        seen_guessed = 0;
+        if (!lens.known) { seen_w = seen_h = 0; return; }
+        const int cols = lens.persp ? std::max(64,(int)lroundf(6.2831853f * lens.f)) : std::max(64,(vx1 - vx0) * 4);
+        const int rows = std::max(16,(vy1 - vy0) * 2);
+        if ((size_t)cols * (size_t)rows > ((size_t)24 << 20)) { seen_w = seen_h = 0; return; }      /* (a picture too big to keep) */
+        seen_w = cols; seen_h = rows;
+        seen_persp = lens.persp; seen_f = lens.f; seen_cx = lens.cx;
+        seen_view.x0 = vx0; seen_view.x1 = vx1; seen_view.y0 = vy0; seen_view.y1 = vy1;
+        seen.resize((size_t)cols * rows);
+        seen_at.assign((size_t)cols * rows,0);
+    }
+
+    /* The column of the memory for what shows at column x of a view that looks in direction dir, and how much
+     * taller things are drawn there than on the cylinder (1 in the view's middle). */
+    int seenColumn(float x,double dir,float &tall) const {
+        const float u = x - lens.cx;
+        double col;
+        if (lens.persp) { col = (double)lens.f * (atan((double)u / lens.f) - dir); tall = sqrtf(lens.f * lens.f + u * u) / lens.f; }
+        else { col = (double)u - dir; tall = 1.0f; }
+        long c = lround(col) % (long)seen_w;
+        if (c < 0) c += seen_w;
+        return (int)c;
+    }
+
+    void seenStore(const uint32_t *argb,uint64_t now) {
+        if (seen_w == 0 || !seenFits()) { seenReset(); if (seen_w == 0) return; }
+        if (still_dirty || stay.size() != (size_t)w * h) cleanStill();
+        const uint16_t at = seenStamp(now);
+        const float cy = (float)(vy0 + vy1 - 1) * 0.5f;
+        const bool layered = anyLayer(now);
+        std::vector<uint8_t> &skiprow = tmp.skiprow;
+        if (layered) {
+            const int bh = std::max(1,(vy1 - vy0) / (int)VP_CELLROWS);
+            skiprow.assign(h,0);
+            for (int y=vy0;y < vy1;y++) skiprow[(size_t)y] = evenBand((unsigned)std::min((int)VP_CELLROWS - 1,(y - vy0) / bh),now) ? 1 : 0;
+        }
+        for (int x=vx0;x < vx1;x++) {
+            float tall;
+            const int c = seenColumn((float)x,seen_dir,tall);
+            uint32_t *pc = seen.data() + (size_t)c * seen_h;
+            uint16_t *pt = seen_at.data() + (size_t)c * seen_h;
+            /* row j of the memory for row y of the view: (y - cy - down) / tall + half its height, in 16.16 */
+            const int32_t step = (int32_t)lroundf(65536.0f / tall);
+            int64_t jf = (int64_t)llroundf(((float)vy0 - cy - (float)seen_down) / tall * 65536.0f) + ((int64_t)(seen_h / 2) << 16) + 32768;
+            const uint8_t *sy = stay.data() + (size_t)vy0 * w + x;
+            const uint32_t *ay = argb + (size_t)vy0 * w + x;
+            for (int y=vy0;y < vy1;y++, jf += step, sy += w, ay += w) {
+                if (*sy) continue;
+                if (layered && skiprow[(size_t)y]) continue;
+                const int j = (int)(jf >> 16);
+                if (j < 0 || j >= seen_h) continue;
+                pc[j] = *ay;
+                pt[j] = at;
+            }
+        }
+    }
+
+    static bool modifier(unsigned k) {
+        return k == (unsigned)KBD_leftshift || k == (unsigned)KBD_rightshift || k == (unsigned)KBD_leftctrl
+            || k == (unsigned)KBD_rightctrl || k == (unsigned)KBD_leftalt || k == (unsigned)KBD_rightalt;
+    }
+
+    /* Whether key k was held at t, and since when it was (or was not; 0: longer than is remembered). */
+    bool heldAt(unsigned k,uint64_t t,uint64_t &since) const {
+        const VPKeyHist &h = khist[k];
+        for (unsigned i=h.n;i-- > 0;) if (h.t[i] <= t) { since = h.t[i]; return h.down[i]; }
+        since = 0;
+        return h.n > 0 && !h.down[0];
+    }
+
+    /* Which of Shift, Ctrl and Alt were held at t: they change what other keys do (run, strafe). */
+    unsigned contextAt(uint64_t t) const {
+        uint64_t x;
+        unsigned c = 0;
+        if (heldAt((unsigned)KBD_leftshift,t,x) || heldAt((unsigned)KBD_rightshift,t,x)) c |= 1;
+        if (heldAt((unsigned)KBD_leftctrl,t,x) || heldAt((unsigned)KBD_rightctrl,t,x)) c |= 2;
+        if (heldAt((unsigned)KBD_leftalt,t,x) || heldAt((unsigned)KBD_rightalt,t,x)) c |= 4;
+        return c;
+    }
+
+    /* For how many milliseconds of (b0,b1] key k was in each of the 16 stretches of having been held or let go. */
+    bool keyTime(unsigned k,uint64_t b0,uint64_t b1,float *ms) const {
+        const VPKeyHist &h = khist[k];
+        if (h.n == 0) return false;
+        memset(ms,0,sizeof(float) * VP_KEYBINS);
+        bool any = false;
+        uint64_t t = b0;
+        while (t < b1) {
+            uint64_t since;
+            const bool down = heldAt(k,t,since);
+            uint64_t next = b1;
+            for (unsigned i=0;i < h.n;i++) if (h.t[i] > t) { next = std::min(next,h.t[i]); break; }
+            if (since == 0 && !down) { t = next; continue; }
+            const double a0 = since ? (double)(t - since) / 1000.0 : 1e9, a1 = a0 + (double)(next - t) / 1000.0;
+            if (down) {
+                for (unsigned b=0;b < 11;b++) {
+                    const double lo = VP_KEYEDGE[b], hi = (b == 10) ? 1e18 : (double)VP_KEYEDGE[b+1];
+                    const double o = std::min(a1,hi) - std::max(a0,lo);
+                    if (o > 0) { ms[b] += (float)o; any = true; }
+                }
+            }
+            else {
+                double lo = 0;
+                for (unsigned b=0;b < 5;b++) {
+                    const double hi = VP_KEYEDGE[12 + b];
+                    const double o = std::min(a1,hi) - std::max(a0,lo);
+                    if (o > 0) { ms[11 + b] += (float)o; any = true; }
+                    lo = hi;
+                }
+            }
+            t = next;
+        }
+        return any;
+    }
+
+    /* A key that could matter for (b0,b1]: held, or let go less than a fifth of a second before. */
+    bool keyNear(unsigned k,uint64_t b0) const {
+        const VPKeyHist &h = khist[k];
+        if (h.n == 0 || modifier(k)) return false;
+        return h.down[h.n-1] || h.t[h.n-1] + 200000 > b0;
+    }
+
+    /* What the keys do to the view, learned from one frame: the movement the mouse does not explain is shared out
+     * among the keys held (or just let go) in proportion to their time, a little at a time, so that keys that are
+     * always held together are told apart as soon as one is held alone. */
+    void learnKeys(const VPSample &s) {
+        if (khist.empty()) return;
+        if (kmodel.empty()) {
+            kmodel.resize((size_t)KBD_LAST * VP_KEYCTX);
+            memset(kmodel.data(),0,kmodel.size() * sizeof(VPKeyModel));
+        }
+        const uint64_t b0 = bound(s.c0,s.q0), b1 = bound(s.c1,s.q1);
+        if (b1 <= b0 || b1 - b0 > 400000) { kframes.clear(); return; }
+        double resx = s.sx, resy = s.sy;
+        bool usex = s.okx, usey = s.oky;
+        double x1, y1, x0, y0;
+        cum(bound(s.c1 - (uint64_t)ax.delay,s.q1),x1,y1); cum(bound(s.c0 - (uint64_t)ax.delay,s.q0),x0,y0);
+        if (x1 != x0) { if (ax.known) resx -= ax.gain * (x1 - x0); else usex = false; }
+        cum(bound(s.c1 - (uint64_t)ay.delay,s.q1),x1,y1); cum(bound(s.c0 - (uint64_t)ay.delay,s.q0),x0,y0);
+        if (y1 != y0) { if (ay.known) resy -= ay.gain * (y1 - y0); else usey = false; }
+        if (!usex) { kframes.clear(); return; }
+        const unsigned ctx = contextAt(b1);
+        kact.clear();
+        double norm = 0, predx = 0, predy = 0;
+        KeyAct a;
+        for (unsigned k=1;k < (unsigned)KBD_LAST;k++) {
+            if (!keyNear(k,b0) || !keyTime(k,b0,b1,a.ms)) continue;
+            a.k = k;
+            const VPKeyModel &m = kmodel[(size_t)k * VP_KEYCTX + ctx];
+            a.px = 0;
+            a.held = 0;
+            for (unsigned b=0;b < VP_KEYBINS;b++) {
+                if (b < 11) a.held += a.ms[b];
+                norm += (double)a.ms[b] * a.ms[b];
+                a.px += m.vx[b] * a.ms[b];
+                predy += (double)m.vy[b] * a.ms[b];
+            }
+            norm += (double)a.held * a.held;
+            a.px += m.mx * a.held;
+            predy += (double)m.my * a.held;
+            predx += a.px;
+            kact.push_back(a);
+        }
+        if (kact.empty() || norm < 1.0) { kframes.clear(); return; }
+        const double errx = resx - predx, erry = resy - predy;
+        if (debug >= 2) {
+            char list[400]; size_t at = 0; list[0] = 0;
+            for (size_t i=0;i < kact.size() && at + 120 < sizeof(list);i++) {
+                float held = 0, gone = 0;
+                for (unsigned b=0;b < 11;b++) held += kact[i].ms[b];
+                for (unsigned b=11;b < VP_KEYBINS;b++) gone += kact[i].ms[b];
+                at += (size_t)snprintf(list + at,sizeof(list) - at," key %u held %.0f gone %.0f says %.1f [",kact[i].k,held,gone,kact[i].px);
+                for (unsigned b=0;b < VP_KEYBINS && at + 24 < sizeof(list);b++) if (kact[i].ms[b] > 0)
+                    at += (size_t)snprintf(list + at,sizeof(list) - at,"%u:%.0fms*%.3f ",b,kact[i].ms[b],kmodel[(size_t)kact[i].k * VP_KEYCTX + ctx].vx[b] + (b < 11 ? kmodel[(size_t)kact[i].k * VP_KEYCTX + ctx].mx : 0.0f));
+                if (at + 3 < sizeof(list)) at += (size_t)snprintf(list + at,sizeof(list) - at,"];");
+            }
+            LOG_MSG("INPUTNET: vp keys: %.1f ms, the picture moved %.2f (keys: %.2f), predicted %.2f, ctx %u:%s",(b1 - b0) / 1000.0,s.sx,resx,predx,ctx,list);
+        }
+
+        /* How well the keys were predicted lately (before this frame is learned from): four frames together. */
+        KeyFrame kf = { (float)resx, (float)predx, (float)resy, (float)predy };
+        kframes.push_back(kf);
+        if (kframes.size() >= 4) {
+            double R = 0, P = 0;
+            for (size_t i=0;i < kframes.size();i++) { R += kframes[i].resx; P += kframes[i].predx; }
+            kframes.clear();    /* four frames together, each frame judged once */
+            if (fabs(R) >= 2.0 * unitx || fabs(P) >= 2.0 * unitx) {
+                const bool ok = fabs(R - P) <= std::max(3.0 * (double)unitx,0.35 * std::max(fabs(R),fabs(P)));
+                bool shown = false;
+                for (size_t i=0;i < kact.size();i++) {
+                    VPKeyModel &m = kmodel[(size_t)kact[i].k * VP_KEYCTX + ctx];
+                    if (m.open && m.n >= 20) shown = true;
+                    /* a key is judged by what it was said to do, or by what happened when it said nothing yet */
+                    if (fabs(kact[i].px) >= 0.3 * fabs(predx) || fabs(predx) < 1.0 * unitx) {
+                        m.q = ok ? std::min(1.0f,m.q + 0.34f) : std::max(0.0f,m.q - 0.34f);
+                        if (m.q >= 0.66f) m.open = true; else if (m.q < 0.33f) m.open = false;
+                    }
+                }
+                kst_err += fabs(R - P); kst_base += fabs(R); kst_n++;
+                if (shown) kst_open++;
+            }
+        }
+
+        /* A frame in which a key was held for a moment only says little about it, however far the picture moved:
+         * the step is measured against a frame of 20 ms, and against no more than a dozen pixels of surprise. */
+        const double room = norm + 400.0, most = 12.0;
+        const double stepx = std::max(-most * unitx,std::min(most * (double)unitx,errx));
+        const double stepy = std::max(-most * unity,std::min(most * (double)unity,erry));
+        for (size_t i=0;i < kact.size();i++) {
+            VPKeyModel &m = kmodel[(size_t)kact[i].k * VP_KEYCTX + ctx];
+            const double mu = m.n < 30 ? 0.5 : 0.2;        /* quick while a key is new, steady once it is known */
+            m.mx += (float)(mu * stepx * kact[i].held / room);
+            if (usey) m.my += (float)(mu * stepy * kact[i].held / room);
+            for (unsigned b=0;b < VP_KEYBINS;b++) {
+                if (kact[i].ms[b] <= 0) continue;
+                m.vx[b] += (float)(mu * stepx * kact[i].ms[b] / room);
+                if (usey) m.vy[b] += (float)(mu * stepy * kact[i].ms[b] / room);
+            }
+            if (m.n < 1000000) m.n++;
+        }
+    }
+
+    /* The game's own delay as a key's curve has it: the time its start falls short of what the key does once held
+     * (nothing at first, then all of it: that long). Microseconds. */
+    static uint64_t keyDelay(const VPKeyModel &m) {
+        const float fullx = m.mx + m.vx[10], fully = m.my + m.vy[10];
+        const bool tilt = fabsf(fully) > fabsf(fullx);
+        const float full = tilt ? fully : fullx;
+        if (fabsf(full) < 1e-4f) return 0;
+        /* (a game that turns slowly at first, as Doom does for six of its steps, is not late: only stretches with
+         * next to nothing in them count, and the part missing of the one after) */
+        double miss = 0;
+        for (unsigned b=0;b < 6;b++) {      /* the first 180 ms */
+            const double part = (double)((tilt ? m.my + m.vy[b] : m.mx + m.vx[b]) / full);
+            const double width = (double)(VP_KEYEDGE[b+1] - VP_KEYEDGE[b]);
+            if (part < 0.25) { miss += width; continue; }
+            if (b > 0 && part < 1.0) miss += width * (1.0 - part);
+            break;
+        }
+        return (uint64_t)(std::min(150.0,miss) * 1000.0);
+    }
+
+    /* How far the keys have moved the view since the frame on the screen was taken, for the player's input up to
+     * now: what the game has yet to show of it is part of that (it turns on for its own delay after a key is let
+     * go, and has not begun to when one was just pressed; the curve of each key says how). */
+    void keyOffset(uint64_t now,float &kx,float &ky) const {
+        kx = ky = 0;
+        if (khist.empty() || kmodel.empty() || !shown_hasc) return;
+        const uint64_t b0 = bound(shown_c,shown_seq);
+        if (now <= b0 || now - b0 > 1000000) return;
+        const unsigned ctx = contextAt(now);
+        float ms[VP_KEYBINS];
+        for (unsigned k=1;k < (unsigned)KBD_LAST;k++) {
+            if (!keyNear(k,b0)) continue;
+            const VPKeyModel &m = kmodel[(size_t)k * VP_KEYCTX + ctx];
+            if (!m.open || m.n < 20) continue;
+            const uint64_t ahead = ax.known ? (uint64_t)ax.delay : keyDelay(m);
+            if (!keyTime(k,b0,now + ahead,ms)) continue;
+            for (unsigned b=0;b < VP_KEYBINS;b++) {
+                kx += (m.vx[b] + (b < 11 ? m.mx : 0.0f)) * ms[b];
+                ky += (m.vy[b] + (b < 11 ? m.my : 0.0f)) * ms[b];
+            }
+        }
+    }
+
+    /* The newest frames together, about a tenth of a second of them: a game that turns in steps of its own (30 a
+     * second, say) spreads a movement over frames differently each time, a stretch of them evens that out. */
+    void learn(void) {
+        for (unsigned axis=0;axis < 2;axis++) {
+            double S = 0;
+            size_t i = samples.size();
+            const uint64_t c1 = samples.back().c1;
+            const uint32_t q1 = samples.back().q1;
+            uint64_t c0 = c1;
+            uint32_t q0 = q1;
+            bool full = false;
+            while (i > 0) {
+                const VPSample &s = samples[i-1];
+                if (!(axis ? s.oky : s.okx) || s.c1 != c0) break;
+                S += axis ? s.sy : s.sx;
+                c0 = s.c0; q0 = s.q0;
+                i--;
+                if (c1 - c0 >= 80000) { full = true; break; }
+            }
+            if (!full) continue;
+            /* stretches that do not share frames: one frame that went wrong (the host stalled, a frame was late) is
+             * then judged once, not with every stretch it would be part of */
+            if (c0 < block_end[axis] && block_end[axis] <= c1) continue;
+            block_end[axis] = c1;
+            double M[VP_LAGS];
+            for (unsigned j=0;j < VP_LAGS;j++) {
+                double x1, y1, x0, y0;
+                cum(bound(c1 - j * VP_LAG_STEP,q1),x1,y1);
+                cum(bound(c0 - j * VP_LAG_STEP,q0),x0,y0);
+                M[j] = axis ? y1 - y0 : x1 - x0;
+            }
+            learnAxis(axis ? ay : ax,S,M,axis ? unity : unitx);
+        }
+    }
+
+    /* S: how far the picture moved over a stretch of frames; M: the mouse counts that stretch shows, for each
+     * candidate delay of the game. */
+    void learnAxis(VPAxis &a,double S,const double *M,double unit) {
+        bool any = false;
+        for (unsigned j=0;j < VP_LAGS;j++) if (M[j] != 0) any = true;
+        if (!any) return;
+        const double pred = a.known ? a.gain * M[a.lag] : 0;
+        if (fabs(S) < 0.5 * unit) {
+            /* the mouse moved and the picture stayed: the game is not listening to it now */
+            if (a.known && fabs(pred) >= 4.0 * unit) {
+                a.gate(false);
+                a.st_err += fabs(pred); a.st_n++;
+            }
+            return;
+        }
+        if (a.known) {
+            if (fabs(pred) < 1.5 * unit) return;    /* the picture moved for another reason */
+            const double err = fabs(S - pred);
+            const bool ok = err <= std::max(2.5 * unit,0.3 * std::max(fabs(S),fabs(pred)));
+            a.gate(ok);
+            a.st_err += err; a.st_base += fabs(S); a.st_n++;
+            if (a.open) a.st_open++;
+            if (!ok) {
+                /* a dozen in a row: the game answers the mouse differently now (its sensitivity setting, a zoom) */
+                if (++a.rejected >= 12) a.reset();
+                return;
+            }
+            a.rejected = 0;
+        }
+        const double keep = 0.99;
+        for (unsigned j=0;j < VP_LAGS;j++) {
+            a.a[j] = a.a[j] * keep + S * M[j];
+            a.b[j] = a.b[j] * keep + M[j] * M[j];
+        }
+        a.c = a.c * keep + S * S;
+        a.n++;
+        double best = 0;
+        unsigned bj = 0;
+        for (unsigned j=0;j < VP_LAGS;j++) {
+            if (a.b[j] <= 1e-9) continue;
+            const double e = a.a[j] * a.a[j] / a.b[j];
+            if (e > best) { best = e; bj = j; }
+        }
+        if (best <= 0) return;
+        const bool first = !a.known;
+        if (first) {
+            /* enough movement seen, and the mouse explains most of it */
+            if (a.n < 12 || a.c < 100.0 * unit * unit || best < 0.7 * a.c) return;
+            a.known = true;
+            LOG_MSG("INPUTNET: view prediction: the mouse %s the view by %.3f pixels a count (%u stretches of frames, the mouse explains %.0f%% of the movement)",
+                &a == &ax ? "turns" : "tilts",a.a[bj] / a.b[bj],a.n,100.0 * best / a.c);
+        }
+        a.lag = bj;
+        a.gain = a.a[bj] / a.b[bj];
+        double d = (double)bj;
+        if (bj > 0 && bj + 1 < VP_LAGS && a.b[bj-1] > 1e-9 && a.b[bj+1] > 1e-9) {
+            const double l = a.a[bj-1] * a.a[bj-1] / a.b[bj-1], r = a.a[bj+1] * a.a[bj+1] / a.b[bj+1];
+            const double den = l - 2.0 * best + r;
+            if (den < -1e-12) d += std::max(-0.5,std::min(0.5,0.5 * (l - r) / den));
+        }
+        const double target = d * (double)VP_LAG_STEP;
+        a.delay = first ? target : a.delay + 0.2 * (target - a.delay);
+    }
+
+    /* What scrolls evenly: a band of the view (a sixth of its height) that an even scroll explains clearly better
+     * than the lens does (VP_Bands). That is a sky or a backdrop an engine scrolls at a rate of its own (Build's sky:
+     * about a fifth faster than the ground in the middle of the view, and the same in every column). Such a band is
+     * moved by its own rate; every other band by the lens. A band has to say so three times more often than not, and
+     * is asked again every few seconds: what is in it changes as the player looks around. */
+    void learnLayers(const VPMotion &mo,uint64_t now) {
+        if (!mo.okx || !mo.bands) return;
+        for (unsigned b=0;b < VP_CELLROWS;b++) {
+            if (now > band_t[b] + 3000000) band_score[b] = 0;
+            if (mo.bandvote[b] == 0) continue;
+            band_t[b] = now;
+            if (mo.bandvote[b] > 0) {
+                band_rate[b] = (band_score[b] > 0 && band_rate[b] > 0) ? band_rate[b] + 0.25f * (mo.bandrate[b] - band_rate[b]) : mo.bandrate[b];
+                band_score[b] = std::min(6.0f,band_score[b] + 1.0f);
+            }
+            else band_score[b] = std::max(-6.0f,band_score[b] - 2.0f);
+        }
+    }
+
+    bool evenBand(unsigned b,uint64_t now) const { return band_score[b] >= 3.0f && now <= band_t[b] + 4000000; }
+
+    /* What the bands say. 0: none scrolls evenly (or nothing is known); 1: all do, at one rate (a 2D view, no
+     * layers); 2: some do: layers. row0, row1: the rows in which the view's own movement is measured (in 2 the
+     * longest run of bands that do not scroll evenly). */
+    int layerState(uint64_t now,int &row0,int &row1) const {
+        row0 = vy0; row1 = vy1;
+        unsigned even = 0, other = 0;
+        float lo = 0, hi = 0;
+        for (unsigned b=0;b < VP_CELLROWS;b++) {
+            if (evenBand(b,now)) {
+                if (even == 0) lo = hi = band_rate[b];
+                lo = std::min(lo,band_rate[b]); hi = std::max(hi,band_rate[b]);
+                even++;
+            }
+            else other++;
+        }
+        if (even == 0) return 0;
+        if (other == 0 || (even >= 5 && hi <= lo * 1.08f)) return (hi <= lo * 1.08f) ? 1 : 2;
+        int best0 = -1, bestn = 0, run0 = -1;
+        for (unsigned b=0;b <= VP_CELLROWS;b++) {
+            const bool geo = b < VP_CELLROWS && !evenBand(b,now);
+            if (geo && run0 < 0) run0 = (int)b;
+            if (!geo && run0 >= 0) {
+                if ((int)b - run0 > bestn) { bestn = (int)b - run0; best0 = run0; }
+                run0 = -1;
+            }
+        }
+        if (best0 >= 0) {
+            const int bh = (vy1 - vy0) / (int)VP_CELLROWS;
+            row0 = vy0 + best0 * bh;
+            row1 = (best0 + bestn == (int)VP_CELLROWS) ? vy1 : vy0 + (best0 + bestn) * bh;
+        }
+        return 2;
+    }
+
+    /* For a row of the picture: how much of it moves evenly (0: all by the lens, 1: all evenly), and at what rate. */
+    void rowLayer(int y,uint64_t now,float &even,float &rate) const {
+        even = 0; rate = 1;
+        if (vy1 - vy0 < (int)VP_CELLROWS * 2) return;
+        const float fy = ((float)(y - vy0) + 0.5f) / ((float)(vy1 - vy0) / (float)VP_CELLROWS) - 0.5f;
+        const int b0 = std::max(0,std::min((int)VP_CELLROWS - 2,(int)floorf(fy)));
+        const float t = std::max(0.0f,std::min(1.0f,fy - (float)b0));
+        const bool e0 = evenBand((unsigned)b0,now), e1 = evenBand((unsigned)b0 + 1,now);
+        if (!e0 && !e1) return;
+        /* between two bands of which one scrolls evenly the change comes over a third of a band around their border */
+        const float edge = std::max(0.0f,std::min(1.0f,(t - 0.33f) * 3.0f));
+        even = (e0 ? 1.0f - edge : 0.0f) + (e1 ? edge : 0.0f);
+        rate = (e0 && e1) ? band_rate[b0] + (band_rate[b0+1] - band_rate[b0]) * t : (e0 ? band_rate[b0] : band_rate[b0+1]);
+    }
+
+    /* Whether some of the view is moved by a rate of its own now. */
+    bool anyLayer(uint64_t now) const {
+        int a, b;
+        return lens.persp && layerState(now,a,b) == 2;
+    }
+
+    /* The lens: over many frames with a clear sideways movement, how far each of the 8 strips of the picture moves
+     * against its middle. A turn in perspective gives a parabola (more at the sides), a 2D view the same everywhere;
+     * other movement (walking, strafing) gives something else each time, and then nothing is decided. */
+    void learnLens(const VPMotion &mo) {
+        /* (not only frames that fit the lens as it is known: a lens learned wrong could never be put right) */
+        if (!mo.oneway || mo.measured < 5) return;
+        if (fabsf(mo.whole) < 2.0f * unitx || fabsf(mo.whole) > (float)w / 12.0f) return;
+        if (mo.layered) {
+            layers_at = RP_Micros();
+            /* The view moves in layers (a sky above the ground): what is left to measure is low in the view, where
+             * the strips are not to be trusted (see VP_Measure), so such frames do not teach the lens. When there
+             * are no others, the lens is taken to be what nearly every game of the kind has: 90 degrees across the
+             * view, its middle in the view's middle. */
+            if (!lens.assumed && (!lens.known || lens_clean < 30)) {
+                /* (a lens decided from a few frames before the layers showed was decided from the sky too) */
+                lens.known = lens.persp = lens.assumed = true;
+                lens.f = (float)(vx1 - vx0) * 0.5f;
+                lens.cx = (float)(vx0 + vx1 - 1) * 0.5f;
+                memset(lens_n,0,sizeof(lens_n));
+                lens_frames = lens_clean = 0;
+                LOG_MSG("INPUTNET: view prediction: the view moves in layers (a sky, a backdrop); its lens is taken to be 90 degrees wide");
+            }
+            return;
+        }
+        /* the bands have not had their say yet, or said "layers" a moment ago (they are only asked while the view
+         * moves far enough, and a sky does not go away while it does not) */
+        if (cells_done < 3 || (layers_at != 0 && RP_Micros() < layers_at + 20000000)) return;
+        lens_clean++;
+        for (unsigned s=0;s < VP_STRIPS;s++) {
+            if (mo.sk[s] != 1) continue;
+            const double q = mo.sd[s] / mo.whole;
+            if (q < 0.4 || q > 3.2) continue;
+            const double al = std::max(0.07,1.0 / (double)(lens_n[s] + 1));
+            const double dlt = q - lens_mean[s];
+            lens_mean[s] += al * dlt;
+            lens_var[s] = (1.0 - al) * (lens_var[s] + al * dlt * dlt);
+            lens_n[s]++;
+        }
+        lens_frames++;
+        if (lens_frames >= 12 && lens_frames % 4 == 0) fitLens();
+    }
+
+    void fitLens(void) {
+        double s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, q0 = 0, q1 = 0, q2 = 0, spread = 0;
+        unsigned used = 0;
+        for (unsigned s=1;s + 1 < VP_STRIPS;s++) {      /* not the outer strips: a border, and what comes into view, pull them */
+            if (lens_n[s] < 8) continue;
+            /* a strip that says something else every time (a weapon that sways in it) counts for little */
+            const double sd = sqrt(lens_var[s]);
+            if (sd > 0.3) continue;
+            const double u = (((double)s + 0.5) / VP_STRIPS) * 2.0 - 1.0, q = lens_mean[s], wt = 1.0 / (0.01 + lens_var[s]);
+            s0 += wt; s1 += wt * u; s2 += wt * u * u; s3 += wt * u * u * u; s4 += wt * u * u * u * u;
+            q0 += wt * q; q1 += wt * q * u; q2 += wt * q * u * u;
+            spread += sd;
+            used++;
+        }
+        if (used < 5) return;
+        spread /= used;
+        /* a + b u + c u^2 through the strips (u: -1 at the view's left edge, 1 at its right) */
+        const double det = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2);
+        if (fabs(det) < 1e-9) return;
+        const double a = (q0 * (s2 * s4 - s3 * s3) - s1 * (q1 * s4 - s3 * q2) + s2 * (q1 * s3 - s2 * q2)) / det;
+        const double b = (s0 * (q1 * s4 - s3 * q2) - q0 * (s1 * s4 - s3 * s2) + s2 * (s1 * q2 - q1 * s2)) / det;
+        const double c = (s0 * (s2 * q2 - q1 * s3) - s1 * (s1 * q2 - q1 * s2) + q0 * (s1 * s3 - s2 * s2)) / det;
+        double rms = 0;
+        for (unsigned s=1;s + 1 < VP_STRIPS;s++) {
+            if (lens_n[s] < 8 || sqrt(lens_var[s]) > 0.3) continue;
+            const double u = (((double)s + 0.5) / VP_STRIPS) * 2.0 - 1.0, e = lens_mean[s] - (a + b * u + c * u * u);
+            rms += e * e;
+        }
+        rms = sqrt(rms / used);
+        lens_fit_a = a; lens_fit_b = b; lens_fit_c = c; lens_fit_rms = rms; lens_fit_spread = spread;
+        /* turns mixed with other movement: not decided (and from few frames only when they agree well) */
+        if (spread > 0.22 || rms > 0.1 || (lens_frames < 30 && (spread > 0.16 || rms > 0.06))) return;
+        VPLens nl;
+        nl.known = true;
+        if (c >= 0.12) {
+            const double u0 = -b / (2.0 * c), a0 = a - b * b / (4.0 * c);
+            if (fabs(u0) > 0.6 || a0 < 0.2) return;
+            const double fu = 1.0 / sqrt(c / a0);   /* in half widths of the picture */
+            if (fu < 0.35 || fu > 5.0) return;
+            nl.persp = true;
+            nl.f = (float)(fu * (double)(vx1 - vx0) * 0.5);
+            nl.cx = (float)((double)vx0 + (u0 + 1.0) * (double)(vx1 - vx0) * 0.5 - 0.5);
+        }
+        else if (fabs(c) > 0.06 || fabs(b) > 0.08) return;
+        const bool other = !lens.known || nl.persp != lens.persp || lens.assumed;
+        if (!other && nl.persp) {
+            /* the same kind of lens, measured again: follow it gently */
+            lens.f += 0.3f * (nl.f - lens.f);
+            lens.cx += 0.3f * (nl.cx - lens.cx);
+            return;
+        }
+        if (!other) return;
+        lens = nl;
+        if (lens.persp)
+            LOG_MSG("INPUTNET: view prediction: the view is in perspective, %.0f degrees wide, its middle at column %.0f of %u",
+                2.0 * atan((double)(vx1 - vx0) * 0.5 / lens.f) * 180.0 / 3.14159265358979,lens.cx,w);
+        else LOG_MSG("INPUTNET: view prediction: the view moves as one piece (no perspective)");
+    }
+
+    template <typename T> static inline bool same(const uint8_t *a,const uint8_t *b) {
+        T x, y;
+        memcpy(&x,a,sizeof(T)); memcpy(&y,b,sizeof(T));
+        return x == y;
+    }
+
+    /* The pixels that stay while the view moves: the same as a frame ago in their place, and not what the view's
+     * movement would have brought there (nor its neighbours: the movement is only known to about a pixel). A pixel
+     * that changes in place starts over. */
+    void markStill(const uint8_t *raw,const uint8_t *prevraw,const VPMotion &mo) {
+        if (!mo.okx) return;
+        const bool movedy = mo.oky && fabsf(mo.sy) >= 1.5f * unity;
+        if (fabsf(mo.sx) < 1.5f * unitx && !movedy) return;
+        const size_t bpp = RP_BytesPerPixel(fmt), pal = (fmt == 8) ? 768 : 0;
+        const int iw = (int)w, ih = (int)h, dy = mo.oky ? (int)lroundf(mo.sy) : 0;
+        const uint64_t nowus = RP_Micros();
+        const bool layered = anyLayer(nowus);
+        tmp.srcx.resize(w);
+        tmp.rowk.assign(w,0);       /* per column: the pixels that changed */
+        if (rowch.size() != h || colch.size() != w) { rowch.assign(h,0.0f); colch.assign(w,0.0f); view_frames = 0; }
+        for (int x=0;x < iw;x++) tmp.srcx[(size_t)x] = (int32_t)lroundf(VP_SourceX(lens,(float)x,mo.sx));
+        for (int y=0;y < ih;y++) {
+            const int ys = y - dy;
+            const bool rowok = ys >= 0 && ys < ih;
+            const uint8_t *c = raw + pal + (size_t)y * w * bpp, *p = prevraw + pal + (size_t)y * w * bpp;
+            const uint8_t *ps = prevraw + pal + (size_t)(rowok ? ys : 0) * w * bpp;
+            uint8_t *st = still.data() + (size_t)y * w;
+            int changed = 0;
+            float even = 0, rate = 1;
+            if (layered) rowLayer(y,nowus,even,rate);
+            const int flat = (int)lroundf(rate * mo.sx);
+            for (int x=0;x < iw;x++) {
+                const uint8_t *cp = c + (size_t)x * bpp;
+                if (!samePixel(cp,p + (size_t)x * bpp,bpp)) { st[x] = 0; changed++; tmp.rowk[(size_t)x]++; continue; }
+                const int xs = even > 0.5f ? x - flat : tmp.srcx[(size_t)x];
+                if (!rowok || xs < 1 || xs >= iw - 1) continue;
+                const uint8_t *sp = ps + (size_t)xs * bpp;
+                if (!samePixel(cp,sp,bpp) && !samePixel(cp,sp - bpp,bpp) && !samePixel(cp,sp + bpp,bpp) && st[x] < 255) st[x]++;
+            }
+            rowch[(size_t)y] += 0.1f * ((float)changed / (float)iw - rowch[(size_t)y]);
+        }
+        for (int x=0;x < iw;x++) colch[(size_t)x] += 0.1f * ((float)tmp.rowk[(size_t)x] / (float)ih - colch[(size_t)x]);
+        still_dirty = true;
+        /* The view: the rows and columns where the picture changes when the view moves. A status bar below it, a
+         * border around it, a panel beside it are outside, and nothing there is moved or moved in from. */
+        if (++view_frames >= 6) {
+            const float bar = 0.06f * std::min(1.0f,(float)view_frames / 20.0f + 0.3f);
+            int a = 0, b = ih, c0 = 0, c1 = iw;
+            while (a < ih && rowch[(size_t)a] < bar) a++;
+            while (b > a && rowch[(size_t)(b - 1)] < bar) b--;
+            while (c0 < iw && colch[(size_t)c0] < bar) c0++;
+            while (c1 > c0 && colch[(size_t)(c1 - 1)] < bar) c1--;
+            if (b - a >= ih / 4 && c1 - c0 >= iw / 4) { vy0 = a; vy1 = b; vx0 = c0; vx1 = c1; }
+        }
+    }
+
+    static inline bool samePixel(const uint8_t *a,const uint8_t *b,size_t bpp) {
+        return bpp == 1 ? *a == *b : (bpp == 2 ? same<uint16_t>(a,b) : same<uint32_t>(a,b));
+    }
+
+    /* What the picture is moved by: a pixel counts as staying when most of the 3 x 3 around it do, so that single
+     * pixels of the world that happened to pass (or of a status bar that did not) make no specks or holes. */
+    void cleanStill(void) {
+        still_dirty = false;
+        const int iw = (int)w, ih = (int)h;
+        stay.assign((size_t)w * h,0);
+        tmp.rowk.assign((size_t)w * 3,0);      /* three rows of sums of three */
+        int32_t *rows[3] = { tmp.rowk.data(), tmp.rowk.data() + w, tmp.rowk.data() + 2 * (size_t)w };
+        auto sumrow = [&](int y,int32_t *out) {
+            if (y < 0 || y >= ih) { for (int x=0;x < iw;x++) out[x] = 0; return; }
+            const uint8_t *st = still.data() + (size_t)y * w;
+            for (int x=0;x < iw;x++)
+                out[x] = (x > 0 && st[x-1] >= VP_STILL) + (st[x] >= VP_STILL) + (x + 1 < iw && st[x+1] >= VP_STILL);
+        };
+        sumrow(-1,rows[0]); sumrow(0,rows[1]);
+        for (int y=0;y < ih;y++) {
+            sumrow(y + 1,rows[2]);
+            uint8_t *o = stay.data() + (size_t)y * w;
+            for (int x=0;x < iw;x++) o[x] = (uint8_t)((rows[0][x] + rows[1][x] + rows[2][x]) >= 5);
+            int32_t *first = rows[0];
+            rows[0] = rows[1]; rows[1] = rows[2]; rows[2] = first;
+        }
+    }
+
+public:
+    double lens_fit_a = 0, lens_fit_b = 0, lens_fit_c = 0, lens_fit_rms = 0, lens_fit_spread = 0;   /* the last fit, for tests */
+};
+
 struct Assembly {
     bool used = false;
     uint32_t id = 0;
@@ -2172,7 +4253,13 @@ struct PendingEvent {
 
 /* Latency measurement: when each input event was made and first sent, and what the host said about each frame. */
 struct InputTime { uint32_t seq = 0; uint64_t made = 0, sent = 0; };
-struct FrameInfo { uint32_t id = 0, seq = 0, wait_us = 0, enc_us = 0; uint64_t at = 0; };
+struct FrameInfo {
+    uint32_t id = 0, seq = 0, wait_us = 0, enc_us = 0;
+    uint32_t taken = 0;     /* when the host took the frame: its clock, microseconds, the low 32 bits */
+    bool hastaken = false;  /* (hosts before view prediction do not say) */
+    VPPointer ptr;          /* the DOS mouse driver's pointer when the frame was taken */
+    uint64_t at = 0;
+};
 struct LatencySums {
     unsigned n = 0, rtt_n = 0;
     double total = 0, most = 0, local = 0, net = 0, wait = 0, enc = 0, xfer = 0, draw = 0, rtt = 0;
@@ -2218,6 +4305,10 @@ public:
     unsigned audio_rate = 0;
     uint32_t audio_seq = 0;
     bool audio_playing = false;
+    float aud_fast = 1.0f;          /* below 1: played that much faster, to shorten what waits (see handleAudio) */
+    std::vector<uint8_t> aud_out;
+    uint64_t aud_wait_sum = 0;      /* for the log: how long sound waited to be played, how often it was sped up */
+    unsigned aud_wait_n = 0, aud_fast_n = 0;
 
     /* input */
     std::deque<PendingEvent> pending;
@@ -2241,6 +4332,35 @@ public:
     unsigned pieces_logged = 0;
     LatencySums lat;
     std::string latency_text;
+
+    /* view prediction (see ViewPredict) */
+    ViewPredict vp;
+    std::vector<uint32_t> pix;      /* the frame as the texture's pixels, converted once a frame */
+    bool pix_dirty = true;
+    bool vp_due = false;            /* a decoded frame waits to be analysed (after it has been shown) */
+    bool frame_hasc = false;        /* the frame on the screen: up to which moment it shows the input */
+    uint64_t frame_c = 0;
+    uint32_t frame_seq = 0xFFFFFFFFu;       /* ...and the newest input the host had applied when it took it (if it said) */
+    VPPointer frame_ptr;            /* ...and where the DOS mouse driver had its pointer */
+    bool dot_on = false;            /* the pointer dot is on the screen, at dot_px, dot_py of the window */
+    int dot_px = 0, dot_py = 0;
+    std::string shot_dir;           /* NN_RP_PREDICTSHOT=<folder>: the first pictures moved far, before and after, as PPM */
+    unsigned shots = 0;
+    uint64_t arrive_est = 0;        /* how long after that moment a frame usually arrives, microseconds */
+    uint32_t off_cur = 0, off_prev = 0;     /* the host's clock against this one: the least of the last seconds */
+    bool off_hascur = false, off_hasprev = false;
+    uint64_t off_bucket = 0;
+    uint64_t last_present_us = 0;
+    float shown_px = 0, shown_py = 0;       /* the prediction in the picture on the screen */
+    uint64_t unshown_us = 0;        /* the oldest mouse movement the screen does not show yet */
+    double m2s_sum = 0;             /* mouse to screen with prediction, for the log */
+    unsigned m2s_n = 0;
+    /* test input (NN_RP_TESTINPUT): the mouse and keys move by themselves, the same way every time */
+    std::string test_mode;
+    FILE *rec_ev = NULL, *rec_fr = NULL;    /* NN_RP_RECORD=<folder>: the frames and the input, to learn from again offline */
+    double test_scale = 1.0, test_scaley = 1.0, test_start = 6.0, test_frac = 0, test_fracy = 0;
+    uint64_t test_t0 = 0, test_last = 0;
+    int test_keystate = 0;
 
     ViewerSession() { memset(keydown,0,sizeof(keydown)); }
 
@@ -2303,6 +4423,9 @@ public:
         keydown[k] = pressed;
         uint8_t b[4] = { RPEV_KEY, (uint8_t)k, (uint8_t)((unsigned)k >> 8), (uint8_t)(pressed ? 1 : 0) };
         pushEvent(b,4);
+        const uint64_t t = RP_Micros();
+        vp.key((unsigned)k,pressed,t,nextseq - 1);
+        if (rec_ev) fprintf(rec_ev,"K %llu %u %d %u\n",(unsigned long long)t,(unsigned)k,pressed ? 1 : 0,nextseq - 1);
     }
 
     void buttonEvent(uint8_t button,bool pressed) {
@@ -2322,6 +4445,11 @@ public:
         tmp.f32(acc_xrel); tmp.f32(acc_yrel); tmp.f32(last_x); tmp.f32(last_y);
         tmp.u8(captured ? 1 : 0);
         pushEvent(tmp.buf + start,tmp.len - start,motion_made);
+        if (captured && (acc_xrel != 0 || acc_yrel != 0)) {
+            const uint64_t t = RP_Micros();
+            vp.mouse(t,nextseq - 1,acc_xrel,acc_yrel);
+            if (rec_ev) fprintf(rec_ev,"M %llu %g %g %u\n",(unsigned long long)t,(double)acc_xrel,(double)acc_yrel,nextseq - 1);
+        }
         motion_made = 0;
         acc_xrel = acc_yrel = 0;
         lastmove = SDL_GetTicks();
@@ -2453,6 +4581,12 @@ public:
                     updateTitle();
                     break;
                 }
+                if (e.key.keysym.scancode == SDL_SCANCODE_F12 && (mod & KMOD_CTRL)) {
+                    vp.enabled = !vp.enabled;
+                    LOG_MSG("INPUTNET: view prediction %s",vp.enabled ? "on" : "off");
+                    redraw = true;
+                    break;
+                }
                 keyEvent(RP_MapScancode(e.key.keysym.scancode),true);
                 break;
             }
@@ -2462,6 +4596,7 @@ public:
             case SDL_MOUSEMOTION:
                 if (captured) {
                     if (acc_xrel == 0 && acc_yrel == 0 && motion_made == 0) motion_made = RP_Micros();
+                    if (unshown_us == 0) unshown_us = RP_Micros();
                     acc_xrel += (float)e.motion.xrel;
                     acc_yrel += (float)e.motion.yrel;
                     pointerAt(e.motion.x,e.motion.y);
@@ -2622,6 +4757,70 @@ public:
         haveframe = true;
         needkey = false;
         newframe = true;    /* drawn as soon as the packets that arrived together are handled */
+        pix_dirty = true;
+        frame_hasc = frameClock(id,frame_c,frame_seq);
+        vp.shown(frame_hasc,frame_c,frame_seq,frame_done,id);
+        frame_ptr = (infos[id & 31u].id == id) ? infos[id & 31u].ptr : VPPointer();
+        vp_due = true;
+        if (rec_ev && rec_fr) {
+            fprintf(rec_ev,"F %u %llu %d %llu %u %u %u %llu %u\n",id,(unsigned long long)frame_done,frame_hasc ? 1 : 0,(unsigned long long)frame_c,
+                frame_w,frame_h,frame_fmt,(unsigned long long)frame.size(),frame_seq);
+            fwrite(frame.data(),1,frame.size(),rec_fr);
+        }
+    }
+
+    /* Up to which moment of this computer's clock a frame shows the input: input sent before it had been applied when
+     * the host took the frame. From the host's own clock when it says when it took the frame (the least difference
+     * between the two clocks over the last seconds is the way there at its quickest), otherwise from the newest
+     * input the frame had and how long that had been applied; without either, from when frames usually arrive. */
+    bool frameClock(uint32_t id,uint64_t &c,uint32_t &seq) {
+        const FrameInfo &f = infos[id & 31u];
+        const uint64_t now = RP_Micros();
+        seq = 0xFFFFFFFFu;
+        if (f.id == id && f.seq != 0 && f.wait_us != 0xFFFFFFFFu) {
+            const InputTime &t = times[f.seq & 1023u];
+            seq = f.seq;
+            if (t.seq == f.seq && t.sent != 0) {
+                c = t.sent + f.wait_us;
+                if (f.hastaken) {
+                    const uint32_t off = f.taken - f.wait_us - (uint32_t)t.sent;
+                    if (now - off_bucket > 6000000) {
+                        off_prev = off_cur; off_hasprev = off_hascur;
+                        off_hascur = false;
+                        off_bucket = now;
+                    }
+                    if (!off_hascur || (int32_t)(off - off_cur) < 0) { off_cur = off; off_hascur = true; }
+                    const uint32_t least = (off_hasprev && (int32_t)(off_prev - off_cur) < 0) ? off_prev : off_cur;
+                    c = now - (uint32_t)((uint32_t)now - (f.taken - least));
+                }
+                if (c <= now && now - c < 5000000 && frame_done >= c) {
+                    const uint64_t d = frame_done - c;
+                    arrive_est = arrive_est ? (arrive_est * 7 + d) / 8 : d;
+                    return true;
+                }
+            }
+        }
+        if (arrive_est != 0 && frame_done > arrive_est) { c = frame_done - arrive_est; return true; }
+        return false;
+    }
+
+    /* Learns from the frame just shown (ViewPredict::frame), against the frame learned from before it. */
+    void analyse(void) {
+        vp_due = false;
+        if (rec_ev && haveframe) {
+            fprintf(rec_ev,"A %u %llu\n",lastid,(unsigned long long)RP_Micros());
+            fflush(rec_ev);
+            if (rec_fr) fflush(rec_fr);
+        }
+        if (!haveframe || !vp.enabled) return;
+        bool valid = false;
+        const uint32_t pid = vp.prevId(valid);
+        const uint8_t *prev = NULL;
+        if (valid && pid != lastid)
+            for (size_t i=hist.size();i-- > 0 && prev == NULL;)
+                if (hist[i].first == pid && hist[i].second.size() == frame.size()) prev = hist[i].second.data();
+        vp.frame(lastid,frame.data(),frame.size(),frame_w,frame_h,frame_fmt,prev,frame_hasc,frame_c,frame_seq,
+            (!pix_dirty && pix.size() == (size_t)frame_w * frame_h) ? pix.data() : NULL,frame_ptr);
     }
 
     /* Input to screen for the newest input event this frame is the first to show (the host says which), split into
@@ -2681,17 +4880,84 @@ public:
             latency_text = tmp;
         }
         lat = LatencySums();
+        if (aud_wait_n) {
+            LOG_MSG("INPUTNET: sound waits %u ms on average to be played%s",(unsigned)(aud_wait_sum / aud_wait_n),
+                aud_fast_n ? (std::string(", played faster for ") + std::to_string(aud_fast_n * 100u / aud_wait_n) + "% of the time to catch up").c_str() : "");
+            aud_wait_sum = 0; aud_wait_n = aud_fast_n = 0;
+        }
+        vp.report();
+        if (m2s_n) LOG_MSG("INPUTNET: with view prediction the picture followed the mouse after %.1f ms on average (%u movements)",m2s_sum / m2s_n,m2s_n);
+        m2s_sum = 0; m2s_n = 0;
         if (show_latency) updateTitle();
     }
 
+    /* The frame as the texture's pixels (once a frame: the picture may be drawn several times, moved differently). */
+    void convertFrame(void) {
+        pix.resize((size_t)frame_w * frame_h);
+        const uint8_t *p = frame.data();
+        uint32_t lut[256];
+        if (frame_fmt == 8)
+            for (unsigned i=0;i < 256;i++)
+                lut[i] = 0xFF000000u | ((uint32_t)p[i*3] << 16) | ((uint32_t)p[i*3+1] << 8) | p[i*3+2];
+        for (unsigned y=0;y < frame_h;y++) {
+            uint32_t *o = pix.data() + (size_t)y * frame_w;
+            if (frame_fmt == 8) {
+                const uint8_t *s = p + 768 + (size_t)y * frame_w;
+                for (unsigned x=0;x < frame_w;x++) o[x] = lut[s[x]];
+            }
+            else if (frame_fmt == 15 || frame_fmt == 16) {
+                const uint8_t *s = p + (size_t)y * frame_w * 2;
+                for (unsigned x=0;x < frame_w;x++) {
+                    const unsigned v = s[x*2] | (s[x*2+1] << 8);
+                    unsigned r, g, b;
+                    if (frame_fmt == 15) { r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); }
+                    else { r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); }
+                    b = (b << 3) | (b >> 2);
+                    o[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                }
+            }
+            else {
+                const uint8_t *s = p + (size_t)y * frame_w * 4;
+                for (unsigned x=0;x < frame_w;x++) {
+                    uint32_t v;
+                    memcpy(&v,s + x*4,4);
+                    o[x] = 0xFF000000u | (v & 0xFFFFFFu);
+                }
+            }
+        }
+        pix_dirty = false;
+    }
+
+    /* Where in the window the pointer dot goes at this moment; false: there is none. */
+    bool pointerDot(const SDL_Rect &r,int &x,int &y) {
+        float nx, ny;
+        if (!captured || abs_pointer || !haveframe || !vp.pointerAt(acc_xrel,acc_yrel,nx,ny)) return false;
+        x = r.x + (int)lroundf(nx * (float)(r.w - 1));
+        y = r.y + (int)lroundf(ny * (float)(r.h - 1));
+        return true;
+    }
+
+    /* How far view prediction moves the picture at this moment; false: not at all. */
+    bool predicted(uint64_t now_us,float &px,float &py) {
+        px = py = 0;
+        if (!vp.enabled || !haveframe || vp.w != frame_w || vp.h != frame_h) return false;
+        if (vp.offset(now_us,captured ? acc_xrel : 0.0f,captured ? acc_yrel : 0.0f,px,py)) return true;
+        px = py = 0;
+        return false;
+    }
+
     void present(void) {
+        const uint64_t now_us = RP_Micros();
+        float px = 0, py = 0;
         if (haveframe) {
             if (texture == NULL || tex_w != frame_w || tex_h != frame_h) {
                 if (texture) SDL_DestroyTexture(texture);
                 texture = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,(int)frame_w,(int)frame_h);
                 tex_w = frame_w; tex_h = frame_h;
             }
-            /* Converted straight into the texture (one copy less), or through argb when it cannot be locked. */
+            if (pix_dirty || pix.size() != (size_t)frame_w * frame_h) convertFrame();
+            const bool moved = predicted(now_us,px,py);
+            /* Straight into the texture, or through argb when it cannot be locked. */
             void *dst = NULL;
             int dpitch = 0;
             const bool locked = texture != NULL && SDL_LockTexture(texture,NULL,&dst,&dpitch) == 0;
@@ -2700,48 +4966,148 @@ public:
                 dst = argb.data();
                 dpitch = (int)(frame_w * 4);
             }
-            const uint8_t *p = frame.data();
-            uint32_t lut[256];
-            if (frame_fmt == 8)
-                for (unsigned i=0;i < 256;i++)
-                    lut[i] = 0xFF000000u | ((uint32_t)p[i*3] << 16) | ((uint32_t)p[i*3+1] << 8) | p[i*3+2];
-            for (unsigned y=0;y < frame_h;y++) {
-                uint32_t *o = (uint32_t*)((uint8_t*)dst + (size_t)y * (size_t)dpitch);
-                if (frame_fmt == 8) {
-                    const uint8_t *s = p + 768 + (size_t)y * frame_w;
-                    for (unsigned x=0;x < frame_w;x++) o[x] = lut[s[x]];
-                }
-                else if (frame_fmt == 15 || frame_fmt == 16) {
-                    const uint8_t *s = p + (size_t)y * frame_w * 2;
-                    for (unsigned x=0;x < frame_w;x++) {
-                        const unsigned v = s[x*2] | (s[x*2+1] << 8);
-                        unsigned r, g, b;
-                        if (frame_fmt == 15) { r = (v >> 10) & 31; g = (v >> 5) & 31; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); }
-                        else { r = (v >> 11) & 31; g = (v >> 5) & 63; b = v & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); }
-                        b = (b << 3) | (b >> 2);
-                        o[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            if (moved) vp.warp(pix.data(),(uint8_t*)dst,dpitch,px,py);
+            else for (unsigned y=0;y < frame_h;y++)
+                memcpy((uint8_t*)dst + (size_t)y * (size_t)dpitch,pix.data() + (size_t)y * frame_w,(size_t)frame_w * 4);
+            if (moved && !shot_dir.empty() && shots < 12 && fabsf(px) >= (float)(8 + 8 * (shots % 4)) * (float)frame_w / 320.0f) {
+                for (int k=0;k < 2;k++) {
+                    char name[64];
+                    snprintf(name,sizeof(name),"/shot%02u-%s.ppm",shots,k ? "moved" : "frame");
+                    FILE *fp = fopen((shot_dir + name).c_str(),"wb");
+                    if (fp == NULL) continue;
+                    fprintf(fp,"P6\n%u %u\n255\n",frame_w,frame_h);
+                    for (unsigned y=0;y < frame_h;y++) {
+                        const uint32_t *row = k ? (const uint32_t*)((const uint8_t*)dst + (size_t)y * (size_t)dpitch) : pix.data() + (size_t)y * frame_w;
+                        for (unsigned x=0;x < frame_w;x++) { const uint8_t rgb[3] = { (uint8_t)(row[x] >> 16), (uint8_t)(row[x] >> 8), (uint8_t)row[x] }; fwrite(rgb,1,3,fp); }
                     }
+                    fclose(fp);
                 }
-                else {
-                    const uint8_t *s = p + (size_t)y * frame_w * 4;
-                    for (unsigned x=0;x < frame_w;x++) {
-                        uint32_t v;
-                        memcpy(&v,s + x*4,4);
-                        o[x] = 0xFF000000u | (v & 0xFFFFFFu);
-                    }
-                }
+                LOG_MSG("INPUTNET: view prediction test picture %u: moved by %.1f, %.1f",shots,px,py);
+                shots++;
             }
             if (locked) SDL_UnlockTexture(texture);
             else if (texture) SDL_UpdateTexture(texture,NULL,argb.data(),(int)(frame_w * 4));
         }
         SDL_SetRenderDrawColor(renderer,0,0,0,255);
         SDL_RenderClear(renderer);
+        dot_on = false;
         if (texture && haveframe) {
             const SDL_Rect r = displayRect();
             SDL_RenderCopy(renderer,texture,NULL,&r);
+            /* the pointer dot (see ViewPredict::pointerTold): a white square in a black ring, as over a Windows guest */
+            if (pointerDot(r,dot_px,dot_py)) {
+                dot_on = true;
+                const SDL_Rect ring = { dot_px - 3, dot_py - 3, 7, 7 }, core = { dot_px - 1, dot_py - 1, 3, 3 };
+                SDL_SetRenderDrawColor(renderer,0,0,0,255);
+                SDL_RenderFillRect(renderer,&ring);
+                SDL_SetRenderDrawColor(renderer,255,255,255,255);
+                SDL_RenderFillRect(renderer,&core);
+            }
         }
         SDL_RenderPresent(renderer);
         redraw = false;
+        shown_px = px; shown_py = py;
+        last_present_us = now_us;
+        if (unshown_us != 0) {
+            /* mouse movement the screen shows now, ahead of the host's own frames */
+            if (px != 0 || py != 0) { m2s_sum += (double)(RP_Micros() - unshown_us) / 1000.0; m2s_n++; }
+            unshown_us = 0;
+        }
+    }
+
+    /* Test input (NN_RP_TESTINPUT=mouse|look|keys|mix|walk|walkkeys|none, NN_RP_TESTSCALE, NN_RP_TESTSTART seconds):
+     * a mouse and keys that move by themselves, the same way every time, to measure view prediction without a hand
+     * on them ("none": only what NN_RP_TESTKEYS says). */
+    void testInput(void) {
+        if (test_mode.empty() || !welcomed) return;
+        const uint64_t now = RP_Micros();
+        if (test_t0 == 0) {
+            test_t0 = now + (uint64_t)(test_start * 1e6);
+            test_last = test_t0;
+            captured = true;    /* relative motion, without taking the system's pointer */
+            return;
+        }
+        if (now <= test_last) return;
+        const double t = (double)(now - test_t0) / 1e6, dt = (double)(now - test_last) / 1e6;
+        test_last = now;
+        const bool mix = test_mode == "mix";
+        const double ph = fmod(t,6.0);
+        const bool second = fmod(t,12.0) >= 6.0;
+        double vx = 0, vy = 0;      /* mouse counts a second */
+        int keys = 0;               /* 1 left, 2 right, 4 up */
+        if (test_mode == "mouse" || test_mode == "look" || test_mode == "walk" || (mix && !second)) {
+            if (ph < 2.0) vx = 500.0 * sin(2.0 * 3.14159265358979 * ph);
+            else if (ph >= 2.4 && ph < 2.55) vx = 1600.0;
+            else if (ph >= 3.2 && ph < 3.35) vx = -1600.0;
+            else if (ph >= 4.0 && ph < 5.2) vx = 200.0;
+            else if (ph >= 5.6 && ph < 5.9) vx = -800.0;
+            if (test_mode == "look" && ph < 2.0) vy = 250.0 * sin(2.0 * 3.14159265358979 * 0.5 * ph);
+        }
+        if (test_mode == "keys" || test_mode == "walkkeys" || (mix && second)) {
+            if (ph < 0.5) keys = 1;
+            else if (ph >= 1.0 && ph < 1.5) keys = 2;
+            else if (ph >= 2.0 && ph < 2.2) keys = 1;
+            else if (ph >= 2.6 && ph < 2.8) keys = 2;
+            else if (ph >= 3.2 && ph < 4.2) keys = 1;
+            else if (ph >= 4.6 && ph < 5.6) keys = 2;
+        }
+        if (test_mode == "walk" || test_mode == "walkkeys") keys |= 4;
+        test_frac += vx * test_scale * dt;
+        test_fracy += vy * test_scaley * dt;
+        const double wx = trunc(test_frac), wy = trunc(test_fracy);
+        if (wx != 0 || wy != 0) {
+            test_frac -= wx; test_fracy -= wy;
+            if (acc_xrel == 0 && acc_yrel == 0 && motion_made == 0) motion_made = now;
+            if (unshown_us == 0) unshown_us = now;
+            acc_xrel += (float)wx;
+            acc_yrel += (float)wy;
+        }
+        if (keys != test_keystate) {
+            keyEvent(KBD_left,(keys & 1) != 0);
+            keyEvent(KBD_right,(keys & 2) != 0);
+            keyEvent(KBD_up,(keys & 4) != 0);
+            test_keystate = keys;
+        }
+        /* NN_RP_TESTKEYS="12:esc:0.1,20.5:lalt:3": at 12 s Escape for 0.1 s, at 20.5 s left Alt for 3 s */
+        for (size_t i=0;i < test_keys.size();i++) {
+            TestKey &k = test_keys[i];
+            const bool down = t >= k.at && t < k.at + k.hold;
+            if (down != k.down) {
+                k.down = down;
+                if (k.key == KBD_NONE) { flushMotion(); buttonEvent(0,down); }  /* "click": the left mouse button */
+                else keyEvent(k.key,down);
+            }
+        }
+    }
+
+    struct TestKey { double at, hold; KBD_KEYS key; bool down; };
+    std::vector<TestKey> test_keys;
+    void parseTestKeys(const char *spec) {
+        static const struct { const char *name; KBD_KEYS key; } names[] = {
+            { "esc", KBD_esc }, { "enter", KBD_enter }, { "space", KBD_space }, { "up", KBD_up }, { "down", KBD_down },
+            { "left", KBD_left }, { "right", KBD_right }, { "comma", KBD_comma }, { "period", KBD_period },
+            { "lalt", KBD_leftalt }, { "lctrl", KBD_leftctrl }, { "lshift", KBD_leftshift }, { "tab", KBD_tab },
+            { "pgup", KBD_pageup }, { "pgdn", KBD_pagedown }, { "home", KBD_home }, { "end", KBD_end },
+            { "a", KBD_a }, { "d", KBD_d }, { "w", KBD_w }, { "s", KBD_s }, { "u", KBD_u }, { "y", KBD_y }, { "n", KBD_n },
+            { "f1", KBD_f1 }, { "f2", KBD_f2 }, { "kp4", KBD_kp4 }, { "kp6", KBD_kp6 }, { "kp8", KBD_kp8 }, { "kp2", KBD_kp2 },
+            { "1", KBD_1 }, { "2", KBD_2 }, { "3", KBD_3 }, { "ins", KBD_insert }, { "del", KBD_delete }, { "click", KBD_NONE }
+        };
+        std::string text = spec;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t end = text.find(',',pos);
+            if (end == std::string::npos) end = text.size();
+            const std::string item = text.substr(pos,end - pos);
+            pos = end + 1;
+            const size_t c1 = item.find(':'), c2 = item.find(':',c1 == std::string::npos ? 0 : c1 + 1);
+            if (c1 == std::string::npos) continue;
+            const std::string name = item.substr(c1 + 1,c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
+            for (size_t i=0;i < sizeof(names) / sizeof(names[0]);i++) {
+                if (name != names[i].name) continue;
+                TestKey k = { atof(item.c_str()), c2 == std::string::npos ? 0.1 : atof(item.c_str() + c2 + 1), names[i].key, false };
+                test_keys.push_back(k);
+            }
+        }
     }
 
     void handleVideo(Reader &r) {
@@ -2818,7 +5184,33 @@ public:
             audio_playing = false;
             if (audio == 0) return;
         }
-        SDL_QueueAudio(audio,pcm,(Uint32)n);
+        /* Sound that waits to be played is sound heard late. The queue grows whenever packets arrive in a burst (or
+         * the host's clock runs a little faster than this sound card's) and never shrank again by itself: it sat
+         * anywhere up to the quarter of a second at which it is thrown away. Above 70 ms it is now played 3% faster
+         * (8% above 130 ms), a few samples left out of every packet by interpolation, until it is back at 45 ms:
+         * no gap, no click, and a change of pitch too small and too short to hear. */
+        const Uint32 bytes_ms = rate * 4u / 1000u;
+        const Uint32 waiting = bytes_ms ? SDL_GetQueuedAudioSize(audio) / bytes_ms : 0;
+        aud_wait_sum += waiting; aud_wait_n++;
+        if (audio_playing && waiting > 130) aud_fast = 0.92f;
+        else if (audio_playing && waiting > 70) aud_fast = std::min(aud_fast,0.97f);
+        else if (waiting <= 45) aud_fast = 1.0f;
+        if (aud_fast >= 1.0f || frames < 8) { SDL_QueueAudio(audio,pcm,(Uint32)n); return; }
+        aud_fast_n++;
+        const unsigned outn = std::max(1u,(unsigned)lroundf((float)frames * aud_fast));
+        aud_out.resize((size_t)outn * 4);
+        const double step = (double)(frames - 1) / (double)std::max(1u,outn - 1);
+        for (unsigned i=0;i < outn;i++) {
+            const double at = (double)i * step;
+            const unsigned a = std::min(frames - 1,(unsigned)at), b = std::min(frames - 1,a + 1);
+            const double f = at - (double)a;
+            for (unsigned c=0;c < 2;c++) {
+                const int16_t va = (int16_t)(pcm[(a*2+c)*2] | (pcm[(a*2+c)*2+1] << 8)), vb = (int16_t)(pcm[(b*2+c)*2] | (pcm[(b*2+c)*2+1] << 8));
+                const int16_t v = (int16_t)lround((double)va + ((double)vb - (double)va) * f);
+                aud_out[(i*2+c)*2] = (uint8_t)v; aud_out[(i*2+c)*2+1] = (uint8_t)((uint16_t)v >> 8);
+            }
+        }
+        SDL_QueueAudio(audio,aud_out.data(),(Uint32)aud_out.size());
     }
 
     void pumpAudio(void) {
@@ -2877,8 +5269,16 @@ public:
                 f.wait_us = r.u32();
                 f.enc_us = r.u32();
                 if (!r.ok) break;
+                if (r.pos + 4 <= r.len) { f.taken = r.u32(); f.hastaken = true; }
+                if (r.pos + 1 <= r.len && (r.u8() & 1) && r.pos + 20 <= r.len) {
+                    f.ptr.x = (float)r.u16() / 65535.0f; f.ptr.y = (float)r.u16() / 65535.0f;
+                    f.ptr.gx1 = r.f32(); f.ptr.gy1 = r.f32(); f.ptr.gxs = r.f32(); f.ptr.gys = r.f32();
+                    f.ptr.has = r.ok;
+                }
+                f.ptr.told = true;
                 f.at = RP_Micros();
                 infos[f.id & 31u] = f;
+                vp.pointerTold(f.id,f.seq,f.ptr);
                 break;
             }
             case RP_INPUTACK: {
@@ -2910,6 +5310,21 @@ public:
             if (p > 0 && p < 65536) port = (unsigned)p;
             const int t = sec->Get_int("timeout");
             if (t >= 250 && t <= 600000) timeout = (unsigned)t;
+            vp.enabled = sec->Get_bool("predict");
+        }
+        if (const char *e = getenv("NN_RP_PREDICT")) vp.enabled = atoi(e) != 0;
+        if (const char *e = getenv("NN_RP_PREDICTLOG")) vp.debug = atoi(e);
+        if (const char *e = getenv("NN_RP_PREDICTSHOT")) shot_dir = e;
+        if (const char *e = getenv("NN_RP_RECORD")) {
+            rec_ev = fopen((std::string(e) + "/events.txt").c_str(),"w");
+            rec_fr = fopen((std::string(e) + "/frames.bin").c_str(),"wb");
+        }
+        if (const char *e = getenv("NN_RP_TESTINPUT")) {
+            test_mode = e;
+            if (const char *k = getenv("NN_RP_TESTSCALE")) test_scale = test_scaley = atof(k);
+            if (const char *k = getenv("NN_RP_TESTSCALEY")) test_scaley = atof(k);
+            if (const char *k = getenv("NN_RP_TESTSTART")) test_start = atof(k);
+            if (const char *k = getenv("NN_RP_TESTKEYS")) parseTestKeys(k);
         }
         const size_t colon = host.rfind(':');
         if (colon != std::string::npos && host.find(':') == colon) {
@@ -2960,9 +5375,11 @@ public:
                 present();
                 measureShown();
             }
+            if (vp_due) analyse();
 
             SDL_Event e;
             while (SDL_PollEvent(&e)) handleEvent(e);
+            testInput();
 
             const uint32_t now = SDL_GetTicks();
             if (now - lasthello >= (welcomed ? 1000u : 500u)) sendHello();
@@ -2976,6 +5393,18 @@ public:
             }
             pumpAudio();
             if (redraw) present();
+            else if (vp.enabled && haveframe) {
+                /* Between frames the picture follows the mouse too: drawn again when the prediction has changed. */
+                const uint64_t now_us = RP_Micros();
+                if (now_us - last_present_us >= 5000) {
+                    vp.idle(now_us);
+                    float px, py;
+                    predicted(now_us,px,py);
+                    int dx = 0, dy = 0;
+                    const bool dot = pointerDot(displayRect(),dx,dy);
+                    if (fabsf(px - shown_px) >= 0.5f || fabsf(py - shown_py) >= 0.5f || dot != dot_on || (dot && (dx != dot_px || dy != dot_py))) present();
+                }
+            }
             reportLatency();
 
             /* Until the host answers, keep trying: its DOSBox-X may still be starting.
@@ -2995,6 +5424,8 @@ public:
             send(w);
         }
         if (captured) SDL_SetRelativeMouseMode(SDL_FALSE);
+        if (rec_ev) fclose(rec_ev);
+        if (rec_fr) fclose(rec_fr);
         if (audio) SDL_CloseAudioDevice(audio);
         if (texture) SDL_DestroyTexture(texture);
         if (dot_cursor) { SDL_SetCursor(SDL_GetDefaultCursor()); SDL_FreeCursor(dot_cursor); dot_cursor = NULL; }

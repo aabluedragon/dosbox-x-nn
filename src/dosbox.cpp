@@ -5397,6 +5397,12 @@ void DOSBOX_SetupConfigSections(void) {
                       "  scanout: as the emulated display draws it, one refresh later (as without remote play).\n"
                       "Use retrace or scanout for a game whose picture flickers or tears with flip.");
 
+    Pbool = secprop->Add_bool("predict",Property::Changeable::WhenIdle, true);
+    Pbool->Set_help("Remote play viewer: view prediction. The picture is moved at once by the mouse movement the host's\n"
+                    "frames do not show yet (turning and looking in a first-person view), learned from the stream\n"
+                    "while playing, so the view follows the hand without the delay of the connection. It stops by\n"
+                    "itself where the picture does not follow the mouse (menus). Ctrl+F12 turns it off and on.");
+
     Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"
                     "option -inputnet-hidescreen), the window stays small, without the picture, does not take\n"
