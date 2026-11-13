@@ -192,15 +192,21 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   A prediction is shown only while arriving frames keep agreeing with what was predicted for them, so it switches
   itself off in menus, pauses and cutscenes and on again in the game; Escape, Tab and the function keys switch it off
   at once. Only turning and looking are predicted: walking, other players and shots keep the connection's delay.
-  Nothing is drawn that the frame does not have. A turn uncovers a strip at one edge; filling it was tried three
-  ways and taken out each time after a player saw it (the view mirrored there, pictures kept by direction, a smear
-  of the nearest pixel; the last most on a relay with a long round trip, where the strip is wide). Now the movement
-  falls off smoothly over the outer 30% of each side to nothing at the edge, so the edge stays where it is and the
-  outer parts stretch or squeeze a little until the frame catches up, and the picture is moved by at most a
-  twentieth of the view's width (or height), which keeps that change in size under a quarter. The price is on fast
-  turns: over the Doom stream between two computers 70 ms apart the view was 9.6 pixels (of 320) from where the
-  hand had turned it on average, against 2.9 without the limit and 19.6 without prediction; slow aiming is followed
-  as before (Duke Nukem 3D looking around: 10.8 without prediction, 3.5 with).
+  Nothing is drawn that the frame does not have, and nothing is resampled. Once the view is known to turn in
+  perspective (a first-person game), the viewer shows it a little larger, a fortieth of its width and height cut off
+  at each side (the status bar is shown as it is), and moves the picture as one piece, by whole pixels as games move
+  it, by at most that margin: a turn uncovers nothing on the screen. The enlargement is done when the picture is
+  scaled to the window: by whole pixels first, then to the window with linear filtering, so every pixel is as wide as
+  the next and nothing crawls when the picture moves. Filling an uncovered edge was tried three ways (the view
+  mirrored there, pictures kept by direction, a smear of the nearest pixel) and moving the sides less than the middle
+  once (a stretch that looked wobbly); each was taken out after a player saw it. The price is on fast turns, where the
+  view is moved by at most 2.5% of its width: over the Doom stream between two computers 70 ms apart it was 13 pixels
+  (of 320) from where the hand had turned it on average, against 19.6 without prediction; slow aiming is followed
+  closely (Duke Nukem 3D looking around: 10.8 without prediction, 5.6 with). A turn in perspective moves the sides a
+  little further than the middle; that is left to the next frame.
+  Only small things that stay are held in place (the strokes of a crosshair, the letters of a message, at most 16 x 16
+  pixels of a 320 x 200 picture, or a bar across nearly the whole view); under them the pixel beside them is drawn. A
+  weapon moves with the view until the next frame: held, it uncovered the world it hid.
   What stays in place (a weapon, a crosshair, text on the screen) is learned only from pixels of the world: a
   pixel compared with one that stays proves nothing (one arm of a crosshair, moved by its size, looked like the
   world bringing the other; the plain pixels beside it looked as if they stayed). 1-pixel strokes count as a whole,

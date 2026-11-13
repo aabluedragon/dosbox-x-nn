@@ -2312,8 +2312,7 @@ const unsigned VP_KEYBINS = 16;         /* what a key does to the view is learne
                                            held and 5 of the time since it was let go */
 const unsigned VP_KEYCTX = 8;           /* ...separately with and without Shift, Ctrl and Alt held */
 const unsigned VP_KEYHIST = 6;          /* presses and releases remembered per key */
-const float VP_AHEAD = 0.05f;           /* the picture is moved by at most this much of the view's width (height) */
-const float VP_TAPER = 0.3f;            /* ...and less and less over the outer 30% of each side, nothing at the edge */
+const float VP_MARGIN = 0.025f;         /* the view is shown this much larger at each side, and moved at most that much */
 
 /* The DOS mouse driver's pointer as the host reports it with a frame: its place (0 ... 1 of its range each way)
  * and how far one count of mouse motion moves it (a single count; a larger motion, per count). */
@@ -2429,7 +2428,7 @@ struct VPScratch {
     std::vector<uint8_t> mask[VP_LEVELS], maskc, stillnow;
     std::vector<float> vals, sorted;
     std::vector<int32_t> srcx, rowk;
-    std::vector<float> reach, tapx, tapy;
+    std::vector<int32_t> label, stack, members;
 };
 
 /* How unlike the picture cur is to the earlier one moved by (d,e), in the window of columns [x0,x1) and rows [y0,y1),
@@ -2835,27 +2834,14 @@ const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
     20, 40, 60, 90, 130                                                 /* let go: 0-20, ... 90-130 */
 };
 
-/* What a pixel that stays hides of the world, at column xi of row srow (stay row strow, n columns), seen from
- * column x: when the run of staying pixels there is thin (at most thin columns: a stroke of a crosshair or of text),
- * the pixel just past it on the side of x, which is what it covered; beside anything wider (a weapon), fallback,
- * the frame's own pixel at that place. */
-static inline uint32_t VP_Behind(const uint32_t *srow,const uint8_t *strow,int n,int xi,int x,int thin,uint32_t fallback) {
-    int a = xi, b = xi;
-    while (a > 0 && strow[a - 1] && xi - a < thin) a--;
-    while (b + 1 < n && strow[b + 1] && b - xi < thin) b++;
-    if (b - a + 1 > thin) return fallback;
-    const int k = x > xi ? b + 1 : a - 1;
-    return (k >= 0 && k < n && !strow[k]) ? srow[k] : fallback;
-}
-
-/* How much of the predicted movement a column (or row) at distance d from the edge of the view gets, in a view n
- * wide: all of it in the middle, falling smoothly to nothing at the edge over the outer VP_TAPER of each side. */
-static inline float VP_Taper(float d,float n) {
-    const float band = VP_TAPER * n;
-    if (band <= 0.0f || d >= band) return 1.0f;
-    if (d <= 0.0f) return 0.0f;
-    const float u = d / band;
-    return u * u * (3.0f - 2.0f * u);
+/* What a held pixel (a stroke of a crosshair or of text, see ViewPredict::cleanStill) hides of the world, at column
+ * xi of row srow (held row hrow, n columns), seen from column x: the first pixel past it on the side of x, which is
+ * what it covered. False when the stroke goes on further than reach. */
+static inline bool VP_Behind(const uint32_t *srow,const uint8_t *hrow,int n,int xi,int x,int reach,uint32_t &out) {
+    const int step = x >= xi ? 1 : -1;
+    for (int k=xi + step, d=1;k >= 0 && k < n && d <= reach;k += step, d++) if (!hrow[k]) { out = srow[k]; return true; }
+    for (int k=xi - step, d=1;k >= 0 && k < n && d <= reach;k -= step, d++) if (!hrow[k]) { out = srow[k]; return true; }
+    return false;
 }
 
 class ViewPredict {
@@ -3153,92 +3139,65 @@ public:
             keyOffset(now,kx,ky);
             px += kx * kstrength; py += ky * kstrength;
         }
-        /* at most a twentieth of the view: see warp */
-        const float capx = VP_AHEAD * (float)(vx1 - vx0), capy = VP_AHEAD * (float)(vy1 - vy0);
-        px = std::max(-capx,std::min(capx,px));
-        py = std::max(-capy,std::min(capy,py));
+        /* no further than the margin the view is shown larger by: see warp */
+        int mx, my;
+        margins(mx,my);
+        px = std::max(-(float)mx,std::min((float)mx,px));
+        py = std::max(-(float)my,std::min((float)my,py));
         return fabsf(px) >= 0.5f || fabsf(py) >= 0.5f;
     }
 
-    /* The picture src (w x h pixels) moved by (px,py) into dst; the pixels that never move with the view stay.
-     * Nothing is drawn that the frame does not have: the movement falls off towards the edges of the view (see
-     * VP_Taper), so the edge itself stays where it is and a turn stretches or squeezes the outer parts a little
-     * instead of uncovering a strip there (it was filled with the view mirrored, then with pictures kept by
-     * direction, then with a smear of the nearest pixel; players saw each of them, most on links with a long round
-     * trip). For the same reason the movement is limited (VP_AHEAD in offset): with at most a twentieth of the view
-     * the outer parts change in size by at most a quarter. Where the moved picture would show what a pixel that
-     * stays hides, see VP_Behind. */
+    /* Whether the view is shown larger (see warp), and its rectangle: once the view is known to turn in perspective
+     * (a first-person game), from then on, so that it does not change size when prediction comes and goes. */
+    bool zoomed(void) const { return enabled && lens.known && lens.persp && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4; }
+    void viewBox(int &x0,int &y0,int &x1,int &y1) const { x0 = vx0; y0 = vy0; x1 = vx1; y1 = vy1; }
+    void margins(int &mx,int &my) const {
+        mx = std::max(1,(int)floorf(VP_MARGIN * (float)(vx1 - vx0)));
+        my = std::max(1,(int)floorf(VP_MARGIN * (float)(vy1 - vy0)));
+    }
+
+    /* The picture src (w x h pixels) moved by (px,py), rounded to whole pixels, into dst. Nothing is drawn that the
+     * frame does not have, and nothing is resampled: the view is moved as one piece, by whole pixels as games move it,
+     * and the viewer shows it a little larger (VP_MARGIN at each side, see ViewerSession::present), so a movement of
+     * up to that much uncovers nothing on the screen. (Filling an uncovered edge with the view mirrored, with pictures
+     * kept by direction or with a smear, and moving the sides less than the middle, were each tried and taken out
+     * after a player saw them; a turn in perspective moves the sides a little further than the middle, which this
+     * leaves to the next frame.) What stays on the screen and is small (a crosshair, the letters of a message) is held
+     * in place; under it the pixel beside it is drawn. Anything larger that stays (a weapon) moves with the view until
+     * the next frame: held, it uncovered the world it hid. */
     void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
         const uint64_t t0 = RP_Micros();
         const int iw = (int)w, ih = (int)h;
-        if (still_dirty || stay.size() != (size_t)w * h) cleanStill();
-        tmp.srcx.resize(w);
-        tmp.rowk.resize(w);
-        tmp.reach.resize(w);
-        tmp.tapx.resize(w);
-        tmp.tapy.resize(h);
-        const bool layered = anyLayer(t0);
-        const float vw = (float)(vx1 - vx0), vh = (float)(vy1 - vy0);
-        const int thin = std::max(2,(int)lroundf(8.0f * unitx));    /* see VP_Behind */
-        bool rows = fabsf(py) >= 0.5f;
-        for (int x=vx0;x < vx1;x++) {
-            const float t = VP_Taper(std::min((float)(x - vx0) + 0.5f,(float)(vx1 - x) - 0.5f),vw);
-            tmp.tapx[(size_t)x] = t;
-            const float xs = VP_SourceX(lens,(float)x,px);
-            tmp.reach[(size_t)x] = (float)x - xs;
-            tmp.srcx[(size_t)x] = std::max(vx0,std::min(vx1 - 1,(int)lroundf((float)x + t * (xs - (float)x))));
-            const int32_t k = (int32_t)lroundf(VP_RowScale(lens,xs,px) * 65536.0f);
-            tmp.rowk[(size_t)x] = k;
-            if (k != 65536) rows = true;
-        }
-        for (int y=vy0;y < vy1;y++) tmp.tapy[(size_t)y] = VP_Taper(std::min((float)(y - vy0) + 0.5f,(float)(vy1 - y) - 0.5f),vh);
-        const float cy = (float)(vy0 + vy1 - 1) * 0.5f;
-        const uint8_t *st = stay.data();
-        const int32_t *sx = tmp.srcx.data(), *rk = tmp.rowk.data();
-        const float *tx = tmp.tapx.data(), *reach = tmp.reach.data();
+        if (still_dirty || stay.size() != (size_t)w * h || hold.size() != (size_t)w * h) cleanStill();
+        int mx, my;
+        margins(mx,my);
+        const int sx = std::max(-mx,std::min(mx,(int)lroundf(px))), sy = std::max(-my,std::min(my,(int)lroundf(py)));
+        const uint8_t *hd = hold.data();
+        const int reach = std::max(2,(int)lroundf(16.0f * unitx)) + 1, reachy = std::max(2,(int)lroundf(16.0f * unity)) + 1;
         for (int y=0;y < ih;y++) {
             uint32_t *o = (uint32_t*)(dst + (size_t)y * (size_t)pitch);
             const uint32_t *in = src + (size_t)y * w;
-            if (y < vy0 || y >= vy1) { memcpy(o,in,(size_t)w * 4); continue; }
-            const uint8_t *sr = st + (size_t)y * w;
+            if (y < vy0 || y >= vy1 || (sx == 0 && sy == 0)) { memcpy(o,in,(size_t)w * 4); continue; }
+            const uint8_t *hr = hd + (size_t)y * w;
             if (vx0 > 0) memcpy(o,in,(size_t)vx0 * 4);
             if (vx1 < iw) memcpy(o + vx1,in + vx1,(size_t)(iw - vx1) * 4);
-            const float ty = tmp.tapy[(size_t)y];
-            const float yr = (float)y - py - cy;
-            float even = 0, rate = 1;
-            if (layered) rowLayer(y,t0,even,rate);
-            if (even > 0) {
-                /* a row of what scrolls evenly (or partly so, next to the border of such a band): every column by
-                 * the same, and no taller towards the side it leaves by */
-                const float flat = rate * px * even, part = 1.0f - even;
-                for (int x=vx0;x < vx1;x++) {
-                    if (sr[x]) { o[x] = in[x]; continue; }
-                    const int xi = std::max(vx0,std::min(vx1 - 1,(int)lroundf((float)x - tx[x] * (reach[x] * part + flat))));
-                    int ys = y;
-                    if (rows) {
-                        const float full = cy + yr * (1.0f + (float)(rk[x] - 65536) / 65536.0f * part);
-                        ys = std::max(vy0,std::min(vy1 - 1,(int)lroundf((float)y + ty * (full - (float)y))));
-                    }
-                    const size_t si = (size_t)ys * w + (size_t)xi;
-                    o[x] = st[si] ? VP_Behind(src + (size_t)ys * w,st + (size_t)ys * w,iw,xi,x,thin,in[x]) : src[si];
+            const int ys = std::max(vy0,std::min(vy1 - 1,y - sy));     /* (outside the view only in the margin) */
+            const uint32_t *srow = src + (size_t)ys * w;
+            const uint8_t *shr = hd + (size_t)ys * w;
+            for (int x=vx0;x < vx1;x++) {
+                if (hr[x]) { o[x] = in[x]; continue; }
+                const int xs = std::max(vx0,std::min(vx1 - 1,x - sx));
+                if (!shr[xs]) { o[x] = srow[xs]; continue; }
+                uint32_t c;
+                if (VP_Behind(srow,shr,iw,xs,x,reach,c)) { o[x] = c; continue; }
+                /* a stroke that runs on sideways: the pixel above or below it */
+                bool found = false;
+                for (int d=1;d <= reachy && !found;d++) {
+                    const int ya = ys - d, yb = ys + d;
+                    if (ya >= vy0 && !hd[(size_t)ya * w + (size_t)xs]) { c = src[(size_t)ya * w + (size_t)xs]; found = true; }
+                    else if (yb < vy1 && !hd[(size_t)yb * w + (size_t)xs]) { c = src[(size_t)yb * w + (size_t)xs]; found = true; }
                 }
-                continue;
-            }
-            if (!rows) {
-                for (int x=vx0;x < vx1;x++) {
-                    if (sr[x]) { o[x] = in[x]; continue; }
-                    const int xi = sx[x];
-                    o[x] = sr[xi] ? VP_Behind(in,sr,iw,xi,x,thin,in[x]) : in[xi];
-                }
-            }
-            else {
-                for (int x=vx0;x < vx1;x++) {
-                    if (sr[x]) { o[x] = in[x]; continue; }
-                    const float full = cy + yr * (float)rk[x] / 65536.0f;
-                    const int ys = std::max(vy0,std::min(vy1 - 1,(int)lroundf((float)y + ty * (full - (float)y))));
-                    const size_t si = (size_t)ys * w + (size_t)sx[x];
-                    o[x] = st[si] ? VP_Behind(src + (size_t)ys * w,st + (size_t)ys * w,iw,sx[x],x,thin,in[x]) : src[si];
-                }
+                o[x] = found ? c : srow[xs];
             }
         }
         st_warps++;
@@ -3317,6 +3276,7 @@ private:
     std::vector<uint32_t> still_at;     /* ...when it last counted as staying (ms, 0: not lately), see markStill */
     std::vector<uint32_t> world_at;     /* ...when the world was last seen moving through it (ms, 0: not lately) */
     std::vector<uint8_t> stay;          /* ...and whether it counts as staying (see cleanStill) */
+    std::vector<uint8_t> hold;          /* ...and whether warp holds it in place (see cleanStill) */
     bool still_dirty = true;
     VPPointer told_ptr;                 /* the newest report of the driver's pointer the host has sent... */
     uint32_t told_id = 0, told_seq = 0; /* ...its frame, and the newest input the host had applied then */
@@ -4044,11 +4004,15 @@ private:
                     if (world) { st[x] = 0; sa[x] = 0; wa[x] = nowms; }
                     else {
                         st[x] /= 2;
-                        if (told && sa[x] != 0 && nowms - sa[x] <= 2000u) sa[x] = nowms;
+                        if (sa[x] != 0 && nowms - sa[x] <= 2000u) sa[x] = nowms;
                     }
                     continue;
                 }
-                if (!told || world) continue;
+                if (world) continue;
+                /* the same in place while the view moved: one that counts as staying goes on counting, also when
+                 * the view moved by less than its size and it could only be compared with itself (small turns
+                 * wore the crosshair's mark out, and an arm of it was moved with the world) */
+                if (!told) { if (sa[x] != 0 && nowms - sa[x] <= 2000u) sa[x] = nowms; continue; }
                 if (st[x] < 255) st[x]++;
                 if (st[x] >= VP_STILL) sa[x] = nowms;
             }
@@ -4128,6 +4092,46 @@ private:
                 if (!u) continue;
                 for (int k=1;k <= reachy && !d && y + k < ih;k++) d = sv[i + (size_t)k * w] != 0;
                 if (d) stay[i] = 1;
+            }
+        }
+        /* What warp holds in place: each piece of what stays (8-connected) that is small, at most 16 x 16 pixels of a
+         * 320 x 200 picture (the strokes of a crosshair, the letters of a message), or that runs across nearly the
+         * whole view (a bar of names, which uncovers nothing when it is held). A weapon is neither: it moves with the
+         * view until the next frame. */
+        hold.assign((size_t)w * h,0);
+        tmp.label.assign((size_t)w * h,0);
+        int32_t *lab = tmp.label.data();
+        std::vector<int32_t> &stack = tmp.stack;
+        std::vector<int32_t> &members = tmp.members;
+        const int smallx = (int)lroundf(16.0f * unitx), smally = (int)lroundf(16.0f * unity), widex = (vx1 - vx0) * 9 / 10;
+        int32_t next = 0;
+        for (int y=vy0;y < vy1;y++) {
+            for (int x=vx0;x < vx1;x++) {
+                const size_t i0 = (size_t)y * w + (size_t)x;
+                if (!stay[i0] || lab[i0]) continue;
+                next++;
+                int bx0 = x, bx1 = x, by0 = y, by1 = y;
+                stack.clear(); members.clear();
+                stack.push_back((int32_t)i0); lab[i0] = next;
+                while (!stack.empty()) {
+                    const int32_t i = stack.back(); stack.pop_back();
+                    members.push_back(i);
+                    const int cx = i % (int)w, cy = i / (int)w;
+                    bx0 = std::min(bx0,cx); bx1 = std::max(bx1,cx); by0 = std::min(by0,cy); by1 = std::max(by1,cy);
+                    for (int dy=-1;dy <= 1;dy++) {
+                        const int ny = cy + dy;
+                        if (ny < vy0 || ny >= vy1) continue;
+                        for (int dx=-1;dx <= 1;dx++) {
+                            const int nx = cx + dx;
+                            if (nx < vx0 || nx >= vx1) continue;
+                            const size_t j = (size_t)ny * w + (size_t)nx;
+                            if (stay[j] && !lab[j]) { lab[j] = next; stack.push_back((int32_t)j); }
+                        }
+                    }
+                }
+                const bool small = bx1 - bx0 < smallx && by1 - by0 < smally;
+                const bool across = bx1 - bx0 >= widex;
+                if (small || across) for (size_t k=0;k < members.size();k++) hold[(size_t)members[k]] = 1;
             }
         }
     }
@@ -4241,6 +4245,8 @@ public:
     uint64_t frame_c = 0;
     uint32_t frame_seq = 0xFFFFFFFFu;       /* ...and the newest input the host had applied when it took it (if it said) */
     VPPointer frame_ptr;            /* ...and where the DOS mouse driver had its pointer */
+    SDL_Texture *zoom_tex = NULL;   /* the view enlarged by whole pixels (see present) */
+    int zoom_w = 0, zoom_h = 0;
     bool dot_on = false;            /* the pointer dot is on the screen, at dot_px, dot_py of the window */
     int dot_px = 0, dot_py = 0;
     std::string shot_dir;           /* NN_RP_PREDICTSHOT=<folder>: the first pictures moved far, before and after, as PPM */
@@ -4830,9 +4836,31 @@ public:
     bool pointerDot(const SDL_Rect &r,int &x,int &y) {
         float nx, ny;
         if (!captured || abs_pointer || !haveframe || !vp.pointerAt(acc_xrel,acc_yrel,nx,ny)) return false;
-        x = r.x + (int)lroundf(nx * (float)(r.w - 1));
-        y = r.y + (int)lroundf(ny * (float)(r.h - 1));
+        float fx = nx * (float)(frame_w - 1), fy = ny * (float)(frame_h - 1);
+        zoomPoint(fx,fy);
+        x = r.x + (int)lroundf(fx * (float)r.w / (float)frame_w);
+        y = r.y + (int)lroundf(fy * (float)r.h / (float)frame_h);
         return true;
+    }
+
+    /* The view shown larger (see ViewPredict::warp): what of the frame is drawn where the view is. False: shown as is. */
+    bool zoomCrop(SDL_Rect &view,SDL_Rect &crop) const {
+        if (!vp.zoomed() || vp.w != frame_w || vp.h != frame_h) return false;
+        int x0, y0, x1, y1, mx, my;
+        vp.viewBox(x0,y0,x1,y1);
+        vp.margins(mx,my);
+        if (x1 - x0 <= 4 * mx || y1 - y0 <= 4 * my) return false;
+        view.x = x0; view.y = y0; view.w = x1 - x0; view.h = y1 - y0;
+        crop.x = x0 + mx; crop.y = y0 + my; crop.w = view.w - 2 * mx; crop.h = view.h - 2 * my;
+        return true;
+    }
+
+    /* Where a point of the frame (in its pixels) is on the screen, in frame pixels, with the view shown larger. */
+    void zoomPoint(float &fx,float &fy) const {
+        SDL_Rect v, c;
+        if (!zoomCrop(v,c) || fx < (float)v.x || fx >= (float)(v.x + v.w) || fy < (float)v.y || fy >= (float)(v.y + v.h)) return;
+        fx = (float)v.x + (fx - (float)c.x) * (float)v.w / (float)c.w;
+        fy = (float)v.y + (fy - (float)c.y) * (float)v.h / (float)c.h;
     }
 
     /* How far view prediction moves the picture at this moment; false: not at all. */
@@ -4854,7 +4882,7 @@ public:
                 tex_w = frame_w; tex_h = frame_h;
             }
             if (pix_dirty || pix.size() != (size_t)frame_w * frame_h) convertFrame();
-            const bool moved = predicted(now_us,px,py);
+            const bool moved = predicted(now_us,px,py) && (lroundf(px) != 0 || lroundf(py) != 0);
             /* Straight into the texture, or through argb when it cannot be locked. */
             void *dst = NULL;
             int dpitch = 0;
@@ -4892,6 +4920,34 @@ public:
         if (texture && haveframe) {
             const SDL_Rect r = displayRect();
             SDL_RenderCopy(renderer,texture,NULL,&r);
+            /* the view shown larger, over itself (see ViewPredict::warp); the status bar and the rest as they are */
+            SDL_Rect view, crop;
+            if (zoomCrop(view,crop)) {
+                const float sxw = (float)r.w / (float)frame_w, syh = (float)r.h / (float)frame_h;
+#if SDL_VERSION_ATLEAST(2,0,12)
+                /* Scaled by a little more than the rest, "nearest" would make some of its pixels a screen pixel wider
+                 * than others, and what moves would crawl through that pattern: enlarged by whole pixels first, then
+                 * to the window with linear filtering, every pixel is as wide as the next (DOSBox's "sharp" output). */
+                const SDL_FRect d = { (float)r.x + (float)view.x * sxw, (float)r.y + (float)view.y * syh, (float)view.w * sxw, (float)view.h * syh };
+                const int kx = std::max(1,(int)ceilf(d.w / (float)crop.w)), ky = std::max(1,(int)ceilf(d.h / (float)crop.h));
+                bool sharp = SDL_RenderTargetSupported(renderer) == SDL_TRUE;
+                if (sharp && (zoom_tex == NULL || zoom_w != crop.w * kx || zoom_h != crop.h * ky)) {
+                    if (zoom_tex) SDL_DestroyTexture(zoom_tex);
+                    zoom_w = crop.w * kx; zoom_h = crop.h * ky;
+                    zoom_tex = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_TARGET,zoom_w,zoom_h);
+                    if (zoom_tex) SDL_SetTextureScaleMode(zoom_tex,SDL_ScaleModeLinear);
+                }
+                if (sharp && zoom_tex && SDL_SetRenderTarget(renderer,zoom_tex) == 0) {
+                    SDL_RenderCopy(renderer,texture,&crop,NULL);
+                    SDL_SetRenderTarget(renderer,NULL);
+                    SDL_RenderCopyF(renderer,zoom_tex,NULL,&d);
+                }
+                else SDL_RenderCopyF(renderer,texture,&crop,&d);
+#else
+                const SDL_Rect d = { r.x + (int)lroundf((float)view.x * sxw), r.y + (int)lroundf((float)view.y * syh), (int)lroundf((float)view.w * sxw), (int)lroundf((float)view.h * syh) };
+                SDL_RenderCopy(renderer,texture,&crop,&d);
+#endif
+            }
             /* the pointer dot (see ViewPredict::pointerTold): a white square in a black ring, as over a Windows guest */
             if (pointerDot(r,dot_px,dot_py)) {
                 dot_on = true;
@@ -5326,6 +5382,7 @@ public:
         if (rec_fr) fclose(rec_fr);
         if (audio) SDL_CloseAudioDevice(audio);
         if (texture) SDL_DestroyTexture(texture);
+        if (zoom_tex) SDL_DestroyTexture(zoom_tex);
         if (dot_cursor) { SDL_SetCursor(SDL_GetDefaultCursor()); SDL_FreeCursor(dot_cursor); dot_cursor = NULL; }
         if (renderer) SDL_DestroyRenderer(renderer);
         /* The viewer window goes first: on some window managers (labwc, for one) a message box for it opened behind
