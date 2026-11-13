@@ -2312,6 +2312,8 @@ const unsigned VP_KEYBINS = 16;         /* what a key does to the view is learne
                                            held and 5 of the time since it was let go */
 const unsigned VP_KEYCTX = 8;           /* ...separately with and without Shift, Ctrl and Alt held */
 const unsigned VP_KEYHIST = 6;          /* presses and releases remembered per key */
+const float VP_AHEAD = 0.05f;           /* the picture is moved by at most this much of the view's width (height) */
+const float VP_TAPER = 0.3f;            /* ...and less and less over the outer 30% of each side, nothing at the edge */
 
 /* The DOS mouse driver's pointer as the host reports it with a frame: its place (0 ... 1 of its range each way)
  * and how far one count of mouse motion moves it (a single count; a larger motion, per count). */
@@ -2427,7 +2429,7 @@ struct VPScratch {
     std::vector<uint8_t> mask[VP_LEVELS], maskc, stillnow;
     std::vector<float> vals, sorted;
     std::vector<int32_t> srcx, rowk;
-    std::vector<float> reach;
+    std::vector<float> reach, tapx, tapy;
 };
 
 /* How unlike the picture cur is to the earlier one moved by (d,e), in the window of columns [x0,x1) and rows [y0,y1),
@@ -2833,12 +2835,27 @@ const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
     20, 40, 60, 90, 130                                                 /* let go: 0-20, ... 90-130 */
 };
 
-/* The pixel of row srow at column xi, or, when that one stays in place (stay row strow: a weapon, a crosshair), the
- * nearest one towards column x that does not; x itself, or fallback, when every one in between stays. */
-static inline uint32_t VP_Uncovered(const uint32_t *srow,const uint8_t *strow,int xi,int x,uint32_t fallback) {
-    const int step = x > xi ? 1 : -1;
-    for (int k=xi;k != x;k += step) if (!strow[k]) return srow[k];
-    return strow[x] ? fallback : srow[x];
+/* What a pixel that stays hides of the world, at column xi of row srow (stay row strow, n columns), seen from
+ * column x: when the run of staying pixels there is thin (at most thin columns: a stroke of a crosshair or of text),
+ * the pixel just past it on the side of x, which is what it covered; beside anything wider (a weapon), fallback,
+ * the frame's own pixel at that place. */
+static inline uint32_t VP_Behind(const uint32_t *srow,const uint8_t *strow,int n,int xi,int x,int thin,uint32_t fallback) {
+    int a = xi, b = xi;
+    while (a > 0 && strow[a - 1] && xi - a < thin) a--;
+    while (b + 1 < n && strow[b + 1] && b - xi < thin) b++;
+    if (b - a + 1 > thin) return fallback;
+    const int k = x > xi ? b + 1 : a - 1;
+    return (k >= 0 && k < n && !strow[k]) ? srow[k] : fallback;
+}
+
+/* How much of the predicted movement a column (or row) at distance d from the edge of the view gets, in a view n
+ * wide: all of it in the middle, falling smoothly to nothing at the edge over the outer VP_TAPER of each side. */
+static inline float VP_Taper(float d,float n) {
+    const float band = VP_TAPER * n;
+    if (band <= 0.0f || d >= band) return 1.0f;
+    if (d <= 0.0f) return 0.0f;
+    const float u = d / band;
+    return u * u * (3.0f - 2.0f * u);
 }
 
 class ViewPredict {
@@ -2859,6 +2876,7 @@ public:
         if (samesize) return;   /* only the colours changed: what was learned still holds */
         still.assign((size_t)w * h,0);
         still_at.assign((size_t)w * h,0);
+        world_at.assign((size_t)w * h,0);
         still_dirty = true;
         rowch.clear(); colch.clear(); view_frames = 0;
         vx0 = vy0 = 0; vx1 = (int)w; vy1 = (int)h;
@@ -3135,37 +3153,49 @@ public:
             keyOffset(now,kx,ky);
             px += kx * kstrength; py += ky * kstrength;
         }
-        px = std::max(-0.3f * (float)w,std::min(0.3f * (float)w,px));
-        py = std::max(-0.2f * (float)h,std::min(0.2f * (float)h,py));
+        /* at most a twentieth of the view: see warp */
+        const float capx = VP_AHEAD * (float)(vx1 - vx0), capy = VP_AHEAD * (float)(vy1 - vy0);
+        px = std::max(-capx,std::min(capx,px));
+        py = std::max(-capy,std::min(capy,py));
         return fabsf(px) >= 0.5f || fabsf(py) >= 0.5f;
     }
 
     /* The picture src (w x h pixels) moved by (px,py) into dst; the pixels that never move with the view stay.
-     * Where the moved picture would show what the frame does not have (beyond the edge of the view, or behind a
-     * pixel that stays, such as the weapon or the crosshair), the nearest pixel it does have is drawn longer. */
+     * Nothing is drawn that the frame does not have: the movement falls off towards the edges of the view (see
+     * VP_Taper), so the edge itself stays where it is and a turn stretches or squeezes the outer parts a little
+     * instead of uncovering a strip there (it was filled with the view mirrored, then with pictures kept by
+     * direction, then with a smear of the nearest pixel; players saw each of them, most on links with a long round
+     * trip). For the same reason the movement is limited (VP_AHEAD in offset): with at most a twentieth of the view
+     * the outer parts change in size by at most a quarter. Where the moved picture would show what a pixel that
+     * stays hides, see VP_Behind. */
     void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
         const uint64_t t0 = RP_Micros();
         const int iw = (int)w, ih = (int)h;
         if (still_dirty || stay.size() != (size_t)w * h) cleanStill();
         tmp.srcx.resize(w);
         tmp.rowk.resize(w);
+        tmp.reach.resize(w);
+        tmp.tapx.resize(w);
+        tmp.tapy.resize(h);
         const bool layered = anyLayer(t0);
+        const float vw = (float)(vx1 - vx0), vh = (float)(vy1 - vy0);
+        const int thin = std::max(2,(int)lroundf(8.0f * unitx));    /* see VP_Behind */
         bool rows = fabsf(py) >= 0.5f;
         for (int x=vx0;x < vx1;x++) {
+            const float t = VP_Taper(std::min((float)(x - vx0) + 0.5f,(float)(vx1 - x) - 0.5f),vw);
+            tmp.tapx[(size_t)x] = t;
             const float xs = VP_SourceX(lens,(float)x,px);
-            tmp.srcx[(size_t)x] = std::max(vx0,std::min(vx1 - 1,(int)lroundf(xs)));
+            tmp.reach[(size_t)x] = (float)x - xs;
+            tmp.srcx[(size_t)x] = std::max(vx0,std::min(vx1 - 1,(int)lroundf((float)x + t * (xs - (float)x))));
             const int32_t k = (int32_t)lroundf(VP_RowScale(lens,xs,px) * 65536.0f);
             tmp.rowk[(size_t)x] = k;
             if (k != 65536) rows = true;
         }
+        for (int y=vy0;y < vy1;y++) tmp.tapy[(size_t)y] = VP_Taper(std::min((float)(y - vy0) + 0.5f,(float)(vy1 - y) - 0.5f),vh);
         const float cy = (float)(vy0 + vy1 - 1) * 0.5f;
-        const int64_t cyf = (int64_t)llroundf(cy * 16777216.0f) + (1 << 23);
         const uint8_t *st = stay.data();
         const int32_t *sx = tmp.srcx.data(), *rk = tmp.rowk.data();
-        if (layered) {
-            tmp.reach.resize(w);
-            for (int x=vx0;x < vx1;x++) tmp.reach[(size_t)x] = (float)x - VP_SourceX(lens,(float)x,px);
-        }
+        const float *tx = tmp.tapx.data(), *reach = tmp.reach.data();
         for (int y=0;y < ih;y++) {
             uint32_t *o = (uint32_t*)(dst + (size_t)y * (size_t)pitch);
             const uint32_t *in = src + (size_t)y * w;
@@ -3173,20 +3203,24 @@ public:
             const uint8_t *sr = st + (size_t)y * w;
             if (vx0 > 0) memcpy(o,in,(size_t)vx0 * 4);
             if (vx1 < iw) memcpy(o + vx1,in + vx1,(size_t)(iw - vx1) * 4);
-            const int64_t yr = (int64_t)llroundf(((float)y - py - cy) * 256.0f);
+            const float ty = tmp.tapy[(size_t)y];
+            const float yr = (float)y - py - cy;
             float even = 0, rate = 1;
             if (layered) rowLayer(y,t0,even,rate);
             if (even > 0) {
                 /* a row of what scrolls evenly (or partly so, next to the border of such a band): every column by
                  * the same, and no taller towards the side it leaves by */
                 const float flat = rate * px * even, part = 1.0f - even;
-                const float *reach = tmp.reach.data();
                 for (int x=vx0;x < vx1;x++) {
                     if (sr[x]) { o[x] = in[x]; continue; }
-                    const int xi = std::max(vx0,std::min(vx1 - 1,(int)lroundf((float)x - reach[x] * part - flat)));
+                    const int xi = std::max(vx0,std::min(vx1 - 1,(int)lroundf((float)x - tx[x] * (reach[x] * part + flat))));
                     int ys = y;
-                    if (rows) ys = std::max(vy0,std::min(vy1 - 1,(int)((cyf + yr * (65536 + (int64_t)((float)(rk[x] - 65536) * part))) >> 24)));
-                    o[x] = VP_Uncovered(src + (size_t)ys * w,st + (size_t)ys * w,xi,x,in[x]);
+                    if (rows) {
+                        const float full = cy + yr * (1.0f + (float)(rk[x] - 65536) / 65536.0f * part);
+                        ys = std::max(vy0,std::min(vy1 - 1,(int)lroundf((float)y + ty * (full - (float)y))));
+                    }
+                    const size_t si = (size_t)ys * w + (size_t)xi;
+                    o[x] = st[si] ? VP_Behind(src + (size_t)ys * w,st + (size_t)ys * w,iw,xi,x,thin,in[x]) : src[si];
                 }
                 continue;
             }
@@ -3194,15 +3228,16 @@ public:
                 for (int x=vx0;x < vx1;x++) {
                     if (sr[x]) { o[x] = in[x]; continue; }
                     const int xi = sx[x];
-                    o[x] = sr[xi] ? VP_Uncovered(in,sr,xi,x,in[x]) : in[xi];
+                    o[x] = sr[xi] ? VP_Behind(in,sr,iw,xi,x,thin,in[x]) : in[xi];
                 }
             }
             else {
                 for (int x=vx0;x < vx1;x++) {
                     if (sr[x]) { o[x] = in[x]; continue; }
-                    const int ys = std::max(vy0,std::min(vy1 - 1,(int)((cyf + yr * rk[x]) >> 24)));
+                    const float full = cy + yr * (float)rk[x] / 65536.0f;
+                    const int ys = std::max(vy0,std::min(vy1 - 1,(int)lroundf((float)y + ty * (full - (float)y))));
                     const size_t si = (size_t)ys * w + (size_t)sx[x];
-                    o[x] = st[si] ? VP_Uncovered(src + (size_t)ys * w,st + (size_t)ys * w,sx[x],x,in[x]) : src[si];
+                    o[x] = st[si] ? VP_Behind(src + (size_t)ys * w,st + (size_t)ys * w,iw,sx[x],x,thin,in[x]) : src[si];
                 }
             }
         }
@@ -3280,6 +3315,7 @@ private:
     VPScratch tmp;
     std::vector<uint8_t> still;         /* per pixel: how often it stayed the same while the view moved */
     std::vector<uint32_t> still_at;     /* ...when it last counted as staying (ms, 0: not lately), see markStill */
+    std::vector<uint32_t> world_at;     /* ...when the world was last seen moving through it (ms, 0: not lately) */
     std::vector<uint8_t> stay;          /* ...and whether it counts as staying (see cleanStill) */
     bool still_dirty = true;
     VPPointer told_ptr;                 /* the newest report of the driver's pointer the host has sent... */
@@ -3955,9 +3991,10 @@ private:
 
     /* The pixels that stay while the view moves: the same as a frame ago in their place, and not what the view's
      * movement would have brought there (nor its neighbours: the movement is only known to about a pixel). A pixel
-     * that changes in place starts over, but one that counted as staying lately keeps counting for two seconds
-     * unless what changed it is the world moving through it: a weapon that bobs while the player walks, or fires,
-     * changes its pixels all the time and is still no part of the world (moved with it, it came apart). */
+     * that changes in place starts over only when what changed it is the world moving through it; otherwise one
+     * that counted as staying lately keeps counting for two seconds: a weapon that bobs while the player walks, or
+     * fires, and a crosshair that changes its shade, change their pixels all the time and are still no part of the
+     * world (moved with it, they came apart). */
     void markStill(const uint8_t *raw,const uint8_t *prevraw,const VPMotion &mo) {
         if (!mo.okx) return;
         const bool movedy = mo.oky && fabsf(mo.sy) >= 1.5f * unity;
@@ -3968,6 +4005,7 @@ private:
         const uint32_t nowms = (uint32_t)(nowus / 1000u) | 1u;
         const bool layered = anyLayer(nowus);
         if (still_at.size() != still.size()) still_at.assign(still.size(),0);
+        if (world_at.size() != still.size()) world_at.assign(still.size(),0);
         tmp.srcx.resize(w);
         tmp.rowk.assign(w,0);       /* per column: the pixels that changed */
         if (rowch.size() != h || colch.size() != w) { rowch.assign(h,0.0f); colch.assign(w,0.0f); view_frames = 0; }
@@ -3979,6 +4017,7 @@ private:
             const uint8_t *ps = prevraw + pal + (size_t)(rowok ? ys : 0) * w * bpp;
             uint8_t *st = still.data() + (size_t)y * w;
             uint32_t *sa = still_at.data() + (size_t)y * w;
+            uint32_t *wa = world_at.data() + (size_t)y * w;
             int changed = 0;
             float even = 0, rate = 1;
             if (layered) rowLayer(y,nowus,even,rate);
@@ -3988,18 +4027,28 @@ private:
                 const int xs = even > 0.5f ? x - flat : tmp.srcx[(size_t)x];
                 const bool known = rowok && xs >= 1 && xs < iw - 1;
                 const uint8_t *sp = ps + (size_t)(known ? xs : 0) * bpp;
-                /* what the view's movement brings there; a pixel that stays itself (or did lately) proves nothing:
-                 * the arms of a crosshair have one colour, and moved by about its size one arm "brought" the other */
+                /* what the view's movement brings there. Only a pixel of the world says anything: compared with a
+                 * pixel that stays (or did lately), one arm of a crosshair, moved by about its size, looked as if
+                 * the world had brought it the other, and a dark pixel next to a crosshair always differed from it
+                 * and was held in place as a dark patch beside it. (Inside a weapon, moved by less than its width,
+                 * the weapon is compared with itself and learns nothing either: see the holes in cleanStill.) */
                 const size_t si = (size_t)(rowok ? ys : 0) * w + (size_t)(known ? xs : 1);
                 auto moves = [&](size_t i) { return still[i] < VP_STILL && (still_at[i] == 0 || nowms - still_at[i] > 2000u); };
-                const bool world = known && ((samePixel(cp,sp,bpp) && moves(si)) || (samePixel(cp,sp - bpp,bpp) && moves(si - 1))
-                    || (samePixel(cp,sp + bpp,bpp) && moves(si + 1)));
+                const bool told = known && moves(si) && moves(si - 1) && moves(si + 1);
+                const bool world = told && (samePixel(cp,sp,bpp) || samePixel(cp,sp - bpp,bpp) || samePixel(cp,sp + bpp,bpp));
                 if (!samePixel(cp,p + (size_t)x * bpp,bpp)) {
-                    st[x] = 0; changed++; tmp.rowk[(size_t)x]++;
-                    if (world) sa[x] = 0;
+                    /* changed in place: by the world moving through it (it is world), or otherwise (a crosshair
+                     * that changes its shade, a weapon that bobs or fires: halved, and against a known world
+                     * still not the world, so whether it stays is kept fresh) */
+                    changed++; tmp.rowk[(size_t)x]++;
+                    if (world) { st[x] = 0; sa[x] = 0; wa[x] = nowms; }
+                    else {
+                        st[x] /= 2;
+                        if (told && sa[x] != 0 && nowms - sa[x] <= 2000u) sa[x] = nowms;
+                    }
                     continue;
                 }
-                if (!known || world) continue;
+                if (!told || world) continue;
                 if (st[x] < 255) st[x]++;
                 if (st[x] >= VP_STILL) sa[x] = nowms;
             }
@@ -4057,6 +4106,29 @@ private:
             }
             int32_t *first = rows[0];
             rows[0] = rows[1]; rows[1] = rows[2]; rows[2] = first;
+        }
+        /* Holes inside something that stays (plain parts of a weapon or a hand, which compared with the rest of it
+         * prove nothing either way, see markStill): a pixel with staying pixels within a few columns to its left
+         * and right and a few rows above and below it stays too, unless the world was seen moving through it
+         * lately (the middle of a crosshair). */
+        if (world_at.size() != still.size()) world_at.assign(still.size(),0);
+        const int reachx = std::max(2,(int)lroundf(6.0f * unitx)), reachy = std::max(2,(int)lroundf(6.0f * unity));
+        tmp.stillnow.assign(stay.begin(),stay.end());
+        const uint8_t *sv = tmp.stillnow.data();
+        for (int y=1;y + 1 < ih;y++) {
+            for (int x=1;x + 1 < iw;x++) {
+                const size_t i = (size_t)y * w + (size_t)x;
+                if (sv[i] || (world_at[i] != 0 && nowms - world_at[i] <= 2000u)) continue;
+                bool l = false, r = false, u = false, d = false;
+                for (int k=1;k <= reachx && !l && x - k >= 0;k++) l = sv[i - (size_t)k] != 0;
+                if (!l) continue;
+                for (int k=1;k <= reachx && !r && x + k < iw;k++) r = sv[i + (size_t)k] != 0;
+                if (!r) continue;
+                for (int k=1;k <= reachy && !u && y - k >= 0;k++) u = sv[i - (size_t)k * w] != 0;
+                if (!u) continue;
+                for (int k=1;k <= reachy && !d && y + k < ih;k++) d = sv[i + (size_t)k * w] != 0;
+                if (d) stay[i] = 1;
+            }
         }
     }
 

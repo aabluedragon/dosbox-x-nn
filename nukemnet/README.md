@@ -182,8 +182,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
     (a 2D view moves as one piece), learned only from movement the player's input made;
   - what each held key does to the view by how long it has been held, per combination of Shift, Ctrl and Alt;
   - the view's rectangle (not the status bar, a border or a side panel) and the pixels in it that never move with it
-    (a weapon, a crosshair, text on the screen): 1-pixel strokes count as a whole, and a weapon that bobs or fires
-    keeps counting for two seconds unless the world is seen moving through its pixels;
+    (a weapon, a crosshair, text on the screen; see below);
   - layers: bands of the view that an engine scrolls evenly at a rate of its own (`VP_Bands`). Build's sky does:
     measured in Duke Nukem 3D at 1.24 times the ground's movement in the middle of the view, the same in every
     column, where the lens moves the sides 1.8 times as far. Each of 6 bands is tried both ways against a frame a
@@ -193,13 +192,20 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   A prediction is shown only while arriving frames keep agreeing with what was predicted for them, so it switches
   itself off in menus, pauses and cutscenes and on again in the game; Escape, Tab and the function keys switch it off
   at once. Only turning and looking are predicted: walking, other players and shots keep the connection's delay.
-  What a turn brings into view at the edge is not in the frame, and neither is what a weapon held still hides: the
-  nearest pixel the frame has is drawn longer there, a smear that reads as motion. Inventing that part was tried and
-  taken out before release: the view mirrored at the edge, and pictures kept by direction to fill it with what was
-  seen there before, both put copies of the weapon and the crosshair into the world (a player saw them at once in
-  Duke Nukem 3D). The smear is also nearer to what the game later draws: over a Doom stream between two computers the
-  mean difference in brightness was 9.2 with it against 9.7 with the mirror and the memory (13.5 to 12.0 at the
-  sides), and the viewer's cost went down by about half (0.7 ms a frame to learn, 0.6 to move the picture).
+  Nothing is drawn that the frame does not have. A turn uncovers a strip at one edge; filling it was tried three
+  ways and taken out each time after a player saw it (the view mirrored there, pictures kept by direction, a smear
+  of the nearest pixel; the last most on a relay with a long round trip, where the strip is wide). Now the movement
+  falls off smoothly over the outer 30% of each side to nothing at the edge, so the edge stays where it is and the
+  outer parts stretch or squeeze a little until the frame catches up, and the picture is moved by at most a
+  twentieth of the view's width (or height), which keeps that change in size under a quarter. The price is on fast
+  turns: over the Doom stream between two computers 70 ms apart the view was 9.6 pixels (of 320) from where the
+  hand had turned it on average, against 2.9 without the limit and 19.6 without prediction; slow aiming is followed
+  as before (Duke Nukem 3D looking around: 10.8 without prediction, 3.5 with).
+  What stays in place (a weapon, a crosshair, text on the screen) is learned only from pixels of the world: a
+  pixel compared with one that stays proves nothing (one arm of a crosshair, moved by its size, looked like the
+  world bringing the other; the plain pixels beside it looked as if they stayed). 1-pixel strokes count as a whole,
+  holes enclosed by what stays are filled (the plain inside of a weapon or a hand), and a weapon that bobs or fires,
+  or a crosshair that changes its shade, keeps counting for two seconds unless the world is seen moving through it.
   Measured (November 2026) with scripted mouse and key input in the viewer. One PC, 50 ms added each way (112 ms
   from input to screen): Doom follows the mouse after 7 ms; the picture was 6 to 9 pixels (of 320) behind the hand
   without prediction and 0.4 to 0.7 off with it; arrow-key turns 23 to 26 behind without, 1 to 3 off with; lens found
