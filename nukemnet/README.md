@@ -191,12 +191,13 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   A prediction is shown only while arriving frames keep agreeing with what was predicted for them, so it switches
   itself off in menus, pauses and cutscenes and on again in the game; Escape, Tab and the function keys switch it off
   at once. Only turning and looking are predicted: walking, other players and shots keep the connection's delay.
-  What a turn brings into view at the edge: every frame is also written into a picture of all directions around the
-  player (a column per pixel of turn, by height on a cylinder; `seenStore`), and the edge of a moved picture, and what
-  a weapon held still hides, is filled from there when it was seen in the last four seconds and the player has not
-  walked since (aiming goes back and forth: in the tests 94 to 97% of the edge was filled that way in Duke Nukem 3D
-  with mouse turns, 36 to 56% in Doom, where the test also holds a turn key for a second at a time); otherwise the
-  view mirrored there, dimmed, stands in.
+  What a turn brings into view at the edge is not in the frame, and neither is what a weapon held still hides: the
+  nearest pixel the frame has is drawn longer there, a smear that reads as motion. Inventing that part was tried and
+  taken out before release: the view mirrored at the edge, and pictures kept by direction to fill it with what was
+  seen there before, both put copies of the weapon and the crosshair into the world (a player saw them at once in
+  Duke Nukem 3D). The smear is also nearer to what the game later draws: over a Doom stream between two computers the
+  mean difference in brightness was 9.2 with it against 9.7 with the mirror and the memory (13.5 to 12.0 at the
+  sides), and the viewer's cost went down by about half (0.7 ms a frame to learn, 0.6 to move the picture).
   Measured (November 2026) with scripted mouse and key input in the viewer. One PC, 50 ms added each way (112 ms
   from input to screen): Doom follows the mouse after 7 ms; the picture was 6 to 9 pixels (of 320) behind the hand
   without prediction and 0.4 to 0.7 off with it; arrow-key turns 23 to 26 behind without, 1 to 3 off with; lens found
@@ -207,15 +208,14 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   after 7 ms, 0.4 off where it had moved 4 to 7, key turns 2.2 off where it had moved 34; while frames arrived 200 to
   340 ms late for a moment the view still followed the mouse to within 3 pixels. A menu opened with Escape: off at
   once, on again two stretches of frames after the game answers the mouse. Cost in the viewer: about 1 ms a frame to
-  learn and 0.5 to 0.8 ms to move the picture at 320x200, 2.5 ms a frame to learn at 800x600. The mean difference in
-  brightness between what was on the screen and the frame the game later drew for that moment: Doom 11.9 as
-  received, 6.2 as shown; at the sides of the view 12.3 and 6.9.
+  learn and 0.5 to 0.8 ms to move the picture at 320x200 (before the edge memory was taken out; see above), 2.5 ms
+  a frame to learn at 800x600. The mean difference in brightness between what was on the screen and the frame the
+  game later drew for that moment: Doom on one PC 11.9 as received, 6.2 as shown.
   Not verified in a game: looking up and down (measured and moved the same way, tested with synthetic pictures
   only). A game that changes how the mouse turns (sensitivity, a zoom) is learned again after about a second.
   A 2D side-scroller gains nothing: in Jazz Jackrabbit the view is recognised as one that moves as one piece, but
   its scrolling follows the character's momentum, not the keys held, so the predictions keep failing their check
-  and the picture is shown as received (prediction was on in 0 to 8% of the stretches); what was seen is kept for
-  such flat views too, which only synthetic pictures have tested.
+  and the picture is shown as received (prediction was on in 0 to 8% of the stretches).
 - Remote play pointer dot for DOS games (viewer, with a host from this release on): a game that draws its own
   pointer (a strategy game, an adventure, a menu) shows it one round trip late like everything else. The host now
   reports with every frame where the DOS mouse driver has its pointer and how far a count of motion moves it

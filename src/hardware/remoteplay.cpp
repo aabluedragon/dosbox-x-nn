@@ -2285,13 +2285,11 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
  * in a menu, a pause or a cutscene the picture does not follow the mouse, and prediction stops after two stretches
  * of frames that say so. Escape, Tab and the function keys close the gates at once, since they open menus.
  * Ctrl+F12 turns prediction off and on; [inputnet] predict = false keeps it off.
- * What a turn brings into view at the edge is not in the frame. Every frame is therefore also written into a picture
- * of all directions around the player (seenStore: a column per pixel of turn, on a cylinder for a view in
- * perspective), placed by the movement measured since; the edge of a moved picture, and what a pixel that stays
- * hides of the world, is filled from there when it was seen in the last four seconds. The memory starts over when
- * the picture changes in a way that is not the view turning (the player walks: everything is seen from another place
- * then) and when the lens or the view's rectangle is found to be another (seenFits). Where it has nothing, the view
- * mirrored there, dimmed, stands in. Things that move by themselves keep their own lag.
+ * What a turn brings into view at the edge is not in the frame, and neither is what a weapon held still hides of the
+ * world: the nearest pixel the frame does have is drawn longer there (a smear, which reads as motion). Inventing it
+ * was tried and taken out again: the view mirrored at the edge and pictures kept by direction both put copies of the
+ * weapon and the crosshair into the world, which players saw at once (Duke Nukem 3D, November 2026). Things that move
+ * by themselves keep their own lag.
  * A game that draws a pointer of its own where the DOS mouse driver has it (strategy games, adventures, menus) gets
  * a dot instead of a moved picture: the host reports the driver's pointer and how far a count moves it with every
  * frame, the viewer adds the motion the host had not applied and draws the dot at once (pointerAt, from the newest
@@ -2426,11 +2424,10 @@ void VP_BuildPlane(VPPlane &pl,const uint8_t *raw,unsigned w,unsigned h,unsigned
 }
 
 struct VPScratch {
-    std::vector<uint8_t> mask[VP_LEVELS], maskc, skiprow;
+    std::vector<uint8_t> mask[VP_LEVELS], maskc;
     std::vector<float> vals, sorted;
-    std::vector<int32_t> srcx, rowk, seenc;
-    std::vector<uint16_t> dim;
-    std::vector<float> reach, seeni;
+    std::vector<int32_t> srcx, rowk;
+    std::vector<float> reach;
 };
 
 /* How unlike the picture cur is to the earlier one moved by (d,e), in the window of columns [x0,x1) and rows [y0,y1),
@@ -2836,6 +2833,14 @@ const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
     20, 40, 60, 90, 130                                                 /* let go: 0-20, ... 90-130 */
 };
 
+/* The pixel of row srow at column xi, or, when that one stays in place (stay row strow: a weapon, a crosshair), the
+ * nearest one towards column x that does not; x itself, or fallback, when every one in between stays. */
+static inline uint32_t VP_Uncovered(const uint32_t *srow,const uint8_t *strow,int xi,int x,uint32_t fallback) {
+    const int step = x > xi ? 1 : -1;
+    for (int k=xi;k != x;k += step) if (!strow[k]) return srow[k];
+    return strow[x] ? fallback : srow[x];
+}
+
 class ViewPredict {
 public:
     bool enabled = true;        /* the player's switch */
@@ -2859,7 +2864,6 @@ public:
         memset(band_score,0,sizeof(band_score));
         lens_clean = cells_done = 0;
         layers_at = 0;
-        seen_has = false; seen_w = seen_h = 0;
         ptr_q = 0;
         lens = VPLens();
         memset(lens_mean,0,sizeof(lens_mean)); memset(lens_var,0,sizeof(lens_var)); memset(lens_n,0,sizeof(lens_n));
@@ -2910,25 +2914,17 @@ public:
 
     /* The frame now on the screen: up to when it shows the input (if known), the newest input the host had applied
      * when it took the frame (0xFFFFFFFF: not known), and when it arrived. */
-    void shown(bool hasc,uint64_t c,uint32_t seq,uint64_t arrival,uint32_t id) {
+    void shown(bool hasc,uint64_t c,uint32_t seq,uint64_t arrival) {
         shown_seq = seq;
-        /* What was seen lately is kept by the direction of the frame analysed last; the frame that goes on the screen
-         * now has not been analysed yet: how far it has moved on is taken from what the input is known to do. */
-        seen_lead = false;
-        seen_leadx = seen_leady = 0;
-        if (seen_has && id == seen_id) seen_lead = true;
-        else if (seen_has && hasc && seen_hasc && c > seen_c && c - seen_c < 300000)
-            seen_lead = between(seen_c,seen_seq,c,seq,seen_leadx,seen_leady);
         if (shown_arrival != 0 && arrival > shown_arrival) {
             const uint64_t d = std::min<uint64_t>(arrival - shown_arrival,100000);
             ival = ival ? (ival * 7 + d) / 8 : d;
         }
         shown_hasc = hasc; shown_c = c; shown_arrival = arrival;
-        seen_shown_id = id;
     }
 
     /* A decoded frame, and the frame analysed before it when that is still at hand. */
-    void frame(uint32_t id,const uint8_t *raw,size_t rawsize,unsigned fw,unsigned fh,unsigned ffmt,const uint8_t *prevraw,bool hasc,uint64_t c,uint32_t seq,const uint32_t *argb,const VPPointer &ptr) {
+    void frame(uint32_t id,const uint8_t *raw,size_t rawsize,unsigned fw,unsigned fh,unsigned ffmt,const uint8_t *prevraw,bool hasc,uint64_t c,uint32_t seq,const VPPointer &ptr) {
         const uint64_t t0 = RP_Micros();
         if (fw != w || fh != h || ffmt != fmt) { resize(fw,fh,ffmt); prevraw = NULL; }
         VPPlane &pl = planes[(cur + 1) % VP_KEPT];
@@ -3009,30 +3005,6 @@ public:
         }
         else samples.clear();
         cur = (cur + 1) % VP_KEPT;
-        /* What was seen, by direction: this frame's place in it (its measured movement; or, when that could not be
-         * measured, what the input is known to do; or it starts over), and its pixels. */
-        {
-            bool placed = false;
-            if (seen_has && prev.valid && prevraw != NULL && lens.known && seenFits()) {
-                const VPSample *smp = (!samples.empty() && samples.back().c1 == c) ? &samples.back() : NULL;
-                float mx = 0, my = 0;
-                if (smp != NULL && smp->okx) { mx = smp->sx; my = smp->oky ? smp->sy : 0; placed = true; }
-                else if (hasc && seen_hasc && c > seen_c && c - seen_c < 300000 && seen_guessed < 3 && between(seen_c,seen_seq,c,seq,mx,my)) {
-                    placed = true;
-                    seen_guessed++;
-                }
-                if (placed) {
-                    if (smp != NULL && smp->okx) seen_guessed = 0;
-                    seen_dir += lens.persp ? atan((double)mx / lens.f) : (double)mx;
-                    seen_down += my;
-                }
-            }
-            if (!placed) seenReset();
-            seen_has = lens.known;
-            seen_id = id; seen_hasc = hasc; seen_c = c; seen_seq = seq;
-            if (seen_has && argb != NULL) seenStore(argb,RP_Micros());
-            if (id == seen_shown_id) { seen_lead = true; seen_leadx = seen_leady = 0; }
-        }
         st_frames++;
         st_analyse_us += RP_Micros() - t0;
     }
@@ -3167,27 +3139,20 @@ public:
         return fabsf(px) >= 0.5f || fabsf(py) >= 0.5f;
     }
 
-    /* The picture src (w x h pixels) moved by (px,py) into dst; the pixels that never move with the view stay. */
+    /* The picture src (w x h pixels) moved by (px,py) into dst; the pixels that never move with the view stay.
+     * Where the moved picture would show what the frame does not have (beyond the edge of the view, or behind a
+     * pixel that stays, such as the weapon or the crosshair), the nearest pixel it does have is drawn longer. */
     void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
         const uint64_t t0 = RP_Micros();
         const int iw = (int)w, ih = (int)h;
         if (still_dirty || stay.size() != (size_t)w * h) cleanStill();
         tmp.srcx.resize(w);
         tmp.rowk.resize(w);
-        tmp.dim.resize(w);
         const bool layered = anyLayer(t0);
         bool rows = fabsf(py) >= 0.5f;
         for (int x=vx0;x < vx1;x++) {
             const float xs = VP_SourceX(lens,(float)x,px);
-            int xi = (int)lroundf(xs);
-            /* what comes into view at the edge is not in the frame: where it was not seen lately either (below), the
-             * view mirrored there stands in for it, darker the further in (it keeps the picture whole and moving,
-             * and does not pass for the real thing) */
-            int past = 0;
-            if (xi < vx0) { past = vx0 - xi; xi = 2 * vx0 - 1 - xi; }
-            if (xi >= vx1) { past = xi - vx1 + 1; xi = 2 * vx1 - 1 - xi; }
-            tmp.srcx[(size_t)x] = std::max(vx0,std::min(vx1 - 1,xi));
-            tmp.dim[(size_t)x] = dimOf(past);
+            tmp.srcx[(size_t)x] = std::max(vx0,std::min(vx1 - 1,(int)lroundf(xs)));
             const int32_t k = (int32_t)lroundf(VP_RowScale(lens,xs,px) * 65536.0f);
             tmp.rowk[(size_t)x] = k;
             if (k != 65536) rows = true;
@@ -3196,35 +3161,10 @@ public:
         const int64_t cyf = (int64_t)llroundf(cy * 16777216.0f) + (1 << 23);
         const uint8_t *st = stay.data();
         const int32_t *sx = tmp.srcx.data(), *rk = tmp.rowk.data();
-        const uint16_t *dm = tmp.dim.data();
         if (layered) {
             tmp.reach.resize(w);
             for (int x=vx0;x < vx1;x++) tmp.reach[(size_t)x] = (float)x - VP_SourceX(lens,(float)x,px);
         }
-        /* the columns at the edges that show the mirrored view */
-        int dl = vx0, dr = vx1;
-        while (dl < vx1 && dm[dl] != 256) dl++;
-        while (dr > dl && dm[dr - 1] != 256) dr--;
-        /* What was seen lately in the directions the moved picture shows (see seenStore): for its edges, and for what
-         * a part of the picture that stays hides of the world. */
-        const bool useseen = seen_has && seen_lead && seen_w > 0 && seenFits();
-        const uint16_t nowat = seenStamp(t0);
-        const float down = (float)seen_down + seen_leady + py;
-        if (useseen) {
-            const double dir = seen_dir + (lens.persp ? atan((double)seen_leadx / lens.f) + atan((double)px / lens.f) : (double)(seen_leadx + px));
-            tmp.seenc.resize(w); tmp.seeni.resize(w);
-            for (int x=vx0;x < vx1;x++) {
-                float tall;
-                tmp.seenc[(size_t)x] = seenColumn((float)x,dir,tall);
-                tmp.seeni[(size_t)x] = 1.0f / tall;
-            }
-        }
-        const int32_t *sc = tmp.seenc.data();
-        const float *si_ = tmp.seeni.data();
-        const uint32_t *sp = seen.data();
-        const uint16_t *sa = seen_at.data();
-        const int sh2 = seen_h / 2;
-#define VP_FROM_SEEN(X,Y,WAS) (useseen && fromSeen(sp,sa,sc[X],(int)lroundf(((float)(Y) - cy - down) * si_[X]) + sh2,nowat,WAS))
         for (int y=0;y < ih;y++) {
             uint32_t *o = (uint32_t*)(dst + (size_t)y * (size_t)pitch);
             const uint32_t *in = src + (size_t)y * w;
@@ -3242,81 +3182,31 @@ public:
                 const float *reach = tmp.reach.data();
                 for (int x=vx0;x < vx1;x++) {
                     if (sr[x]) { o[x] = in[x]; continue; }
-                    int xi = (int)lroundf((float)x - reach[x] * part - flat);
-                    int past = 0;
-                    if (xi < vx0) { past = vx0 - xi; xi = 2 * vx0 - 1 - xi; }
-                    if (xi >= vx1) { past = xi - vx1 + 1; xi = 2 * vx1 - 1 - xi; }
-                    xi = std::max(vx0,std::min(vx1 - 1,xi));
+                    const int xi = std::max(vx0,std::min(vx1 - 1,(int)lroundf((float)x - reach[x] * part - flat)));
                     int ys = y;
-                    if (rows) {
-                        ys = (int)((cyf + yr * (65536 + (int64_t)((float)(rk[x] - 65536) * part))) >> 24);
-                        if (ys < vy0) ys = 2 * vy0 - 1 - ys;
-                        if (ys >= vy1) ys = 2 * vy1 - 1 - ys;
-                        ys = std::max(vy0,std::min(vy1 - 1,ys));
-                    }
-                    const size_t si = (size_t)ys * w + (size_t)xi;
-                    uint32_t c = st[si] ? in[x] : src[si];
-                    if (past || st[si]) {
-                        uint32_t was;
-                        if (VP_FROM_SEEN(x,y,was)) c = was;
-                        else if (past) {
-                            const uint32_t k = dimOf(past);
-                            c = 0xFF000000u | ((((c & 0xFF00FFu) * k) >> 8) & 0xFF00FFu) | ((((c & 0x00FF00u) * k) >> 8) & 0x00FF00u);
-                        }
-                    }
-                    o[x] = c;
+                    if (rows) ys = std::max(vy0,std::min(vy1 - 1,(int)((cyf + yr * (65536 + (int64_t)((float)(rk[x] - 65536) * part))) >> 24)));
+                    o[x] = VP_Uncovered(src + (size_t)ys * w,st + (size_t)ys * w,xi,x,in[x]);
                 }
                 continue;
             }
             if (!rows) {
                 for (int x=vx0;x < vx1;x++) {
+                    if (sr[x]) { o[x] = in[x]; continue; }
                     const int xi = sx[x];
-                    if (sr[x]) o[x] = in[x];
-                    else if (sr[xi]) { uint32_t was; o[x] = VP_FROM_SEEN(x,y,was) ? was : in[x]; }  /* what the weapon hid */
-                    else o[x] = in[xi];
+                    o[x] = sr[xi] ? VP_Uncovered(in,sr,xi,x,in[x]) : in[xi];
                 }
             }
             else {
                 for (int x=vx0;x < vx1;x++) {
                     if (sr[x]) { o[x] = in[x]; continue; }
-                    int ys = (int)((cyf + yr * rk[x]) >> 24);
-                    if (ys < vy0) ys = 2 * vy0 - 1 - ys;
-                    if (ys >= vy1) ys = 2 * vy1 - 1 - ys;
-                    ys = std::max(vy0,std::min(vy1 - 1,ys));
+                    const int ys = std::max(vy0,std::min(vy1 - 1,(int)((cyf + yr * rk[x]) >> 24)));
                     const size_t si = (size_t)ys * w + (size_t)sx[x];
-                    if (st[si]) { uint32_t was; o[x] = VP_FROM_SEEN(x,y,was) ? was : in[x]; }
-                    else o[x] = src[si];
-                }
-            }
-            for (int side=0;side < 2;side++) {
-                for (int x=side ? dr : vx0;x < (side ? vx1 : dl);x++) {
-                    if (sr[x]) continue;
-                    uint32_t was;
-                    if (VP_FROM_SEEN(x,y,was)) { o[x] = was; st_seen++; continue; }
-                    st_mirror++;
-                    const uint32_t c = o[x], k = dm[x];
-                    o[x] = 0xFF000000u | ((((c & 0xFF00FFu) * k) >> 8) & 0xFF00FFu) | ((((c & 0x00FF00u) * k) >> 8) & 0x00FF00u);
+                    o[x] = st[si] ? VP_Uncovered(src + (size_t)ys * w,st + (size_t)ys * w,sx[x],x,in[x]) : src[si];
                 }
             }
         }
-#undef VP_FROM_SEEN
         st_warps++;
         st_warp_us += RP_Micros() - t0;
-    }
-
-    /* What was seen at row j of column c of the memory, when that is no more than four seconds ago. */
-    inline bool fromSeen(const uint32_t *px,const uint16_t *at,int c,int j,uint16_t nowat,uint32_t &out) const {
-        if (j < 0 || j >= seen_h) return false;
-        const size_t i = (size_t)c * seen_h + (size_t)j;
-        const uint16_t a = at[i];
-        if (a == 0 || (uint16_t)(nowat - a) > 244) return false;
-        out = px[i];
-        return true;
-    }
-
-    /* How dark the mirrored view is drawn, by how many columns past the edge it stands in for (256: as it is). */
-    uint16_t dimOf(int past) const {
-        return past ? (uint16_t)(256 - std::min(120,24 + (int)((float)past * 4.0f / unitx))) : (uint16_t)256;
     }
 
     /* Every five seconds, for the log. */
@@ -3373,13 +3263,10 @@ public:
         if (kst_n) snprintf(keys,sizeof(keys),"%u keys that move the view (%u stretches, %u%% shown): off by %.1f px where the picture moved %.1f",
             nkeys,kst_n,kst_open * 100u / kst_n,kst_err / kst_n,kst_base / kst_n);
         else snprintf(keys,sizeof(keys),"%u keys that move the view",nkeys);
-        char edge[80];
-        edge[0] = 0;
-        if (st_seen + st_mirror) snprintf(edge,sizeof(edge),"; %u%% of what turns came into view was seen just before",(unsigned)((uint64_t)st_seen * 100u / (st_seen + st_mirror)));
-        LOG_MSG("INPUTNET: view prediction%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place%s; "
+        LOG_MSG("INPUTNET: view prediction%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place; "
             "%.2f ms a frame to learn, %.2f ms to move the picture (%u times)",
             was ? "" : (said_ready ? " ready" : " learning"),turn,look,keys,lensText,layers,vx1 - vx0,vy1 - vy0,vx0,vy0,
-            still.empty() ? 0u : (unsigned)((uint64_t)stillpx * 100u / still.size()),edge,
+            still.empty() ? 0u : (unsigned)((uint64_t)stillpx * 100u / still.size()),
             st_analyse_us / 1000.0 / st_frames,st_warps ? st_warp_us / 1000.0 / st_warps : 0.0,st_warps);
         clearStats();
     }
@@ -3393,18 +3280,6 @@ private:
     std::vector<uint8_t> still;         /* per pixel: how often it stayed the same while the view moved */
     std::vector<uint8_t> stay;          /* ...and whether it counts as staying (see cleanStill) */
     bool still_dirty = true;
-    /* What was seen lately, by direction (see seenStore): columns all the way round, each twice the view's height. */
-    std::vector<uint32_t> seen;
-    std::vector<uint16_t> seen_at;      /* per pixel: when (units of 16 ms; 0: never) */
-    int seen_w = 0, seen_h = 0;
-    double seen_dir = 0, seen_down = 0; /* where the frame analysed last looks, and how far its content has moved down in all */
-    bool seen_has = false, seen_hasc = false, seen_lead = false, seen_persp = false;
-    uint32_t seen_id = 0, seen_seq = 0xFFFFFFFFu, seen_shown_id = 0;
-    uint64_t seen_c = 0;
-    unsigned seen_guessed = 0;          /* frames in a row placed by what the input does, not by measuring */
-    float seen_leadx = 0, seen_leady = 0, seen_f = 0, seen_cx = 0;
-    VPView seen_view = { 0, 0, 0, 0 };
-    unsigned st_seen = 0, st_mirror = 0;        /* for the log: pixels at the edge filled from memory, and mirrored */
     VPPointer told_ptr;                 /* the newest report of the driver's pointer the host has sent... */
     uint32_t told_id = 0, told_seq = 0; /* ...its frame, and the newest input the host had applied then */
     bool told_any = false;
@@ -3457,7 +3332,6 @@ private:
         ax.st_n = ax.st_open = ay.st_n = ay.st_open = 0;
         kst_err = kst_base = 0;
         kst_n = kst_open = 0;
-        st_seen = st_mirror = 0;
     }
 
     void describe(const VPAxis &a,char *out,size_t n) const {
@@ -3585,84 +3459,6 @@ private:
             if (m.open) { mx += kx; my += ky; }
         }
         return true;
-    }
-
-    /* ---- What was seen lately, by direction ----
-     * A turn brings into view at one edge what the frame on the screen does not have. Often the player has just
-     * looked there: aiming goes back and forth. Every analysed frame is therefore written into a picture of all
-     * directions around the player: a column per pixel of turn at the view's middle (2 pi f of them, all the way
-     * round), each holding what was seen in that direction, by height on a cylinder around the player (so that what
-     * the lens stretches towards the sides of a view lands in one place whichever column it was seen in), together
-     * with when. The edge of a moved picture, and what a weapon held still hides of the world, is then filled from
-     * there when it was seen in the last four seconds; otherwise the view mirrored stands in as before. A view
-     * that moves as one piece (no perspective) is kept the same way, flat. What stays in the picture is not written;
-     * neither are bands that scroll at a rate of their own (they would land in the wrong directions). The memory
-     * starts over when the picture changes in a way that is not the view turning (the player walks: everything is
-     * seen from another place then), after three frames at most. */
-    static uint16_t seenStamp(uint64_t us) { const uint16_t v = (uint16_t)(us >> 14); return v ? v : (uint16_t)1; }
-
-    bool seenFits(void) const {
-        return seen_w > 0 && seen_persp == lens.persp && seen_view.x0 == vx0 && seen_view.x1 == vx1 && seen_view.y0 == vy0 && seen_view.y1 == vy1
-            && fabsf(seen_f - lens.f) <= 0.02f * lens.f + 0.01f && fabsf(seen_cx - lens.cx) <= 1.0f;
-    }
-
-    void seenReset(void) {
-        seen_dir = seen_down = 0;
-        seen_guessed = 0;
-        if (!lens.known) { seen_w = seen_h = 0; return; }
-        const int cols = lens.persp ? std::max(64,(int)lroundf(6.2831853f * lens.f)) : std::max(64,(vx1 - vx0) * 4);
-        const int rows = std::max(16,(vy1 - vy0) * 2);
-        if ((size_t)cols * (size_t)rows > ((size_t)24 << 20)) { seen_w = seen_h = 0; return; }      /* (a picture too big to keep) */
-        seen_w = cols; seen_h = rows;
-        seen_persp = lens.persp; seen_f = lens.f; seen_cx = lens.cx;
-        seen_view.x0 = vx0; seen_view.x1 = vx1; seen_view.y0 = vy0; seen_view.y1 = vy1;
-        seen.resize((size_t)cols * rows);
-        seen_at.assign((size_t)cols * rows,0);
-    }
-
-    /* The column of the memory for what shows at column x of a view that looks in direction dir, and how much
-     * taller things are drawn there than on the cylinder (1 in the view's middle). */
-    int seenColumn(float x,double dir,float &tall) const {
-        const float u = x - lens.cx;
-        double col;
-        if (lens.persp) { col = (double)lens.f * (atan((double)u / lens.f) - dir); tall = sqrtf(lens.f * lens.f + u * u) / lens.f; }
-        else { col = (double)u - dir; tall = 1.0f; }
-        long c = lround(col) % (long)seen_w;
-        if (c < 0) c += seen_w;
-        return (int)c;
-    }
-
-    void seenStore(const uint32_t *argb,uint64_t now) {
-        if (seen_w == 0 || !seenFits()) { seenReset(); if (seen_w == 0) return; }
-        if (still_dirty || stay.size() != (size_t)w * h) cleanStill();
-        const uint16_t at = seenStamp(now);
-        const float cy = (float)(vy0 + vy1 - 1) * 0.5f;
-        const bool layered = anyLayer(now);
-        std::vector<uint8_t> &skiprow = tmp.skiprow;
-        if (layered) {
-            const int bh = std::max(1,(vy1 - vy0) / (int)VP_CELLROWS);
-            skiprow.assign(h,0);
-            for (int y=vy0;y < vy1;y++) skiprow[(size_t)y] = evenBand((unsigned)std::min((int)VP_CELLROWS - 1,(y - vy0) / bh),now) ? 1 : 0;
-        }
-        for (int x=vx0;x < vx1;x++) {
-            float tall;
-            const int c = seenColumn((float)x,seen_dir,tall);
-            uint32_t *pc = seen.data() + (size_t)c * seen_h;
-            uint16_t *pt = seen_at.data() + (size_t)c * seen_h;
-            /* row j of the memory for row y of the view: (y - cy - down) / tall + half its height, in 16.16 */
-            const int32_t step = (int32_t)lroundf(65536.0f / tall);
-            int64_t jf = (int64_t)llroundf(((float)vy0 - cy - (float)seen_down) / tall * 65536.0f) + ((int64_t)(seen_h / 2) << 16) + 32768;
-            const uint8_t *sy = stay.data() + (size_t)vy0 * w + x;
-            const uint32_t *ay = argb + (size_t)vy0 * w + x;
-            for (int y=vy0;y < vy1;y++, jf += step, sy += w, ay += w) {
-                if (*sy) continue;
-                if (layered && skiprow[(size_t)y]) continue;
-                const int j = (int)(jf >> 16);
-                if (j < 0 || j >= seen_h) continue;
-                pc[j] = *ay;
-                pt[j] = at;
-            }
-        }
     }
 
     static bool modifier(unsigned k) {
@@ -4759,7 +4555,7 @@ public:
         newframe = true;    /* drawn as soon as the packets that arrived together are handled */
         pix_dirty = true;
         frame_hasc = frameClock(id,frame_c,frame_seq);
-        vp.shown(frame_hasc,frame_c,frame_seq,frame_done,id);
+        vp.shown(frame_hasc,frame_c,frame_seq,frame_done);
         frame_ptr = (infos[id & 31u].id == id) ? infos[id & 31u].ptr : VPPointer();
         vp_due = true;
         if (rec_ev && rec_fr) {
@@ -4819,8 +4615,7 @@ public:
         if (valid && pid != lastid)
             for (size_t i=hist.size();i-- > 0 && prev == NULL;)
                 if (hist[i].first == pid && hist[i].second.size() == frame.size()) prev = hist[i].second.data();
-        vp.frame(lastid,frame.data(),frame.size(),frame_w,frame_h,frame_fmt,prev,frame_hasc,frame_c,frame_seq,
-            (!pix_dirty && pix.size() == (size_t)frame_w * frame_h) ? pix.data() : NULL,frame_ptr);
+        vp.frame(lastid,frame.data(),frame.size(),frame_w,frame_h,frame_fmt,prev,frame_hasc,frame_c,frame_seq,frame_ptr);
     }
 
     /* Input to screen for the newest input event this frame is the first to show (the host says which), split into
