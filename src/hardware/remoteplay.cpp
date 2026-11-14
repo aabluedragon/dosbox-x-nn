@@ -320,6 +320,7 @@ volatile uint32_t host_lastpoll = 0;
 uint16_t host_port = 0;
 Viewer viewers[RP_MAX_VIEWERS];
 unsigned cfg_timeout = 10000;
+bool cfg_blocked[KBD_LAST];     /* [inputnet] block keys: dropped from every remote player (see RP_SetBlockedKeys) */
 unsigned cfg_maxfps = 0;
 int cfg_present = 2;            /* [inputnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
 
@@ -1233,6 +1234,9 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             if (!r.ok || key == 0 || key >= (uint16_t)KBD_LAST) return;
             /* Print Screen makes the BIOS print the screen on the host's printer emulation. */
             if (key == (uint16_t)KBD_printscreen || !Guard_Allows()) return;
+            /* Keys the host blocked for remote players ([inputnet] block keys): a release still goes through for a key
+             * that was down before (none can be: the list is read before anyone joins), the rest is dropped. */
+            if (cfg_blocked[key] && !(v.keydown[key] && !pressed)) return;
             v.keydown[key] = pressed;
             if (pressed) guard_typed = true;
             KEYBOARD_AddKeyRaw((KBD_KEYS)key,pressed);
@@ -1493,7 +1497,47 @@ int Host_KeepaliveThread(void *) {
 
 } /* namespace */
 
+static const struct { const char *name; KBD_KEYS key; } rp_key_names[] = {
+    {"1",KBD_1},{"2",KBD_2},{"3",KBD_3},{"4",KBD_4},{"5",KBD_5},{"6",KBD_6},{"7",KBD_7},{"8",KBD_8},{"9",KBD_9},{"0",KBD_0},
+    {"q",KBD_q},{"w",KBD_w},{"e",KBD_e},{"r",KBD_r},{"t",KBD_t},{"y",KBD_y},{"u",KBD_u},{"i",KBD_i},{"o",KBD_o},{"p",KBD_p},
+    {"a",KBD_a},{"s",KBD_s},{"d",KBD_d},{"f",KBD_f},{"g",KBD_g},{"h",KBD_h},{"j",KBD_j},{"k",KBD_k},{"l",KBD_l},{"z",KBD_z},
+    {"x",KBD_x},{"c",KBD_c},{"v",KBD_v},{"b",KBD_b},{"n",KBD_n},{"m",KBD_m},
+    {"f1",KBD_f1},{"f2",KBD_f2},{"f3",KBD_f3},{"f4",KBD_f4},{"f5",KBD_f5},{"f6",KBD_f6},{"f7",KBD_f7},{"f8",KBD_f8},
+    {"f9",KBD_f9},{"f10",KBD_f10},{"f11",KBD_f11},{"f12",KBD_f12},
+    {"esc",KBD_esc},{"tab",KBD_tab},{"bspace",KBD_backspace},{"enter",KBD_enter},{"space",KBD_space},
+    {"lalt",KBD_leftalt},{"ralt",KBD_rightalt},{"lctrl",KBD_leftctrl},{"rctrl",KBD_rightctrl},
+    {"lshift",KBD_leftshift},{"rshift",KBD_rightshift},{"capslock",KBD_capslock},{"scrolllock",KBD_scrolllock},{"numlock",KBD_numlock},
+    {"grave",KBD_grave},{"minus",KBD_minus},{"equals",KBD_equals},{"backslash",KBD_backslash},
+    {"lbracket",KBD_leftbracket},{"rbracket",KBD_rightbracket},{"semicolon",KBD_semicolon},{"quote",KBD_quote},
+    {"period",KBD_period},{"comma",KBD_comma},{"slash",KBD_slash},{"lessthan",KBD_extra_lt_gt},
+    {"pause",KBD_pause},{"insert",KBD_insert},{"home",KBD_home},{"pageup",KBD_pageup},
+    {"delete",KBD_delete},{"end",KBD_end},{"pagedown",KBD_pagedown},
+    {"left",KBD_left},{"up",KBD_up},{"down",KBD_down},{"right",KBD_right},
+    {"kp_1",KBD_kp1},{"kp_2",KBD_kp2},{"kp_3",KBD_kp3},{"kp_4",KBD_kp4},{"kp_5",KBD_kp5},{"kp_6",KBD_kp6},{"kp_7",KBD_kp7},
+    {"kp_8",KBD_kp8},{"kp_9",KBD_kp9},{"kp_0",KBD_kp0},{"kp_divide",KBD_kpdivide},{"kp_multiply",KBD_kpmultiply},
+    {"kp_minus",KBD_kpminus},{"kp_plus",KBD_kpplus},{"kp_enter",KBD_kpenter},{"kp_period",KBD_kpperiod},
+    {"lwindows",KBD_lwindows},{"rwindows",KBD_rwindows},{"rwinmenu",KBD_rwinmenu},
+};
+
+/* Parses a list of key names separated by spaces or commas into cfg_blocked. Unknown names are logged and skipped. */
+void RP_SetBlockedKeys(const std::string &list) {
+    for (unsigned k=0;k < (unsigned)KBD_LAST;k++) cfg_blocked[k] = false;
+    std::string name, shown;
+    for (size_t i=0;i <= list.size();i++) {
+        const char c = i < list.size() ? list[i] : ' ';
+        if (c != ' ' && c != ',' && c != '\t') { name += (char)tolower((unsigned char)c); continue; }
+        if (name.empty()) continue;
+        bool found = false;
+        for (const auto &e : rp_key_names) if (name == e.name) { cfg_blocked[e.key] = found = true; break; }
+        if (found) shown += (shown.empty() ? "" : " ") + name;
+        else LOG_MSG("INPUTNET: block keys: unknown key name \"%s\"",name.c_str());
+        name.clear();
+    }
+    if (!shown.empty()) LOG_MSG("INPUTNET: keys blocked for remote players: %s",shown.c_str());
+}
+
 void REMOTEPLAY_Configure(Section_prop *section) {
+    RP_SetBlockedKeys(section->Get_string("block keys"));
     int v = section->Get_int("timeout");
     cfg_timeout = (unsigned)((v >= 250 && v <= 600000) ? v : 10000);
     v = section->Get_int("stream fps");

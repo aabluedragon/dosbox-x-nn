@@ -166,6 +166,10 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   With both, a Windows 95 game hosted for four players (three 640x480 streams from one computer through NukemNet's
   IPv6 tunnel, 73 ms away) plays at the game's full 30 to 34 frames a second for each viewer with the ping at the
   route's own; before, the tunnel's queue grew until pings passed a second and viewers got a few frames a second.
+- Remote play host key blocking (capability `inputnetBlockKeys`): `[inputnet] block keys` lists keys, by keymapper
+  name (`esc f10 lalt kp_5`, space or comma separated), that the host drops from every remote player's input; the
+  host's own keyboard is not affected and unknown names are logged and skipped. NukemNet's Host Game field "Blocked
+  keys" sets it on the host's copies that serve viewers.
 - Remote play view prediction is **off by default** (capability `inputnetPredictView`: `[inputnet] predict view`,
   default false; Ctrl+F12 in the viewer switches it; NukemNet's Host Game option "Experimental prediction" turns it on
   for a room's viewers). Without it the viewer shows every frame exactly as the host sent it. Why: a first-person

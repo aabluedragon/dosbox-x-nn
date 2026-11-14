@@ -5410,6 +5410,11 @@ void DOSBOX_SetupConfigSections(void) {
                     "frame, which shows while turning. Off, the picture is shown exactly as the host sends it.\n"
                     "Ctrl+F12 in the viewer turns it on and off.");
 
+    Pstring = secprop->Add_string("block keys",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("Remote play host: keys the remote players' key presses never reach the game with, separated\n"
+                      "by spaces, named as in the keymapper (esc f1 f10 lalt lctrl tab enter bspace kp_5 ...).\n"
+                      "The host's own keyboard is not affected. Empty: nothing is blocked.");
+
     Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"
                     "option -inputnet-hidescreen), the window stays small, without the picture, does not take\n"
