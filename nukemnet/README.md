@@ -171,9 +171,15 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   (b: blocked by `block keys`), `{"t":"button","n":0,"d":1}`, `{"t":"move","dx":..,"dy":..}` (motion gathered ten
   times a second per player). NukemNet's server automation gets them as inputnetInput events.
 - NukemNet control channel (capability `nnControl`, any DOSBox-X-NN, remote play or not): env `NN_DOSBOX_CONTROL_PORT`
-  and `NN_DOSBOX_CONTROL_TOKEN` (16+ characters) open a UDP port; datagrams from 127.0.0.1 that start with the token:
-  `type <text>` (Shift where a character needs it), `keys <name> [name...]`, `key <name> down|up`, one key step every
-  40 ms. NukemNet's `nn.typeInGame()` types chat messages into the host's own game with it.
+  and `NN_DOSBOX_CONTROL_TOKEN` (16+ characters) open a UDP port. A datagram from 127.0.0.1 is `<token> <commands>`:
+  one command, or several separated by newlines, queued in the order given: `type <text>` (Shift where a character
+  needs it), `keys <name> [name...]`, `key <name> down|up`, `wait <ms>` (a pause of up to 10000 ms before what
+  follows) and `sync <id>`, which answers the datagram `done <id>` to the sender, from the same port, once everything
+  before it has gone out (the id: up to 32 characters, sent back as they came). Key steps go out one every 40 ms;
+  anything else is ignored. NukemNet's `nn.typeInGame()` types chat messages into the host's own game with it.
+  `block <name> [name...]` (capability `inputnetBlockKeysLive`) replaces `[inputnet] block keys` at once, while the
+  game runs (`block none`: no key); NukemNet sends it to the copies that serve viewers when the room's "Blocked keys"
+  change during a game.
 - Remote play host key blocking (capability `inputnetBlockKeys`): `[inputnet] block keys` lists keys, by keymapper
   name (`esc f10 lalt kp_5`, space or comma separated), that the host drops from every remote player's input; the
   host's own keyboard is not affected and unknown names are logged and skipped. NukemNet's Host Game field "Blocked

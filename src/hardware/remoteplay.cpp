@@ -34,6 +34,7 @@ bool remoteplay_screen_hidden = false;
 #if C_INPUTNET
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -275,6 +276,55 @@ bool RP_OpenNet(void) {
     return true;
 }
 
+const uint32_t RP_LOOPBACK = 0x7F000001u;   /* 127.0.0.1: where NukemNet listens and talks from */
+
+/* The keys by their keymapper names: [inputnet] block keys, the input reports and NukemNet's control channel name
+ * keys this way. */
+const struct { const char *name; KBD_KEYS key; } rp_key_names[] = {
+    {"1",KBD_1},{"2",KBD_2},{"3",KBD_3},{"4",KBD_4},{"5",KBD_5},{"6",KBD_6},{"7",KBD_7},{"8",KBD_8},{"9",KBD_9},{"0",KBD_0},
+    {"q",KBD_q},{"w",KBD_w},{"e",KBD_e},{"r",KBD_r},{"t",KBD_t},{"y",KBD_y},{"u",KBD_u},{"i",KBD_i},{"o",KBD_o},{"p",KBD_p},
+    {"a",KBD_a},{"s",KBD_s},{"d",KBD_d},{"f",KBD_f},{"g",KBD_g},{"h",KBD_h},{"j",KBD_j},{"k",KBD_k},{"l",KBD_l},{"z",KBD_z},
+    {"x",KBD_x},{"c",KBD_c},{"v",KBD_v},{"b",KBD_b},{"n",KBD_n},{"m",KBD_m},
+    {"f1",KBD_f1},{"f2",KBD_f2},{"f3",KBD_f3},{"f4",KBD_f4},{"f5",KBD_f5},{"f6",KBD_f6},{"f7",KBD_f7},{"f8",KBD_f8},
+    {"f9",KBD_f9},{"f10",KBD_f10},{"f11",KBD_f11},{"f12",KBD_f12},
+    {"esc",KBD_esc},{"tab",KBD_tab},{"bspace",KBD_backspace},{"enter",KBD_enter},{"space",KBD_space},
+    {"lalt",KBD_leftalt},{"ralt",KBD_rightalt},{"lctrl",KBD_leftctrl},{"rctrl",KBD_rightctrl},
+    {"lshift",KBD_leftshift},{"rshift",KBD_rightshift},{"capslock",KBD_capslock},{"scrolllock",KBD_scrolllock},{"numlock",KBD_numlock},
+    {"grave",KBD_grave},{"minus",KBD_minus},{"equals",KBD_equals},{"backslash",KBD_backslash},
+    {"lbracket",KBD_leftbracket},{"rbracket",KBD_rightbracket},{"semicolon",KBD_semicolon},{"quote",KBD_quote},
+    {"period",KBD_period},{"comma",KBD_comma},{"slash",KBD_slash},{"lessthan",KBD_extra_lt_gt},
+    {"pause",KBD_pause},{"insert",KBD_insert},{"home",KBD_home},{"pageup",KBD_pageup},
+    {"delete",KBD_delete},{"end",KBD_end},{"pagedown",KBD_pagedown},
+    {"left",KBD_left},{"up",KBD_up},{"down",KBD_down},{"right",KBD_right},
+    {"kp_1",KBD_kp1},{"kp_2",KBD_kp2},{"kp_3",KBD_kp3},{"kp_4",KBD_kp4},{"kp_5",KBD_kp5},{"kp_6",KBD_kp6},{"kp_7",KBD_kp7},
+    {"kp_8",KBD_kp8},{"kp_9",KBD_kp9},{"kp_0",KBD_kp0},{"kp_divide",KBD_kpdivide},{"kp_multiply",KBD_kpmultiply},
+    {"kp_minus",KBD_kpminus},{"kp_plus",KBD_kpplus},{"kp_enter",KBD_kpenter},{"kp_period",KBD_kpperiod},
+    {"lwindows",KBD_lwindows},{"rwindows",KBD_rwindows},{"rwinmenu",KBD_rwinmenu},
+};
+
+const char *RP_KeyName(unsigned key) {
+    for (const auto &e : rp_key_names) if ((unsigned)e.key == key) return e.name;
+    return "unknown";
+}
+
+bool RP_KeyByName(const std::string &name,KBD_KEYS &key) {
+    for (const auto &e : rp_key_names) if (name == e.name) { key = e.key; return true; }
+    return false;
+}
+
+/* The words of a text, in lower case. */
+std::vector<std::string> RP_Words(const std::string &text,const char *separators) {
+    std::vector<std::string> words;
+    size_t pos = 0;
+    while ((pos = text.find_first_not_of(separators,pos)) != std::string::npos) {
+        const size_t end = std::min(text.find_first_of(separators,pos),text.size());
+        words.push_back(text.substr(pos,end - pos));
+        for (char &c : words.back()) c = (char)tolower((unsigned char)c);
+        pos = end;
+    }
+    return words;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Host                                                                       */
 /* ------------------------------------------------------------------------- */
@@ -323,9 +373,7 @@ uint16_t host_port = 0;
 Viewer viewers[RP_MAX_VIEWERS];
 unsigned cfg_timeout = 10000;
 bool cfg_blocked[KBD_LAST];     /* [inputnet] block keys: dropped from every remote player (see RP_SetBlockedKeys) */
-uint16_t cfg_report_port = 0;   /* [inputnet] report input: UDP port on 127.0.0.1 that hears every player's input */
-const char *RP_KeyName(unsigned key);
-void RP_ReportInput(Viewer &v,const char *json_fields);
+IPaddress cfg_report_to = { 0, 0 }; /* [inputnet] report input: 127.0.0.1:<port> hears every player's input (port 0: off) */
 unsigned cfg_maxfps = 0;
 int cfg_present = 2;            /* [inputnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
 
@@ -1227,6 +1275,39 @@ void Host_DropViewer(Viewer &v,const char *reason,bool notify) {
     Host_UpdateStreaming();
 }
 
+/* [inputnet] block keys: key names separated by spaces or commas. Unknown names are logged and skipped. */
+void RP_SetBlockedKeys(const std::string &list) {
+    std::fill(cfg_blocked,cfg_blocked + KBD_LAST,false);
+    std::string shown;
+    for (const std::string &name : RP_Words(list," ,\t")) {
+        KBD_KEYS key;
+        if (!RP_KeyByName(name,key)) { LOG_MSG("INPUTNET: block keys: unknown key name \"%s\"",name.c_str()); continue; }
+        cfg_blocked[key] = true;
+        shown += (shown.empty() ? "" : " ") + name;
+    }
+    if (!shown.empty()) LOG_MSG("INPUTNET: keys blocked for remote players: %s",shown.c_str());
+}
+
+/* [inputnet] report input: one datagram per input event of a remote player to 127.0.0.1:<port>, the fields given
+ * here after the player's name: {"p":"<player>",<fields>} (NukemNet's server automation hears them as inputnetInput
+ * events). Nothing is formatted while the setting is off. */
+void RP_ReportInput(Viewer &v,const char *fmt,...) GCC_ATTRIBUTE(__format__(__printf__,2,3));
+void RP_ReportInput(Viewer &v,const char *fmt,...) {
+    if (!cfg_report_to.port || !host_sock) return;
+    std::string name;
+    for (char c : v.name) if (c != '"' && c != '\\' && (unsigned char)c >= 32) name += c;
+    char buf[256];
+    int n = snprintf(buf,sizeof(buf),"{\"p\":\"%s\",",name.c_str());
+    if (n < 0 || n >= (int)sizeof(buf)) return;
+    va_list ap;
+    va_start(ap,fmt);
+    const int fields = vsnprintf(buf + n,sizeof(buf) - (size_t)n,fmt,ap);
+    va_end(ap);
+    if (fields < 0 || (n += fields) >= (int)sizeof(buf) - 1) return;    /* no room left for the closing brace */
+    buf[n++] = '}';
+    Host_SendTo(cfg_report_to,(const uint8_t*)buf,(size_t)n);
+}
+
 /* Viewer input goes straight to the emulated keyboard and mouse (below the
  * mapper), so it can never trigger DOSBox-X's own hotkeys or menu functions.
  * It is dropped while the remote input guard blocks it. */
@@ -1241,15 +1322,9 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             if (key == (uint16_t)KBD_printscreen || !Guard_Allows()) return;
             /* Keys the host blocked for remote players ([inputnet] block keys): a release still goes through for a key
              * that was down before (none can be: the list is read before anyone joins), the rest is dropped. */
-            if (cfg_blocked[key] && !(v.keydown[key] && !pressed)) {
-                char rep[96]; snprintf(rep,sizeof(rep),"\"t\":\"key\",\"k\":\"%s\",\"d\":%d,\"b\":1",RP_KeyName(key),pressed ? 1 : 0);
-                RP_ReportInput(v,rep);
-                return;
-            }
-            {
-                char rep[96]; snprintf(rep,sizeof(rep),"\"t\":\"key\",\"k\":\"%s\",\"d\":%d,\"b\":0",RP_KeyName(key),pressed ? 1 : 0);
-                RP_ReportInput(v,rep);
-            }
+            const bool blocked = cfg_blocked[key] && !(v.keydown[key] && !pressed);
+            RP_ReportInput(v,"\"t\":\"key\",\"k\":\"%s\",\"d\":%d,\"b\":%d",RP_KeyName(key),pressed ? 1 : 0,blocked ? 1 : 0);
+            if (blocked) return;
             v.keydown[key] = pressed;
             if (pressed) guard_typed = true;
             KEYBOARD_AddKeyRaw((KBD_KEYS)key,pressed);
@@ -1259,10 +1334,7 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const uint8_t button = r.u8();
             const bool pressed = r.u8() != 0;
             if (!r.ok || button >= 32 || !Guard_Allows()) return;
-            {
-                char rep[64]; snprintf(rep,sizeof(rep),"\"t\":\"button\",\"n\":%u,\"d\":%d",(unsigned)button,pressed ? 1 : 0);
-                RP_ReportInput(v,rep);
-            }
+            RP_ReportInput(v,"\"t\":\"button\",\"n\":%u,\"d\":%d",(unsigned)button,pressed ? 1 : 0);
             if (pressed) { v.buttons |= 1u << button; Mouse_ButtonPressedRaw(button); }
             else { v.buttons &= ~(1u << button); Mouse_ButtonReleasedRaw(button); }
             break;
@@ -1271,13 +1343,12 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
             const bool emulate = r.u8() != 0;
             if (!r.ok || !Guard_Allows()) return;
-            if (cfg_report_port) {
+            if (cfg_report_to.port) {
                 /* motion is gathered and reported at most ten times a second per player */
                 v.report_dx += xrel; v.report_dy += yrel;
                 const uint32_t now = SDL_GetTicks();
                 if (now - v.report_ms >= 100 && (v.report_dx != 0 || v.report_dy != 0)) {
-                    char rep[80]; snprintf(rep,sizeof(rep),"\"t\":\"move\",\"dx\":%.1f,\"dy\":%.1f",v.report_dx,v.report_dy);
-                    RP_ReportInput(v,rep);
+                    RP_ReportInput(v,"\"t\":\"move\",\"dx\":%.1f,\"dy\":%.1f",v.report_dx,v.report_dy);
                     v.report_dx = v.report_dy = 0; v.report_ms = now;
                 }
             }
@@ -1350,6 +1421,8 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             v->applied = 0;
             v->applied_us = 0;
             v->buttons = 0;
+            v->report_dx = v->report_dy = 0;    /* (nothing of the slot's last player) */
+            v->report_ms = 0;
             v->features = features;
             v->hasack = false;
             v->acked = 0;
@@ -1522,98 +1595,61 @@ int Host_KeepaliveThread(void *) {
     return 0;
 }
 
-} /* namespace */
+/* ------------------------------------------------------------------------- */
+/* NukemNet's control channel                                                 */
+/* ------------------------------------------------------------------------- */
 
-static const struct { const char *name; KBD_KEYS key; } rp_key_names[] = {
-    {"1",KBD_1},{"2",KBD_2},{"3",KBD_3},{"4",KBD_4},{"5",KBD_5},{"6",KBD_6},{"7",KBD_7},{"8",KBD_8},{"9",KBD_9},{"0",KBD_0},
-    {"q",KBD_q},{"w",KBD_w},{"e",KBD_e},{"r",KBD_r},{"t",KBD_t},{"y",KBD_y},{"u",KBD_u},{"i",KBD_i},{"o",KBD_o},{"p",KBD_p},
-    {"a",KBD_a},{"s",KBD_s},{"d",KBD_d},{"f",KBD_f},{"g",KBD_g},{"h",KBD_h},{"j",KBD_j},{"k",KBD_k},{"l",KBD_l},{"z",KBD_z},
-    {"x",KBD_x},{"c",KBD_c},{"v",KBD_v},{"b",KBD_b},{"n",KBD_n},{"m",KBD_m},
-    {"f1",KBD_f1},{"f2",KBD_f2},{"f3",KBD_f3},{"f4",KBD_f4},{"f5",KBD_f5},{"f6",KBD_f6},{"f7",KBD_f7},{"f8",KBD_f8},
-    {"f9",KBD_f9},{"f10",KBD_f10},{"f11",KBD_f11},{"f12",KBD_f12},
-    {"esc",KBD_esc},{"tab",KBD_tab},{"bspace",KBD_backspace},{"enter",KBD_enter},{"space",KBD_space},
-    {"lalt",KBD_leftalt},{"ralt",KBD_rightalt},{"lctrl",KBD_leftctrl},{"rctrl",KBD_rightctrl},
-    {"lshift",KBD_leftshift},{"rshift",KBD_rightshift},{"capslock",KBD_capslock},{"scrolllock",KBD_scrolllock},{"numlock",KBD_numlock},
-    {"grave",KBD_grave},{"minus",KBD_minus},{"equals",KBD_equals},{"backslash",KBD_backslash},
-    {"lbracket",KBD_leftbracket},{"rbracket",KBD_rightbracket},{"semicolon",KBD_semicolon},{"quote",KBD_quote},
-    {"period",KBD_period},{"comma",KBD_comma},{"slash",KBD_slash},{"lessthan",KBD_extra_lt_gt},
-    {"pause",KBD_pause},{"insert",KBD_insert},{"home",KBD_home},{"pageup",KBD_pageup},
-    {"delete",KBD_delete},{"end",KBD_end},{"pagedown",KBD_pagedown},
-    {"left",KBD_left},{"up",KBD_up},{"down",KBD_down},{"right",KBD_right},
-    {"kp_1",KBD_kp1},{"kp_2",KBD_kp2},{"kp_3",KBD_kp3},{"kp_4",KBD_kp4},{"kp_5",KBD_kp5},{"kp_6",KBD_kp6},{"kp_7",KBD_kp7},
-    {"kp_8",KBD_kp8},{"kp_9",KBD_kp9},{"kp_0",KBD_kp0},{"kp_divide",KBD_kpdivide},{"kp_multiply",KBD_kpmultiply},
-    {"kp_minus",KBD_kpminus},{"kp_plus",KBD_kpplus},{"kp_enter",KBD_kpenter},{"kp_period",KBD_kpperiod},
-    {"lwindows",KBD_lwindows},{"rwindows",KBD_rwindows},{"rwinmenu",KBD_rwinmenu},
+/* Env NN_DOSBOX_CONTROL_PORT and NN_DOSBOX_CONTROL_TOKEN (16+ characters) open a UDP port in any DOSBox-X-NN, remote
+ * play or not. A datagram from 127.0.0.1 is "<token> <commands>": one command, or several separated by newlines. They
+ * are queued in the order given, behind what is still waiting:
+ *   type <text>             types the text (Shift where a character needs it)
+ *   keys <name> [name...]   presses and releases each key (the keymapper's names: enter esc f1 kp_5 ...)
+ *   key <name> down|up      one key step
+ *   wait <ms>               nothing for that long (up to 10000) before what follows
+ *   sync <id>               answers "done <id>" to the sender, from this port, once everything before it has gone
+ *                           out (the id: up to 32 characters, sent back as they came)
+ * Key steps go out one every 40 ms, so a game that polls the keyboard sees each of them. Anything else is ignored. */
+struct ControlStep {
+    enum Kind { KEY, WAIT, SYNC } kind;
+    KBD_KEYS key; bool down;        /* KEY */
+    uint32_t ms;                    /* WAIT */
+    IPaddress to; char id[33];      /* SYNC: "done <id>" goes to this address */
 };
 
-/* Parses a list of key names separated by spaces or commas into cfg_blocked. Unknown names are logged and skipped. */
-void RP_SetBlockedKeys(const std::string &list) {
-    for (unsigned k=0;k < (unsigned)KBD_LAST;k++) cfg_blocked[k] = false;
-    std::string name, shown;
-    for (size_t i=0;i <= list.size();i++) {
-        const char c = i < list.size() ? list[i] : ' ';
-        if (c != ' ' && c != ',' && c != '\t') { name += (char)tolower((unsigned char)c); continue; }
-        if (name.empty()) continue;
-        bool found = false;
-        for (const auto &e : rp_key_names) if (name == e.name) { cfg_blocked[e.key] = found = true; break; }
-        if (found) shown += (shown.empty() ? "" : " ") + name;
-        else LOG_MSG("INPUTNET: block keys: unknown key name \"%s\"",name.c_str());
-        name.clear();
-    }
-    if (!shown.empty()) LOG_MSG("INPUTNET: keys blocked for remote players: %s",shown.c_str());
+UDPsocket control_sock = NULL;
+UDPpacket *control_pkt = NULL;      /* what arrives, and the answers */
+std::string control_token;          /* with the space that follows it in a datagram */
+std::deque<ControlStep> control_queue;
+uint32_t control_last = 0, control_pause = 0;   /* when the last step was taken, and how long the next one waits after it */
+
+ControlStep &Control_Add(ControlStep::Kind kind) {
+    control_queue.push_back(ControlStep());
+    control_queue.back().kind = kind;
+    return control_queue.back();
 }
 
-namespace {
-const char *RP_KeyName(unsigned key) {
-    for (const auto &e : rp_key_names) if ((unsigned)e.key == key) return e.name;
-    return "unknown";
+void Control_AddKeyStep(KBD_KEYS key,bool down) {
+    ControlStep &step = Control_Add(ControlStep::KEY);
+    step.key = key; step.down = down;
 }
 
-/* One datagram per input event to 127.0.0.1:[inputnet] report input: {"p":"<player>", ...fields} (NukemNet's server
- * automation hears them as inputnetInput events). */
-void RP_ReportInput(Viewer &v,const char *json_fields) {
-    if (!cfg_report_port || !host_sock) return;
-    static IPaddress to = { 0, 0 };
-    static uint16_t to_port = 0;
-    if (to_port != cfg_report_port) { SDLNet_ResolveHost(&to,"127.0.0.1",cfg_report_port); to_port = cfg_report_port; }
-    std::string name;
-    for (char c : v.name) if (c != '"' && c != '\\' && (unsigned char)c >= 32) name += c;
-    char buf[256];
-    const int n = snprintf(buf,sizeof(buf),"{\"p\":\"%s\",%s}",name.c_str(),json_fields);
-    if (n > 0 && n < (int)sizeof(buf)) Host_SendTo(to,(const uint8_t*)buf,(size_t)n);
-}
-} /* namespace */
-
-/* NukemNet's control channel (env NN_DOSBOX_CONTROL_PORT and NN_DOSBOX_CONTROL_TOKEN, any DOSBox-X-NN, remote play or
- * not): datagrams from 127.0.0.1 that start with the token: "type <text>" types text (Shift where a character needs
- * it), "keys <name> [name...]" presses and releases keys, "key <name> down|up". Keys go out one step every 40 ms, so
- * a game that polls the keyboard sees each of them. */
-static UDPsocket control_sock = NULL;
-static std::string control_token;
-static bool control_checked = false;
-static std::vector<std::pair<KBD_KEYS,bool> > control_queue;
-static size_t control_next = 0;
-static uint32_t control_last = 0;
-
-static bool RP_KeyByName(const std::string &name,KBD_KEYS &key) {
-    for (const auto &e : rp_key_names) if (name == e.name) { key = e.key; return true; }
-    return false;
+/* A key pressed and released, in Shift if asked. */
+void Control_QueueKey(KBD_KEYS key,bool shift) {
+    if (shift) Control_AddKeyStep(KBD_leftshift,true);
+    Control_AddKeyStep(key,true);
+    Control_AddKeyStep(key,false);
+    if (shift) Control_AddKeyStep(KBD_leftshift,false);
 }
 
-static void Control_QueueKey(KBD_KEYS key,bool shift) {
-    if (shift) control_queue.push_back(std::make_pair(KBD_leftshift,true));
-    control_queue.push_back(std::make_pair(key,true));
-    control_queue.push_back(std::make_pair(key,false));
-    if (shift) control_queue.push_back(std::make_pair(KBD_leftshift,false));
-}
-
-static void Control_QueueChar(char c) {
+void Control_QueueChar(char c) {
     static const char *plain = "`1234567890-=[]\\;',./";
     static const char *shifted = "~!@#$%^&*()_+{}|:\"<>?";
     static const KBD_KEYS keys[] = { KBD_grave,KBD_1,KBD_2,KBD_3,KBD_4,KBD_5,KBD_6,KBD_7,KBD_8,KBD_9,KBD_0,KBD_minus,KBD_equals,
         KBD_leftbracket,KBD_rightbracket,KBD_backslash,KBD_semicolon,KBD_quote,KBD_comma,KBD_period,KBD_slash };
-    if (c >= 'a' && c <= 'z') { KBD_KEYS k; std::string n(1,c); if (RP_KeyByName(n,k)) Control_QueueKey(k,false); return; }
-    if (c >= 'A' && c <= 'Z') { KBD_KEYS k; std::string n(1,(char)(c - 'A' + 'a')); if (RP_KeyByName(n,k)) Control_QueueKey(k,true); return; }
+    const bool upper = c >= 'A' && c <= 'Z';
+    const char letter = upper ? (char)(c - 'A' + 'a') : c;
+    KBD_KEYS k;
+    if (letter >= 'a' && letter <= 'z') { if (RP_KeyByName(std::string(1,letter),k)) Control_QueueKey(k,upper); return; }
     if (c == ' ') { Control_QueueKey(KBD_space,false); return; }
     for (unsigned i=0;plain[i];i++) {
         if (plain[i] == c) { Control_QueueKey(keys[i],false); return; }
@@ -1621,54 +1657,92 @@ static void Control_QueueChar(char c) {
     }
 }
 
-static void Control_Poll(void) {
-    if (!control_checked) {
-        control_checked = true;
+/* One command of a datagram that came from this address. */
+void Control_Command(const std::string &line,const IPaddress &from) {
+    const size_t space = line.find(' ');
+    if (space == std::string::npos) return;
+    const std::string cmd = line.substr(0,space), arg = line.substr(space + 1);
+    KBD_KEYS k;
+    if (cmd == "type") {
+        for (char c : arg) Control_QueueChar(c);
+    } else if (cmd == "keys") {
+        for (const std::string &name : RP_Words(arg," ")) if (RP_KeyByName(name,k)) Control_QueueKey(k,false);
+    } else if (cmd == "key") {
+        const std::vector<std::string> words = RP_Words(arg," ");
+        if (words.size() == 2 && RP_KeyByName(words[0],k)) Control_AddKeyStep(k,words[1] == "down");
+    } else if (cmd == "wait") {
+        Control_Add(ControlStep::WAIT).ms = (uint32_t)std::min(std::max(strtol(arg.c_str(),NULL,10),0L),10000L);
+    } else if (cmd == "block") {
+        /* [inputnet] block keys from now on, for the remote players of the running game ("none": no key) */
+        if (arg == "none") LOG_MSG("INPUTNET: no keys blocked for remote players any more");
+        RP_SetBlockedKeys(arg == "none" ? std::string() : arg);
+    } else if (cmd == "sync" && !arg.empty() && arg.size() < sizeof(ControlStep::id)) {
+        ControlStep &step = Control_Add(ControlStep::SYNC);
+        step.to = from;
+        memcpy(step.id,arg.c_str(),arg.size() + 1);
+    }
+}
+
+/* Opens the channel the first time, when the environment names a port and a token. True while there is one. */
+bool Control_Open(void) {
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
         const char *port = getenv("NN_DOSBOX_CONTROL_PORT"), *token = getenv("NN_DOSBOX_CONTROL_TOKEN");
         const int p = port ? atoi(port) : 0;
-        if (p > 0 && p < 65536 && token && strlen(token) >= 16) {
-            control_token = token;
-            control_sock = SDLNet_UDP_Open((uint16_t)p);
+        /* (RP_OpenNet: the socket library may not be up yet when nothing else of this DOSBox-X uses the network) */
+        if (p > 0 && p < 65536 && token && strlen(token) >= 16 && RP_OpenNet()) {
+            control_token = std::string(token) + ' ';
+            control_pkt = SDLNet_AllocPacket(1024);
+            control_sock = control_pkt ? SDLNet_UDP_Open((uint16_t)p) : NULL;
             if (control_sock) LOG_MSG("NUKEMNET: control channel on UDP port %d",p);
             else LOG_MSG("NUKEMNET: control channel: UDP port %d is not free",p);
         }
     }
-    if (!control_sock) return;
-    UDPpacket *pkt = SDLNet_AllocPacket(1024);
-    if (pkt) {
-        while (SDLNet_UDP_Recv(control_sock,pkt) > 0) {
-            const uint32_t loopback = 0x7F000001u;
-            if (SDLNet_Read32(&pkt->address.host) != loopback) continue;
-            std::string msg((const char*)pkt->data,(size_t)pkt->len);
-            if (msg.size() <= control_token.size() + 1 || msg.compare(0,control_token.size(),control_token) != 0 || msg[control_token.size()] != ' ') continue;
-            msg = msg.substr(control_token.size() + 1);
-            if (msg.compare(0,5,"type ") == 0) {
-                for (char c : msg.substr(5)) Control_QueueChar(c);
-            } else if (msg.compare(0,5,"keys ") == 0 || msg.compare(0,4,"key ") == 0) {
-                const bool single = msg.compare(0,4,"key ") == 0;
-                std::vector<std::string> words; std::string w;
-                for (char c : msg.substr(single ? 4 : 5)) { if (c == ' ') { if (!w.empty()) words.push_back(w); w.clear(); } else w += (char)tolower((unsigned char)c); }
-                if (!w.empty()) words.push_back(w);
-                KBD_KEYS k;
-                if (single) { if (words.size() == 2 && RP_KeyByName(words[0],k)) control_queue.push_back(std::make_pair(k,words[1] == "down")); }
-                else for (auto &name : words) if (RP_KeyByName(name,k)) Control_QueueKey(k,false);
-            }
+    return control_sock != NULL;
+}
+
+/* Queues what arrived and takes the queue's next step when the one before it has had its time. */
+void Control_Poll(uint32_t now) {
+    while (SDLNet_UDP_Recv(control_sock,control_pkt) > 0) {
+        if (SDLNet_Read32(&control_pkt->address.host) != RP_LOOPBACK) continue;
+        const std::string msg((const char*)control_pkt->data,(size_t)control_pkt->len);
+        if (msg.size() <= control_token.size() || msg.compare(0,control_token.size(),control_token) != 0) continue;
+        for (size_t pos = control_token.size();pos < msg.size();) {
+            const size_t end = std::min(msg.find('\n',pos),msg.size());
+            Control_Command(msg.substr(pos,end - pos),control_pkt->address);
+            pos = end + 1;
         }
-        SDLNet_FreePacket(pkt);
     }
-    const uint32_t now = SDL_GetTicks();
-    if (control_next < control_queue.size() && now - control_last >= 40) {
-        KEYBOARD_AddKeyRaw(control_queue[control_next].first,control_queue[control_next].second);
-        control_next++;
+    while (!control_queue.empty() && now - control_last >= control_pause) {
+        const ControlStep step = control_queue.front();
+        control_queue.pop_front();
         control_last = now;
-        if (control_next == control_queue.size()) { control_queue.clear(); control_next = 0; }
+        control_pause = 0;
+        switch (step.kind) {
+            case ControlStep::KEY:
+                KEYBOARD_AddKeyRaw(step.key,step.down);
+                control_pause = 40;
+                break;
+            case ControlStep::WAIT:
+                control_pause = step.ms;
+                break;
+            case ControlStep::SYNC:
+                control_pkt->len = snprintf((char*)control_pkt->data,(size_t)control_pkt->maxlen,"done %s",step.id);
+                control_pkt->address = step.to;
+                SDLNet_UDP_Send(control_sock,-1,control_pkt);
+                break;
+        }
     }
 }
+
+} /* namespace */
 
 void REMOTEPLAY_Configure(Section_prop *section) {
     RP_SetBlockedKeys(section->Get_string("block keys"));
     const int report = section->Get_int("report input");
-    cfg_report_port = (uint16_t)((report > 0 && report < 65536) ? report : 0);
+    SDLNet_Write32(RP_LOOPBACK,&cfg_report_to.host);
+    SDLNet_Write16((uint16_t)((report > 0 && report < 65536) ? report : 0),&cfg_report_to.port);
     int v = section->Get_int("timeout");
     cfg_timeout = (unsigned)((v >= 250 && v <= 600000) ? v : 10000);
     v = section->Get_int("stream fps");
@@ -1826,16 +1900,21 @@ void REMOTEPLAY_Status(Program *prog) {
 }
 
 void REMOTEPLAY_Poll(void) {
-    Control_Poll();
-    if (!host_running) return;
+    /* Neither a control channel nor a host: nothing to look at, not even the clock (GFX_Events runs very often, and
+     * under Emscripten reading the clock is what costs). */
+    const bool listening = Control_Open();
+    if (!listening && !host_running) return;
 
-    /* GFX_Events runs very often; the socket only needs a look once a
+    /* GFX_Events runs very often; the sockets only need a look once a
      * millisecond (the video rate allows more once a millisecond too, and
      * whoever queues video sends what may go at once). */
     static uint32_t lastpoll = 0;
     const uint32_t now = SDL_GetTicks();
     if (now == lastpoll) return;
     lastpoll = now;
+
+    if (listening) Control_Poll(now);
+    if (!host_running) return;
 
     /* Releases what viewers hold as soon as a game has ended, even when no
      * input arrives. */
@@ -5214,18 +5293,10 @@ public:
     struct TestKey { double at, hold; KBD_KEYS key; bool down; };
     std::vector<TestKey> test_keys;
     void parseTestKeys(const char *spec) {
-        static const struct { const char *name; KBD_KEYS key; } names[] = {
-            { "esc", KBD_esc }, { "enter", KBD_enter }, { "space", KBD_space }, { "up", KBD_up }, { "down", KBD_down },
-            { "left", KBD_left }, { "right", KBD_right }, { "comma", KBD_comma }, { "period", KBD_period },
-            { "lalt", KBD_leftalt }, { "lctrl", KBD_leftctrl }, { "lshift", KBD_leftshift }, { "tab", KBD_tab },
-            { "pgup", KBD_pageup }, { "pgdn", KBD_pagedown }, { "home", KBD_home }, { "end", KBD_end },
-            { "a", KBD_a }, { "d", KBD_d }, { "w", KBD_w }, { "s", KBD_s }, { "u", KBD_u }, { "y", KBD_y }, { "n", KBD_n },
-            { "f1", KBD_f1 }, { "f2", KBD_f2 }, { "f11", KBD_f11 }, { "kp4", KBD_kp4 }, { "kp6", KBD_kp6 }, { "kp8", KBD_kp8 }, { "kp2", KBD_kp2 },
-            { "1", KBD_1 }, { "2", KBD_2 }, { "3", KBD_3 }, { "4", KBD_4 }, { "5", KBD_5 }, { "6", KBD_6 }, { "7", KBD_7 },
-            { "8", KBD_8 }, { "9", KBD_9 }, { "0", KBD_0 }, { "b", KBD_b }, { "c", KBD_c }, { "e", KBD_e }, { "f", KBD_f },
-            { "g", KBD_g }, { "h", KBD_h }, { "i", KBD_i }, { "j", KBD_j }, { "k", KBD_k }, { "l", KBD_l }, { "m", KBD_m },
-            { "o", KBD_o }, { "p", KBD_p }, { "q", KBD_q }, { "r", KBD_r }, { "t", KBD_t }, { "v", KBD_v }, { "x", KBD_x },
-            { "z", KBD_z }, { "ins", KBD_insert }, { "del", KBD_delete }, { "click", KBD_NONE }
+        /* the keymapper's names (RP_KeyByName), and these */
+        static const struct { const char *name; KBD_KEYS key; } more[] = {
+            { "pgup", KBD_pageup }, { "pgdn", KBD_pagedown }, { "ins", KBD_insert }, { "del", KBD_delete },
+            { "kp2", KBD_kp2 }, { "kp4", KBD_kp4 }, { "kp6", KBD_kp6 }, { "kp8", KBD_kp8 }, { "click", KBD_NONE }
         };
         std::string text = spec;
         size_t pos = 0;
@@ -5237,11 +5308,12 @@ public:
             const size_t c1 = item.find(':'), c2 = item.find(':',c1 == std::string::npos ? 0 : c1 + 1);
             if (c1 == std::string::npos) continue;
             const std::string name = item.substr(c1 + 1,c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
-            for (size_t i=0;i < sizeof(names) / sizeof(names[0]);i++) {
-                if (name != names[i].name) continue;
-                TestKey k = { atof(item.c_str()), c2 == std::string::npos ? 0.1 : atof(item.c_str() + c2 + 1), names[i].key, false };
-                test_keys.push_back(k);
-            }
+            KBD_KEYS key = KBD_NONE;
+            bool known = RP_KeyByName(name,key);
+            for (const auto &m : more) if (!known && name == m.name) { key = m.key; known = true; }
+            if (!known) continue;
+            TestKey k = { atof(item.c_str()), c2 == std::string::npos ? 0.1 : atof(item.c_str() + c2 + 1), key, false };
+            test_keys.push_back(k);
         }
     }
 
