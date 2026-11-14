@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 Bitu vga_read_p3da(Bitu port, Bitu iolen);
+void vga_misc_debug_timing(double *out);
 extern bool vga_render_on_demand;
 extern bool enable_vretrace_poll_debugging_marker;
 extern unsigned char vga_p3da_undefined_bits;
@@ -123,6 +124,17 @@ TEST_F(VGAStatusTest, TsengRetraceComplementRemainsCorrect) {
 TEST_F(VGAStatusTest, IntegrationDeviceStatusLockoutRemainsEffective) {
     vga.dosboxig.vga_3da_lockout = true;
     EXPECT_EQ(0u, At(90.5));
+}
+
+TEST_F(VGAStatusTest, TemporaryDiagnosis) {
+    vga.draw.delay.framestart = -7.5;
+    double o[6];
+    vga_misc_debug_timing(o);
+    const double test_off = (double)((const char*)&vga.draw.delay.hdend - (const char*)&vga);
+    EXPECT_EQ(0, 1) << "misc sees hdend=" << o[0] << " htotal=" << o[1] << " off(delay in draw)=" << o[2]
+        << " off(hdend in vga)=" << o[3] << " sizeof(vga)=" << o[4] << " timeInFrame=" << o[5]
+        << " | test: hdend=" << vga.draw.delay.hdend << " off(hdend in vga)=" << test_off << " sizeof(vga)=" << sizeof(vga)
+        << " PIC_FullIndex=" << (double)PIC_FullIndex() << " At(7.5)=" << At(7.5);
 }
 
 } // namespace

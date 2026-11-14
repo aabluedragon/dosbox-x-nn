@@ -294,3 +294,13 @@ void pc98_clear_graphics(void) {
 		*((uint16_t*)(vga.mem.linear + i + PC98_VRAM_GRAPHICS_OFFSET + 0x78000)) = 0;
 	}
 }
+
+/* TEMPORARY (CI diagnosis of the 32-bit SDL2 unit test failure): what this file sees of the timing. */
+void vga_misc_debug_timing(double *out) {
+	out[0] = vga.draw.delay.hdend;
+	out[1] = vga.draw.delay.htotal;
+	out[2] = (double)offsetof(VGA_Draw, delay);
+	out[3] = (double)((const char*)&vga.draw.delay.hdend - (const char*)&vga);
+	out[4] = (double)sizeof(vga);
+	out[5] = (double)(PIC_FullIndex() - vga.draw.delay.framestart);
+}
