@@ -289,6 +289,8 @@ struct Viewer {
     uint64_t applied_us = 0;            /* when it was applied (RP_Micros) */
     bool keydown[KBD_LAST];
     uint32_t buttons = 0;
+    float report_dx = 0, report_dy = 0; /* [inputnet] report input: mouse motion not reported yet */
+    uint32_t report_ms = 0;
     uint32_t features = 0;              /* RP_FEAT_* from its HELLO */
     bool hasack = false;
     uint32_t acked = 0;                 /* newest frame it decoded */
@@ -321,6 +323,9 @@ uint16_t host_port = 0;
 Viewer viewers[RP_MAX_VIEWERS];
 unsigned cfg_timeout = 10000;
 bool cfg_blocked[KBD_LAST];     /* [inputnet] block keys: dropped from every remote player (see RP_SetBlockedKeys) */
+uint16_t cfg_report_port = 0;   /* [inputnet] report input: UDP port on 127.0.0.1 that hears every player's input */
+const char *RP_KeyName(unsigned key);
+void RP_ReportInput(Viewer &v,const char *json_fields);
 unsigned cfg_maxfps = 0;
 int cfg_present = 2;            /* [inputnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
 
@@ -1236,7 +1241,15 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             if (key == (uint16_t)KBD_printscreen || !Guard_Allows()) return;
             /* Keys the host blocked for remote players ([inputnet] block keys): a release still goes through for a key
              * that was down before (none can be: the list is read before anyone joins), the rest is dropped. */
-            if (cfg_blocked[key] && !(v.keydown[key] && !pressed)) return;
+            if (cfg_blocked[key] && !(v.keydown[key] && !pressed)) {
+                char rep[96]; snprintf(rep,sizeof(rep),"\"t\":\"key\",\"k\":\"%s\",\"d\":%d,\"b\":1",RP_KeyName(key),pressed ? 1 : 0);
+                RP_ReportInput(v,rep);
+                return;
+            }
+            {
+                char rep[96]; snprintf(rep,sizeof(rep),"\"t\":\"key\",\"k\":\"%s\",\"d\":%d,\"b\":0",RP_KeyName(key),pressed ? 1 : 0);
+                RP_ReportInput(v,rep);
+            }
             v.keydown[key] = pressed;
             if (pressed) guard_typed = true;
             KEYBOARD_AddKeyRaw((KBD_KEYS)key,pressed);
@@ -1246,6 +1259,10 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const uint8_t button = r.u8();
             const bool pressed = r.u8() != 0;
             if (!r.ok || button >= 32 || !Guard_Allows()) return;
+            {
+                char rep[64]; snprintf(rep,sizeof(rep),"\"t\":\"button\",\"n\":%u,\"d\":%d",(unsigned)button,pressed ? 1 : 0);
+                RP_ReportInput(v,rep);
+            }
             if (pressed) { v.buttons |= 1u << button; Mouse_ButtonPressedRaw(button); }
             else { v.buttons &= ~(1u << button); Mouse_ButtonReleasedRaw(button); }
             break;
@@ -1254,6 +1271,16 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             const float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
             const bool emulate = r.u8() != 0;
             if (!r.ok || !Guard_Allows()) return;
+            if (cfg_report_port) {
+                /* motion is gathered and reported at most ten times a second per player */
+                v.report_dx += xrel; v.report_dy += yrel;
+                const uint32_t now = SDL_GetTicks();
+                if (now - v.report_ms >= 100 && (v.report_dx != 0 || v.report_dy != 0)) {
+                    char rep[80]; snprintf(rep,sizeof(rep),"\"t\":\"move\",\"dx\":%.1f,\"dy\":%.1f",v.report_dx,v.report_dy);
+                    RP_ReportInput(v,rep);
+                    v.report_dx = v.report_dy = 0; v.report_ms = now;
+                }
+            }
             if (mouse_notify_mode != 0) {
                 /* The guest's pointer driver asks the integration device where the pointer is (bios.cpp): for this
                  * player that is the place in the viewer's picture. A viewer that captured its mouse gives relative
@@ -1536,8 +1563,112 @@ void RP_SetBlockedKeys(const std::string &list) {
     if (!shown.empty()) LOG_MSG("INPUTNET: keys blocked for remote players: %s",shown.c_str());
 }
 
+namespace {
+const char *RP_KeyName(unsigned key) {
+    for (const auto &e : rp_key_names) if ((unsigned)e.key == key) return e.name;
+    return "unknown";
+}
+
+/* One datagram per input event to 127.0.0.1:[inputnet] report input: {"p":"<player>", ...fields} (NukemNet's server
+ * automation hears them as inputnetInput events). */
+void RP_ReportInput(Viewer &v,const char *json_fields) {
+    if (!cfg_report_port || !host_sock) return;
+    static IPaddress to = { 0, 0 };
+    static uint16_t to_port = 0;
+    if (to_port != cfg_report_port) { SDLNet_ResolveHost(&to,"127.0.0.1",cfg_report_port); to_port = cfg_report_port; }
+    std::string name;
+    for (char c : v.name) if (c != '"' && c != '\\' && (unsigned char)c >= 32) name += c;
+    char buf[256];
+    const int n = snprintf(buf,sizeof(buf),"{\"p\":\"%s\",%s}",name.c_str(),json_fields);
+    if (n > 0 && n < (int)sizeof(buf)) Host_SendTo(to,(const uint8_t*)buf,(size_t)n);
+}
+} /* namespace */
+
+/* NukemNet's control channel (env NN_DOSBOX_CONTROL_PORT and NN_DOSBOX_CONTROL_TOKEN, any DOSBox-X-NN, remote play or
+ * not): datagrams from 127.0.0.1 that start with the token: "type <text>" types text (Shift where a character needs
+ * it), "keys <name> [name...]" presses and releases keys, "key <name> down|up". Keys go out one step every 40 ms, so
+ * a game that polls the keyboard sees each of them. */
+static UDPsocket control_sock = NULL;
+static std::string control_token;
+static bool control_checked = false;
+static std::vector<std::pair<KBD_KEYS,bool> > control_queue;
+static size_t control_next = 0;
+static uint32_t control_last = 0;
+
+static bool RP_KeyByName(const std::string &name,KBD_KEYS &key) {
+    for (const auto &e : rp_key_names) if (name == e.name) { key = e.key; return true; }
+    return false;
+}
+
+static void Control_QueueKey(KBD_KEYS key,bool shift) {
+    if (shift) control_queue.push_back(std::make_pair(KBD_leftshift,true));
+    control_queue.push_back(std::make_pair(key,true));
+    control_queue.push_back(std::make_pair(key,false));
+    if (shift) control_queue.push_back(std::make_pair(KBD_leftshift,false));
+}
+
+static void Control_QueueChar(char c) {
+    static const char *plain = "`1234567890-=[]\\;',./";
+    static const char *shifted = "~!@#$%^&*()_+{}|:\"<>?";
+    static const KBD_KEYS keys[] = { KBD_grave,KBD_1,KBD_2,KBD_3,KBD_4,KBD_5,KBD_6,KBD_7,KBD_8,KBD_9,KBD_0,KBD_minus,KBD_equals,
+        KBD_leftbracket,KBD_rightbracket,KBD_backslash,KBD_semicolon,KBD_quote,KBD_comma,KBD_period,KBD_slash };
+    if (c >= 'a' && c <= 'z') { KBD_KEYS k; std::string n(1,c); if (RP_KeyByName(n,k)) Control_QueueKey(k,false); return; }
+    if (c >= 'A' && c <= 'Z') { KBD_KEYS k; std::string n(1,(char)(c - 'A' + 'a')); if (RP_KeyByName(n,k)) Control_QueueKey(k,true); return; }
+    if (c == ' ') { Control_QueueKey(KBD_space,false); return; }
+    for (unsigned i=0;plain[i];i++) {
+        if (plain[i] == c) { Control_QueueKey(keys[i],false); return; }
+        if (shifted[i] == c) { Control_QueueKey(keys[i],true); return; }
+    }
+}
+
+static void Control_Poll(void) {
+    if (!control_checked) {
+        control_checked = true;
+        const char *port = getenv("NN_DOSBOX_CONTROL_PORT"), *token = getenv("NN_DOSBOX_CONTROL_TOKEN");
+        const int p = port ? atoi(port) : 0;
+        if (p > 0 && p < 65536 && token && strlen(token) >= 16) {
+            control_token = token;
+            control_sock = SDLNet_UDP_Open((uint16_t)p);
+            if (control_sock) LOG_MSG("NUKEMNET: control channel on UDP port %d",p);
+            else LOG_MSG("NUKEMNET: control channel: UDP port %d is not free",p);
+        }
+    }
+    if (!control_sock) return;
+    UDPpacket *pkt = SDLNet_AllocPacket(1024);
+    if (pkt) {
+        while (SDLNet_UDP_Recv(control_sock,pkt) > 0) {
+            const uint32_t loopback = 0x7F000001u;
+            if (SDLNet_Read32(&pkt->address.host) != loopback) continue;
+            std::string msg((const char*)pkt->data,(size_t)pkt->len);
+            if (msg.size() <= control_token.size() + 1 || msg.compare(0,control_token.size(),control_token) != 0 || msg[control_token.size()] != ' ') continue;
+            msg = msg.substr(control_token.size() + 1);
+            if (msg.compare(0,5,"type ") == 0) {
+                for (char c : msg.substr(5)) Control_QueueChar(c);
+            } else if (msg.compare(0,5,"keys ") == 0 || msg.compare(0,4,"key ") == 0) {
+                const bool single = msg.compare(0,4,"key ") == 0;
+                std::vector<std::string> words; std::string w;
+                for (char c : msg.substr(single ? 4 : 5)) { if (c == ' ') { if (!w.empty()) words.push_back(w); w.clear(); } else w += (char)tolower((unsigned char)c); }
+                if (!w.empty()) words.push_back(w);
+                KBD_KEYS k;
+                if (single) { if (words.size() == 2 && RP_KeyByName(words[0],k)) control_queue.push_back(std::make_pair(k,words[1] == "down")); }
+                else for (auto &name : words) if (RP_KeyByName(name,k)) Control_QueueKey(k,false);
+            }
+        }
+        SDLNet_FreePacket(pkt);
+    }
+    const uint32_t now = SDL_GetTicks();
+    if (control_next < control_queue.size() && now - control_last >= 40) {
+        KEYBOARD_AddKeyRaw(control_queue[control_next].first,control_queue[control_next].second);
+        control_next++;
+        control_last = now;
+        if (control_next == control_queue.size()) { control_queue.clear(); control_next = 0; }
+    }
+}
+
 void REMOTEPLAY_Configure(Section_prop *section) {
     RP_SetBlockedKeys(section->Get_string("block keys"));
+    const int report = section->Get_int("report input");
+    cfg_report_port = (uint16_t)((report > 0 && report < 65536) ? report : 0);
     int v = section->Get_int("timeout");
     cfg_timeout = (unsigned)((v >= 250 && v <= 600000) ? v : 10000);
     v = section->Get_int("stream fps");
@@ -1695,6 +1826,7 @@ void REMOTEPLAY_Status(Program *prog) {
 }
 
 void REMOTEPLAY_Poll(void) {
+    Control_Poll();
     if (!host_running) return;
 
     /* GFX_Events runs very often; the socket only needs a look once a

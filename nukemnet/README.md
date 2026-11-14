@@ -166,6 +166,14 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   With both, a Windows 95 game hosted for four players (three 640x480 streams from one computer through NukemNet's
   IPv6 tunnel, 73 ms away) plays at the game's full 30 to 34 frames a second for each viewer with the ping at the
   route's own; before, the tunnel's queue grew until pings passed a second and viewers got a few frames a second.
+- Remote play host input reports (capability `inputnetReportInput`): `[inputnet] report input = <port>` sends every
+  remote player's input to 127.0.0.1:<port> as one JSON datagram per event, `{"p":"<player>","t":"key","k":"esc","d":1,"b":0}`
+  (b: blocked by `block keys`), `{"t":"button","n":0,"d":1}`, `{"t":"move","dx":..,"dy":..}` (motion gathered ten
+  times a second per player). NukemNet's server automation gets them as inputnetInput events.
+- NukemNet control channel (capability `nnControl`, any DOSBox-X-NN, remote play or not): env `NN_DOSBOX_CONTROL_PORT`
+  and `NN_DOSBOX_CONTROL_TOKEN` (16+ characters) open a UDP port; datagrams from 127.0.0.1 that start with the token:
+  `type <text>` (Shift where a character needs it), `keys <name> [name...]`, `key <name> down|up`, one key step every
+  40 ms. NukemNet's `nn.typeInGame()` types chat messages into the host's own game with it.
 - Remote play host key blocking (capability `inputnetBlockKeys`): `[inputnet] block keys` lists keys, by keymapper
   name (`esc f10 lalt kp_5`, space or comma separated), that the host drops from every remote player's input; the
   host's own keyboard is not affected and unknown names are logged and skipped. NukemNet's Host Game field "Blocked

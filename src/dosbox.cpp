@@ -5415,6 +5415,11 @@ void DOSBOX_SetupConfigSections(void) {
                       "by spaces, named as in the keymapper (esc f1 f10 lalt lctrl tab enter bspace kp_5 ...).\n"
                       "The host's own keyboard is not affected. Empty: nothing is blocked.");
 
+    Pint = secprop->Add_int("report input",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("Remote play host: a UDP port on 127.0.0.1 that gets every remote player's input as a small JSON\n"
+                   "datagram (keys by keymapper name, mouse buttons, mouse motion gathered ten times a second), with\n"
+                   "the player's name. NukemNet's server automation uses it. 0: off.");
+
     Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"
                     "option -inputnet-hidescreen), the window stays small, without the picture, does not take\n"
