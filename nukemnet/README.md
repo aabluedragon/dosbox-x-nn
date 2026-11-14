@@ -166,8 +166,19 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   With both, a Windows 95 game hosted for four players (three 640x480 streams from one computer through NukemNet's
   IPv6 tunnel, 73 ms away) plays at the game's full 30 to 34 frames a second for each viewer with the ping at the
   route's own; before, the tunnel's queue grew until pings passed a second and viewers got a few frames a second.
-- Remote play view prediction (capability `inputnetPredict`, viewer side, `[inputnet] predict = true`, Ctrl+F12
-  turns it off and on): what a player feels as lag in a streamed first-person game is the view, which turns one round
+- Remote play view prediction is **off by default** (capability `inputnetPredictView`: `[inputnet] predict view`,
+  default false; Ctrl+F12 in the viewer switches it; NukemNet's Host Game option "Experimental prediction" turns it on
+  for a room's viewers). Without it the viewer shows every frame exactly as the host sent it. Why: a first-person
+  view cannot be moved ahead of the host without it showing. Whatever stays on the screen in the game (the weapon, the
+  crosshair, a message) either moves with the view and returns with the next frame, or is held in place, and then the
+  part of the world it covered has to be made up; both were built, and the player saw each one (Duke Nukem 3D and
+  Doom, November 2026: marks between the letters of messages and leftover pixels beside the weapon when held, the
+  weapon and crosshair sliding with every turn when moved). Measured with the same input on one PC, 50 ms each way:
+  off, the weapon, crosshair and text were out of place in 0 of 195 frames; on, in all 195 (the view is also shown
+  2.5% larger). The pointer dot (below) is not affected and stays on. What follows describes the view prediction
+  when it is turned on; the viewer learns in the background either way, so the switch works at once.
+- Remote play view prediction (capability `inputnetPredict`, viewer side, with `predict view` on, see above): what
+  a player feels as lag in a streamed first-person game is the view, which turns one round
   trip and the game's own reaction after the hand. The viewer shows the newest frame already moved by the input that
   frame does not show yet, and draws it again between frames whenever that changes, so the view follows the mouse
   and the turn keys at once and the frames that arrive later land where the picture already is. Nothing about a game
@@ -283,7 +294,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the real link: 127 ms after a hiccup, back to 49 ms within seconds).
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true,"inputnetPredict":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true,"inputnetPredict":true,"inputnetPredictView":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.

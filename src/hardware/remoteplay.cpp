@@ -2258,7 +2258,14 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
 /* View prediction (viewer)                                                   */
 /* ------------------------------------------------------------------------- */
 
-/* Most of what a player feels as lag in a streamed game is the view: the mouse moves, and the picture turns one round
+/* Moving the picture is OFF unless the player asks for it ([inputnet] predict view = true, or Ctrl+F12 in the viewer):
+ * a moved first-person view shows. What stays on the screen (a weapon, a crosshair, a message) either moves with the
+ * view and returns with the next frame, or is held in place, and then the world it covered has to be made up; both
+ * were built, and a player saw each (see the end of this note). By default the viewer shows every frame exactly as
+ * the host sent it, and only the pointer dot (below) is predicted. The rest of this note describes what happens when
+ * it is turned on; it is learned in the background either way, so the switch works at once.
+ *
+ * Most of what a player feels as lag in a streamed game is the view: the mouse moves, and the picture turns one round
  * trip and the game's own reaction later. A turn is a simple change of the picture: it moves the whole view sideways
  * by an amount that depends on the column only, never on how far away things are (looking up and down moves it
  * vertically). So the viewer shows the newest frame already moved by the input that frame does not show yet; the
@@ -2284,12 +2291,13 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
  * A prediction is shown only while the frames that arrive agree with what had been predicted for them (the gate):
  * in a menu, a pause or a cutscene the picture does not follow the mouse, and prediction stops after two stretches
  * of frames that say so. Escape, Tab and the function keys close the gates at once, since they open menus.
- * Ctrl+F12 turns prediction off and on; [inputnet] predict = false keeps it off.
+ * Ctrl+F12 turns moving the picture on and off; [inputnet] predict = false turns all prediction off.
  * Nothing is drawn that the frame does not have: the view is shown slightly larger and moved as one piece, by whole
- * pixels, within that margin (see ViewPredict::warp), with everything in it, the crosshair and messages included.
- * Mirroring the edge, pictures kept by direction, a smear, a stretch, and holding what stays in place with guesses
- * for what it hid were each tried and taken out after a player saw them (Duke Nukem 3D, November 2026). Things that
- * move by themselves keep their own lag.
+ * pixels, within that margin (see ViewPredict::warp), with everything in it, the weapon, the crosshair and messages
+ * included; they return to their places with the next frame, which a player sees while turning (the reason this is
+ * off by default). Mirroring the edge, pictures kept by direction, a smear, a stretch, and holding what stays in
+ * place with guesses for what it hid were each tried and taken out after a player saw them (Duke Nukem 3D, November
+ * 2026). Things that move by themselves keep their own lag.
  * A game that draws a pointer of its own where the DOS mouse driver has it (strategy games, adventures, menus) gets
  * a dot instead of a moved picture: the host reports the driver's pointer and how far a count moves it with every
  * frame, the viewer adds the motion the host had not applied and draws the dot at once (pointerAt, from the newest
@@ -2298,7 +2306,8 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
  * Everything happens in the viewer; a host that says when it took each frame makes the timing exact, an older one
  * is followed as well as its frame information allows (and gets no pointer dot).
  *
- * For tests (environment): NN_RP_PREDICT=0|1, NN_RP_PREDICTLOG=1|2 (what was learned; every frame),
+ * For tests (environment): NN_RP_PREDICT=0|1, NN_RP_PREDICTVIEW=0|1 (moving the picture), NN_RP_PREDICTLOG=1|2 (what
+ * was learned; every frame),
  * NN_RP_RECORD=<folder> (frames and input, to learn from again offline), NN_RP_PREDICTSHOT=<folder> (pictures moved
  * far, before and after), NN_RP_TESTINPUT=mouse|look|keys|mix|walk|walkkeys|none with NN_RP_TESTSCALE,
  * NN_RP_TESTSCALEY, NN_RP_TESTSTART and NN_RP_TESTKEYS (a mouse and keys that move by themselves; "t:key:secs", the
@@ -2835,7 +2844,13 @@ const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
 
 class ViewPredict {
 public:
-    bool enabled = true;        /* the player's switch */
+    bool enabled = true;        /* the player's switch for all of it ([inputnet] predict) */
+    bool moveView = false;      /* ...and for moving the picture ([inputnet] predict view, Ctrl+F12). Off unless asked
+                                 * for: a first-person view cannot be moved ahead of the host without showing it.
+                                 * Whatever stays on the screen (a weapon, a crosshair, a message) either moves with
+                                 * the view and jumps back with the next frame, or is held in place, and then what it
+                                 * covered has to be made up. A player saw both (Duke Nukem 3D and Doom, November 2026).
+                                 * Without it the picture is shown exactly as the host sent it. */
     int debug = 0;              /* NN_RP_PREDICTLOG: 1 what was learned every five seconds, 2 every frame */
     unsigned dbg_pairs = 0, dbg_same = 0, dbg_okx = 0, dbg_oky = 0, dbg_moved = 0, dbg_regx = 0, dbg_regy = 0;
     unsigned w = 0, h = 0, fmt = 0;
@@ -3143,8 +3158,8 @@ public:
     bool zoomed(void) const {
         /* Once on it stays on for the video mode: a lens measured again the other way, or a moment without one, would
          * otherwise switch the enlargement off and on, which is a jump of the whole picture. */
-        if (enabled && box_known && lens.known && lens.persp) zoom_on = true;
-        return enabled && zoom_on && box_known && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4;
+        if (enabled && moveView && box_known && lens.known && lens.persp) zoom_on = true;
+        return enabled && moveView && zoom_on && box_known && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4;
     }
     void viewBox(int &x0,int &y0,int &x1,int &y1) const { x0 = vx0; y0 = vy0; x1 = vx1; y1 = vy1; }
     void margins(int &mx,int &my) const {
@@ -3165,7 +3180,7 @@ public:
     void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
         const uint64_t t0 = RP_Micros();
         const int iw = (int)w, ih = (int)h;
-        if (!box_known) px = py = 0;    /* (predicted() says no first: see box_known) */
+        if (!box_known || !moveView) px = py = 0;    /* (predicted() says no first: see box_known, moveView) */
         int mx, my;
         margins(mx,my);
         const int sx = std::max(-mx,std::min(mx,(int)lroundf(px))), sy = std::max(-my,std::min(my,(int)lroundf(py)));
@@ -3211,6 +3226,7 @@ public:
         st_dot_us = st_dot_on_us = 0;
         st_ptr_err = st_ptr_errmax = 0; st_ptr_errn = 0;
         if (!lens.known && !ax.known && !ay.known && kst_n == 0) { clearStats(); return; }
+        if (!moveView && !debug) { clearStats(); return; }     /* (learned all the same, so Ctrl+F12 works at once) */
         char lensText[64];
         if (!lens.known) snprintf(lensText,sizeof(lensText),"not known yet");
         else if (lens.persp) snprintf(lensText,sizeof(lensText),"%.0f degrees wide%s",2.0 * atan((double)(vx1 - vx0) * 0.5 / lens.f) * 180.0 / 3.14159265358979,lens.assumed ? " (taken to be)" : "");
@@ -3237,9 +3253,9 @@ public:
         if (kst_n) snprintf(keys,sizeof(keys),"%u keys that move the view (%u stretches, %u%% shown): off by %.1f px where the picture moved %.1f",
             nkeys,kst_n,kst_open * 100u / kst_n,kst_err / kst_n,kst_base / kst_n);
         else snprintf(keys,sizeof(keys),"%u keys that move the view",nkeys);
-        LOG_MSG("INPUTNET: view prediction%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place; "
+        LOG_MSG("INPUTNET: view prediction%s%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place; "
             "%.2f ms a frame to learn, %.2f ms to move the picture (%u times)",
-            was ? "" : (said_ready ? " ready" : " learning"),turn,look,keys,lensText,layers,vx1 - vx0,vy1 - vy0,vx0,vy0,
+            moveView ? "" : " (off, the picture is not moved)",was ? "" : (said_ready ? " ready" : " learning"),turn,look,keys,lensText,layers,vx1 - vx0,vy1 - vy0,vx0,vy0,
             still.empty() ? 0u : (unsigned)((uint64_t)stillpx * 100u / still.size()),
             st_analyse_us / 1000.0 / st_frames,st_warps ? st_warp_us / 1000.0 / st_warps : 0.0,st_warps);
         clearStats();
@@ -4471,8 +4487,9 @@ public:
                     break;
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F12 && (mod & KMOD_CTRL)) {
-                    vp.enabled = !vp.enabled;
-                    LOG_MSG("INPUTNET: view prediction %s",vp.enabled ? "on" : "off");
+                    vp.moveView = !vp.moveView;
+                    LOG_MSG("INPUTNET: view prediction %s",vp.moveView ? "on: the picture is moved by the input the host's frames do not show yet"
+                        : "off: the picture is shown as the host sends it");
                     redraw = true;
                     break;
                 }
@@ -4850,7 +4867,7 @@ public:
     /* How far view prediction moves the picture at this moment; false: not at all. */
     bool predicted(uint64_t now_us,float &px,float &py) {
         px = py = 0;
-        if (!vp.enabled || !haveframe || vp.w != frame_w || vp.h != frame_h || !vp.boxKnown()) return false;
+        if (!vp.enabled || !vp.moveView || !haveframe || vp.w != frame_w || vp.h != frame_h || !vp.boxKnown()) return false;
         if (vp.offset(now_us,captured ? acc_xrel : 0.0f,captured ? acc_yrel : 0.0f,px,py)) return true;
         px = py = 0;
         return false;
@@ -5253,8 +5270,10 @@ public:
             const int t = sec->Get_int("timeout");
             if (t >= 250 && t <= 600000) timeout = (unsigned)t;
             vp.enabled = sec->Get_bool("predict");
+            vp.moveView = sec->Get_bool("predict view");
         }
         if (const char *e = getenv("NN_RP_PREDICT")) vp.enabled = atoi(e) != 0;
+        if (const char *e = getenv("NN_RP_PREDICTVIEW")) vp.moveView = atoi(e) != 0;
         if (const char *e = getenv("NN_RP_PREDICTLOG")) vp.debug = atoi(e);
         if (const char *e = getenv("NN_RP_PREDICTSHOT")) shot_dir = e;
         if (const char *e = getenv("NN_RP_RECORD")) {

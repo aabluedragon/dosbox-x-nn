@@ -5398,10 +5398,17 @@ void DOSBOX_SetupConfigSections(void) {
                       "Use retrace or scanout for a game whose picture flickers or tears with flip.");
 
     Pbool = secprop->Add_bool("predict",Property::Changeable::WhenIdle, true);
-    Pbool->Set_help("Remote play viewer: view prediction. The picture is moved at once by the mouse movement the host's\n"
-                    "frames do not show yet (turning and looking in a first-person view), learned from the stream\n"
-                    "while playing, so the view follows the hand without the delay of the connection. It stops by\n"
-                    "itself where the picture does not follow the mouse (menus). Ctrl+F12 turns it off and on.");
+    Pbool->Set_help("Remote play viewer: prediction. A game that draws its own mouse pointer gets a small dot where\n"
+                    "the pointer will be, without the delay of the connection. See also \"predict view\".\n"
+                    "false turns all prediction off.");
+
+    Pbool = secprop->Add_bool("predict view",Property::Changeable::WhenIdle, false);
+    Pbool->Set_help("Remote play viewer: view prediction (off by default). The picture of a first-person game is\n"
+                    "shown slightly larger and moved at once by the mouse and turn-key input the host's frames do\n"
+                    "not show yet, so the view follows the hand without the delay of the connection. Everything in\n"
+                    "the view moves with it, a weapon and a crosshair too, and returns to its place with the next\n"
+                    "frame, which shows while turning. Off, the picture is shown exactly as the host sends it.\n"
+                    "Ctrl+F12 in the viewer turns it on and off.");
 
     Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"
