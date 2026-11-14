@@ -98,10 +98,10 @@ jobs:
         shell: bash
         run: |
           top=`pwd`
-          $top/bin/x64/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
-          $top/bin/x64/"Release SDL2"/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
-          $top/bin/Win32/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
-          $top/bin/Win32/"Release SDL2"/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
+          $top/bin/x64/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
+          $top/bin/x64/"Release SDL2"/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
+          $top/bin/Win32/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
+          $top/bin/Win32/"Release SDL2"/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
       - name: Package Visual Studio x86/x64 builds
         shell: bash
         run: |
