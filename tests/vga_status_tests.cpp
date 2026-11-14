@@ -3,6 +3,7 @@
 #include "pic.h"
 #include "vga.h"
 #include <gtest/gtest.h>
+#include <cmath>
 
 Bitu vga_read_p3da(Bitu port, Bitu iolen);
 extern bool vga_render_on_demand;
@@ -130,7 +131,7 @@ TEST_F(VGAStatusTest, LinePositionDoesNotDependOnRounding) {
     // put it before the start of the next one.
     for (unsigned i = 0; i < 400; i++) {
         const double time = 5.0 + i * 0.0125 + 10.0 * (i % 7);
-        const double inLine = time - 10.0 * (double)(unsigned)(time / 10.0);
+        const double inLine = std::fmod(time, 10.0);    // (not an integer conversion: that rounds here too)
         EXPECT_EQ(inLine >= 7.0 ? 1u : 0u, At(time) & 1) << time;
     }
 }
