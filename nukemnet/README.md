@@ -184,7 +184,11 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   - the view's rectangle (not the status bar, a border or a side panel): the rows and columns that change when the
     view moves, some of it explained by the movement, and where most pixels do not stay. A status bar whose numbers
     change while the player turns, or that a flash of colour changes all over, used to count as view; its numbers
-    then slid across their panels (Duke Nukem 3D, November 2026);
+    then slid across their panels (Duke Nukem 3D, November 2026). Nothing is moved or enlarged until the rectangle
+    has been measured in the current video mode: until then it is the whole picture, and a viewer that predicted from
+    it enlarged the status bar and moved its numbers. Reproduced with Duke's brightness key (F11) pressed while
+    turning, which changes every colour as its pickup and damage flashes do: the old viewer took 320x380 of 320x400 as
+    the view, status bar included; this one keeps 320x316 (rows 16-331) in a NukemNet IPX-over-InputNet room;
   - the pixels in it that never move with it (a weapon, a crosshair, text on the screen), which are left out of
     measuring (see below);
   - layers: bands of the view that an engine scrolls evenly at a rate of its own (`VP_Bands`). Build's sky does:

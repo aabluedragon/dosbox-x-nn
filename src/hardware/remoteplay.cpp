@@ -2854,7 +2854,7 @@ public:
         world_at.assign((size_t)w * h,0);
         still_dirty = true;
         rowch.clear(); colch.clear(); rowcg.clear(); colcg.clear(); view_frames = 0;
-        cand_x0 = cand_x1 = cand_y0 = cand_y1 = -1; cand_n = 0; zoom_on = false;
+        cand_x0 = cand_x1 = cand_y0 = cand_y1 = -1; cand_n = 0; zoom_on = false; box_known = false;
         vx0 = vy0 = 0; vx1 = (int)w; vy1 = (int)h;
         memset(band_score,0,sizeof(band_score));
         lens_clean = cells_done = 0;
@@ -3139,11 +3139,12 @@ public:
 
     /* Whether the view is shown larger (see warp), and its rectangle: once the view is known to turn in perspective
      * (a first-person game), from then on, so that it does not change size when prediction comes and goes. */
+    bool boxKnown(void) const { return box_known; }
     bool zoomed(void) const {
         /* Once on it stays on for the video mode: a lens measured again the other way, or a moment without one, would
          * otherwise switch the enlargement off and on, which is a jump of the whole picture. */
-        if (enabled && lens.known && lens.persp) zoom_on = true;
-        return enabled && zoom_on && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4;
+        if (enabled && box_known && lens.known && lens.persp) zoom_on = true;
+        return enabled && zoom_on && box_known && vx1 - vx0 >= (int)w / 4 && vy1 - vy0 >= (int)h / 4;
     }
     void viewBox(int &x0,int &y0,int &x1,int &y1) const { x0 = vx0; y0 = vy0; x1 = vx1; y1 = vy1; }
     void margins(int &mx,int &my) const {
@@ -3164,6 +3165,7 @@ public:
     void warp(const uint32_t *src,uint8_t *dst,int pitch,float px,float py) {
         const uint64_t t0 = RP_Micros();
         const int iw = (int)w, ih = (int)h;
+        if (!box_known) px = py = 0;    /* (predicted() says no first: see box_known) */
         int mx, my;
         margins(mx,my);
         const int sx = std::max(-mx,std::min(mx,(int)lroundf(px))), sy = std::max(-my,std::min(my,(int)lroundf(py)));
@@ -3279,6 +3281,10 @@ private:
     int cand_x0 = -1, cand_x1 = -1, cand_y0 = -1, cand_y1 = -1;  /* ...one measured differently (see markStill) */
     unsigned cand_n = 0;                        /* ...and how many times in a row */
     mutable bool zoom_on = false;               /* the view is shown larger (see zoomed) */
+    bool box_known = false;                     /* the view's rectangle has been measured in this video mode: until
+                                                 * then it is the whole picture, status bar and all, so nothing is
+                                                 * moved or shown larger (a viewer that predicted from the whole
+                                                 * picture moved the numbers of Duke Nukem 3D's status bar) */
     float unitx = 1, unity = 1;         /* a pixel of a 320x200 picture, in this picture's pixels */
     std::deque<VPSample> samples;
     uint64_t block_end[2] = { 0, 0 };   /* where the last stretch of frames learned from ended, per direction */
@@ -4043,7 +4049,10 @@ private:
                 if (abs(a - cand_y0) <= 1 && abs(b - cand_y1) <= 1 && abs(c0 - cand_x0) <= 1 && abs(c1 - cand_x1) <= 1) cand_n++;
                 else { cand_y0 = a; cand_y1 = b; cand_x0 = c0; cand_x1 = c1; cand_n = 1; }
                 const bool differs = abs(cand_y0 - vy0) > 1 || abs(cand_y1 - vy1) > 1 || abs(cand_x0 - vx0) > 1 || abs(cand_x1 - vx1) > 1;
-                if (differs && cand_n >= (zoom_on ? 120u : 3u)) { vy0 = cand_y0; vy1 = cand_y1; vx0 = cand_x0; vx1 = cand_x1; }
+                if ((differs || !box_known) && cand_n >= (zoom_on ? 120u : 3u)) {
+                    vy0 = cand_y0; vy1 = cand_y1; vx0 = cand_x0; vx1 = cand_x1;
+                    box_known = true;
+                }
             }
         }
     }
@@ -4841,7 +4850,7 @@ public:
     /* How far view prediction moves the picture at this moment; false: not at all. */
     bool predicted(uint64_t now_us,float &px,float &py) {
         px = py = 0;
-        if (!vp.enabled || !haveframe || vp.w != frame_w || vp.h != frame_h) return false;
+        if (!vp.enabled || !haveframe || vp.w != frame_w || vp.h != frame_h || !vp.boxKnown()) return false;
         if (vp.offset(now_us,captured ? acc_xrel : 0.0f,captured ? acc_yrel : 0.0f,px,py)) return true;
         px = py = 0;
         return false;
@@ -5018,7 +5027,7 @@ public:
             { "lalt", KBD_leftalt }, { "lctrl", KBD_leftctrl }, { "lshift", KBD_leftshift }, { "tab", KBD_tab },
             { "pgup", KBD_pageup }, { "pgdn", KBD_pagedown }, { "home", KBD_home }, { "end", KBD_end },
             { "a", KBD_a }, { "d", KBD_d }, { "w", KBD_w }, { "s", KBD_s }, { "u", KBD_u }, { "y", KBD_y }, { "n", KBD_n },
-            { "f1", KBD_f1 }, { "f2", KBD_f2 }, { "kp4", KBD_kp4 }, { "kp6", KBD_kp6 }, { "kp8", KBD_kp8 }, { "kp2", KBD_kp2 },
+            { "f1", KBD_f1 }, { "f2", KBD_f2 }, { "f11", KBD_f11 }, { "kp4", KBD_kp4 }, { "kp6", KBD_kp6 }, { "kp8", KBD_kp8 }, { "kp2", KBD_kp2 },
             { "1", KBD_1 }, { "2", KBD_2 }, { "3", KBD_3 }, { "4", KBD_4 }, { "5", KBD_5 }, { "6", KBD_6 }, { "7", KBD_7 },
             { "8", KBD_8 }, { "9", KBD_9 }, { "0", KBD_0 }, { "b", KBD_b }, { "c", KBD_c }, { "e", KBD_e }, { "f", KBD_f },
             { "g", KBD_g }, { "h", KBD_h }, { "i", KBD_i }, { "j", KBD_j }, { "k", KBD_k }, { "l", KBD_l }, { "m", KBD_m },
