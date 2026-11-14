@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           top=`pwd`
-          $top/bin/x64/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
+          $top/bin/x64/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
           cat tests.log
       - name: Package Visual Studio Win64 SDL1
         shell: bash
@@ -98,7 +98,7 @@ jobs:
         shell: bash
         run: |
           top=`pwd`
-          $top/bin/x64/"Release SDL2"/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
+          $top/bin/x64/"Release SDL2"/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
           cat tests.log
       - name: Package Visual Studio Win64 SDL2
         shell: bash
@@ -312,7 +312,7 @@ jobs:
         shell: bash
         run: |
           top=`pwd`
-          #$top/bin/Win32/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
+          #$top/bin/Win32/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
           #cat tests.log
           mkdir -p $top/package/drivez
           mkdir -p $top/package/scripts
@@ -407,7 +407,7 @@ jobs:
         shell: bash
         run: |
           top=`pwd`
-          #$top/bin/Win32/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (echo Unit test completed: failure && exit 1)
+          #$top/bin/Win32/Release/dosbox-x.exe -tests -set waitonerror=false -set logfile=tests.log || (cat tests.log; echo Unit test completed: failure && exit 1)
           #cat tests.log
           mkdir -p $top/package/drivez
           mkdir -p $top/package/scripts
