@@ -180,6 +180,11 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   `block <name> [name...]` (capability `inputnetBlockKeysLive`) replaces `[inputnet] block keys` at once, while the
   game runs (`block none`: no key); NukemNet sends it to the copies that serve viewers when the room's "Blocked keys"
   change during a game.
+- Remote play viewers can be moved (capability `inputnetMove`, feature bit 16 in a viewer's HELLO): the datagram
+  `NNRP`, version, type 12 (RP_MOVED) from the address the viewer talks to makes it start over as a new session,
+  keeping its window. NukemNet's proxy (IPX/NullModem-over-InputNet: one copy of the game per player) sends it when
+  the host gives a player another copy; the proxy tells the old copy the player left (RP_BYE) and routes the new
+  session to the new one. A viewer without the bit gets RP_BYE instead and closes.
 - Remote play host key blocking (capability `inputnetBlockKeys`): `[inputnet] block keys` lists keys, by keymapper
   name (`esc f10 lalt kp_5`, space or comma separated), that the host drops from every remote player's input; the
   host's own keyboard is not affected and unknown names are logged and skipped. NukemNet's Host Game field "Blocked

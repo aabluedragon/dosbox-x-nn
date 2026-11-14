@@ -114,12 +114,15 @@ enum {
     RP_BYE      = 9,    /* either way: leaving (reason) */
     RP_FRAMEACK = 10,   /* viewer -> host: session, u8 flags (1: has a frame), newest decoded frame,
                            video fragments expected and received (cumulative) */
-    RP_FRAMEINFO = 11   /* host -> viewer (RP_FEAT_TIMING): frame id, newest input event applied before the frame was
+    RP_FRAMEINFO = 11,  /* host -> viewer (RP_FEAT_TIMING): frame id, newest input event applied before the frame was
                            taken, microseconds from applying it to taking the frame, microseconds encoding the frame,
                            and (hosts with view prediction) when it was taken: the host's clock in microseconds, its
                            low 32 bits; then u8 1 when the DOS mouse driver's pointer follows: u16 x, u16 y (its
                            place as parts of its range, 65535 = the far end) and four f32: how far one count of
                            mouse motion moves it, x and y, for a motion of one count and for a larger one */
+    RP_MOVED    = 12    /* to a viewer with RP_FEAT_MOVE, from what stands between it and the hosts (NukemNet's proxy,
+                           which gives each player one of several copies of a game): this player's copy is another one
+                           now. The viewer keeps its window and starts over there as a new session. */
 };
 
 /* Viewer features (u32 after the session id in RP_HELLO; older viewers send none) */
@@ -127,6 +130,7 @@ const uint32_t RP_FEAT_REFS = 1;        /* decodes against the frame a frame nam
 const uint32_t RP_FEAT_TIMING = 2;      /* reads RP_FRAMEINFO to measure how long input takes to reach its screen */
 const uint32_t RP_FEAT_PIECES = 4;      /* reads the piece table of a frame compressed in pieces and inflates them at once */
 const uint32_t RP_FEAT_SHIFT = 8;       /* reads the shift table of a frame predicted from a moved base (scrolling), see RP_ShiftXor */
+const uint32_t RP_FEAT_MOVE = 16;       /* starts a new session when told RP_MOVED */
 
 enum {
     RPEV_KEY     = 1,   /* u16 KBD_KEYS, u8 pressed */
@@ -4538,9 +4542,37 @@ public:
         if (user == NULL) user = getenv("USER");
         w.str(user ? user : "player");
         w.u32(session);
-        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES | RP_FEAT_SHIFT);
+        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES | RP_FEAT_SHIFT | RP_FEAT_MOVE);
         send(w);
         lasthello = SDL_GetTicks();
+    }
+
+    void newSession(void) {
+        session = (uint32_t)rand() ^ ((uint32_t)rand() << 16) ^ (uint32_t)SDL_GetPerformanceCounter() ^ (uint32_t)(uintptr_t)this;
+        if (session == 0) session = 1;
+    }
+
+    /* RP_MOVED: another copy of the game plays for this player from now on. Nothing of the old one is of use there:
+     * its frames (their numbers mean nothing to the new copy), its sound, the input still on its way. The keys held
+     * down were released on the old copy when it was told this player left; here they count as up, so letting go of
+     * one sends nothing. */
+    void moved(void) {
+        newSession();
+        welcomed = false;
+        for (Assembly &a : asm_slots) a.used = false;
+        hist.clear();
+        haveframe = havekey = false;
+        needkey = true;
+        lastid = keyid = 0;
+        frags_exp = frags_got = 0;
+        audio_seq = 0;
+        if (audio) SDL_ClearQueuedAudio(audio);
+        pending.clear();
+        memset(keydown,0,sizeof(keydown));
+        buttons = 0;
+        acc_xrel = acc_yrel = 0;
+        updateTitle();
+        sendHello();
     }
 
     /* The newest decoded frame and the fragment counts, so the host picks bases we have and paces to the link. */
@@ -5463,6 +5495,9 @@ public:
                 error = "The host ended the session: " + r.str();
                 running = false;
                 break;
+            case RP_MOVED:
+                moved();
+                break;
             case RP_VIDEO:
                 handleVideo(r);
                 break;
@@ -5569,8 +5604,7 @@ public:
 
     void loop(void) {
         started = lastheard = SDL_GetTicks();
-        session = (uint32_t)rand() ^ ((uint32_t)rand() << 16) ^ (uint32_t)SDL_GetPerformanceCounter() ^ (uint32_t)(uintptr_t)this;
-        if (session == 0) session = 1;
+        newSession();
         sendHello();
         while (running) {
             SDLNet_CheckSockets(set,1);
