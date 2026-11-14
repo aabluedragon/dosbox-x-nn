@@ -89,7 +89,13 @@ Bitu vga_read_p3da(Bitu port,Bitu iolen) {
 			htotal_cached = vga.draw.delay.htotal;
 			htotal_inv = (htotal_cached > 0.0) ? (1.0 / htotal_cached) : 0.0;
 		}
-		const double timeInLine = timeInFrame - htotal_cached * (double)(int32_t)(timeInFrame * htotal_inv);
+		/* (the conversion to an integer can round instead of truncating: 32-bit x86 builds convert with the x87
+		 * FPU's current rounding mode, which emulating the guest's FPU can leave at "nearest". Rounded up, the
+		 * second half of every scanline came out as the line after it, before its start: a step back corrects
+		 * that whatever the mode) */
+		double lines = (double)(int32_t)(timeInFrame * htotal_inv);
+		if (lines > 0.0 && lines * htotal_cached > timeInFrame) lines -= 1.0;
+		const double timeInLine = timeInFrame - htotal_cached * lines;
 		/* Input Status 1 bit 0 is the inverted display-enable signal, not
 		 * the blanking-register pulse. The display stays disabled through
 		 * the back porch until the next line; reporting it active again at
@@ -293,14 +299,4 @@ void pc98_clear_graphics(void) {
 		*((uint16_t*)(vga.mem.linear + i + PC98_VRAM_GRAPHICS_OFFSET + 0x70000)) = 0;
 		*((uint16_t*)(vga.mem.linear + i + PC98_VRAM_GRAPHICS_OFFSET + 0x78000)) = 0;
 	}
-}
-
-/* TEMPORARY (CI diagnosis of the 32-bit SDL2 unit test failure): what this file sees of the timing. */
-void vga_misc_debug_timing(double *out) {
-	out[0] = vga.draw.delay.hdend;
-	out[1] = vga.draw.delay.htotal;
-	out[2] = (double)offsetof(VGA_Draw, delay);
-	out[3] = (double)((const char*)&vga.draw.delay.hdend - (const char*)&vga);
-	out[4] = (double)sizeof(vga);
-	out[5] = (double)(PIC_FullIndex() - vga.draw.delay.framestart);
 }
