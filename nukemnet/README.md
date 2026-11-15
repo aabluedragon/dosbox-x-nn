@@ -184,6 +184,54 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   scaling = nearest | bilinear | sharp`, Ctrl+F7 in the viewer switches. Only the viewer does it, with the graphics card,
   after the frame arrived: the host sends the same picture whatever is chosen (no bandwidth, no latency); a software
   renderer keeps nearest. sharp enlarges by whole pixels into a render target, then linearly to the window.
+- Who may connect to a remote play host (capability `inputnetAuth`, feature bit 32 in a viewer's HELLO). A host started
+  with env `NN_RP_AUTH_SECRET` (16+ characters; NukemNet gives one per room, from the environment because other users
+  can read a command line) lets in only viewers whose HELLO carries, after the features, a token (u8 length + text) for
+  the name it gives: the first 16 bytes of HMAC-SHA256(secret, name in lower case) in hex (`RP_AuthToken`); a viewer
+  reads its own from env `NN_RP_AUTH_TOKEN`. Others get RP_REFUSE ("not invited to this room", or "needs a newer
+  NukemNet and DOSBox-X-NN" for a viewer without the bit). One slot per name: the same name from another address
+  replaces the old slot, a different name cannot take over an address in use. Such a host sends no video or sound to a
+  viewer until it has proved its address: WELCOME carries a cookie (and the host's stream id and the viewer's session),
+  the viewer's next HELLO echoes it (u32 after the token). So a HELLO with a forged source address gets one small
+  WELCOME back, never a stream. Everything the host sends after WELCOME carries its stream id (u32) right after the
+  header; the viewer drops packets without it (a forged BYE, MOVED or frame), and RP_REFUSE ends with the viewer's
+  session. A viewer's RP_BYE ends with its session too, which such a host requires. Cookies and the stream id are
+  HMACs keyed with the secret (no OS random source needed). Without the secret a host takes anyone, as before.
+- Video per viewer (Nov 2026; needs nothing new from viewers, any that decode against named frames). Every viewer has
+  its own video rate and queue: loss or late frames on one viewer's link change that viewer's rate only (there was one
+  rate and one queue for all, so one slow or lossy viewer took everyone down to its rate). A frame is stored once
+  (`VideoPackets`, its datagrams back to back in one buffer) and every viewer takes it at its own pace (`SendJob`). A
+  viewer whose queue is full leaves whole frames out; from then on it does not have what the others have, so it goes
+  "at its own pace" (`Viewer::straggler`): the others' frames are encoded against a frame they have, as if it was not
+  there, and it gets an encoding of its own of the same frame against a frame it has (`Enc_Private`: one difference
+  and one compression, no scroll search), at most one a frame and only when it is done before the game shows its next
+  picture (ten a second when there is never such time). A frame's content is the same whoever it was encoded for, so
+  any frame a viewer decoded can be a base (`Enc_Base`: the newest frame every viewer of a group was sent, has
+  decoded by now, and still keeps). A key frame goes to every viewer that takes a frame. A viewer that asks for a key
+  frame, and one that joins, gets it for itself: the others get no key frame for it. After a second of taking every
+  frame a viewer is with the others again. The host keeps a viewer's base (the newest frame it said it decoded, its
+  last key frame) beyond the newest 16 frames. With one viewer (every copy of an IPX/NullModem-over-InputNet game)
+  nothing is encoded twice. The host's log line names every viewer's rate and what it was sent ("*": at its own pace).
+  Measured on one PC with Duke Nukem 3D (70 pictures/s), a viewer "fast" straight to the host and one behind a
+  600 KB/s bottleneck: fast alone 65-70 frames/s, 11-18 ms from input to screen; with the slow one 68-70 frames/s,
+  10-13 ms (slow: 13-15 frames/s, what its link carries next to 180 KB/s of sound); with the build before, 18-24
+  frames/s and 137-187 ms for fast, 4-8 frames/s for slow. With 5% loss on the slow one's link instead: fast 57-70
+  frames/s at 8-12 ms (before: 4-15 frames/s, 200-800 ms). Two slow viewers at different rates and a fast one: the
+  fast one as with two viewers without bottlenecks (two interleaved rounds). Sound is not paced: a link below its
+  1.4 Mbit/s (16-bit stereo, uncompressed) loses packets whatever the video does.
+- Local only (capability `inputnetLocalLinks`): env `NN_RP_LOCAL_ONLY=1` makes the remote play server and the IPX server
+  (`IPXNET STARTSERVER`) take datagrams from 127.0.0.1 only: NukemNet sets it on every copy of an IPX/NullModem-over-
+  InputNet game (its proxy and the other copies are on the host's computer). The null modem's ENet server now reports
+  a client's real address (it reported its own, `::`, so `nonlocal:0` refused even 127.0.0.1), so such a link no longer
+  needs `nonlocal:1`.
+- Remote play hardening (Nov 2026 audit): the viewer refuses frames larger than 2560x2048 and fragment counts beyond the
+  largest such frame (one datagram could make it allocate 77 MB), checks a frame's piece sizes in 64 bits (a 32-bit
+  build wrapped around), does not analyse pictures under 16 pixels for view prediction (read past the buffer), reopens
+  the sound device at most once in 2 s, and gives up after 90 s without an answer. The host drops non-finite mouse
+  motion, Delete while a remote player holds Ctrl and Alt (Ctrl+Alt+Del rebooted the machine), more than one key frame
+  request per viewer in 300 ms, and control channel key presses while the guard blocks (automation never types at the
+  DOS prompt); it keeps viewer names to 40 printable characters. RP_MOVED may carry a reason (u8 length + text) the
+  viewer shows in its title for a few seconds.
 - Remote play viewers can be moved (capability `inputnetMove`, feature bit 16 in a viewer's HELLO): the datagram
   `NNRP`, version, type 12 (RP_MOVED) from the address the viewer talks to makes it start over as a new session,
   keeping its window. NukemNet's proxy (IPX/NullModem-over-InputNet: one copy of the game per player) sends it when

@@ -32,6 +32,7 @@
 
 IPaddress ipxServerIp;  // IPAddress for server's listening port
 UDPsocket ipxServerSocket;  // Listening server socket
+static bool ipxServerLocalOnly = false;  // NukemNet: env NN_RP_LOCAL_ONLY (127.0.0.1 only)
 
 packetBuffer connBuffer[SOCKETTABLESIZE];
 
@@ -171,6 +172,9 @@ static void IPX_ServerLoop() {
 
 
 	result = SDLNet_UDP_Recv(ipxServerSocket, &inPacket);
+	/* NukemNet: a server started with env NN_RP_LOCAL_ONLY (the link between the copies of an IPX-over-InputNet game,
+	 * which all run on the host's computer) takes nothing from outside it. */
+	if (result != 0 && ipxServerLocalOnly && SDLNet_Read32(&inPacket.address.host) != 0x7F000001u) return;
 	if (result != 0) {
 		// Check to see if incoming packet is a registration packet
 		// For this, I just spoofed the echo protocol packet designation 0x02
@@ -238,6 +242,11 @@ bool IPX_StartServer(uint16_t portnum) {
 		//serverSocketSet = SDLNet_AllocSocketSet(SOCKETTABLESIZE);
 		ipxServerSocket = SDLNet_UDP_Open(portnum);
 		if(!ipxServerSocket) return false;
+		{
+			const char *local = getenv("NN_RP_LOCAL_ONLY");
+			ipxServerLocalOnly = local != NULL && local[0] != 0 && local[0] != '0';
+			if (ipxServerLocalOnly) LOG_MSG("IPXSERVER: 127.0.0.1 only");
+		}
 
 		for(i=0;i<SOCKETTABLESIZE;i++) connBuffer[i].connected = false;
 

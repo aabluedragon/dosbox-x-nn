@@ -42,7 +42,9 @@ bool remoteplay_screen_hidden = false;
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -131,6 +133,7 @@ const uint32_t RP_FEAT_TIMING = 2;      /* reads RP_FRAMEINFO to measure how lon
 const uint32_t RP_FEAT_PIECES = 4;      /* reads the piece table of a frame compressed in pieces and inflates them at once */
 const uint32_t RP_FEAT_SHIFT = 8;       /* reads the shift table of a frame predicted from a moved base (scrolling), see RP_ShiftXor */
 const uint32_t RP_FEAT_MOVE = 16;       /* starts a new session when told RP_MOVED */
+const uint32_t RP_FEAT_AUTH = 32;       /* sends a token and the host's cookie in HELLO, checks the stream id (see Auth) */
 
 enum {
     RPEV_KEY     = 1,   /* u16 KBD_KEYS, u8 pressed */
@@ -159,6 +162,13 @@ const int RP_SHIFT_LIMIT = 127;         /* ...and named up to this far when the 
 const unsigned RP_SHIFT_MAX = 3;        /* ...by one of up to three distances a frame (layers that scroll at different speeds) */
 struct ShiftVec { int dx, dy; };        /* pixel (x,y) of the frame comes from the base's pixel (x-dx,y-dy) */
 const unsigned RP_PIECES_MAX = 8;
+/* The biggest picture either side takes (2560x2048 at 32 bits: more than any mode DOSBox-X draws), and so the most
+ * fragments a frame can have: its zlib stream at worst a little larger than the picture, plus the tables. A viewer
+ * allocates a frame's buffer from the count in its first fragment, so a host could otherwise make it set aside
+ * 77 MB with one small datagram. */
+const unsigned RP_MAX_W = 2560, RP_MAX_H = 2048;
+const size_t RP_RAW_MAX = (size_t)RP_MAX_W * RP_MAX_H * 4;
+const unsigned RP_MAX_FRAGS = (unsigned)((RP_RAW_MAX + RP_RAW_MAX / 512 + 65536) / RP_FRAG + 1);
                                         /* back: frames between this one and its base (0: the previous frame) */
 const unsigned RP_HISTORY = 16;         /* decoded frames both sides keep as delta bases */
 const size_t RP_HISTORY_BYTES = (size_t)48 << 20;
@@ -231,6 +241,114 @@ std::string RP_AddrString(const IPaddress &a) {
     char tmp[32];
     snprintf(tmp,sizeof(tmp),"%u.%u.%u.%u",h[0],h[1],h[2],h[3]);
     return tmp;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Auth                                                                       */
+/* ------------------------------------------------------------------------- */
+
+/* A host started with env NN_RP_AUTH_SECRET (NukemNet gives it one per launch) lets in only viewers whose HELLO carries
+ * the token for the name they give: the first 16 bytes of HMAC-SHA256(secret, name in lower case), in hex. NukemNet
+ * hands each player of the room their own token (env NN_RP_AUTH_TOKEN of their viewer), so nobody outside the room
+ * can join, and nobody in it can take another player's name (an IPX-over-InputNet host routes viewers by name).
+ * Such a host also streams nothing to an address before it has proved it gets the host's packets (it echoes the
+ * cookie of its WELCOME in its next HELLO): a HELLO with a forged source address no longer makes the host send video
+ * to someone else. Every packet it sends after WELCOME carries its stream id right after the header, so packets
+ * forged in its name (a BYE, a frame) are dropped by the viewer. Without the secret a host behaves as before. */
+struct RP_Sha256 {
+    uint32_t h[8];
+    uint64_t total = 0;
+    uint8_t buf[64];
+    size_t n = 0;
+    RP_Sha256() {
+        static const uint32_t init[8] = { 0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u };
+        memcpy(h,init,sizeof(h));
+    }
+    static uint32_t ror(uint32_t x,unsigned r) { return (x >> r) | (x << (32 - r)); }
+    void block(const uint8_t *p) {
+        static const uint32_t k[64] = {
+            0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+            0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+            0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+            0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+            0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+            0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+            0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+            0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u };
+        uint32_t w[64];
+        for (unsigned i=0;i < 16;i++) w[i] = ((uint32_t)p[i*4] << 24) | ((uint32_t)p[i*4+1] << 16) | ((uint32_t)p[i*4+2] << 8) | p[i*4+3];
+        for (unsigned i=16;i < 64;i++) {
+            const uint32_t s0 = ror(w[i-15],7) ^ ror(w[i-15],18) ^ (w[i-15] >> 3), s1 = ror(w[i-2],17) ^ ror(w[i-2],19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (unsigned i=0;i < 64;i++) {
+            const uint32_t t1 = hh + (ror(e,6) ^ ror(e,11) ^ ror(e,25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
+            const uint32_t t2 = (ror(a,2) ^ ror(a,13) ^ ror(a,22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+    }
+    void add(const void *data,size_t len) {
+        const uint8_t *p = (const uint8_t*)data;
+        total += len;
+        while (len > 0) {
+            const size_t take = std::min(len,(size_t)64 - n);
+            memcpy(buf + n,p,take); n += take; p += take; len -= take;
+            if (n == 64) { block(buf); n = 0; }
+        }
+    }
+    void finish(uint8_t out[32]) {
+        const uint64_t bits = total * 8;
+        const uint8_t one = 0x80, zero = 0;
+        add(&one,1);
+        while (n != 56) add(&zero,1);
+        uint8_t len[8];
+        for (unsigned i=0;i < 8;i++) len[i] = (uint8_t)(bits >> (56 - 8 * i));
+        add(len,8);
+        for (unsigned i=0;i < 8;i++) { out[i*4] = (uint8_t)(h[i] >> 24); out[i*4+1] = (uint8_t)(h[i] >> 16); out[i*4+2] = (uint8_t)(h[i] >> 8); out[i*4+3] = (uint8_t)h[i]; }
+    }
+};
+
+void RP_HmacSha256(const std::string &key,const void *msg,size_t len,uint8_t out[32]) {
+    uint8_t k[64];
+    memset(k,0,sizeof(k));
+    if (key.size() > 64) { RP_Sha256 kh; kh.add(key.data(),key.size()); kh.finish(k); }
+    else memcpy(k,key.data(),key.size());
+    uint8_t pad[64], inner[32];
+    for (unsigned i=0;i < 64;i++) pad[i] = k[i] ^ 0x36;
+    RP_Sha256 a; a.add(pad,64); a.add(msg,len); a.finish(inner);
+    for (unsigned i=0;i < 64;i++) pad[i] = k[i] ^ 0x5c;
+    RP_Sha256 b; b.add(pad,64); b.add(inner,32); b.finish(out);
+}
+
+/* The token for a player name (see above). */
+std::string RP_AuthToken(const std::string &secret,const std::string &name) {
+    std::string lower = name;
+    for (char &c : lower) c = (char)tolower((unsigned char)c);
+    uint8_t mac[32];
+    RP_HmacSha256(secret,lower.data(),lower.size(),mac);
+    static const char hex[] = "0123456789abcdef";
+    std::string t;
+    for (unsigned i=0;i < 16;i++) { t += hex[mac[i] >> 4]; t += hex[mac[i] & 15]; }
+    return t;
+}
+
+/* Compares without stopping at the first difference (no timing hint about how much of a guess was right). */
+bool RP_SameSecret(const std::string &a,const std::string &b) {
+    if (a.size() != b.size()) return false;
+    unsigned diff = 0;
+    for (size_t i=0;i < a.size();i++) diff |= (unsigned)(uint8_t)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+/* A player's name as the host keeps and shows it: printable ASCII and at most 40 characters (it goes into the log
+ * and through the DOS console, whose ANSI escapes could otherwise remap keys). */
+std::string RP_CleanName(const std::string &name,size_t max = 40) {
+    std::string out;
+    for (char c : name) if ((unsigned char)c >= 32 && (unsigned char)c < 127) out += c;
+    if (out.size() > max) out.resize(max);
+    return out;
 }
 
 unsigned RP_BytesPerPixel(unsigned fmt) {
@@ -333,6 +451,27 @@ std::vector<std::string> RP_Words(const std::string &text,const char *separators
 /* Host                                                                       */
 /* ------------------------------------------------------------------------- */
 
+/* One encoding of a frame, cut into datagrams that lie back to back in one buffer (each a header and up to RP_FRAG
+ * bytes of the frame; the last one shorter). The viewers it goes to share it, each with its own place in it (SendJob):
+ * a frame is stored once however many viewers get it, and every viewer takes it at the rate its own link allows. */
+struct VideoPackets {
+    std::unique_ptr<uint8_t[]> bytes;
+    uint32_t id = 0;
+    unsigned count = 0;
+    size_t step = 0;        /* a full datagram's length */
+    size_t last = 0;        /* the last datagram's */
+    const uint8_t *at(unsigned i) const { return bytes.get() + (size_t)i * step; }
+    size_t len(unsigned i) const { return (i + 1 < count) ? step : last; }
+    size_t total(void) const { return count ? (size_t)(count - 1) * step + last : 0; }
+};
+struct SendJob {
+    std::shared_ptr<const VideoPackets> p;
+    unsigned next = 0;      /* the first datagram not sent yet */
+};
+/* A frame a viewer was sent: when its last datagram left (SDL ticks; 0 while it waits for the viewer's rate). */
+struct SentFrame { uint32_t id, ms; };
+const unsigned RP_SENT_RING = 64;
+
 struct Viewer {
     bool active = false;
     IPaddress addr = { 0, 0 };
@@ -346,6 +485,29 @@ struct Viewer {
     float report_dx = 0, report_dy = 0; /* [inputnet] report input: mouse motion not reported yet */
     uint32_t report_ms = 0;
     uint32_t features = 0;              /* RP_FEAT_* from its HELLO */
+    bool proven = true;                 /* (an auth host) it echoed its cookie: video and sound go to it */
+    uint32_t cookie = 0;                /* what its next HELLO has to carry */
+    uint32_t joined_ms = 0;
+    uint32_t keyreq_ms = 0;             /* its last RP_KEYREQ that was acted on */
+    /* Video, per viewer (see "Video per viewer" below): its own rate and queue, the frames it was sent, and whether it
+     * takes every frame with the others or goes at its own pace. */
+    double rate = RP_RATE_MAX;          /* video bytes/s */
+    double budget = 0;                  /* bytes that may go to it now */
+    double delivered = 0;               /* the most video bytes/s it has received lately */
+    bool limited = false;               /* it reported loss (or frames arriving late): its video is paced from then on */
+    uint32_t pace_ms = 0, backlog_ms = 0, cut_ms = 0;
+    std::deque<SendJob> queue;          /* frames waiting for its rate, oldest first */
+    size_t queued = 0;                  /* bytes of them still to send */
+    SentFrame sent[RP_SENT_RING];       /* the newest frames it was sent (a ring; sent_n counts them all) */
+    unsigned sent_n = 0;
+    bool has_key = false;               /* key_id: the last frame it was sent as a key frame (it keeps that one) */
+    uint32_t key_id = 0, key_ms = 0;
+    bool needkey = true;                /* it has no frame a difference could be sent against (new, or it asked) */
+    bool straggler = true;              /* not taking every frame with the others: it gets encodings of its own */
+    uint32_t skip_ms = 0;               /* when it last left a frame out (or joined) */
+    uint32_t priv_ms = 0;               /* when it last got an encoding of its own */
+    uint64_t video_bytes = 0, video_logged = 0;     /* video sent to it; ...when the log last said so */
+    uint32_t video_frames = 0, video_frames_logged = 0;
     bool hasack = false;
     uint32_t acked = 0;                 /* newest frame it decoded */
     uint32_t loss_exp = 0, loss_got = 0, loss_ms = 0;  /* fragment counters at the last rate decision */
@@ -374,7 +536,98 @@ SDL_Thread *host_keepalive = NULL;
 volatile int host_keepalive_stop = 0;
 volatile uint32_t host_lastpoll = 0;
 uint16_t host_port = 0;
+bool host_auth = false;             /* env NN_RP_AUTH_SECRET (see Auth) */
+std::string host_secret;
+uint32_t host_stream = 0;           /* the stream id this host's packets carry (auth hosts) */
+uint32_t host_cookie_seq = 0;
+bool host_local_only = false;       /* env NN_RP_LOCAL_ONLY: only 127.0.0.1 (a copy NukemNet's proxy talks to) */
+
+/* Packets a host sends after WELCOME: an auth host puts its stream id right after the header. */
+struct HostWriter : Writer {
+    explicit HostWriter(uint8_t type) : Writer(type) { if (host_auth) u32(host_stream); }
+};
+
+/* A number nobody without the secret can guess (cookies, the stream id), for an auth host. */
+uint32_t Host_Unguessable(const char *what,const IPaddress &addr) {
+    uint8_t msg[40], mac[32];
+    size_t n = 0;
+    const uint32_t seq = ++host_cookie_seq;
+    const uint64_t pc = (uint64_t)SDL_GetPerformanceCounter();
+    memcpy(msg + n,&seq,4); n += 4;
+    memcpy(msg + n,&pc,8); n += 8;
+    memcpy(msg + n,&addr.host,4); n += 4;
+    memcpy(msg + n,&addr.port,2); n += 2;
+    const size_t wl = std::min(strlen(what),(size_t)20);
+    memcpy(msg + n,what,wl); n += wl;
+    RP_HmacSha256(host_secret,msg,n,mac);
+    uint32_t v;
+    memcpy(&v,mac,4);
+    return v ? v : 1;
+}
+
+/* A datagram from 127.0.0.1 (local only hosts take nothing else). */
+inline bool RP_IsLoopback(const IPaddress &a) { return SDLNet_Read32(&a.host) == 0x7F000001u; }
 Viewer viewers[RP_MAX_VIEWERS];
+
+/* ------------------------------------------------------------------------- */
+/* Video per viewer                                                           */
+/* ------------------------------------------------------------------------- */
+
+/* Every viewer has its own video rate and its own queue (Viewer::rate, queue): what one viewer's link loses or delays
+ * changes that viewer's rate only. A viewer whose queue is full leaves frames out (whole ones: it is never sent part
+ * of a frame), the others still get them. From then on the frames it has differ from the others', so it is a
+ * straggler: the others' frames are encoded against a frame they have (their picture and their bandwidth are as if
+ * it was not there), and it gets an encoding of its own against a frame it has (Enc_Private: one difference and one
+ * compression, at most one a frame, and when the encoder is behind only ten times a second). A frame's content is
+ * the same whoever it was encoded for, so any frame a viewer decoded can be anyone's base. A viewer that took every
+ * frame for a second is back with the others. With one viewer (every copy of an IPX-over-InputNet game has one)
+ * nothing is encoded twice. */
+
+/* The viewer takes another frame now: nothing waits for its rate, or no more than 60 ms of it. */
+inline bool Viewer_Wants(const Viewer &v) {
+    return v.queue.empty() || (double)v.queued <= std::max(v.rate * 0.06,64.0 * 1024.0);
+}
+
+/* How many frames it was sent after this one (0: this is the newest), looking at the newest `within`; -1: not among them. */
+inline int Viewer_SentAge(const Viewer &v,uint32_t id,unsigned within) {
+    const unsigned n = std::min(std::min(v.sent_n,RP_SENT_RING),within);
+    for (unsigned k=0;k < n;k++) if (v.sent[(v.sent_n - 1u - k) % RP_SENT_RING].id == id) return (int)k;
+    return -1;
+}
+
+inline void Viewer_NoteQueued(Viewer &v,uint32_t id) {
+    SentFrame &f = v.sent[v.sent_n % RP_SENT_RING];
+    f.id = id; f.ms = 0;
+    v.sent_n++;
+}
+
+/* A frame's last datagram leaves for this viewer now. */
+inline void Viewer_NoteLeft(Viewer &v,uint32_t id,uint32_t now) {
+    const unsigned n = std::min(v.sent_n,RP_SENT_RING);
+    for (unsigned k=0;k < n;k++) {
+        SentFrame &f = v.sent[(v.sent_n - 1u - k) % RP_SENT_RING];
+        if (f.id == id) { f.ms = now ? now : 1u; return; }
+    }
+}
+
+/* Nothing of the video sent so far counts for this viewer any more (it joined, or its queue was thrown away). */
+void Viewer_ResetVideo(Viewer &v,uint32_t now) {
+    v.rate = RP_RATE_MAX; v.budget = 0; v.delivered = 0;
+    v.limited = false;
+    v.pace_ms = v.backlog_ms = 0;
+    v.cut_ms = now;
+    v.queue.clear();
+    v.queued = 0;
+    v.sent_n = 0;
+    v.has_key = false; v.key_id = 0; v.key_ms = 0;
+    v.needkey = true;
+    v.straggler = true;
+    v.skip_ms = now;
+    v.priv_ms = 0;
+    v.video_bytes = v.video_logged = 0;
+    v.video_frames = v.video_frames_logged = 0;
+}
+
 unsigned cfg_timeout = 10000;
 bool cfg_blocked[KBD_LAST];     /* [inputnet] block keys: dropped from every remote player (see RP_SetBlockedKeys) */
 IPaddress cfg_report_to = { 0, 0 }; /* [inputnet] report input: 127.0.0.1:<port> hears every player's input (port 0: off) */
@@ -403,15 +656,11 @@ EncFrame enc_key;                               /* the last key frame (kept even
 unsigned enc_w = 0, enc_h = 0, enc_fmt = 0;
 bool enc_haveprev = false, enc_needkey = true, enc_haskey = false, enc_keyreq = false;
 uint32_t enc_frameid = 0, enc_lastkey = 0, enc_lastsend = 0;
-std::deque<std::vector<uint8_t> > send_queue;     /* paced video fragments */
-size_t send_queued = 0;                         /* bytes in send_queue */
-uint32_t send_lastms = 0, send_backlog_ms = 0, rate_cut_ms = 0, rate_log_ms = 0;
-double send_budget = 0;                         /* bytes that may go out now */
-double send_rate = RP_RATE_MAX;                 /* video bytes/s */
-uint32_t frame_sent_id[64], frame_sent_ms[64];  /* when the last fragment of each of the newest frames left (SDL ticks) */
-double rate_delivered = 0;                      /* the most video bytes/s a viewer has received lately */
+uint32_t rate_log_ms = 0;
 bool rate_adaptive = false;
-bool rate_limited = false;                      /* a viewer reported loss: video is paced from then on */
+uint32_t enc_priv_ms = 0;                       /* when a viewer last got an encoding of its own (Enc_Private) */
+uint64_t enc_priv_us = 0;                       /* how long such an encoding takes (smoothed, microseconds) */
+uint64_t cap_prev_us = 0, cap_interval_us = 0;  /* when the game showed its last picture; the time between pictures (smoothed) */
 
 /* The video encoder thread. REMOTEPLAY_AddFrame runs on the emulation thread, in the middle of the game's own frame:
  * indexing, comparing and compressing the picture there took the game 3 to 6 ms a frame at 800x600, a tenth to a
@@ -947,9 +1196,11 @@ bool RP_IndexParallel(const uint8_t *px,size_t pixels,uint8_t *idx) {
  * anything is off; the caller then inflates the stream the ordinary way. */
 bool RP_InflatePieces(const uint8_t *stream,size_t slen,const uint32_t *lens,unsigned n,uint8_t *out,size_t rawsize) {
     if (n < 2 || n > RP_PIECES_MAX || slen < 6) return false;
-    size_t sum = 0;
-    for (unsigned k=0;k < n;k++) sum += lens[k];
-    if (sum + 6 != slen) return false;
+    /* (summed in 64 bits and each checked: the sizes come from the host, and on 32-bit builds a size_t sum of
+     * two 2 GB pieces would wrap around to the stream's length) */
+    uint64_t sum = 0;
+    for (unsigned k=0;k < n;k++) { if (lens[k] > slen) return false; sum += lens[k]; }
+    if (sum + 6 != (uint64_t)slen) return false;
     RP_ZStart();
     const unsigned wave = zworkers + 1;
     const size_t piece = rawsize / n;
@@ -995,6 +1246,7 @@ uint64_t stat_bytes = 0, stat_enc_us = 0, stat_index_us = 0, stat_cap_us = 0;
 uint64_t stat_part_us[5] = { 0, 0, 0, 0, 0 };
 uint32_t stat_frames = 0, stat_keys = 0, stat_offered = 0, stat_skipped = 0, stat_replaced = 0;
 uint32_t stat_shifted = 0;                      /* frames sent with scroll prediction */
+uint32_t stat_private = 0;                      /* encodings made for viewers that go at their own pace (Enc_Private) */
 
 /* Remote input guard. Viewers must never be able to type DOS commands on the
  * host (DEL, FORMAT, MOUNT, ... on host folders mounted as drives), so their
@@ -1075,7 +1327,7 @@ void Host_SendTo(const IPaddress &addr,const uint8_t *data,size_t len) {
 
 void Host_SendAll(const uint8_t *data,size_t len) {
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
-        if (viewers[i].active) Host_SendTo(viewers[i].addr,data,len);
+        if (viewers[i].active && viewers[i].proven) Host_SendTo(viewers[i].addr,data,len);
 }
 
 /* A datagram sent from the caller's own memory, without host_lock: sending on a socket another thread receives or
@@ -1129,10 +1381,14 @@ void Host_UpdateRateMode(void) {
     const bool adaptive = Host_RefsMode();
     if (adaptive == rate_adaptive) return;
     rate_adaptive = adaptive;
-    send_rate = RP_RATE_MAX;
-    rate_delivered = 0;
-    rate_limited = false;
-    rate_cut_ms = SDL_GetTicks();
+    const uint32_t now = SDL_GetTicks();
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        Viewer &v = viewers[i];
+        v.rate = RP_RATE_MAX;
+        v.delivered = 0;
+        v.limited = false;
+        v.cut_ms = now;
+    }
 }
 
 /* A viewer's fragment counters (cumulative, from RP_FRAMEACK): less on loss, more while the link takes everything and
@@ -1144,8 +1400,12 @@ void Host_UpdateRateMode(void) {
  * a second). The shortest time of the last 10 to 20 seconds is taken for the way itself; a time well above it means
  * a queue is growing, and the rate is cut as it is on loss (Host_RateFeedback). */
 void Host_DelayFeedback(Viewer &v,uint32_t id,uint32_t now) {
-    if (!rate_adaptive || frame_sent_id[id & 63u] != id) return;
-    const uint32_t d = now - frame_sent_ms[id & 63u];
+    if (!rate_adaptive) return;
+    const int age = Viewer_SentAge(v,id,RP_SENT_RING);
+    if (age < 0) return;
+    const uint32_t left = v.sent[(v.sent_n - 1u - (unsigned)age) % RP_SENT_RING].ms;
+    if (left == 0) return;
+    const uint32_t d = now - left;
     if (d > 20000u) return;
     if (v.delay_bucket_ms == 0 || now - v.delay_bucket_ms >= 10000u) {
         v.delay_base_prev = v.delay_bucket_ms ? v.delay_base : d;
@@ -1171,36 +1431,37 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
     if (de == 0 || de > 0x7fffffffu) return;
     const double loss = dg < de ? (double)(de - dg) / (double)de : 0.0;
 
-    /* Video goes out as fast as it comes (no pacing, no added latency) until a viewer reports loss: a 320x200 game,
+    /* Video goes out as fast as it comes (no pacing, no added latency) until the viewer reports loss: a 320x200 game,
      * or any game on a link that takes it all, is never paced. Loss turns pacing on, at what actually got through, and
      * from then on the rate follows the link: down on loss, up while video waits for it and none is lost, and never
-     * above twice what viewers have received lately (remembered for a while, halving in about half a minute), so a
-     * still picture does not let it creep up and the next burst of motion is not sent far faster than the link takes. */
+     * above twice what the viewer has received lately (remembered for a while, halving in about half a minute), so a
+     * still picture does not let it creep up and the next burst of motion is not sent far faster than the link takes.
+     * All of it is this viewer's own: another viewer's link changes nothing here. */
     const double delivered_now = (double)dg * RP_FRAG / secs;
-    rate_delivered = std::max(rate_delivered * pow(0.98,secs),delivered_now);
+    v.delivered = std::max(v.delivered * pow(0.98,secs),delivered_now);
     if (loss > 0.03) {
         /* Loss reports lag a round trip behind: cut again only once the last cut could show. */
-        if (now - rate_cut_ms >= 400) {
-            if (!rate_limited) send_rate = std::min(send_rate,std::max(RP_RATE_START,delivered_now));
-            else send_rate = std::max(RP_RATE_MIN,send_rate * 0.75);
-            rate_limited = true;
-            rate_cut_ms = now;
+        if (now - v.cut_ms >= 400) {
+            if (!v.limited) v.rate = std::min(v.rate,std::max(RP_RATE_START,delivered_now));
+            else v.rate = std::max(RP_RATE_MIN,v.rate * 0.75);
+            v.limited = true;
+            v.cut_ms = now;
         }
     }
     else if (v.delay_late) {
         /* Frames arrive late: a queue stands somewhere on the way (Host_DelayFeedback). While it does, what arrives
          * is what the way takes: a little below that, so the queue empties. The rate is never cut step after step
          * while the queue empties (that took it down to almost nothing on a link that carried 700 KB/s). */
-        if (now - rate_cut_ms >= 400) {
-            send_rate = std::min(send_rate,std::max(4.0 * RP_RATE_MIN,delivered_now * 0.85));
-            rate_limited = true;
-            rate_cut_ms = now;
+        if (now - v.cut_ms >= 400) {
+            v.rate = std::min(v.rate,std::max(4.0 * RP_RATE_MIN,delivered_now * 0.85));
+            v.limited = true;
+            v.cut_ms = now;
         }
     }
-    else if (rate_limited && loss < 0.01 && !v.delay_raised && now - rate_cut_ms >= 400 && now - send_backlog_ms < 300) {
-        send_rate = std::min(send_rate * 1.2,RP_RATE_MAX);
+    else if (v.limited && loss < 0.01 && !v.delay_raised && now - v.cut_ms >= 400 && now - v.backlog_ms < 300) {
+        v.rate = std::min(v.rate * 1.2,RP_RATE_MAX);
     }
-    if (rate_limited) send_rate = std::min(send_rate,std::max(RP_RATE_START,rate_delivered * 2.0));
+    if (v.limited) v.rate = std::min(v.rate,std::max(RP_RATE_START,v.delivered * 2.0));
     if (now - rate_log_ms >= 5000) {
         static uint32_t last_frames = 0;
         static uint64_t last_bytes = 0;
@@ -1209,10 +1470,24 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
         static uint32_t last_offered = 0, last_skipped = 0;
         static uint32_t last_replaced = 0, last_shifted = 0;
         static uint64_t last_enc_us = 0, last_index_us = 0, last_cap_us = 0;
-        LOG_MSG("INPUTNET: video at most %u KB/s, sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder), %.1f%% of fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; scroll prediction in %u%% of the frames; frames acknowledged after %.0f ms (%u at best)%s; CPU %ld cycles",
-            (unsigned)(send_rate / 1024.0),(unsigned)((stat_bytes - last_bytes) / 1024.0 / secs),frames / secs,
+        /* (every viewer's own: "name 1500 (sent 640 in 35.0 frames/s)", with "*" while it goes at its own pace) */
+        std::string rates;
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+            Viewer &o = viewers[i];
+            if (!o.active || !o.proven) continue;
+            char one[120];
+            snprintf(one,sizeof(one),"%s%s%s %u (sent %u in %.1f frames/s)",rates.empty() ? "" : ", ",o.name.c_str(),o.straggler ? "*" : "",
+                (unsigned)(o.rate / 1024.0),(unsigned)((o.video_bytes - o.video_logged) / 1024.0 / secs),(o.video_frames - o.video_frames_logged) / secs);
+            o.video_logged = o.video_bytes; o.video_frames_logged = o.video_frames;
+            rates += one;
+        }
+        static uint32_t last_private = 0;
+        const uint32_t privates = stat_private - last_private;
+        last_private = stat_private;
+        LOG_MSG("INPUTNET: video at most (KB/s) %s; sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder, %.1f encoded again for a viewer at its own pace), %.1f%% of \"%s\"'s fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; scroll prediction in %u%% of the frames; frames acknowledged after %.0f ms (%u at best)%s; CPU %ld cycles",
+            rates.c_str(),(unsigned)((stat_bytes - last_bytes) / 1024.0 / secs),frames / secs,
             (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,
-            (stat_replaced - last_replaced) / secs,loss * 100.0,
+            (stat_replaced - last_replaced) / secs,privates / secs,loss * 100.0,v.name.c_str(),
             frames ? (stat_enc_us - last_enc_us) / 1000.0 / frames : 0.0,
             frames ? (stat_index_us - last_index_us) / 1000.0 / frames : 0.0,zworkers + 1,
             frames ? (stat_cap_us - last_cap_us) / 1000.0 / frames : 0.0,
@@ -1238,15 +1513,14 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
 
 void Host_UpdateStreaming(void) {
     bool any = false;
-    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) any = any || viewers[i].active;
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) any = any || (viewers[i].active && viewers[i].proven);
     if (any && !remoteplay_streaming) {
         enc_needkey = true;
         enc_haveprev = false;
     }
     remoteplay_streaming = any;
     if (!any) {
-        send_queue.clear();
-        send_queued = 0;
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++) { viewers[i].queue.clear(); viewers[i].queued = 0; }
         aud_buf.clear();
     }
     Host_UpdateRateMode();
@@ -1269,13 +1543,15 @@ void Host_ReleaseInput(Viewer &v) {
 void Host_DropViewer(Viewer &v,const char *reason,bool notify) {
     if (!v.active) return;
     if (notify) {
-        Writer w(RP_BYE);
+        HostWriter w(RP_BYE);
         w.str(reason ? reason : "");
         Host_SendTo(v.addr,w.buf,w.len);
     }
     Host_ReleaseInput(v);
     LOG_MSG("INPUTNET: remote player \"%s\" left (%s)",v.name.c_str(),reason ? reason : "");
     v.active = false;
+    v.queue.clear();    /* (its share of the frames that waited for its rate) */
+    v.queued = 0;
     Host_UpdateStreaming();
 }
 
@@ -1324,6 +1600,17 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             if (!r.ok || key == 0 || key >= (uint16_t)KBD_LAST) return;
             /* Print Screen makes the BIOS print the screen on the host's printer emulation. */
             if (key == (uint16_t)KBD_printscreen || !Guard_Allows()) return;
+            /* Ctrl+Alt+Del restarts the emulated machine (the BIOS keyboard handler reboots): Delete (and the keypad's
+             * period, Del with Num Lock off) is not pressed while any remote player holds Ctrl and Alt. */
+            if (pressed && (key == (uint16_t)KBD_delete || key == (uint16_t)KBD_kpperiod)) {
+                bool ctrl = false, alt = false;
+                for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+                    if (!viewers[i].active) continue;
+                    ctrl = ctrl || viewers[i].keydown[KBD_leftctrl] || viewers[i].keydown[KBD_rightctrl];
+                    alt = alt || viewers[i].keydown[KBD_leftalt] || viewers[i].keydown[KBD_rightalt];
+                }
+                if (ctrl && alt) return;
+            }
             /* Keys the host blocked for remote players ([inputnet] block keys): a release still goes through for a key
              * that was down before (none can be: the list is read before anyone joins), the rest is dropped. */
             const bool blocked = cfg_blocked[key] && !(v.keydown[key] && !pressed);
@@ -1344,9 +1631,14 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
             break;
         }
         case RPEV_MMOVE: {
-            const float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
+            float xrel = r.f32(), yrel = r.f32(), x = r.f32(), y = r.f32();
             const bool emulate = r.u8() != 0;
             if (!r.ok || !Guard_Allows()) return;
+            /* NaN or infinity would stick in the mouse driver's position and counters (no clamp undoes NaN) and break
+             * the mouse for everyone: dropped. Motion is limited to what a hand can do in one event. */
+            if (!std::isfinite(xrel) || !std::isfinite(yrel) || !std::isfinite(x) || !std::isfinite(y)) return;
+            xrel = std::max(-4096.0f,std::min(4096.0f,xrel)); yrel = std::max(-4096.0f,std::min(4096.0f,yrel));
+            x = std::max(-1.0f,std::min(2.0f,x)); y = std::max(-1.0f,std::min(2.0f,y));
             if (cfg_report_to.port) {
                 /* motion is gathered and reported at most ten times a second per player */
                 v.report_dx += xrel; v.report_dy += yrel;
@@ -1387,7 +1679,26 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
     }
 }
 
+/* WELCOME: the viewer's slot and the sound rate; an auth host adds the cookie the viewer's next HELLO echoes and the
+ * stream id its packets carry from now on. */
+void Host_Welcome(const Viewer &v,const IPaddress &to) {
+    Writer w(RP_WELCOME);
+    w.u8((uint8_t)(&v - viewers));
+    w.u32(aud_rate);
+    if (host_auth) { w.u32(v.cookie); w.u32(host_stream); w.u32(v.session); }
+    Host_SendTo(to,w.buf,w.len);
+}
+
+/* REFUSE: the reason, then (auth hosts) the viewer's session, so a refusal cannot be forged without seeing its HELLO. */
+void Host_Refuse(const IPaddress &to,const char *reason,uint32_t session) {
+    Writer w(RP_REFUSE);
+    w.str(reason);
+    if (host_auth) w.u32(session);
+    Host_SendTo(to,w.buf,w.len);
+}
+
 void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
+    if (host_local_only && !RP_IsLoopback(from)) return;
     Reader r(data,len);
     const uint8_t type = RP_Header(r);
     if (type == 0) return;
@@ -1402,22 +1713,38 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
         const uint32_t session = r.u32();
         if (!r.ok) return;
         const uint32_t features = (r.pos + 4 <= r.len) ? r.u32() : 0;
+        std::string token;
+        uint32_t cookie = 0;
+        if ((features & RP_FEAT_AUTH) && r.pos < r.len) {
+            token = r.str();
+            cookie = r.u32();
+            if (!r.ok) return;
+        }
+        if (host_auth) {
+            /* Only a player NukemNet gave a token, and only under the name it was given for. */
+            if (!(features & RP_FEAT_AUTH)) { Host_Refuse(from,"this room needs a newer NukemNet and DOSBox-X-NN",session); return; }
+            if (name.empty() || !RP_SameSecret(token,RP_AuthToken(host_secret,name))) { Host_Refuse(from,"not invited to this room (no valid token)",session); return; }
+        }
+        name = RP_CleanName(name);
         if (name.empty()) name = "player";
         if (v != NULL && v->session != session) {
-            /* Same address, new DOSBox-X: forget the old one's input. */
+            /* Same address, new DOSBox-X: forget the old one's input. An auth host lets only the same (proven) name
+             * take a slot over this way. */
+            if (host_auth && name != v->name) { Host_Refuse(from,"that address is in use",session); return; }
             Host_DropViewer(*v,"rejoined",false);
             v = NULL;
+        }
+        if (v == NULL && host_auth) {
+            /* One slot per player: the same player from a new address (a restarted viewer) takes the place of the old
+             * one, and nobody can fill the slots with one token. */
+            for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
+                if (viewers[i].active && viewers[i].name == name) Host_DropViewer(viewers[i],"rejoined from another address",true);
         }
         if (v == NULL) {
             for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
                 if (!viewers[i].active) { v = &viewers[i]; break; }
             }
-            if (v == NULL) {
-                Writer w(RP_REFUSE);
-                w.str("the host is full");
-                Host_SendTo(from,w.buf,w.len);
-                return;
-            }
+            if (v == NULL) { Host_Refuse(from,"the host is full",session); return; }
             v->active = true;
             v->addr = from;
             v->name = name;
@@ -1431,16 +1758,27 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             v->hasack = false;
             v->acked = 0;
             v->loss_ms = 0;
+            v->keyreq_ms = 0;
+            v->joined_ms = SDL_GetTicks();
+            Viewer_ResetVideo(*v,v->joined_ms);
+            v->proven = !host_auth;
+            v->cookie = host_auth ? Host_Unguessable("cookie",from) : 0;
             memset(v->keydown,0,sizeof(v->keydown));
             LOG_MSG("INPUTNET: remote player \"%s\" joined from %s",name.c_str(),RP_AddrString(from).c_str());
             Host_UpdateStreaming();
-            enc_needkey = true;
+            /* A viewer that decodes against named frames gets its first key frame for itself (Enc_Private); the others'
+             * video goes on as it was. Only the older way starts everyone over. */
+            if (!rate_adaptive) enc_needkey = true;
+        }
+        else if (host_auth && !v->proven && cookie == v->cookie) {
+            /* It gets what we send to that address: from now on it is streamed to. */
+            v->proven = true;
+            LOG_MSG("INPUTNET: remote player \"%s\" confirmed its address",v->name.c_str());
+            Host_UpdateStreaming();
+            if (!rate_adaptive) enc_needkey = true;
         }
         v->lastheard = SDL_GetTicks();
-        Writer w(RP_WELCOME);
-        w.u8((uint8_t)(v - viewers));
-        w.u32(aud_rate);
-        Host_SendTo(from,w.buf,w.len);
+        Host_Welcome(*v,from);
         return;
     }
 
@@ -1473,16 +1811,24 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
                     if (seq > v->applied + 1) { r.pos = before; break; }
                 }
             }
-            Writer w(RP_INPUTACK);
+            HostWriter w(RP_INPUTACK);
             w.u32(v->applied);
             Host_SendTo(from,w.buf,w.len);
             break;
         }
-        case RP_KEYREQ:
-            /* With named bases a viewer asks when it lacks one; one key frame per round trip is enough. */
-            if (rate_adaptive) enc_keyreq = true;
+        case RP_KEYREQ: {
+            /* With named bases a viewer asks when it lacks one; one key frame per round trip is enough. At most one
+             * request in 300 ms per viewer counts (a viewer asking all the time would make every frame a key frame for
+             * everyone). */
+            const uint32_t now = SDL_GetTicks();
+            if (v->keyreq_ms != 0 && now - v->keyreq_ms < 300) break;
+            v->keyreq_ms = now;
+            /* With named frames the viewer that asks gets a key frame of its own, at its own pace: the frame it
+             * lacks is its link's loss, not the others'. */
+            if (rate_adaptive) { v->needkey = true; if (!v->straggler) { v->straggler = true; v->skip_ms = now; } }
             else enc_needkey = true;
             break;
+        }
         case RP_FRAMEACK: {
             if (r.u32() != v->session) break;
             const uint8_t flags = r.u8();
@@ -1499,6 +1845,10 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             break;
         }
         case RP_BYE:
+            /* (a viewer's BYE carries its reason and then its session; an older viewer's has no session, and an auth
+             * host has no older viewers) */
+            (void)r.str();
+            if (r.ok && r.pos + 4 <= r.len ? r.u32() != v->session : host_auth) break;
             Host_DropViewer(*v,"left the session",false);
             break;
         default:
@@ -1512,9 +1862,9 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
  * away by the viewer). The main loop does not wait for it (wait false): the encoder is sending already, and what the
  * rate holds back goes with the next poll. */
 void Host_FlushQueue(bool wait) {
-    std::vector<std::vector<uint8_t> > out;
-    IPaddress to[RP_MAX_VIEWERS];
-    unsigned nto = 0;
+    /* (what goes out now: runs of datagrams of shared frames, sent after the lock is released) */
+    struct Run { IPaddress to; std::shared_ptr<const VideoPackets> p; unsigned first, end; };
+    std::vector<Run> out;
 
     if (send_lock != NULL) {
 #if SDL_VERSION_ATLEAST(2,0,0)
@@ -1529,44 +1879,51 @@ void Host_FlushQueue(bool wait) {
     }
     Host_Lock();
     const uint32_t now = SDL_GetTicks();
-    if (now != send_lastms) {
-        /* send_rate spread over each millisecond, so a big key frame does not overflow the receiver's socket buffer or
-         * a router's queue in one burst. Up to 32 KB (or 4 ms worth) may still go at once: an ordinary frame of a
-         * 320x200 game fits, and goes out without waiting for the pacing. */
-        const uint32_t elapsed = now - send_lastms;
-        const double burst = std::max(send_rate * 0.004,32.0 * 1024.0);
-        send_budget = std::min(send_budget + send_rate * (double)elapsed / 1000.0,burst);
-        send_lastms = now;
-    }
     size_t bytes = 0;
-    while (!send_queue.empty() && send_budget >= (double)send_queue.front().size()) {
-        const size_t n = send_queue.front().size();
-        {
-            /* "NNRP", version, type, u32 frame, u16 fragment, u16 fragments: the frame's last fragment leaves now */
-            const std::vector<uint8_t> &f = send_queue.front();
-            if (n >= 14 && f[5] == RP_VIDEO && ((unsigned)f[10] | ((unsigned)f[11] << 8)) + 1u == ((unsigned)f[12] | ((unsigned)f[13] << 8))) {
-                const uint32_t fid = (uint32_t)f[6] | ((uint32_t)f[7] << 8) | ((uint32_t)f[8] << 16) | ((uint32_t)f[9] << 24);
-                frame_sent_id[fid & 63u] = fid;
-                frame_sent_ms[fid & 63u] = now;
-            }
+    /* (the viewers that take every frame first, then the ones at their own pace: theirs never go out ahead) */
+    for (unsigned n=0;n < 2 * RP_MAX_VIEWERS;n++) {
+        Viewer &v = viewers[n % RP_MAX_VIEWERS];
+        if (!v.active || !v.proven || v.straggler != (n >= RP_MAX_VIEWERS)) continue;
+        if (now != v.pace_ms) {
+            /* The viewer's rate spread over each millisecond, so a big key frame does not overflow the receiver's
+             * socket buffer or a router's queue in one burst. Up to 32 KB (or 4 ms worth) may still go at once: an
+             * ordinary frame of a 320x200 game fits, and goes out without waiting for the pacing. */
+            const uint32_t elapsed = now - v.pace_ms;
+            const double burst = std::max(v.rate * 0.004,32.0 * 1024.0);
+            v.budget = std::min(v.budget + v.rate * (double)elapsed / 1000.0,burst);
+            v.pace_ms = now;
         }
-        send_budget -= (double)n;
-        send_queued -= std::min(send_queued,n);
-        bytes += n;
-        out.push_back(std::move(send_queue.front()));
-        send_queue.pop_front();
+        while (!v.queue.empty()) {
+            SendJob &j = v.queue.front();
+            const VideoPackets &p = *j.p;
+            const unsigned first = j.next;
+            while (j.next < p.count && v.budget >= (double)p.len(j.next)) {
+                const size_t n = p.len(j.next);
+                v.budget -= (double)n;
+                v.queued -= std::min(v.queued,n);
+                bytes += n;
+                v.video_bytes += n;
+                j.next++;
+            }
+            if (j.next > first) {
+                Run r; r.to = v.addr; r.p = j.p; r.first = first; r.end = j.next;
+                out.push_back(std::move(r));
+            }
+            if (j.next < p.count) break;        /* the rest waits for this viewer's rate */
+            Viewer_NoteLeft(v,p.id,now);        /* the frame's last datagram leaves now */
+            v.video_frames++;
+            v.queue.pop_front();
+        }
+        /* Video waits for the rate, not the other way round: only then is a higher rate worth trying. */
+        if (!v.queue.empty()) v.backlog_ms = now;
     }
-    /* Video waits for the rate, not the other way round: only then is a higher rate worth trying. */
-    if (!send_queue.empty()) send_backlog_ms = now;
-    if (!out.empty()) {
-        for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
-            if (viewers[i].active) to[nto++] = viewers[i].addr;
-        stat_bytes += (uint64_t)bytes * nto;
-    }
+    stat_bytes += (uint64_t)bytes;
     Host_Unlock();
 
-    for (size_t k=0;k < out.size();k++)
-        for (unsigned i=0;i < nto;i++) Host_SendDirect(to[i],out[k].data(),out[k].size());
+    for (size_t k=0;k < out.size();k++) {
+        const Run &r = out[k];
+        for (unsigned i=r.first;i < r.end;i++) Host_SendDirect(r.to,r.p->at(i),r.p->len(i));
+    }
     if (send_lock != NULL) SDL_UnlockMutex(send_lock);
 }
 
@@ -1576,6 +1933,7 @@ int Host_KeepaliveThread(void *) {
         if (SDL_GetTicks() - host_lastpoll < 500) continue;
         SDL_LockMutex(host_lock);
         while (host_sock != NULL && SDLNet_UDP_Recv(host_sock,host_in) > 0) {
+            if (host_local_only && !RP_IsLoopback(host_in->address)) continue;
             Reader r(host_in->data,(size_t)host_in->len);
             const uint8_t type = RP_Header(r);
             if (type == 0) continue;
@@ -1586,10 +1944,7 @@ int Host_KeepaliveThread(void *) {
             if (type == RP_HELLO) {
                 (void)r.str();
                 if (r.u32() != v->session || !r.ok) continue;
-                Writer w(RP_WELCOME);
-                w.u8((uint8_t)(v - viewers));
-                w.u32(aud_rate);
-                Host_SendTo(host_in->address,w.buf,w.len);
+                Host_Welcome(*v,host_in->address);
             }
             if (type == RP_BYE) continue;  /* the main loop sees it through the timeout */
             v->lastheard = SDL_GetTicks();
@@ -1725,6 +2080,10 @@ void Control_Poll(uint32_t now) {
         control_pause = 0;
         switch (step.kind) {
             case ControlStep::KEY:
+                /* Automation types into the game, never at the DOS prompt (a script that types a player's chat line
+                 * just as the game exits would otherwise run it as a command): presses wait for the guard, releases
+                 * always go. */
+                if (step.down && !Guard_Allows()) break;
                 KEYBOARD_AddKeyRaw(step.key,step.down);
                 control_pause = 40;
                 break;
@@ -1794,6 +2153,19 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     }
     RP_WidenSocket(host_sock);
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) viewers[i].active = false;
+    {
+        /* See Auth. From the environment, not the command line, which other users of the computer can read. */
+        const char *secret = getenv("NN_RP_AUTH_SECRET");
+        host_secret = (secret != NULL) ? secret : "";
+        host_auth = host_secret.size() >= 16;
+        if (!host_secret.empty() && !host_auth) LOG_MSG("INPUTNET: NN_RP_AUTH_SECRET is too short (16 characters at least): ignored");
+        host_cookie_seq = 0;
+        host_stream = host_auth ? Host_Unguessable("stream",IPaddress()) : 0;
+        const char *local = getenv("NN_RP_LOCAL_ONLY");
+        host_local_only = local != NULL && local[0] != 0 && local[0] != '0';
+        LOG_MSG("INPUTNET: remote play host: %s%s",host_auth ? "players need a token from the room" : "anyone who reaches the port can join",
+            host_local_only ? ", 127.0.0.1 only" : "");
+    }
     host_running = true;
     host_port = port;
     /* The window may have lost focus already, which stops cycles=max from guessing: a host keeps guessing without it. */
@@ -1835,8 +2207,7 @@ void REMOTEPLAY_StopServer(const char *reason) {
     host_sock = NULL;
     host_running = false;
     remoteplay_streaming = false;
-    send_queue.clear();
-    send_queued = 0;
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) { viewers[i].queue.clear(); viewers[i].queued = 0; }
     RP_ZStop();
     LOG_MSG("INPUTNET: remote play server stopped");
     REMOTEPLAY_UpdateMenu();
@@ -1953,10 +2324,162 @@ void REMOTEPLAY_Poll(void) {
 
 namespace {
 
+/* A frame this viewer can be sent a difference against: one it was sent, among the last it keeps (a viewer keeps the
+ * `window` frames it decoded last, and its last key frame whatever its age), that it has decoded by now (not newer
+ * than the newest it says it decoded) or that is the key frame on its way to it. */
+bool Enc_Usable(const EncFrame &f,const Viewer &v,unsigned window) {
+    if (v.needkey) return false;
+    if (v.has_key && v.key_id == f.id) return true;
+    if (!v.hasack || (int32_t)(v.acked - f.id) < 0) return false;
+    return Viewer_SentAge(v,f.id,window) >= 0;
+}
+
+/* The newest frame every viewer of the group can be sent a difference against, or NULL. (Encoder thread, host_lock
+ * held: the frames kept are the encoder's, the viewers the lock's.) */
+const EncFrame *Enc_Base(uint8_t group,size_t rawsize,uint32_t id) {
+    if (group == 0 || rawsize == 0) return NULL;
+    const unsigned window = (unsigned)std::max((size_t)1,std::min((size_t)RP_HISTORY,RP_HISTORY_BYTES / rawsize));
+    auto all = [&](const EncFrame &f) -> bool {
+        if (f.raw.size() != rawsize || id - f.id > 65535u || id == f.id) return false;
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
+            if ((group & (1u << i)) && !Enc_Usable(f,viewers[i],window)) return false;
+        return true;
+    };
+    for (size_t i=enc_hist.size();i-- > 0;) if (all(enc_hist[i])) return &enc_hist[i];
+    if (enc_haskey && all(enc_key)) return &enc_key;
+    return NULL;
+}
+
+/* Which of the viewers that go at their own pace get an encoding now, and against what. All of them when one frame
+ * serves them all. Else the one that has waited longest, with every other one that has its base too. A viewer with
+ * no base at all gets a key frame (the frame alone), not more often than every 300 ms (one on its way is waited
+ * for), together with the others that need one. False: none of them can be served now. */
+bool Enc_PickGroup(uint8_t own,size_t rawsize,uint32_t id,uint32_t now,uint8_t &group,const EncFrame *&base,bool &key) {
+    group = 0; base = NULL; key = false;
+    if (own == 0 || rawsize == 0) return false;
+    base = Enc_Base(own,rawsize,id);
+    if (base != NULL) { group = own; return true; }
+    const unsigned window = (unsigned)std::max((size_t)1,std::min((size_t)RP_HISTORY,RP_HISTORY_BYTES / rawsize));
+    unsigned order[RP_MAX_VIEWERS], n = 0;
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) if (own & (1u << i)) order[n++] = i;
+    auto waited = [&](unsigned i) -> uint32_t { return viewers[i].priv_ms ? now - viewers[i].priv_ms : 0xffffffffu; };
+    std::sort(order,order + n,[&](unsigned a,unsigned b) { return waited(a) > waited(b); });
+    auto keydue = [&](const Viewer &v) -> bool { return !v.has_key || now - v.key_ms >= 300; };
+    for (unsigned k=0;k < n;k++) {
+        const unsigned i = order[k];
+        const EncFrame *b = Enc_Base((uint8_t)(1u << i),rawsize,id);
+        if (b != NULL) {
+            base = b;
+            group = (uint8_t)(1u << i);
+            for (unsigned j=0;j < RP_MAX_VIEWERS;j++)
+                if (j != i && (own & (1u << j)) && Enc_Usable(*b,viewers[j],window)) group |= (uint8_t)(1u << j);
+            return true;
+        }
+        if (keydue(viewers[i])) {
+            key = true;
+            for (unsigned j=0;j < RP_MAX_VIEWERS;j++)
+                if ((own & (1u << j)) && keydue(viewers[j]) && Enc_Base((uint8_t)(1u << j),rawsize,id) == NULL) group |= (uint8_t)(1u << j);
+            return group != 0;
+        }
+    }
+    return false;
+}
+
+/* A frame's encoding (header, tables and compressed picture, `total` bytes) cut into the datagrams viewers get: one
+ * buffer for all of them. */
+std::shared_ptr<const VideoPackets> RP_MakePackets(uint32_t id,const uint8_t *data,size_t total) {
+    const size_t count = (total + RP_FRAG - 1) / RP_FRAG;
+    if (count == 0 || count > 65535) return std::shared_ptr<const VideoPackets>();
+    const size_t hdr = 6 + (host_auth ? 4 : 0) + 8;     /* "NNRP", version, type; an auth host's stream id; frame, fragment, fragments */
+    std::shared_ptr<VideoPackets> p = std::make_shared<VideoPackets>();
+    p->id = id;
+    p->count = (unsigned)count;
+    p->step = hdr + RP_FRAG;
+    p->last = hdr + (total - (count - 1) * RP_FRAG);
+    p->bytes.reset(new uint8_t[p->total()]);
+    for (size_t i=0;i < count;i++) {
+        uint8_t *o = p->bytes.get() + i * p->step;
+        memcpy(o,"NNRP",4); o[4] = RP_VERSION; o[5] = RP_VIDEO; o += 6;
+        if (host_auth) { o[0] = (uint8_t)host_stream; o[1] = (uint8_t)(host_stream >> 8); o[2] = (uint8_t)(host_stream >> 16); o[3] = (uint8_t)(host_stream >> 24); o += 4; }
+        o[0] = (uint8_t)id; o[1] = (uint8_t)(id >> 8); o[2] = (uint8_t)(id >> 16); o[3] = (uint8_t)(id >> 24);
+        o[4] = (uint8_t)i; o[5] = (uint8_t)(i >> 8);
+        o[6] = (uint8_t)count; o[7] = (uint8_t)(count >> 8);
+        memcpy(o + 8,data + i * RP_FRAG,std::min(RP_FRAG,total - i * RP_FRAG));
+    }
+    return p;
+}
+
+/* Queues an encoding for the viewers of `to` that are still the ones it was made for. (host_lock held.) */
+void Host_QueueFrame(uint8_t to,const uint32_t *session,const std::shared_ptr<const VideoPackets> &p,bool key,uint8_t ownpace,uint32_t now) {
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        if (!(to & (1u << i))) continue;
+        Viewer &v = viewers[i];
+        if (!v.active || !v.proven || v.session != session[i]) continue;
+        SendJob j;
+        j.p = p;
+        v.queue.push_back(std::move(j));
+        v.queued += p->total();
+        Viewer_NoteQueued(v,p->id);
+        if (key) { v.has_key = true; v.key_id = p->id; v.key_ms = now; v.needkey = false; }
+        if (ownpace & (1u << i)) v.priv_ms = now;
+    }
+}
+
+/* Another encoding of the frame just encoded (its picture is enc_hist.back()), for viewers that go at their own pace:
+ * the difference against a frame they have, or the frame alone (key: set when that is what it became), compressed
+ * once. No scroll search and nothing tried twice, so it costs about half of the frame's first encoding. */
+std::shared_ptr<const VideoPackets> Enc_Private(uint32_t id,unsigned width,unsigned height,unsigned fmt,const EncFrame *base,bool &key,bool table) {
+    const std::vector<uint8_t> &raw = enc_hist.back().raw;
+    const size_t rawsize = raw.size();
+    const uint8_t *src = raw.data();
+    if (!key && base != NULL && base->raw.size() == rawsize) {
+        enc_work.resize(rawsize);
+        const uint8_t *a = raw.data(), *b = base->raw.data();
+        uint8_t *d = enc_work.data();
+        size_t i = 0, same = 0;
+        for (;i + 8 <= rawsize;i += 8) {
+            uint64_t x, y;
+            memcpy(&x,a + i,8); memcpy(&y,b + i,8);
+            x ^= y;
+            same += x == 0;
+            memcpy(d + i,&x,8);
+        }
+        for (;i < rawsize;i++) d[i] = a[i] ^ b[i];
+        /* (as in the first encoding: with less than three tenths of the frame as in its base, the frame alone is the
+         * smaller one) */
+        if (rawsize >= 64 && (float)(same * 8) / (float)rawsize < 0.3f) key = true;
+        else src = enc_work.data();
+    }
+    else key = true;
+    size_t clen = 0;
+    if (!RP_Compress(src,rawsize,enc_alt,RP_FRAME_HDR,clen,enc_altpieces)) return std::shared_ptr<const VideoPackets>();
+    const bool pieces_table = table && enc_altpieces.size() >= 2 && enc_altpieces.size() <= RP_PIECES_MAX;
+    const size_t ptbytes = pieces_table ? 1 + 4 * enc_altpieces.size() : 0;
+    if (ptbytes) {
+        enc_alt.resize(RP_FRAME_HDR + ptbytes + clen);
+        uint8_t *t = enc_alt.data() + RP_FRAME_HDR;
+        memmove(t + ptbytes,t,clen);
+        *t++ = (uint8_t)enc_altpieces.size();
+        for (size_t k=0;k < enc_altpieces.size();k++) {
+            const uint32_t v = enc_altpieces[k];
+            *t++ = (uint8_t)v; *t++ = (uint8_t)(v >> 8); *t++ = (uint8_t)(v >> 16); *t++ = (uint8_t)(v >> 24);
+        }
+    }
+    uint8_t *h = enc_alt.data();
+    const unsigned back = key ? 0 : (unsigned)(id - base->id);
+    h[0] = (uint8_t)width; h[1] = (uint8_t)(width >> 8);
+    h[2] = (uint8_t)height; h[3] = (uint8_t)(height >> 8);
+    h[4] = (uint8_t)fmt; h[5] = (uint8_t)((key ? 1 : 0) | (ptbytes ? 2 : 0) | (mouse_notify_mode != 0 ? 4 : 0));
+    h[6] = (uint8_t)back; h[7] = (uint8_t)(back >> 8);
+    h[8] = (uint8_t)rawsize; h[9] = (uint8_t)(rawsize >> 8); h[10] = (uint8_t)(rawsize >> 16); h[11] = (uint8_t)(rawsize >> 24);
+    return RP_MakePackets(id,enc_alt.data(),RP_FRAME_HDR + ptbytes + clen);
+}
+
 /* Encodes one picture and queues it for the viewers: on the encoder thread, or on the emulation thread when there is
  * none. */
 void Enc_Frame(const Capture &c) {
     uint64_t part[5] = { 0, 0, 0, 0, 0 }, mark = RP_Micros();
+    const uint64_t mark0 = mark;    /* when the encoder started on this picture */
     part[0] = mark - std::min(mark,c.taken_us);
     const unsigned width = c.w, height = c.h, bpp = c.bpp;
     const size_t rowbytes = (size_t)width * RP_BytesPerPixel(bpp);
@@ -1985,7 +2508,7 @@ void Enc_Frame(const Capture &c) {
     const bool unchanged = !enc_hist.empty() && enc_hist.back().raw.size() == rawsize
         && memcmp(enc_raw.data(),enc_hist.back().raw.data(),rawsize) == 0;
 
-    /* What to send. */
+    /* What to send, and to whom (see "Video per viewer"). */
     Host_Lock();
     const uint32_t now = SDL_GetTicks();
     stat_index_us += index_us;
@@ -2001,52 +2524,91 @@ void Enc_Frame(const Capture &c) {
     }
     const bool refs = rate_adaptive;
     const bool forced = enc_needkey;
-    bool key = forced || enc_hist.empty() || (now - enc_lastkey) >= (refs ? 10000u : 5000u)
-        || (enc_keyreq && now - enc_lastkey >= 300);
-    if (!key && unchanged && (now - enc_lastsend) < 250) {
-        Host_Unlock();
-        return; /* nothing changed; still send now and then so the viewer knows we are alive */
+    const uint32_t id = enc_frameid + 1;
+    /* Nothing changed since the frame encoded last, a moment ago: only a viewer that does not have that one takes
+     * this. (Still sent now and then, so viewers know we are alive.) */
+    const bool still = !forced && unchanged && (now - enc_lastsend) < 250;
+    const uint32_t lastid = enc_hist.empty() ? 0 : enc_hist.back().id;
+
+    /* Who takes this frame: together with the others, or at its own pace. */
+    uint8_t tog = 0, own = 0;
+    uint32_t session[RP_MAX_VIEWERS];
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+        Viewer &v = viewers[i];
+        session[i] = v.active ? v.session : 0;
+        if (!v.active || !v.proven) continue;
+        const uint8_t bit = (uint8_t)(1u << i);
+        if (!refs) { tog |= bit; continue; }    /* the older way: all of them, every frame */
+        if (still && !v.needkey && Viewer_SentAge(v,lastid,1) == 0) continue;   /* it has this picture (or will: it is in its queue) */
+        if (!Viewer_Wants(v)) {
+            /* Its queue is full: it leaves this frame out, and from here on does not have what the others have. */
+            v.straggler = true;
+            v.skip_ms = now;
+            continue;
+        }
+        /* Took every frame for a second: with the others again. */
+        if (v.straggler && !v.needkey && now - v.skip_ms >= 1000) v.straggler = false;
+        if (v.straggler) own |= bit; else tog |= bit;
     }
 
-    /* The base: the previous frame sent, or with named bases the oldest of each viewer's newest decoded frame (the last
-     * key frame for a viewer that has decoded none we still have). */
+    bool key = forced || enc_hist.empty();
+    uint8_t group = 0;              /* who the encoding made here goes to */
     const EncFrame *base = NULL;
-    if (!key) {
-        if (!refs) base = &enc_hist.back();
-        else {
-            auto find = [](uint32_t id) -> const EncFrame* {
-                for (size_t i=enc_hist.size();i-- > 0;) if (enc_hist[i].id == id) return &enc_hist[i];
-                if (enc_haskey && enc_key.id == id) return &enc_key;
-                return NULL;
-            };
-            for (unsigned i=0;i < RP_MAX_VIEWERS && !key;i++) {
-                const Viewer &v = viewers[i];
-                if (!v.active) continue;
-                const EncFrame *f = v.hasack ? find(v.acked) : NULL;
-                if (f == NULL && enc_haskey && (!v.hasack || (int32_t)(v.acked - enc_key.id) < 0)) f = &enc_key;
-                if (f == NULL) key = true;
-                else if (base == NULL || (int32_t)(f->id - base->id) < 0) base = f;
-            }
-            if (base != NULL && enc_frameid + 1 - base->id > 65535u) key = true;
+    if (!refs) {
+        /* The older way: against the previous frame sent. */
+        group = tog;
+        if ((now - enc_lastkey) >= 5000u) key = true;
+        if (!key && still) {
+            Host_Unlock();
+            return; /* nothing changed; still send now and then so the viewer knows we are alive */
         }
-        if (base == NULL || base->raw.size() != rawsize) key = true;
+        if (!key) {
+            base = &enc_hist.back();
+            if (base->raw.size() != rawsize) key = true;
+        }
     }
-    /* With named bases a key frame goes out at most every 300 ms unless the picture itself changed shape: a viewer that
-     * lost the last one asks again, and back to back key frames would only fill the link. */
-    if (key && refs && !forced && enc_haskey && now - enc_lastkey < 300) {
+    else {
+        if (tog != 0) {
+            /* The viewers that take every frame: against the newest frame they all have. A viewer at its own pace
+             * has no say in it. */
+            group = tog;
+            if ((now - enc_lastkey) >= 10000u) key = true;
+            if (!key) {
+                base = Enc_Base(tog,rawsize,id);
+                if (base == NULL) key = true;
+            }
+            /* A key frame goes out at most every 300 ms unless the picture itself changed shape: a viewer that lost
+             * the last one asks again, and back to back key frames would only fill the link. */
+            if (key && !forced && enc_haskey && now - enc_lastkey < 300) {
+                Host_Unlock();
+                return;
+            }
+        }
+        else if (own != 0) {
+            /* Nobody takes every frame now: this encoding is for viewers at their own pace. */
+            if (key) group = own;
+            else if (!Enc_PickGroup(own,rawsize,id,now,group,base,key)) {
+                Host_Unlock();
+                return;
+            }
+        }
+        /* A key frame decodes for anyone: every viewer that takes a frame now gets this one. */
+        if (key) group = (uint8_t)(tog | own);
+    }
+    if (group == 0) {
         Host_Unlock();
         return;
     }
     /* The requests are taken here, before the slow part: one that comes while this frame is being encoded is for the
      * next frame. */
-    const uint32_t id = enc_frameid + 1;
     enc_needkey = false;
     enc_haveprev = true;
     enc_lastsend = now;
     if (key) { enc_lastkey = now; enc_keyreq = false; }
     const bool table = Host_PiecesMode();
     const bool shiftmode = Host_ShiftMode();
-    const bool limited = rate_limited;
+    bool limited = false;           /* a link of this encoding's viewers limits the video: every byte counts */
+    for (unsigned i=0;i < RP_MAX_VIEWERS;i++) if (group & (1u << i)) limited = limited || viewers[i].limited;
     Host_Unlock();
 
     /* While the picture keeps moving a lot, the frame alone has been the smaller one every time: three frames in four
@@ -2220,19 +2782,13 @@ void Enc_Frame(const Capture &c) {
     h[6] = (uint8_t)back; h[7] = (uint8_t)(back >> 8);
     h[8] = (uint8_t)rawsize; h[9] = (uint8_t)(rawsize >> 8); h[10] = (uint8_t)(rawsize >> 16); h[11] = (uint8_t)(rawsize >> 24);
 
-    std::vector<std::vector<uint8_t> > frags;
-    frags.reserve(count);
-    size_t fragbytes = 0;
-    for (size_t i=0;i < count;i++) {
-        const size_t off = i * RP_FRAG;
-        const size_t n = std::min(RP_FRAG,total - off);
-        Writer w(RP_VIDEO);
-        w.u32(id);
-        w.u16((uint16_t)i);
-        w.u16((uint16_t)count);
-        w.bytes(enc_comp.data() + off,n);
-        frags.push_back(std::vector<uint8_t>(w.buf,w.buf + w.len));
-        fragbytes += w.len;
+    /* The datagrams, in one buffer every viewer of this encoding shares. */
+    std::shared_ptr<const VideoPackets> packets = RP_MakePackets(id,enc_comp.data(),total);
+    if (!packets) {
+        Host_Lock();
+        enc_needkey = true;
+        Host_Unlock();
+        return;
     }
 
     /* Keep it as a base for later frames. */
@@ -2247,14 +2803,41 @@ void Enc_Frame(const Capture &c) {
     f.nstep = enc_step_n;
     for (unsigned k=0;k < enc_step_n;k++) f.step[k] = enc_step_vec[k];
     enc_hist.push_back(std::move(f));
-    while (enc_hist.size() > 1 && (enc_hist.size() > RP_HISTORY || enc_hist.size() * rawsize > RP_HISTORY_BYTES))
-        enc_hist.pop_front();
 
     const uint64_t encoded_us = RP_Micros();
+    std::vector<EncFrame> gone;     /* frames no longer kept: freed after the lock */
+    uint8_t rest = 0, group2 = 0;   /* viewers at their own pace this encoding did not go to; those that get one more */
+    const EncFrame *base2 = NULL;
+    bool key2 = false;
     Host_Lock();
+    const uint32_t queued_ms = SDL_GetTicks();
     enc_frameid = id;
-    for (size_t i=0;i < frags.size();i++) send_queue.push_back(std::move(frags[i]));
-    send_queued += fragbytes;
+    {
+        /* The newest RP_HISTORY frames stay, and older ones that still are a viewer's base (the newest it says it
+         * decoded, its last key frame): a viewer at its own pace is further behind than the others. Never more than
+         * the viewers themselves keep by size. */
+        auto pinned = [&](uint32_t fid) -> bool {
+            for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+                const Viewer &v = viewers[i];
+                if (v.active && ((v.hasack && v.acked == fid) || (v.has_key && v.key_id == fid))) return true;
+            }
+            return false;
+        };
+        if (enc_hist.size() > RP_HISTORY) {
+            for (size_t k=enc_hist.size() - RP_HISTORY;k-- > 0;) {
+                if (refs && pinned(enc_hist[k].id)) continue;
+                gone.push_back(std::move(enc_hist[k]));
+                enc_hist.erase(enc_hist.begin() + (std::ptrdiff_t)k);
+            }
+        }
+        while (enc_hist.size() > 1 && (enc_hist.size() > RP_HISTORY + 2 * RP_MAX_VIEWERS || enc_hist.size() * rawsize > RP_HISTORY_BYTES)) {
+            gone.push_back(std::move(enc_hist.front()));
+            enc_hist.pop_front();
+        }
+    }
+    /* (a frame that became a key frame while it was encoded decodes for anyone too) */
+    const uint8_t to = key ? (uint8_t)(tog | own) : group;
+    Host_QueueFrame(to,session,packets,key,own,queued_ms);
     stat_frames++;
     if (key) stat_keys++;
     if (sbytes) stat_shifted++;
@@ -2266,7 +2849,7 @@ void Enc_Frame(const Capture &c) {
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
         const Viewer &v = viewers[i];
         if (!v.active || !(v.features & RP_FEAT_TIMING) || v.session != c.session[i] || c.applied[i] == 0) continue;
-        Writer w(RP_FRAMEINFO);
+        HostWriter w(RP_FRAMEINFO);
         w.u32(id);
         w.u32(c.applied[i]);
         w.u32(RP_ClampU32(c.taken_us - std::min(c.taken_us,c.applied_us[i])));
@@ -2281,9 +2864,44 @@ void Enc_Frame(const Capture &c) {
         }
         Host_SendTo(v.addr,w.buf,w.len);
     }
+    /* The viewers at their own pace that this encoding did not go to get one more, of the same frame, against a frame
+     * they have. Only in time the encoder has left: no newer picture waits for it, and the encoding (as long as the
+     * last ones took) is done before the game shows its next one. So it never holds up the others' frames. Only when
+     * there is no such time at all do they still get ten a second. */
+    bool fits = false;
+    if (enc_thread != NULL && cap_waiting < 0) {
+        const uint64_t since = encoded_us - std::min(encoded_us,c.taken_us);       /* since the game showed this picture */
+        const uint64_t cost = enc_priv_us ? enc_priv_us : (encoded_us - std::min(encoded_us,mark0)) / 2;
+        fits = cap_interval_us == 0 || since + cost + 500 < cap_interval_us;
+    }
+    if (refs && !key) {
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+            const Viewer &v = viewers[i];
+            if ((own & (1u << i)) && !(to & (1u << i)) && v.active && v.proven && v.session == session[i] && Viewer_Wants(v))
+                rest |= (uint8_t)(1u << i);
+        }
+        /* (without an encoder thread this would run in the game's own thread: ten a second there) */
+        if (rest != 0 && (fits || queued_ms - enc_priv_ms >= 100)
+            && Enc_PickGroup(rest,rawsize,id,queued_ms,group2,base2,key2)) enc_priv_ms = queued_ms;
+        else group2 = 0;
+    }
     Host_Unlock();
 
+    /* The others' frame leaves first. */
     Host_FlushQueue(true);
+    if (group2 != 0) {
+        const uint64_t began = RP_Micros();
+        const std::shared_ptr<const VideoPackets> more = Enc_Private(id,width,height,fmt,base2,key2,table);
+        const uint64_t took = RP_Micros() - began;
+        Host_Lock();
+        enc_priv_us = enc_priv_us ? (enc_priv_us * 3 + took) / 4 : took;
+        if (more) {
+            Host_QueueFrame(key2 ? rest : group2,session,more,key2,rest,SDL_GetTicks());
+            stat_private++;
+        }
+        Host_Unlock();
+        if (more) Host_FlushQueue(true);
+    }
 }
 
 int Enc_Thread(void *) {
@@ -2340,7 +2958,7 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
     if (!host_running || !remoteplay_streaming || data == NULL || TTF_using()) return;
 
     const unsigned bytespp = RP_BytesPerPixel(bpp);
-    if (bytespp == 0 || width == 0 || height == 0 || width > 4096 || height > 4096) return;
+    if (bytespp == 0 || width == 0 || height == 0 || width > RP_MAX_W || height > RP_MAX_H) return;
     const size_t rowbytes = (size_t)width * bytespp;
     if (rowbytes > pitch) return;
 
@@ -2355,21 +2973,45 @@ void REMOTEPLAY_AddFrame(unsigned width,unsigned height,unsigned bpp,unsigned pi
         return;
     }
     stat_offered++;
+    /* (how often the game shows a picture: an encoding for a viewer at its own pace has to fit in between) */
+    if (cap_prev_us != 0 && taken_us - cap_prev_us < 200000u)
+        cap_interval_us = cap_interval_us ? (cap_interval_us * 7 + (taken_us - cap_prev_us)) / 8 : taken_us - cap_prev_us;
+    cap_prev_us = taken_us;
 
-    /* Frames come faster than the link takes them: skip this one. With named bases the next frame is encoded against
-     * what the viewers have; otherwise against the last frame sent, so skipping costs nothing either way. */
-    if (!send_queue.empty() && (double)send_queued > std::max(send_rate * 0.06,64.0 * 1024.0)) {
-        stat_skipped++;
-        if (send_queued > ((size_t)16 << 20)) {     /* nobody takes anything: start over */
-            send_queue.clear();
-            send_queued = 0;
-            enc_needkey = true;
+    /* Frames come faster than the links take them: this one is left out when no viewer takes it (every viewer by its
+     * own queue; the older way, where all get every frame, when any of them is behind). The next frame is encoded
+     * against what its viewers have, so leaving one out costs nothing. `behind`: a viewer that takes a frame lacks the
+     * newest one, so a picture that did not change is still news to it. */
+    bool behind = false;
+    {
+        bool any = false, all = true;
+        for (unsigned i=0;i < RP_MAX_VIEWERS;i++) {
+            Viewer &v = viewers[i];
+            if (!v.active || !v.proven) continue;
+            if (v.queued > ((size_t)16 << 20)) {
+                /* It takes nothing: what waited for it is thrown away, and it starts over from a key frame. */
+                v.queue.clear();
+                v.queued = 0;
+                v.sent_n = 0;
+                v.has_key = false;
+                v.needkey = true;
+                v.straggler = true;
+                v.skip_ms = now;
+                if (!rate_adaptive) enc_needkey = true;
+            }
+            const bool wants = Viewer_Wants(v);
+            any = any || wants;
+            all = all && wants;
+            if (wants && rate_adaptive && (v.needkey || Viewer_SentAge(v,enc_frameid,1) != 0)) behind = true;
         }
-        Host_Unlock();
-        Host_FlushQueue(false);
-        return;
+        if (rate_adaptive ? !any : !all) {
+            stat_skipped++;
+            Host_Unlock();
+            Host_FlushQueue(false);
+            return;
+        }
     }
-    const bool maybe_same = enc_haveprev && !enc_needkey && !enc_keyreq && (now - enc_lastsend) < 250;
+    const bool maybe_same = enc_haveprev && !enc_needkey && !enc_keyreq && !behind && (now - enc_lastsend) < 250;
     const int last = cap_last;
     int slot = 0;
     while (slot == cap_waiting || slot == cap_encoding) slot++;
@@ -2442,7 +3084,7 @@ void REMOTEPLAY_AddAudio(unsigned rate,unsigned frames,const int16_t *samples) {
     aud_buf.insert(aud_buf.end(),samples,samples + (size_t)frames * 2);
     size_t at = 0;
     while (aud_buf.size() - at >= (size_t)RP_AUDIO_FRAMES * 2) {
-        Writer w(RP_AUDIO);
+        HostWriter w(RP_AUDIO);
         w.u32(++aud_seq);
         w.u32(aud_rate);
         w.u16((uint16_t)RP_AUDIO_FRAMES);
@@ -2859,6 +3501,9 @@ void VP_Measure(const VPPlane &cur,const VPPlane &prev,const VPLens &lens,const 
     const int w = (int)cur.w, h = (int)cur.h;
     const float unitx = (float)w / 320.0f;
     if (cur.levels == 0 || cur.levels != prev.levels || cur.ystep != prev.ystep || cur.h != prev.h) { mo.why = 2; return; }
+    /* The view below is at least 8 pixels each way: a smaller picture (a host can send any size) would be read past
+     * its end, so it is not measured at all. */
+    if (w < 16 || h < 16 || prev.w != cur.w) { mo.why = 2; return; }
     VPView v;       /* in rows of the plane (every other row of a picture whose rows come twice) */
     v.x0 = std::max(0,std::min(w - 8,pview.x0)); v.x1 = std::max(v.x0 + 8,std::min(w,pview.x1));
     v.y0 = std::max(0,std::min(h - 8,pview.y0 / (int)cur.ystep)); v.y1 = std::max(v.y0 + 8,std::min(h,(pview.y1 + (int)cur.ystep - 1) / (int)cur.ystep));
@@ -2972,6 +3617,7 @@ void VP_Bands(const VPPlane &cur,const VPPlane &old,const VPLens &lens,const VPV
     for (unsigned b=0;b < VP_CELLROWS;b++) { vote[b] = 0; rate[b] = 1; }
     const int w = (int)cur.w, h = (int)cur.h;
     if (cur.levels == 0 || cur.levels != old.levels || cur.ystep != old.ystep || cur.h != old.h || cur.w != old.w) return;
+    if (w < 16 || h < 16) return;   /* the view below is at least 8 pixels each way (see VP_Measure) */
     VPView v;
     v.x0 = std::max(0,std::min(w - 8,pview.x0)); v.x1 = std::max(v.x0 + 8,std::min(w,pview.x1));
     v.y0 = std::max(0,std::min(h - 8,pview.y0 / (int)cur.ystep)); v.y1 = std::max(v.y0 + 8,std::min(h,(pview.y1 + (int)cur.ystep - 1) / (int)cur.ystep));
@@ -4444,6 +5090,10 @@ public:
     std::string error;
     uint32_t lastheard = 0, lasthello = 0, started = 0;
     uint32_t session = 0;
+    std::string auth_token;             /* env NN_RP_AUTH_TOKEN: this player's token for the room (see Auth) */
+    bool authed = false;                /* the host checks tokens: its packets after WELCOME carry auth_stream */
+    uint32_t connect_since = 0;         /* since when HELLOs go out unanswered (0: welcomed, or not started) */
+    uint32_t auth_cookie = 0, auth_stream = 0;
     unsigned timeout = 10000;
 
     /* video */
@@ -4465,6 +5115,8 @@ public:
     /* sound */
     SDL_AudioDeviceID audio = 0;
     unsigned audio_rate = 0;
+    bool audio_tried = false;          /* the sound device was opened (or tried) at audio_tried_ms */
+    uint32_t audio_tried_ms = 0;
     uint32_t audio_seq = 0;
     bool audio_playing = false;
     float aud_fast = 1.0f;          /* below 1: played that much faster, to shorten what waits (see handleAudio) */
@@ -4510,7 +5162,8 @@ public:
     enum Scaling { SCALE_NEAREST, SCALE_BILINEAR, SCALE_SHARP } scaling = SCALE_NEAREST;
     SDL_Texture *sharp_tex = NULL;  /* the whole picture enlarged by whole pixels (sharp) */
     int sharp_w = 0, sharp_h = 0;
-    uint32_t title_note_until = 0;  /* the title names the scaling for a moment after Ctrl+F7 */
+    uint32_t title_note_until = 0;  /* the title shows title_note for a moment (the scaling after Ctrl+F7, a move) */
+    std::string title_note;
     int zoom_w = 0, zoom_h = 0;
     bool dot_on = false;            /* the pointer dot is on the screen, at dot_px, dot_py of the window */
     int dot_px = 0, dot_py = 0;
@@ -4548,21 +5201,39 @@ public:
         if (user == NULL) user = getenv("USER");
         w.str(user ? user : "player");
         w.u32(session);
-        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES | RP_FEAT_SHIFT | RP_FEAT_MOVE);
+        w.u32(RP_FEAT_REFS | RP_FEAT_TIMING | RP_FEAT_PIECES | RP_FEAT_SHIFT | RP_FEAT_MOVE | RP_FEAT_AUTH);
+        w.str(auth_token);
+        w.u32(auth_cookie);     /* 0 until the host's WELCOME gave one */
         send(w);
         lasthello = SDL_GetTicks();
     }
 
     void newSession(void) {
-        session = (uint32_t)rand() ^ ((uint32_t)rand() << 16) ^ (uint32_t)SDL_GetPerformanceCounter() ^ (uint32_t)(uintptr_t)this;
+        /* Hard to guess from outside (a forged REFUSE or WELCOME has to name it): hashed from several clocks, this
+         * process and the token. */
+        RP_Sha256 h;
+        const uint64_t pc = (uint64_t)SDL_GetPerformanceCounter(), ticks = SDL_GetTicks(), now = (uint64_t)time(NULL);
+        const uintptr_t self = (uintptr_t)this;
+        const int r1 = rand(), r2 = rand();
+        h.add(&pc,8); h.add(&ticks,8); h.add(&now,8); h.add(&self,sizeof(self)); h.add(&r1,sizeof(r1)); h.add(&r2,sizeof(r2));
+        h.add(&session,4); h.add(auth_token.data(),auth_token.size());
+        uint8_t d[32];
+        h.finish(d);
+        memcpy(&session,d,4);
         if (session == 0) session = 1;
+        authed = false; auth_cookie = 0; auth_stream = 0;
     }
 
     /* RP_MOVED: another copy of the game plays for this player from now on. Nothing of the old one is of use there:
      * its frames (their numbers mean nothing to the new copy), its sound, the input still on its way. The keys held
      * down were released on the old copy when it was told this player left; here they count as up, so letting go of
      * one sends nothing. */
-    void moved(void) {
+    void moved(const std::string &why = std::string()) {
+        /* The window stays and the player sees why its picture changed (the title says so for a few seconds; NukemNet
+         * also writes it in the room). */
+        title_note = why.empty() ? std::string("the host moved you to another instance of the game") : why;
+        title_note_until = SDL_GetTicks() + 6000;
+        LOG_MSG("INPUTNET: %s",title_note.c_str());
         newSession();
         welcomed = false;
         for (Assembly &a : asm_slots) a.used = false;
@@ -4637,8 +5308,7 @@ public:
 
     void updateTitle(void) {
         std::string t = "DOSBox-X-NN remote play"; /* the host's address stays private */
-        if (title_note_until && (int32_t)(SDL_GetTicks() - title_note_until) < 0)
-            t += std::string(" - picture: ") + scalingName(scaling) + " (Ctrl+F7)";
+        if (title_note_until && (int32_t)(SDL_GetTicks() - title_note_until) < 0) t += " - " + title_note;
         if (!welcomed) t += " (connecting...)";
         else if (captured) t += " - Ctrl+F10 releases the mouse";
         else if (abs_pointer) t += " - Ctrl+F10 captures the mouse";
@@ -4826,6 +5496,7 @@ public:
                 if (e.key.keysym.scancode == SDL_SCANCODE_F7 && (mod & KMOD_CTRL)) {
                     scaling = softwareRenderer() ? SCALE_NEAREST : (Scaling)((scaling + 1) % 3);
                     LOG_MSG("INPUTNET: picture scaling: %s",scalingName(scaling));
+                    title_note = std::string("picture: ") + scalingName(scaling) + " (Ctrl+F7)";
                     title_note_until = SDL_GetTicks() + 2500;
                     updateTitle();
                     redraw = true;
@@ -4907,7 +5578,7 @@ public:
         setAbsPointer((data[5] & 4) != 0);
         const size_t rawsize = (size_t)data[8] | ((size_t)data[9] << 8) | ((size_t)data[10] << 16) | ((size_t)data[11] << 24);
         const unsigned bytespp = RP_BytesPerPixel(fmt);
-        if (bytespp == 0 || w == 0 || h == 0 || w > 4096 || h > 4096) return;
+        if (bytespp == 0 || w == 0 || h == 0 || w > RP_MAX_W || h > RP_MAX_H) return;
         if (rawsize != (fmt == 8 ? 768u : 0u) + (size_t)w * h * bytespp) return;
 
         /* The base: the frame "back" frames earlier (an older host always means the previous one). */
@@ -5413,7 +6084,7 @@ public:
         const unsigned count = r.u16();
         size_t n = 0;
         const uint8_t *payload = r.rest(n);
-        if (!r.ok || count == 0 || idx >= count || n == 0 || n > RP_FRAG) return;
+        if (!r.ok || count == 0 || count > RP_MAX_FRAGS || idx >= count || n == 0 || n > RP_FRAG) return;
         if (haveframe && (int32_t)(id - lastid) <= 0) return;   /* older than what is shown */
 
         Assembly *a = NULL;
@@ -5469,6 +6140,11 @@ public:
         audio_seq = seq;
 
         if (audio == 0 || rate != audio_rate) {
+            /* Opening the sound device takes milliseconds to tens of them: at most once in 2 s (a host alternating
+             * rates, or a device that fails to open, would otherwise stall the viewer on every packet). */
+            const uint32_t now = SDL_GetTicks();
+            if (audio_tried && now - audio_tried_ms < 2000) return;
+            audio_tried = true; audio_tried_ms = now;
             if (audio) SDL_CloseAudioDevice(audio);
             SDL_AudioSpec want, have;
             memset(&want,0,sizeof(want));
@@ -5536,25 +6212,42 @@ public:
         Reader r(data,len);
         const uint8_t type = RP_Header(r);
         if (type == 0) return;
+        /* A host that checks tokens puts its stream id after the header of everything but WELCOME and REFUSE:
+         * packets forged in its name (a frame, a BYE, a MOVED) do not have it. */
+        if (authed && type != RP_WELCOME && type != RP_REFUSE && (r.u32() != auth_stream || !r.ok)) return;
         lastheard = SDL_GetTicks();
         switch (type) {
-            case RP_WELCOME:
+            case RP_WELCOME: {
+                (void)r.u8();
+                (void)r.u32();
+                if (r.ok && r.pos + 12 <= r.len) {
+                    const uint32_t cookie = r.u32(), stream = r.u32(), echoed = r.u32();
+                    if (echoed != session) return;     /* not an answer to our HELLO */
+                    const bool fresh = !authed || cookie != auth_cookie;
+                    authed = true; auth_cookie = cookie; auth_stream = stream;
+                    if (fresh) sendHello();             /* the cookie back: the host streams once it has it */
+                }
                 if (!welcomed) {
                     welcomed = true;
                     updateTitle();
                     sendInput();
                 }
                 break;
-            case RP_REFUSE:
-                error = "The host refused to let you join: " + r.str();
+            }
+            case RP_REFUSE: {
+                std::string why = RP_CleanName(r.str(),160);
+                /* (a host that checks tokens names our session; an older one does not) */
+                if (r.ok && r.pos + 4 <= r.len && r.u32() != session) return;
+                error = "The host refused to let you join: " + why;
                 running = false;
                 break;
+            }
             case RP_BYE:
-                error = "The host ended the session: " + r.str();
+                error = "The host ended the session: " + RP_CleanName(r.str(),160);
                 running = false;
                 break;
             case RP_MOVED:
-                moved();
+                moved(r.pos < r.len ? RP_CleanName(r.str(),120) : std::string());
                 break;
             case RP_VIDEO:
                 handleVideo(r);
@@ -5615,6 +6308,7 @@ public:
             scaling = scalingNamed(sec->Get_string("viewer scaling"));
         }
         if (const char *e = getenv("NN_RP_SCALING")) scaling = scalingNamed(e);
+        if (const char *t = getenv("NN_RP_AUTH_TOKEN")) auth_token = RP_CleanName(t,64);
         if (const char *e = getenv("NN_RP_PREDICT")) vp.enabled = atoi(e) != 0;
         if (const char *e = getenv("NN_RP_PREDICTVIEW")) vp.moveView = atoi(e) != 0;
         if (const char *e = getenv("NN_RP_PREDICTLOG")) vp.debug = atoi(e);
@@ -5717,7 +6411,14 @@ public:
             reportLatency();
 
             /* Until the host answers, keep trying: its DOSBox-X may still be starting.
-             * The window title says "connecting..." and closing it gives up. */
+             * The window title says "connecting..." and closing it gives up, and so does 90 s of silence (HELLOs go to
+             * the address the room gave: not forever to an address that does not answer). */
+            if (welcomed) connect_since = 0;
+            else if (connect_since == 0) connect_since = now;
+            else if (now - connect_since > 90000) {
+                error = "The host did not answer.";
+                running = false;
+            }
             if (welcomed && now - lastheard > timeout) {
                 error = "The connection to the host was lost.";
                 running = false;
@@ -5729,6 +6430,7 @@ public:
         if (sock != NULL) {
             Writer w(RP_BYE);
             w.str("closed");
+            w.u32(session);
             send(w);
             send(w);
         }

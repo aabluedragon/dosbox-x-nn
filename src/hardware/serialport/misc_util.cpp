@@ -369,8 +369,10 @@ ENETClientSocket::ENETClientSocket(ENetHost *host)
 {
 	assert(host);
 	client  = host;
-	address = client->address;
 	peer    = &client->peers[0];
+	/* The client's address (this was the server's own address, "::", so the null modem's nonlocal:0 check refused
+	 * even connections from 127.0.0.1) */
+	address = peer->address;
 	isopen  = true;
 	LOG_MSG("ENET: Established connection to client %s:%u",
 	         enet_address_to_string(peer->address), peer->address.port);
@@ -504,7 +506,13 @@ bool ENETClientSocket::GetRemoteAddressString(char *buffer)
 	updateState();
 	assert(buffer);
     #if !defined(_WIN32_WINDOWS)
-	enet_address_get_host_ip(&address, buffer, 16);
+	/* An IPv4 peer of the dual-stack socket comes as ::ffff:a.b.c.d (and ::1 is the loopback): written as a.b.c.d,
+	 * which the INET_ADDRSTRLEN buffers callers pass can hold. */
+	const uint8_t *a = (const uint8_t*)&address.host;
+	static const uint8_t mapped[12] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff }, loop6[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 };
+	if (memcmp(a,loop6,16) == 0) strcpy(buffer,"127.0.0.1");
+	else if (memcmp(a,mapped,12) == 0) snprintf(buffer,16,"%u.%u.%u.%u",a[12],a[13],a[14],a[15]);
+	else enet_address_get_host_ip(&address, buffer, 16);
     #else
     buffer[0] = 0;
     #endif
