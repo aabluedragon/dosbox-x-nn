@@ -174,7 +174,10 @@ static void IPX_ServerLoop() {
 	result = SDLNet_UDP_Recv(ipxServerSocket, &inPacket);
 	/* NukemNet: a server started with env NN_RP_LOCAL_ONLY (the link between the copies of an IPX-over-InputNet game,
 	 * which all run on the host's computer) takes nothing from outside it. */
-	if (result != 0 && ipxServerLocalOnly && SDLNet_Read32(&inPacket.address.host) != 0x7F000001u) return;
+	if (result != 0 && ipxServerLocalOnly) {
+		const uint8_t *h = (const uint8_t*)&inPacket.address.host;   /* network byte order */
+		if (!(h[0] == 127 && h[1] == 0 && h[2] == 0 && h[3] == 1)) return;
+	}
 	if (result != 0) {
 		// Check to see if incoming packet is a registration packet
 		// For this, I just spoofed the echo protocol packet designation 0x02

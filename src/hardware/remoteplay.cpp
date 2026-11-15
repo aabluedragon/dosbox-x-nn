@@ -552,7 +552,7 @@ uint32_t Host_Unguessable(const char *what,const IPaddress &addr) {
     uint8_t msg[40], mac[32];
     size_t n = 0;
     const uint32_t seq = ++host_cookie_seq;
-    const uint64_t pc = (uint64_t)SDL_GetPerformanceCounter();
+    const uint64_t pc = RP_Micros();    /* (SDL 1.2 builds have no performance counter call) */
     memcpy(msg + n,&seq,4); n += 4;
     memcpy(msg + n,&pc,8); n += 8;
     memcpy(msg + n,&addr.host,4); n += 4;
@@ -566,7 +566,10 @@ uint32_t Host_Unguessable(const char *what,const IPaddress &addr) {
 }
 
 /* A datagram from 127.0.0.1 (local only hosts take nothing else). */
-inline bool RP_IsLoopback(const IPaddress &a) { return SDLNet_Read32(&a.host) == 0x7F000001u; }
+inline bool RP_IsLoopback(const IPaddress &a) {
+    const uint8_t *h = (const uint8_t*)&a.host;     /* network byte order (SDL 1.2's SDLNet_Read32 takes no const) */
+    return h[0] == 127 && h[1] == 0 && h[2] == 0 && h[3] == 1;
+}
 Viewer viewers[RP_MAX_VIEWERS];
 
 /* ------------------------------------------------------------------------- */
