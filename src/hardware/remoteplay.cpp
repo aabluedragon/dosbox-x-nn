@@ -4505,6 +4505,12 @@ public:
     uint32_t frame_seq = 0xFFFFFFFFu;       /* ...and the newest input the host had applied when it took it (if it said) */
     VPPointer frame_ptr;            /* ...and where the DOS mouse driver had its pointer */
     SDL_Texture *zoom_tex = NULL;   /* the view enlarged by whole pixels (see present) */
+    /* How the picture is enlarged to the window ([inputnet] viewer scaling, Ctrl+F7). Only here, when it is drawn: the
+     * host sends the same picture whatever is chosen. */
+    enum Scaling { SCALE_NEAREST, SCALE_BILINEAR, SCALE_SHARP } scaling = SCALE_NEAREST;
+    SDL_Texture *sharp_tex = NULL;  /* the whole picture enlarged by whole pixels (sharp) */
+    int sharp_w = 0, sharp_h = 0;
+    uint32_t title_note_until = 0;  /* the title names the scaling for a moment after Ctrl+F7 */
     int zoom_w = 0, zoom_h = 0;
     bool dot_on = false;            /* the pointer dot is on the screen, at dot_px, dot_py of the window */
     int dot_px = 0, dot_py = 0;
@@ -4587,8 +4593,52 @@ public:
         lastack = SDL_GetTicks();
     }
 
+    static Scaling scalingNamed(const std::string &name) {
+        return name == "bilinear" ? SCALE_BILINEAR : name == "sharp" ? SCALE_SHARP : SCALE_NEAREST;
+    }
+    static const char *scalingName(Scaling s) {
+        return s == SCALE_BILINEAR ? "bilinear" : s == SCALE_SHARP ? "sharp" : "nearest";
+    }
+    /* Drawing without a graphics card: anything but nearest would cost the processor time on every frame. */
+    bool softwareRenderer(void) {
+        SDL_RendererInfo info;
+        return renderer == NULL || SDL_GetRendererInfo(renderer,&info) != 0 || (info.flags & SDL_RENDERER_SOFTWARE) != 0;
+    }
+
+    /* The picture to the window, enlarged as the player chose (scaling). All of it is the graphics card's work on the
+     * picture already received, so the choice changes nothing the host sends, nor when a frame is shown. */
+    void drawPicture(const SDL_Rect &r) {
+#if SDL_VERSION_ATLEAST(2,0,12)
+        if (scaling == SCALE_SHARP && SDL_RenderTargetSupported(renderer) == SDL_TRUE) {
+            /* whole pixels first (each the same size), then smoothed to the window: DOSBox's "sharp" */
+            const int kx = std::max(1,(int)ceilf((float)r.w / (float)frame_w)), ky = std::max(1,(int)ceilf((float)r.h / (float)frame_h));
+            if (sharp_tex == NULL || sharp_w != (int)frame_w * kx || sharp_h != (int)frame_h * ky) {
+                if (sharp_tex) SDL_DestroyTexture(sharp_tex);
+                sharp_w = (int)frame_w * kx; sharp_h = (int)frame_h * ky;
+                sharp_tex = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_TARGET,sharp_w,sharp_h);
+                if (sharp_tex) SDL_SetTextureScaleMode(sharp_tex,SDL_ScaleModeLinear);
+            }
+            SDL_SetTextureScaleMode(texture,SDL_ScaleModeNearest);
+            if (sharp_tex && SDL_SetRenderTarget(renderer,sharp_tex) == 0) {
+                SDL_RenderCopy(renderer,texture,NULL,NULL);
+                SDL_SetRenderTarget(renderer,NULL);
+                SDL_RenderCopy(renderer,sharp_tex,NULL,&r);
+                return;
+            }
+        }
+        SDL_SetTextureScaleMode(texture,scaling == SCALE_NEAREST ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
+        SDL_RenderCopy(renderer,texture,NULL,&r);
+        /* (what draws over the picture, the enlarged view of view prediction, takes the picture's pixels as they are) */
+        SDL_SetTextureScaleMode(texture,SDL_ScaleModeNearest);
+#else
+        SDL_RenderCopy(renderer,texture,NULL,&r);
+#endif
+    }
+
     void updateTitle(void) {
         std::string t = "DOSBox-X-NN remote play"; /* the host's address stays private */
+        if (title_note_until && (int32_t)(SDL_GetTicks() - title_note_until) < 0)
+            t += std::string(" - picture: ") + scalingName(scaling) + " (Ctrl+F7)";
         if (!welcomed) t += " (connecting...)";
         else if (captured) t += " - Ctrl+F10 releases the mouse";
         else if (abs_pointer) t += " - Ctrl+F10 captures the mouse";
@@ -4771,6 +4821,14 @@ public:
                     show_latency = !show_latency;
                     LOG_MSG("INPUTNET: latency in the window title %s",show_latency ? "on" : "off");
                     updateTitle();
+                    break;
+                }
+                if (e.key.keysym.scancode == SDL_SCANCODE_F7 && (mod & KMOD_CTRL)) {
+                    scaling = softwareRenderer() ? SCALE_NEAREST : (Scaling)((scaling + 1) % 3);
+                    LOG_MSG("INPUTNET: picture scaling: %s",scalingName(scaling));
+                    title_note_until = SDL_GetTicks() + 2500;
+                    updateTitle();
+                    redraw = true;
                     break;
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F12 && (mod & KMOD_CTRL)) {
@@ -5207,7 +5265,7 @@ public:
         dot_on = false;
         if (texture && haveframe) {
             const SDL_Rect r = displayRect();
-            SDL_RenderCopy(renderer,texture,NULL,&r);
+            drawPicture(r);
             /* the view shown larger, over itself (see ViewPredict::warp); the status bar and the rest as they are */
             SDL_Rect view, crop;
             if (zoomCrop(view,crop)) {
@@ -5554,7 +5612,9 @@ public:
             if (t >= 250 && t <= 600000) timeout = (unsigned)t;
             vp.enabled = sec->Get_bool("predict");
             vp.moveView = sec->Get_bool("predict view");
+            scaling = scalingNamed(sec->Get_string("viewer scaling"));
         }
+        if (const char *e = getenv("NN_RP_SCALING")) scaling = scalingNamed(e);
         if (const char *e = getenv("NN_RP_PREDICT")) vp.enabled = atoi(e) != 0;
         if (const char *e = getenv("NN_RP_PREDICTVIEW")) vp.moveView = atoi(e) != 0;
         if (const char *e = getenv("NN_RP_PREDICTLOG")) vp.debug = atoi(e);
@@ -5597,6 +5657,11 @@ public:
         renderer = SDL_CreateRenderer(window,-1,SDL_RENDERER_ACCELERATED);
         if (renderer == NULL) renderer = SDL_CreateRenderer(window,-1,SDL_RENDERER_SOFTWARE);
         if (renderer == NULL) { error = std::string("Unable to draw: ") + SDL_GetError(); return false; }
+        if (scaling != SCALE_NEAREST && softwareRenderer()) {
+            LOG_MSG("INPUTNET: picture scaling %s needs a graphics card: nearest it is",scalingName(scaling));
+            scaling = SCALE_NEAREST;
+        }
+        if (scaling != SCALE_NEAREST) LOG_MSG("INPUTNET: picture scaling: %s (Ctrl+F7 switches)",scalingName(scaling));
         updateTitle();
         present();
         return true;
@@ -5625,6 +5690,7 @@ public:
             testInput();
 
             const uint32_t now = SDL_GetTicks();
+            if (title_note_until && (int32_t)(now - title_note_until) >= 0) { title_note_until = 0; updateTitle(); }
             if (now - lasthello >= (welcomed ? 1000u : 500u)) sendHello();
             if ((acc_xrel != 0 || acc_yrel != 0 || motion_dirty) && now - lastmove >= 4) flushMotion();
             if (!pending.empty() && (input_dirty || now - lastinput >= 30)) sendInput();
@@ -5672,6 +5738,7 @@ public:
         if (audio) SDL_CloseAudioDevice(audio);
         if (texture) SDL_DestroyTexture(texture);
         if (zoom_tex) SDL_DestroyTexture(zoom_tex);
+        if (sharp_tex) SDL_DestroyTexture(sharp_tex);
         if (dot_cursor) { SDL_SetCursor(SDL_GetDefaultCursor()); SDL_FreeCursor(dot_cursor); dot_cursor = NULL; }
         if (renderer) SDL_DestroyRenderer(renderer);
         /* The viewer window goes first: on some window managers (labwc, for one) a message box for it opened behind

@@ -180,6 +180,10 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   `block <name> [name...]` (capability `inputnetBlockKeysLive`) replaces `[inputnet] block keys` at once, while the
   game runs (`block none`: no key); NukemNet sends it to the copies that serve viewers when the room's "Blocked keys"
   change during a game.
+- Remote play viewers choose how the picture is enlarged (capability `inputnetViewerScaling`): `[inputnet] viewer
+  scaling = nearest | bilinear | sharp`, Ctrl+F7 in the viewer switches. Only the viewer does it, with the graphics card,
+  after the frame arrived: the host sends the same picture whatever is chosen (no bandwidth, no latency); a software
+  renderer keeps nearest. sharp enlarges by whole pixels into a render target, then linearly to the window.
 - Remote play viewers can be moved (capability `inputnetMove`, feature bit 16 in a viewer's HELLO): the datagram
   `NNRP`, version, type 12 (RP_MOVED) from the address the viewer talks to makes it start over as a new session,
   keeping its window. NukemNet's proxy (IPX/NullModem-over-InputNet: one copy of the game per player) sends it when

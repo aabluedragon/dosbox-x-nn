@@ -5371,6 +5371,7 @@ void DOSBOX_SetupConfigSections(void) {
 
     const char* inputnetmodes[] = { "remote", "lockstep", 0 };
     const char* inputnetpresent[] = { "flip", "retrace", "scanout", nullptr };
+    const char* inputnetscaling[] = { "nearest", "bilinear", "sharp", nullptr };
     Pstring = secprop->Add_string("mode",Property::Changeable::WhenIdle, "remote");
     Pstring->Set_values(inputnetmodes);
     Pstring->Set_help("How the players share the game.\n"
@@ -5401,6 +5402,18 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("Remote play viewer: prediction. A game that draws its own mouse pointer gets a small dot where\n"
                     "the pointer will be, without the delay of the connection. See also \"predict view\".\n"
                     "false turns all prediction off.");
+
+    Pstring = secprop->Add_string("viewer scaling",Property::Changeable::WhenIdle, "nearest");
+    Pstring->Set_values(inputnetscaling);
+    Pstring->Set_help("Remote play viewer: how the host's picture is enlarged to the window. Only the viewer does it,\n"
+                      "after the picture arrived, with the graphics card: the host sends the same small picture\n"
+                      "whatever is chosen, so it costs no bandwidth and no latency.\n"
+                      "  nearest:  every pixel as a block (the default).\n"
+                      "  bilinear: smoothed.\n"
+                      "  sharp:    enlarged by whole pixels, then smoothed to the window (as DOSBox's sharp shader):\n"
+                      "            crisp, and every pixel equally wide.\n"
+                      "Ctrl+F7 in the viewer switches between them. A viewer without a graphics card (software\n"
+                      "drawing) keeps nearest.");
 
     Pbool = secprop->Add_bool("predict view",Property::Changeable::WhenIdle, false);
     Pbool->Set_help("Remote play viewer: view prediction (off by default). The picture of a first-person game is\n"
