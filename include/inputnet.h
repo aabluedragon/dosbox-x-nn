@@ -88,6 +88,16 @@ bool INPUTNET_ProposeCycleMax(uint32_t newmax,bool reset_counters);
 void DOSBOX_ApplyCycleMax(cpu_cycles_count_t newmax,bool reset_counters);
 bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters);
 
+/* RollbackNet ("mode = rollback", see inputnet.cpp). While a session runs, the main loop calls
+ * INPUTNET_RollbackTick() at the start of every emulated millisecond (right after TIMER_AddTick), and does not
+ * process host events while frames are being replayed after a correction. */
+extern bool inputnet_rollback_active;
+extern bool inputnet_rollback_resim;
+void INPUTNET_RollbackTick(void);
+/* dosbox.cpp: the main loop's budget of emulated milliseconds to run before it waits for real time */
+void DOSBOX_AddTicksRemain(uint32_t n);
+bool DOSBOX_DropTickRemain(void);
+
 /* Session state, for the INPUTNET command and the status line. */
 bool INPUTNET_IsServer(void);
 bool INPUTNET_IsConnected(void);

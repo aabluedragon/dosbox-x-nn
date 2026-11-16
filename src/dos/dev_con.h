@@ -97,6 +97,20 @@ public:
 		key.dst = dst;
 		key_map.push_back(key);
 	}
+	/* RollbackNet's lean save states (savestates.cpp): what the device keeps between calls. DOS programs that write
+	 * to the console or read keys through DOS change it in the middle of a game. */
+	void SaveLeanState(std::ostream& stream) {
+		stream.write((const char*)&readcache, sizeof(readcache));
+		stream.write((const char*)&lasthat, sizeof(lasthat));
+		stream.write((const char*)&ansi, sizeof(ansi));
+		stream.write((const char*)&binary, sizeof(binary));
+	}
+	void LoadLeanState(std::istream& stream) {
+		stream.read((char*)&readcache, sizeof(readcache));
+		stream.read((char*)&lasthat, sizeof(lasthat));
+		stream.read((char*)&ansi, sizeof(ansi));
+		stream.read((char*)&binary, sizeof(binary));
+	}
 private:
 	void ClearAnsi(void);
 	void Output(uint8_t chr);

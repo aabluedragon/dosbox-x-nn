@@ -1471,11 +1471,12 @@ void POD_Save_CPU_Paging( std::ostream& stream )
 //	WRITE_POD( &paging.wp, paging.wp );
 	WRITE_POD( &paging.base, paging.base );
 
-	WRITE_POD( &paging.tlb.read, paging.tlb.read );
-	WRITE_POD( &paging.tlb.write, paging.tlb.write );
-	WRITE_POD( &paging.tlb.phys_page, paging.tlb.phys_page );
-
-	WRITE_POD( &paging.links, paging.links );
+	if (!savestate_lean) { /* RollbackNet: the TLB is a cache of host pointers, cleared on load instead */
+		WRITE_POD( &paging.tlb.read, paging.tlb.read );
+		WRITE_POD( &paging.tlb.write, paging.tlb.write );
+		WRITE_POD( &paging.tlb.phys_page, paging.tlb.phys_page );
+		WRITE_POD( &paging.links, paging.links );
+	}
 //	WRITE_POD( &paging.ur_links, paging.ur_links );
 //	WRITE_POD( &paging.krw_links, paging.krw_links );
 //	WRITE_POD( &paging.kr_links, paging.kr_links );
@@ -1493,11 +1494,12 @@ void POD_Load_CPU_Paging( std::istream& stream )
 //	READ_POD( &paging.wp, paging.wp );
 	READ_POD( &paging.base, paging.base );
 
-	READ_POD( &paging.tlb.read, paging.tlb.read );
-	READ_POD( &paging.tlb.write, paging.tlb.write );
-	READ_POD( &paging.tlb.phys_page, paging.tlb.phys_page );
-
-	READ_POD( &paging.links, paging.links );
+	if (!savestate_lean) {
+		READ_POD( &paging.tlb.read, paging.tlb.read );
+		READ_POD( &paging.tlb.write, paging.tlb.write );
+		READ_POD( &paging.tlb.phys_page, paging.tlb.phys_page );
+		READ_POD( &paging.links, paging.links );
+	}
 //	READ_POD( &paging.ur_links, paging.ur_links );
 //	READ_POD( &paging.krw_links, paging.krw_links );
 //	READ_POD( &paging.kr_links, paging.kr_links );
@@ -1506,7 +1508,11 @@ void POD_Load_CPU_Paging( std::istream& stream )
 	READ_POD( &paging.enabled, paging.enabled );
 
 	READ_POD( &pf_queue, pf_queue );
-
+	if (savestate_lean) {
+		/* the live TLB and its link list belong together: unlinking what is linked leaves every entry fresh */
+		PAGING_ClearTLB();
+		return;
+	}
 	// reset all information
 	paging.links.used = PAGING_LINKS;
 	PAGING_ClearTLB();

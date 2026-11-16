@@ -49,6 +49,8 @@
 #include "pic.h"
 #include "control.h"
 #include "setup.h"
+#include <string>
+#include <vector>
 
 #define SOCKTABLESIZE	150 // DOS IPX driver was limited to 150 open sockets
 
@@ -78,6 +80,7 @@ SDLNet_SocketSet clientSocketSet;
 packetBuffer incomingPacket;
 
 static uint16_t socketCount;
+static bool ipx_cluster = false;     /* a RollbackNet cluster's copy (IPX_ClusterAttach) */
 static uint16_t opensockets[SOCKTABLESIZE]; 
 
 static uint16_t swapByte(uint16_t sockNum) {
@@ -638,6 +641,7 @@ static void receivePacket(uint8_t *buffer, int16_t bufSize) {
 
 	// Check to see if ping packet
 	if(useSocket == 0x2) {
+		if (ipx_cluster) return;	// (a RollbackNet cluster has no IPX server to answer)
 		// Is this a broadcast?
 		if((tmpHeader->dest.addr.byIP.host == 0xffffffff) &&
 			(tmpHeader->dest.addr.byIP.port == 0xffff)) {
@@ -702,6 +706,102 @@ void ethernetSendToIPX(const unsigned char *outptr, unsigned int outlen, unsigne
 		LOG_MSG("IPX: Could not send packet: %s", SDLNet_GetError());
 		DisconnectFromServer(true);
 	}
+}
+
+/* --- RollbackNet clusters (inputnet.cpp) ---------------------------------------------------------------------------
+ * In an IPX-over-RollbackNet game every computer runs a copy of the game for every player, linked by IPX, and the
+ * copies have to see each other's packets at the same emulated moment on every computer. So a copy in a cluster sends to
+ * no server: what it sends during a frame goes to its cluster's leader, which hands every packet to its addressees at
+ * the start of the next frame (IPX_ClusterDeliver). Each copy's node is 10.0.0.<copy + 1> port 0x5555 (the tunnel's
+ * address form). The driver's own state (the ECBs waiting for packets or for their ESR, the open sockets) goes into
+ * RollbackNet's saved frames (IPX_SaveLean / IPX_LoadLean). */
+static std::vector<std::vector<uint8_t> > ipx_cluster_outbox;
+
+void IPX_ClusterAttach(unsigned int copy) {
+	ipx_cluster = true;
+	memset(localIpxAddr.netnum, 0, sizeof(localIpxAddr.netnum));
+	localIpxAddr.netnode[0] = 10; localIpxAddr.netnode[1] = 0; localIpxAddr.netnode[2] = 0;
+	localIpxAddr.netnode[3] = (uint8_t)(copy + 1u); localIpxAddr.netnode[4] = 0x55; localIpxAddr.netnode[5] = 0x55;
+	incomingPacket.connected = true;
+	LOG_MSG("IPX: RollbackNet cluster copy %u, node 10.0.0.%u:21845", copy, copy + 1u);
+}
+
+bool IPX_ClusterActive(void) { return ipx_cluster; }
+
+/* The packets sent since the last call, in order. */
+void IPX_ClusterTakeOutbox(std::vector<std::vector<uint8_t> > &out) {
+	out.swap(ipx_cluster_outbox);
+	ipx_cluster_outbox.clear();
+}
+
+void IPX_ClusterDeliver(const uint8_t *data, size_t len) {
+	if (len < sizeof(IPXHeader) || len > IPXBUFFERSIZE) return;
+	std::vector<uint8_t> copy(data, data + len);    /* receivePacket may keep it (an ECB's data buffer copies) */
+	receivePacket(&copy[0], (int16_t)len);
+}
+
+static void IPX_LeanPut(std::string &out, const void *v, size_t n) { out.append((const char*)v, n); }
+
+/* The driver's state for a saved frame (clusters only): sockets, then the ECBs of both lists in order. */
+void IPX_SaveLean(std::string &out) {
+	if (!ipx_cluster) return;
+	IPX_LeanPut(out, &socketCount, sizeof(socketCount));
+	IPX_LeanPut(out, opensockets, sizeof(opensockets[0]) * socketCount);
+	ECBClass *lists[2] = { ECBList, ESRList };
+	for (unsigned l = 0; l < 2; l++) {
+		uint32_t n = 0;
+		for (ECBClass *e = lists[l]; e != NULL; e = e->nextECB) n++;
+		IPX_LeanPut(out, &n, sizeof(n));
+		for (ECBClass *e = lists[l]; e != NULL; e = e->nextECB) {
+			const uint32_t addr = (uint32_t)e->ECBAddr, len = e->databuffer ? (uint32_t)e->buflen : 0u;
+			IPX_LeanPut(out, &addr, sizeof(addr));
+			IPX_LeanPut(out, &e->iuflag, sizeof(e->iuflag));
+			IPX_LeanPut(out, &e->mysocket, sizeof(e->mysocket));
+			IPX_LeanPut(out, &len, sizeof(len));
+			if (len) IPX_LeanPut(out, e->databuffer, len);
+		}
+	}
+}
+
+/* Puts that state back (guest memory is already the saved frame's). */
+bool IPX_LoadLean(const uint8_t *&p, const uint8_t *end) {
+	if (!ipx_cluster) return true;
+	auto get = [&p, end](void *v, size_t n) -> bool { if ((size_t)(end - p) < n) return false; memcpy(v, p, n); p += n; return true; };
+	while (ESRList != NULL) delete ESRList;     /* (the destructor unlinks the head) */
+	while (ECBList != NULL) delete ECBList;
+	uint16_t sc = 0;
+	if (!get(&sc, sizeof(sc)) || sc > SOCKTABLESIZE) return false;
+	socketCount = sc;
+	if (!get(opensockets, sizeof(opensockets[0]) * sc)) return false;
+	for (unsigned l = 0; l < 2; l++) {
+		uint32_t n = 0;
+		if (!get(&n, sizeof(n)) || n > 4096u) return false;
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t addr = 0, len = 0;
+			uint8_t iu = 0;
+			uint16_t sock = 0;
+			if (!get(&addr, sizeof(addr)) || !get(&iu, sizeof(iu)) || !get(&sock, sizeof(sock)) || !get(&len, sizeof(len))) return false;
+			if (len > IPXBUFFERSIZE || (size_t)(end - p) < len) return false;
+			ECBClass *e = new ECBClass(RealSeg(addr), RealOff(addr));     /* joins the end of ECBList */
+			e->iuflag = iu;
+			e->mysocket = sock;
+			if (len) { e->databuffer = new uint8_t[len]; memcpy(e->databuffer, p, len); e->buflen = len; p += len; }
+			if (l == 1) {               /* it was waiting for its ESR: move it to the end of ESRList */
+				if (e->prevECB == NULL) ECBList = e->nextECB; else e->prevECB->nextECB = e->nextECB;
+				if (e->nextECB != NULL) e->nextECB->prevECB = e->prevECB;
+				e->nextECB = NULL;
+				if (ESRList == NULL) { ESRList = e; e->prevECB = NULL; }
+				else {
+					ECBClass *t = ESRList;
+					while (t->nextECB != NULL) t = t->nextECB;
+					t->nextECB = e;
+					e->prevECB = t;
+				}
+				e->isInESRList = true;
+			}
+		}
+	}
+	return true;
 }
 
 static void sendPacket(ECBClass* sendecb) {
@@ -787,7 +887,12 @@ static void sendPacket(ECBClass* sendecb) {
 		if(immedAddr[m]!=0xff) islocalbroadcast=false;
 	}
 	LOG_IPX("SEND crc:%2x",packetCRC(&outbuffer[0], packetsize));
-	if(!isloopback) {
+	if(!isloopback && ipx_cluster) {
+		/* RollbackNet cluster: to the leader at the end of the frame (see IPX_ClusterAttach) */
+		ipx_cluster_outbox.push_back(std::vector<uint8_t>(outbuffer, outbuffer + packetsize));
+		sendecb->setCompletionFlag(COMP_SUCCESS);
+	}
+	else if(!isloopback) {
 		outPacket.channel = UDPChannel;
 		outPacket.data = (Uint8 *)&outbuffer[0];
 		outPacket.len = packetsize;

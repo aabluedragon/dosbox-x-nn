@@ -327,6 +327,12 @@ static void RENDER_ScalerLineHandler(const void * s) {
 	}
 }
 
+/* A palette change's frame: every line, but not more than the frame has (as RENDER_ScalerLineHandler) */
+static void RENDER_PalLineHandler(const void * s) {
+	if (render.scale.outLine < render.src.height) render.scale.linePalHandler(s);
+	else RENDER_DrawLine = RENDER_EmptyLineHandler;
+}
+
 void D3D11_DrawLine_8bpp(const void* src);
 
 static void RENDER_StartLineHandler(const void * s) {
@@ -394,6 +400,11 @@ static void RENDER_FinishLineHandler(const void * s) {
 static void RENDER_ClearCacheHandler(const void * src) {
     if (render.disablerender)
         return;
+    /* (no more lines than the frame has: a RollbackNet rollback can put the VGA back mid-frame, see RENDER_ScalerLineHandler) */
+    if (render.scale.outLine >= render.src.height) {
+        RENDER_DrawLine = RENDER_EmptyLineHandler;
+        return;
+    }
 
     Bitu x, width;
     uint32_t *srcLine, *cacheLine;
@@ -406,6 +417,12 @@ static void RENDER_ClearCacheHandler(const void * src) {
 }
 
 extern void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused);
+
+/* The next frame redraws every line (RollbackNet, after a replay whose frames were not shown: the line cache no longer
+ * says what the window has, a mode change during the replay left the window blank). */
+void RENDER_RedrawAll(void) {
+    render.scale.clearCache = true;
+}
 
 bool RENDER_StartUpdate(void) {
 
@@ -455,7 +472,7 @@ bool RENDER_StartUpdate(void) {
             /* Assume pal changes always do a full screen update anyway */
             if (GCC_UNLIKELY(!GFX_StartUpdate( render.scale.outWrite, render.scale.outPitch )))
                 return false;
-            RENDER_DrawLine = render.scale.linePalHandler;
+            RENDER_DrawLine = RENDER_PalLineHandler;
             vga.draw.must_complete_frame = true;
             render.fullFrame = true;
         } else {

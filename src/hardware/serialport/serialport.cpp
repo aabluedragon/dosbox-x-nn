@@ -912,6 +912,36 @@ void CSerial::Write_reserved (uint8_t data, uint8_t address) {
 /*****************************************************************************/
 /* MCR Access: returns circuit state as boolean.                            **/
 /*****************************************************************************/
+/* RollbackNet (a cluster's null modem): the UART as a saved frame holds it (its events are the PIC's) */
+void CSerial::SaveRBState(std::string &out) {
+	auto put = [&out](const void *v, size_t n) { out.append((const char*)v, n); };
+	put(&baud_multiplier, sizeof(baud_multiplier)); put(&bytetime, sizeof(bytetime));
+	const uint8_t b[] = { waiting_interrupts, IER, (uint8_t)irq_active, ISR, LCR, (uint8_t)dtr, (uint8_t)rts, (uint8_t)op1,
+		(uint8_t)op2, (uint8_t)loopback, LSR, (uint8_t)errormsg_pending, (uint8_t)d_cts, (uint8_t)d_dsr, (uint8_t)d_ri,
+		(uint8_t)d_cd, (uint8_t)cts, (uint8_t)dsr, (uint8_t)ri, (uint8_t)cd, SPR, loopback_data, FCR, (uint8_t)sync_guardtime };
+	put(b, sizeof(b));
+	const uint32_t w[] = { (uint32_t)baud_divider, (uint32_t)framingErrors, (uint32_t)parityErrors, (uint32_t)overrunErrors,
+		(uint32_t)txOverrunErrors, (uint32_t)overrunIF0, (uint32_t)breakErrors, (uint32_t)errors_in_fifo,
+		(uint32_t)rx_interrupt_threshold, (uint32_t)fifosize };
+	put(w, sizeof(w));
+	rxfifo->SaveRB(out); txfifo->SaveRB(out); errorfifo->SaveRB(out);
+	SaveRBExtra(out);
+}
+
+bool CSerial::LoadRBState(const uint8_t *&p, const uint8_t *end) {
+	auto get = [&p, end](void *v, size_t n) -> bool { if ((size_t)(end - p) < n) return false; memcpy(v, p, n); p += n; return true; };
+	uint8_t b[24];
+	uint32_t w[10];
+	if (!get(&baud_multiplier, sizeof(baud_multiplier)) || !get(&bytetime, sizeof(bytetime)) || !get(b, sizeof(b)) || !get(w, sizeof(w))) return false;
+	waiting_interrupts = b[0]; IER = b[1]; irq_active = b[2] != 0; ISR = b[3]; LCR = b[4]; dtr = b[5] != 0; rts = b[6] != 0;
+	op1 = b[7] != 0; op2 = b[8] != 0; loopback = b[9] != 0; LSR = b[10]; errormsg_pending = b[11] != 0; d_cts = b[12] != 0;
+	d_dsr = b[13] != 0; d_ri = b[14] != 0; d_cd = b[15] != 0; cts = b[16] != 0; dsr = b[17] != 0; ri = b[18] != 0; cd = b[19] != 0;
+	SPR = b[20]; loopback_data = b[21]; FCR = b[22]; sync_guardtime = b[23] != 0;
+	baud_divider = (uint16_t)w[0]; framingErrors = w[1]; parityErrors = w[2]; overrunErrors = w[3]; txOverrunErrors = w[4];
+	overrunIF0 = w[5]; breakErrors = w[6]; errors_in_fifo = w[7]; rx_interrupt_threshold = w[8]; fifosize = w[9];
+	return rxfifo->LoadRB(p, end) && txfifo->LoadRB(p, end) && errorfifo->LoadRB(p, end) && LoadRBExtra(p, end);
+}
+
 bool CSerial::getDTR () {
 	if(loopback) return false;
 	else return dtr;
@@ -1443,6 +1473,16 @@ public:
 					serialports[i] = NULL;
 				}
 			}
+			else if(type=="rbnullmodem") {      /* a RollbackNet cluster's null modem */
+				serialports[i] = new CRBNullModem (i, &cmd);
+				serialports[i]->serialType = SERIAL_TYPE_RBNULL_MODEM;
+				serialports[i]->baud_multiplier = multiplier;
+				cmd.GetStringRemain(serialports[i]->commandLineString);
+				if (!serialports[i]->InstallationSuccessful)  {
+					delete serialports[i];
+					serialports[i] = NULL;
+				}
+			}
 #endif
 			else if(type=="disabled") {
 				serialports[i] = NULL;
@@ -1478,7 +1518,8 @@ static const char *serialTypes[SERIAL_TYPE_COUNT] = {
 #endif
 #if C_MODEM
 	"modem",
-	"nullmodem"
+	"nullmodem",
+	"rbnullmodem"
 #endif
 };
 
@@ -1627,6 +1668,13 @@ void SERIAL::Run()
 				break;
 			case SERIAL_TYPE_NULL_MODEM:
 				serialports[port-1] = new CNullModem(port-1, &cmd);
+				if (!serialports[port-1]->InstallationSuccessful) {
+					delete serialports[port-1];
+					serialports[port-1] = NULL;
+				}
+				break;
+			case SERIAL_TYPE_RBNULL_MODEM:
+				serialports[port-1] = new CRBNullModem(port-1, &cmd);
 				if (!serialports[port-1]->InstallationSuccessful) {
 					delete serialports[port-1];
 					serialports[port-1] = NULL;

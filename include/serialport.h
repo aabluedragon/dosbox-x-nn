@@ -21,6 +21,8 @@
 #define DOSBOX_SERIALPORT_H
 
 #include "inout.h"
+#include <string>
+#include <string.h>
 #include "programs.h"
 
 // set this to 1 for serial debugging in release mode
@@ -70,6 +72,21 @@ public:
 	void clear(void) {
 		pos=used=0;
 		data[0]=0;
+	}
+	/* RollbackNet (a cluster's null modem): the FIFO in a saved frame */
+	void SaveRB(std::string &out) const {
+		const uint32_t v[4] = { (uint32_t)maxsize, (uint32_t)size, (uint32_t)pos, (uint32_t)used };
+		out.append((const char*)v, sizeof(v));
+		out.append((const char*)data, maxsize);
+	}
+	bool LoadRB(const uint8_t *&p, const uint8_t *end) {
+		uint32_t v[4];
+		if ((size_t)(end - p) < sizeof(v)) return false;
+		memcpy(v, p, sizeof(v)); p += sizeof(v);
+		if (v[0] != maxsize || (size_t)(end - p) < maxsize || v[1] > maxsize || v[2] > maxsize || v[3] > maxsize) return false;
+		size = v[1]; pos = v[2]; used = v[3];
+		memcpy(data, p, maxsize); p += maxsize;
+		return true;
 	}
 
 	bool addb(uint8_t _val) {
@@ -124,6 +141,7 @@ enum SerialTypesE {
 #if C_MODEM
 	SERIAL_TYPE_MODEM,
 	SERIAL_TYPE_NULL_MODEM,
+	SERIAL_TYPE_RBNULL_MODEM,	/* RollbackNet cluster's null modem (nullmodem.cpp CRBNullModem) */
 #endif
 	SERIAL_TYPE_COUNT
 };
@@ -263,6 +281,11 @@ public:
 
 	void registerDOSDevice();
 	void unregisterDOSDevice();
+	/* RollbackNet (a cluster's null modem): the port's whole state in a saved frame, and the device's own */
+	void SaveRBState(std::string &out);
+	bool LoadRBState(const uint8_t *&p, const uint8_t *end);
+	virtual void SaveRBExtra(std::string &out) { (void)out; }
+	virtual bool LoadRBExtra(const uint8_t *&p, const uint8_t *end) { (void)p; (void)end; return true; }
 
 private:
 

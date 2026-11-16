@@ -367,6 +367,91 @@ SaveState& SaveState::instance() {
 	return singleton;
 }
 
+bool savestate_lean = false;
+
+namespace {
+/* Components that only hold host state: a rollback must leave them alone. */
+bool LeanSkipped(const std::string& name) {
+	return name == "Render" || name == "Midi" || name == "Dosbox-x";
+}
+
+class LeanAppendBuf : public std::streambuf {
+public:
+	explicit LeanAppendBuf(std::string& s) : out(s) {}
+protected:
+	std::streamsize xsputn(const char* p, std::streamsize n) override { out.append(p, (size_t)n); return n; }
+	int_type overflow(int_type c) override {
+		if (!traits_type::eq_int_type(c, traits_type::eof())) out.push_back(traits_type::to_char_type(c));
+		return traits_type::not_eof(c);
+	}
+private:
+	std::string& out;
+};
+
+class LeanReadBuf : public std::streambuf {
+public:
+	LeanReadBuf(const char* p, size_t n) { char* b = const_cast<char*>(p); setg(b, b, b + n); }
+protected:
+	pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override {
+		if (!(which & std::ios_base::in)) return pos_type(off_type(-1));
+		char* target = (dir == std::ios_base::beg) ? eback() + off : (dir == std::ios_base::cur) ? gptr() + off : egptr() + off;
+		if (target < eback() || target > egptr()) return pos_type(off_type(-1));
+		setg(eback(), target, egptr());
+		return pos_type(off_type(target - eback()));
+	}
+	pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+		return seekoff(off_type(pos), std::ios_base::beg, which);
+	}
+};
+
+struct LeanFlag {
+	LeanFlag() { savestate_lean = true; }
+	~LeanFlag() { savestate_lean = false; }
+};
+}
+
+static bool lean_profile = getenv("NN_RB_PROFILE") != NULL && *getenv("NN_RB_PROFILE");  /* once: what each component costs */
+
+void SaveState::saveLean(std::string& out) {
+	LeanFlag lean;
+	out.clear();
+	for (CompEntry::iterator i = components.begin(); i != components.end(); ++i) {
+		if (LeanSkipped(i->first)) continue;
+		const size_t lenpos = out.size();
+		out.append(4, '\0');
+		const uint64_t t0 = lean_profile ? SDL_GetPerformanceCounter() : 0;
+		{
+			LeanAppendBuf buf(out);
+			std::ostream os(&buf);
+			i->second.comp.getBytes(os);
+		}
+		const uint32_t len = (uint32_t)(out.size() - lenpos - 4);
+		memcpy(&out[lenpos], &len, 4);
+		if (lean_profile)
+			LOG_MSG("SAVESTATE lean: %-12s %8u bytes %8.1f us", i->first.c_str(), (unsigned)len,
+				(double)(SDL_GetPerformanceCounter() - t0) * 1000000.0 / (double)SDL_GetPerformanceFrequency());
+	}
+	lean_profile = false;
+}
+
+bool SaveState::loadLean(const std::string& in) {
+	LeanFlag lean;
+	size_t pos = 0;
+	for (CompEntry::iterator i = components.begin(); i != components.end(); ++i) {
+		if (LeanSkipped(i->first)) continue;
+		if (pos + 4 > in.size()) return false;
+		uint32_t len;
+		memcpy(&len, in.data() + pos, 4);
+		pos += 4;
+		if (pos + len > in.size()) return false;
+		LeanReadBuf buf(in.data() + pos, len);
+		std::istream is(&buf);
+		i->second.comp.setBytes(is);
+		pos += len;
+	}
+	return pos == in.size();
+}
+
 void SaveState::registerComponent(const std::string& uniqueName, Component& comp) {
 	components.insert(std::make_pair(uniqueName, CompData(comp)));
 }

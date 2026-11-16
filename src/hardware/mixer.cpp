@@ -784,6 +784,19 @@ void MIXER_MixSingle(Bitu /*val*/) {
     PIC_AddEvent(MIXER_MixSingle,1000.0 / mixer.freq);
 }
 
+/* RollbackNet (inputnet "mode = rollback"): while frames are replayed after a correction, the sound they produce
+ * was already heard; it is rendered (the sound devices must run exactly as before) but not queued. */
+static bool mixer_rollback_discard = false;
+void MIXER_SetRollbackDiscard(bool on) { mixer_rollback_discard = on; }
+Bitu MIXER_GetRate(void) { return (Bitu)mixer.freq; }   /* RollbackNet's settings fingerprint */
+
+/* RollbackNet needs the same number of samples per emulated millisecond on every participant (the Sound Blaster
+ * and other devices are paced by it): a fixed rate that 1000 divides, whatever the host's audio device prefers. */
+static bool MIXER_RollbackMode(void) {
+    Section_prop *s = static_cast<Section_prop *>(control->GetSection("inputnet"));
+    return s != NULL && s->Get_bool("inputnet") && std::string(s->Get_string("mode")) == "rollback";
+}
+
 static void MIXER_Mix(void) {
     Bitu thr;
 
@@ -796,7 +809,7 @@ static void MIXER_Mix(void) {
     /* render */
     assert((mixer.work_in+mixer.samples_per_ms.w) <= MIXER_BUFSIZE);
     MIXER_MixData((Bitu)mixer.samples_this_ms.w * (Bitu)mixer.samples_this_ms.fd);
-    mixer.work_in += mixer.samples_this_ms.w;
+    if (!mixer_rollback_discard) mixer.work_in += mixer.samples_this_ms.w;
 
     /* how many samples for the next ms? */
     mixer.samples_this_ms.w = mixer.samples_per_ms.w;
@@ -1245,6 +1258,11 @@ void MIXER_Init() {
     Section_prop * section=static_cast<Section_prop *>(control->GetSection("mixer"));
     /* Read out config section */
     mixer.freq=(unsigned int)section->Get_int("rate");
+    const bool rollback_rate = MIXER_RollbackMode();
+    if (rollback_rate && mixer.freq != 48000u) {
+        LOG_MSG("MIXER: RollbackNet runs the mixer at 48000 Hz (rate=%u in the configuration)",(unsigned int)mixer.freq);
+        mixer.freq = 48000u;
+    }
     mixer.nosound=section->Get_bool("nosound");
     mixer.blocksize=(unsigned int)section->Get_int("blocksize");
     mixer.swapstereo=section->Get_bool("swapstereo");
@@ -1291,9 +1309,10 @@ void MIXER_Init() {
         LOG(LOG_MISC,LOG_DEBUG)("MIXER:No Sound Mode Selected.");
         TIMER_AddTickHandler(MIXER_Mix);
 #ifdef C_SDL2
-    } else if ((SDL2_AudioDevice=SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_SAMPLES_CHANGE)) == 0) {
+    } else if ((SDL2_AudioDevice=SDL_OpenAudioDevice(NULL, 0, &spec, &obtained,
+            rollback_rate ? SDL_AUDIO_ALLOW_SAMPLES_CHANGE : (SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_SAMPLES_CHANGE))) == 0) {
 #else
-    } else if (SDL_OpenAudio(&spec, &obtained) <0 ) {
+    } else if (rollback_rate ? (SDL_OpenAudio(&spec, NULL) < 0 || (obtained = spec, false)) : (SDL_OpenAudio(&spec, &obtained) <0) ) {
 #endif
         mixer.nosound = true;
         LOG(LOG_MISC,LOG_DEBUG)("MIXER:Can't open audio: %s , running in nosound mode.",SDL_GetError());
@@ -1451,6 +1470,23 @@ private:
 		POD_Save_PCSpeaker(stream);
 		POD_Save_Sblaster(stream);
 		POD_Save_Tandy_Sound(stream);
+		/* Each channel's rate and filters, after the rest (older states end before it): the devices set them only when
+		 * a game changes them, so a machine that loaded a state kept its own (RollbackNet: a computer joining a game
+		 * whose Sound Blaster plays at another rate queued more samples than its channel played, until it overran). */
+		const uint32_t magic = 0x58494D52u; /* "RMIX" */
+		uint32_t count = 0;
+		for (MixerChannel *c = mixer.channels; c != NULL; c = c->next) count++;
+		stream.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+		stream.write(reinterpret_cast<const char*>(&count), sizeof(count));
+		for (MixerChannel *c = mixer.channels; c != NULL; c = c->next) {
+			const std::string nm = (c->name != NULL) ? std::string(c->name).substr(0, 255) : std::string();
+			const uint8_t nl = (uint8_t)nm.size();
+			const uint32_t v[5] = { (uint32_t)c->freq_n, (uint32_t)c->freq_d_orig, (uint32_t)c->freq_nslew_want,
+				(uint32_t)c->lowpass_freq, (uint32_t)c->lowpass_order };
+			stream.write(reinterpret_cast<const char*>(&nl), 1);
+			stream.write(nm.data(), nl);
+			stream.write(reinterpret_cast<const char*>(v), sizeof(v));
+		}
 	}
 
 	void setBytes(std::istream& stream) override
@@ -1470,10 +1506,38 @@ private:
 		POD_Load_PCSpeaker(stream);
 		POD_Load_Sblaster(stream);
 		POD_Load_Tandy_Sound(stream);
+		{   /* the channels' rates and filters (see getBytes; read, not peek: the save file's zip stream) */
+			uint32_t magic = 0, count = 0;
+			stream.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+			if (stream.gcount() == (std::streamsize)sizeof(magic) && magic == 0x58494D52u) {
+				stream.read(reinterpret_cast<char*>(&count), sizeof(count));
+				for (uint32_t i = 0; i < count && i < 256u && stream.good(); i++) {
+					uint8_t nl = 0;
+					char nm[256];
+					uint32_t v[5] = {0, 0, 0, 0, 0};
+					stream.read(reinterpret_cast<char*>(&nl), 1);
+					stream.read(nm, nl);
+					nm[nl] = 0;
+					stream.read(reinterpret_cast<char*>(v), sizeof(v));
+					if (!stream.good() && stream.gcount() != (std::streamsize)sizeof(v)) break;
+					for (MixerChannel *c = mixer.channels; c != NULL; c = c->next) {
+						if (c->name == NULL || strcmp(c->name, nm) != 0) continue;
+						if (v[0] != 0 && v[1] != 0) c->SetFreq(v[0], v[1]);
+						c->SetSlewFreq(v[2]);
+						c->SetLowpassFreq(v[3], v[4]);
+						c->msbuffer_o = c->msbuffer_i = 0;     /* (what it had queued belongs to the machine before) */
+						break;
+					}
+				}
+			}
+			stream.clear();
+		}
 
-		// reset mixer channel (system data)
-		mixer.pos = 0;
-		mixer.done = 0;
+		// reset mixer channel (system data); a RollbackNet snapshot leaves the output to the sound card alone
+		if (!savestate_lean) {
+			mixer.pos = 0;
+			mixer.done = 0;
+		}
 	}
 
 } dummy;

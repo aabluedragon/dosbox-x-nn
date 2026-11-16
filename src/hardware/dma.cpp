@@ -952,6 +952,17 @@ namespace
 
 			// - pure data
 			WRITE_POD( &ems_board_mapping, ems_board_mapping );
+			/* each channel's transfer mode (read, write, verify), after the rest (older states end before it): a
+			 * machine that loaded a state kept its own, and a Sound Blaster then read nothing by DMA */
+			uint8_t tms[8] = {0};
+			for( int lcv=0; lcv<2; lcv++ ) {
+				if( !DmaControllers[lcv] ) continue;
+				for( unsigned int c=0; c<4; c++ ) {
+					DmaChannel *chan = DmaControllers[lcv]->GetChannel((uint8_t)c);
+					tms[lcv * 4 + c] = chan ? chan->transfer_mode : 0;
+				}
+			}
+			stream.write(reinterpret_cast<const char*>(tms), sizeof(tms));
 		}
 
 		void setBytes(std::istream& stream) override
@@ -973,6 +984,17 @@ namespace
 
 			// - pure data
 			READ_POD( &ems_board_mapping, ems_board_mapping );
+			/* (read, not peek: the save state file's zip stream can only be read; an older state ends here) */
+			uint8_t tms[8];
+			stream.read(reinterpret_cast<char*>(tms), sizeof(tms));
+			if( stream.gcount() != (std::streamsize)sizeof(tms) ) { stream.clear(); return; }
+			for( int lcv=0; lcv<2; lcv++ ) {
+				if( !DmaControllers[lcv] ) continue;
+				for( unsigned int c=0; c<4; c++ ) {
+					DmaChannel *chan = DmaControllers[lcv]->GetChannel((uint8_t)c);
+					if( chan ) chan->transfer_mode = tms[lcv * 4 + c];
+				}
+			}
 		}
 	} dummy;
 }

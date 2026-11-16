@@ -768,6 +768,18 @@ bool PIC_RunQueue(void) {
             pic_queue.next_entry=entry->next;
             srv_lag = entry->index;
 
+            {   /* RollbackNet debugging (NN_RB_EVLOG): the events of the frames after a resync's load */
+                extern bool rb_evlog_on;
+                extern void SBLASTER_DebugState(char *out, size_t n);
+                if (rb_evlog_on) {
+                    char sbs[200];
+                    SBLASTER_DebugState(sbs, sizeof(sbs));
+                    LOG_MSG("RBEV t=%u idx=%.9f h=%ld v=%lu eip=%04x:%08x cl=%ld irr=%02x/%02x isr=%02x/%02x imr=%02x/%02x | %s", (unsigned)PIC_Ticks, (double)entry->index,
+                        (long)((const char*)(void*)entry->pic_event - (const char*)(void*)&PIC_RunQueue), (unsigned long)entry->value,
+                        (unsigned)SegValue(cs), (unsigned)reg_eip, (long)CPU_CycleLeft,
+                        pics[0].irr, pics[1].irr, pics[0].isr, pics[1].isr, pics[0].imr, pics[1].imr, sbs);
+                }
+            }
             if (entry->pic_event != NULL)
                 (entry->pic_event)(entry->value); // call the event handler
             else
@@ -1277,6 +1289,27 @@ public:
 private:
     void getBytes(std::ostream& stream) override
     {
+        if (savestate_lean) {
+            /* RollbackNet snapshot, same process: the event queue goes as it is (its pointers stay valid), at the
+             * full precision the events run at; the timer handler list as below. */
+            SerializeGlobalPOD::getBytes(stream);
+            stream.write(reinterpret_cast<const char*>(&PIC_Ticks), sizeof(PIC_Ticks) );
+            stream.write(reinterpret_cast<const char*>(&PIC_IRQCheck), sizeof(PIC_IRQCheck) );
+            stream.write(reinterpret_cast<const char*>(&PIC_IRQCheckPending), sizeof(PIC_IRQCheckPending) );
+            stream.write(reinterpret_cast<const char*>(&pics), sizeof(pics) );
+            stream.write(reinterpret_cast<const char*>(&pic_queue), sizeof(pic_queue) );
+            stream.write(reinterpret_cast<const char*>(&InEventService), sizeof(InEventService) );
+            stream.write(reinterpret_cast<const char*>(&srv_lag), sizeof(srv_lag) );
+            uint16_t lean_tickers = 0;
+            for (TickerBlock *t = firstticker; t != NULL; t = t->next) lean_tickers++;
+            stream.write(reinterpret_cast<const char*>(&lean_tickers), sizeof(lean_tickers) );
+            for (TickerBlock *t = firstticker; t != NULL; t = t->next) {
+                const uint16_t idx = PIC_State_FindTimer( (Bitu) (t->handler) );
+                stream.write(reinterpret_cast<const char*>(&idx), sizeof(idx) );
+            }
+            return;
+        }
+
 				uint16_t pic_free_idx, pic_next_idx;
 				uint16_t pic_next_ptr[PIC_QUEUESIZE];
 
@@ -1393,6 +1426,17 @@ private:
 				uint16_t ticker_size;
 
 
+        if (savestate_lean) {
+            SerializeGlobalPOD::setBytes(stream);
+            stream.read(reinterpret_cast<char*>(&PIC_Ticks), sizeof(PIC_Ticks) );
+            stream.read(reinterpret_cast<char*>(&PIC_IRQCheck), sizeof(PIC_IRQCheck) );
+            stream.read(reinterpret_cast<char*>(&PIC_IRQCheckPending), sizeof(PIC_IRQCheckPending) );
+            stream.read(reinterpret_cast<char*>(&pics), sizeof(pics) );
+            stream.read(reinterpret_cast<char*>(&pic_queue), sizeof(pic_queue) );
+            stream.read(reinterpret_cast<char*>(&InEventService), sizeof(InEventService) );
+            stream.read(reinterpret_cast<char*>(&srv_lag), sizeof(srv_lag) );
+        }
+        else {
         SerializeGlobalPOD::setBytes(stream);
 
 
@@ -1449,6 +1493,7 @@ private:
             stream.read(reinterpret_cast<char*>(&srv_lag_d), sizeof(srv_lag_d) );
             srv_lag = (pic_tickindex_t)srv_lag_d;
         }
+        } /* !savestate_lean */
 
 
 				// 1- wipe old data

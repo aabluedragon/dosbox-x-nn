@@ -393,6 +393,32 @@ int GameLink::Init( const bool trackonly_mode )
 	return 1;
 }
 
+// Guest RAM of our own (not the shared memory) starts on a host page: RollbackNet's write tracking
+// (inputnet.cpp, RBT_*) protects it page by page. malloc would put it 16 bytes into a page.
+static size_t gl_own_ram_size = 0;
+
+static uint8_t* gl_alloc_own_ram( const size_t size )
+{
+	gl_own_ram_size = size;
+#ifdef WIN32
+	return (uint8_t*)VirtualAlloc( NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+#else
+	void *p = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
+	return ( p == MAP_FAILED ) ? nullptr : (uint8_t*)p;
+#endif
+}
+
+static void gl_free_own_ram( void *p )
+{
+	if ( p == nullptr ) return;
+#ifdef WIN32
+	VirtualFree( p, 0, MEM_RELEASE );
+#else
+	munmap( p, gl_own_ram_size );
+#endif
+	gl_own_ram_size = 0;
+}
+
 //------------------------------------------------------------------------------
 // GameLink::AllocRAM
 //------------------------------------------------------------------------------
@@ -405,7 +431,7 @@ uint8_t* GameLink::AllocRAM( const uint32_t size )
 	g_membase_size = size;
 
 	if (!sdl.gamelink.enable) {
-		membase = (uint8_t*)malloc(g_membase_size);
+		membase = gl_alloc_own_ram(g_membase_size);
 		return membase;
 	}
 
@@ -427,7 +453,7 @@ uint8_t* GameLink::AllocRAM( const uint32_t size )
 	LOG_MSG( "GAMELINK: Initialised. Allocated %d MB of shared memory.", (memory_map_size + (1024*1024) - 1) / (1024*1024) );
 
 	if (sdl.gamelink.snoop) {
-		membase = (uint8_t*)malloc(g_membase_size);
+		membase = gl_alloc_own_ram(g_membase_size);
 	} else {
 		membase = ((uint8_t*)g_p_shared_memory) + MEMORY_MAP_CORE_SIZE;
 	}
@@ -440,7 +466,7 @@ void GameLink::FreeRAM(void *membase)
 {
 	// free memory if we did not use shared memory
 	if (membase != ((uint8_t*)g_p_shared_memory) + MEMORY_MAP_CORE_SIZE) {
-		free(membase);
+		gl_free_own_ram(membase);
 	}
 }
 

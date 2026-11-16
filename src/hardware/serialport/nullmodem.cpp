@@ -633,4 +633,110 @@ void CNullModem::setRTS(bool val) {
 void CNullModem::setDTR(bool val) {
 	setRTSDTR(getRTS(), val);
 }
+
+/* --- RollbackNet cluster's null modem (see nullmodem.h) ------------------------------------------------------------ */
+static CRBNullModem *rb_nullmodem = NULL;   /* (one per copy: a NullModem-over-RollbackNet game links two copies) */
+
+CRBNullModem::CRBNullModem(Bitu id, CommandLine* cmd) : CSerial(id, cmd) {
+	InstallationSuccessful = false;
+	rx_running = false;
+	CSerial::Init_Registers();
+	/* the other side's lines come with its first frame's bytes; until then it is there and ready */
+	setCTS(true); setDSR(true); setCD(true); setRI(false);
+	rb_nullmodem = this;
+	LOG_MSG("Serial%d: RollbackNet null modem", (int)COMNUMBER);
+	InstallationSuccessful = true;
+}
+
+CRBNullModem::~CRBNullModem() {
+	if (rb_nullmodem == this) rb_nullmodem = NULL;
+	for (uint16_t i = 0; i <= SERIAL_BASE_EVENT_COUNT; i++) removeEvent(i);
+}
+
+void CRBNullModem::transmitByte(uint8_t val, bool first) {
+	/* (the UART's timing as CNullModem's) */
+	if (first) setEvent(SERIAL_THR_EVENT, bytetime/8);
+	else setEvent(SERIAL_TX_EVENT, bytetime);
+	outbox.push_back(val);
+}
+
+void CRBNullModem::handleUpperEvent(uint16_t type) {
+	switch (type) {
+		case SERIAL_RX_EVENT:
+			/* one byte per byte time, while the UART takes it (else it waits: the cable has flow control here) */
+			if (!rxq.empty() && CanReceiveByte()) {
+				const uint8_t b = rxq.front();
+				rxq.pop_front();
+				receiveByteEx(b, 0);
+			}
+			if (!rxq.empty()) setEvent(SERIAL_RX_EVENT, bytetime);
+			else rx_running = false;
+			break;
+		case SERIAL_TX_EVENT:
+			ByteTransmitted();
+			break;
+		case SERIAL_THR_EVENT:
+			ByteTransmitting();
+			setEvent(SERIAL_TX_EVENT, bytetime + 0.01f);
+			break;
+		default:
+			break;
+	}
+}
+
+void CRBNullModem::Deliver(const uint8_t *data, size_t n, uint8_t lines) {
+	if (lines & 0x80) {         /* the other side's RTS and DTR (it has a port) */
+		setCTS((lines & 1) != 0);
+		setDSR((lines & 2) != 0);
+		setCD((lines & 2) != 0);
+	}
+	for (size_t i = 0; i < n; i++) rxq.push_back(data[i]);
+	if (!rxq.empty() && !rx_running) {
+		rx_running = true;
+		setEvent(SERIAL_RX_EVENT, bytetime * 0.9f);
+	}
+}
+
+void CRBNullModem::SaveRBExtra(std::string &out) {
+	const uint32_t n = (uint32_t)rxq.size();
+	const uint8_t r = rx_running ? 1 : 0;
+	out.append((const char*)&n, 4);
+	for (size_t i = 0; i < rxq.size(); i++) out.push_back((char)rxq[i]);
+	out.append((const char*)&r, 1);
+}
+
+bool CRBNullModem::LoadRBExtra(const uint8_t *&p, const uint8_t *end) {
+	uint32_t n = 0;
+	if ((size_t)(end - p) < 4) return false;
+	memcpy(&n, p, 4); p += 4;
+	if ((size_t)(end - p) < (size_t)n + 1u) return false;
+	rxq.assign(p, p + n); p += n;
+	rx_running = *p++ != 0;
+	outbox.clear();
+	return true;
+}
+
+/* For RollbackNet (inputnet.cpp). Lines: bit 0 RTS, bit 1 DTR, bit 7 this copy has the port. */
+bool SERIAL_RBPresent(void) { return rb_nullmodem != NULL; }
+
+void SERIAL_RBTakeOutbox(std::vector<uint8_t> &bytes, uint8_t &lines) {
+	bytes.clear();
+	lines = 0;
+	if (rb_nullmodem == NULL) return;
+	bytes.swap(rb_nullmodem->outbox);
+	lines = (uint8_t)(0x80u | (rb_nullmodem->getRTS() ? 1u : 0u) | (rb_nullmodem->getDTR() ? 2u : 0u));
+}
+
+void SERIAL_RBDeliver(const uint8_t *data, size_t n, uint8_t lines) {
+	if (rb_nullmodem != NULL) rb_nullmodem->Deliver(data, n, lines);
+}
+
+void SERIAL_RBSave(std::string &out) {
+	if (rb_nullmodem != NULL) rb_nullmodem->SaveRBState(out);
+}
+
+bool SERIAL_RBLoad(const uint8_t *&p, const uint8_t *end) {
+	if (rb_nullmodem == NULL || p == end) return true;
+	return rb_nullmodem->LoadRBState(p, end);
+}
 #endif

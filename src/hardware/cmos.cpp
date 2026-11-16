@@ -645,5 +645,28 @@ public:
         registerPOD(cmos.timer.acknowledged);
         registerPOD(cmos.last.ended);
     }
+private:
+    /* RollbackNet's lean save states also hold the clock itself (the save state format gets it from the host when it
+     * loads): a rollback across one of the RTC's seconds would otherwise count that second twice. */
+    void getBytes(std::ostream& stream) override {
+        SerializeGlobalPOD::getBytes(stream);
+        if (!savestate_lean) return;
+        stream.write((const char*)&cmos.bcd, sizeof(cmos.bcd));
+        stream.write((const char*)&cmos.ampm, sizeof(cmos.ampm));
+        stream.write((const char*)&cmos.lock, sizeof(cmos.lock));
+        stream.write((const char*)&cmos.clock, sizeof(cmos.clock));
+        stream.write((const char*)&cmos.alarm, sizeof(cmos.alarm));
+        stream.write((const char*)&cmos.clock_time_t, sizeof(cmos.clock_time_t));
+    }
+    void setBytes(std::istream& stream) override {
+        SerializeGlobalPOD::setBytes(stream);
+        if (!savestate_lean) return;
+        stream.read((char*)&cmos.bcd, sizeof(cmos.bcd));
+        stream.read((char*)&cmos.ampm, sizeof(cmos.ampm));
+        stream.read((char*)&cmos.lock, sizeof(cmos.lock));
+        stream.read((char*)&cmos.clock, sizeof(cmos.clock));
+        stream.read((char*)&cmos.alarm, sizeof(cmos.alarm));
+        stream.read((char*)&cmos.clock_time_t, sizeof(cmos.clock_time_t));
+    }
 } dummy;
 }

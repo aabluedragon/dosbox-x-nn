@@ -538,6 +538,10 @@ int disk_data_rate = 2100000;    // 2.1MBytes/sec mid 1990s IDE PIO hard drive w
 int floppy_data_rate;
 
 void diskio_delay(Bits value/*bytes*/, int type = -1) {
+    /* RollbackNet: no emulated disk speed. The delay idles through nested emulation loops inside the DOS call, and no
+     * rollback can cross those (inputnet.cpp, RB_HostContext): every file read would stop prediction for a while. */
+    extern bool inputnet_rollback_active;
+    if (inputnet_rollback_active) return;
     if ((type == 0 && floppy_data_rate != 0) || (type != 0 && disk_data_rate != 0)) {
         double scalar;
         double endtime;

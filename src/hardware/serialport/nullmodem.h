@@ -121,5 +121,33 @@ private:
 	} telClient;
 };
 
+/* A RollbackNet cluster's null modem ("rbnullmodem"): the cable between the two copies of a NullModem-over-RollbackNet
+ * game on one computer, which run in step with the same two copies on the other computer. What a copy sends during a
+ * frame goes to its cluster's leader (SERIAL_RBTakeOutbox), which hands it to the other copy at the start of the next
+ * frame (SERIAL_RBDeliver), on every computer at the same emulated moment; the receiving side takes it in at the line
+ * rate. Each side's RTS and DTR come with it, as the other side's CTS and DSR/CD (null modem wiring). The port's state
+ * is in RollbackNet's saved frames (SERIAL_RBSave / SERIAL_RBLoad). */
+#include <deque>
+#include <vector>
+class CRBNullModem : public CSerial {
+public:
+	CRBNullModem(Bitu id, CommandLine* cmd);
+	~CRBNullModem();
+	void updatePortConfig(double baudrate, uint8_t lcr) override { (void)baudrate; (void)lcr; }
+	void updateMSR() override {}
+	void transmitByte(uint8_t val, bool first) override;
+	void setBreak(bool value) override { (void)value; }
+	void setRTSDTR(bool rts, bool dtr) override { (void)rts; (void)dtr; }
+	void setRTS(bool val) override { (void)val; }
+	void setDTR(bool val) override { (void)val; }
+	void handleUpperEvent(uint16_t type) override;
+	void SaveRBExtra(std::string &out) override;
+	bool LoadRBExtra(const uint8_t *&p, const uint8_t *end) override;
+	std::vector<uint8_t> outbox;	// sent during this frame (the leader takes it at the next frame start)
+	std::deque<uint8_t> rxq;		// delivered, not taken in yet
+	bool rx_running;				// SERIAL_RX_EVENT pending
+	void Deliver(const uint8_t *data, size_t n, uint8_t lines);
+};
+
 #endif	// C_MODEM
 #endif	// include guard

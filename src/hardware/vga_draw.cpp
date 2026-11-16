@@ -6885,7 +6885,12 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
     }
 #endif
     //Check if we can actually render, else skip the rest
-    if (vga.draw.vga_override || !RENDER_StartUpdate()) {
+    /* RollbackNet: the emulated frame goes on even when this computer cannot show it (its window is being made again
+     * after a mode change, a frame skip): whether it was drawn moves the frame clock (vga_mode_frames_since_time_base,
+     * at the next vertical timer), which the guest sees in its retrace timing, and the computers must not differ. The
+     * renderer then draws nothing (its line handler stays empty). */
+    extern bool inputnet_rollback_active;
+    if (vga.draw.vga_override || (!RENDER_StartUpdate() && !inputnet_rollback_active)) {
 #if defined(__EMSCRIPTEN__)
         emw_sufail_count++;
 #endif
@@ -9198,6 +9203,15 @@ void POD_Save_VGA_Draw( std::ostream& stream )
 
 	// - reloc function ptr
 	WRITE_POD( &drawline_idx, drawline_idx );
+	/* RollbackNet snapshot (same process): the line drawing function itself, so that loading needs no
+	 * VGA_SetupDrawing (which would restart the frame and its timing) */
+	if (savestate_lean) {
+		WRITE_POD( &VGA_DrawLine, VGA_DrawLine );
+		/* the frame clock vertical retrace is scheduled from (see VGA_VerticalTimer) */
+		WRITE_POD( &vga_fps, vga_fps );
+		WRITE_POD( &vga_mode_time_base, vga_mode_time_base );
+		WRITE_POD( &vga_mode_frames_since_time_base, vga_mode_frames_since_time_base );
+	}
 
 
 	// - pure data
@@ -9241,6 +9255,13 @@ void POD_Load_VGA_Draw( std::istream& stream )
 
 	// - reloc function ptr
 	READ_POD( &drawline_idx, drawline_idx );
+	VGA_Line_Handler lean_drawline = VGA_DrawLine;
+	if (savestate_lean) {
+		READ_POD( &lean_drawline, lean_drawline );
+		READ_POD( &vga_fps, vga_fps );
+		READ_POD( &vga_mode_time_base, vga_mode_time_base );
+		READ_POD( &vga_mode_frames_since_time_base, vga_mode_frames_since_time_base );
+	}
 
 
 	// - pure data
@@ -9330,4 +9351,5 @@ void POD_Load_VGA_Draw( std::istream& stream )
 		case 18: VGA_DrawLine = VGA_Draw_3270_1BPP_Line; break;
 		case 19: VGA_DrawLine = VGA_Draw_3270_2BPP_Line; break;
 	}
+	if (savestate_lean) VGA_DrawLine = lean_drawline;
 }

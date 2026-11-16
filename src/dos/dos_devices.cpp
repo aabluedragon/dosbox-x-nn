@@ -1142,15 +1142,22 @@ extern bool dos_kernel_disabled;
 void POD_Save_DOS_Devices( std::ostream& stream )
 {
 	if (!dos_kernel_disabled) {
-		if( strcmp( Devices[2]->GetName(), "CON" ) == 0 )
+		if( strcmp( Devices[2]->GetName(), "CON" ) == 0 ) {
 			Devices[2]->SaveState(stream);
+			/* RollbackNet: the console's own state too (not in the save state format) */
+			device_CON *con = savestate_lean ? dynamic_cast<device_CON*>(Devices[2]) : NULL;
+			if (con != NULL) con->SaveLeanState(stream);
+		}
 	}
 }
 
 void POD_Load_DOS_Devices( std::istream& stream )
 {
 	if (!dos_kernel_disabled) {
-		if( strcmp( Devices[2]->GetName(), "CON" ) == 0 )
+		if( strcmp( Devices[2]->GetName(), "CON" ) == 0 ) {
 			Devices[2]->LoadState(stream, false);
+			device_CON *con = savestate_lean ? dynamic_cast<device_CON*>(Devices[2]) : NULL;
+			if (con != NULL) con->LoadLeanState(stream);
+		}
 	}
 }

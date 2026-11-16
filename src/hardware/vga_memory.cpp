@@ -3035,7 +3035,7 @@ void POD_Save_VGA_Memory( std::ostream& stream )
 
 
 	// - pure data
-	WRITE_POD_SIZE( vga.mem.linear, sizeof(uint8_t) * vga.mem.memsize);
+	if (!savestate_lean) { WRITE_POD_SIZE( vga.mem.linear, sizeof(uint8_t) * vga.mem.memsize); } /* RollbackNet: page by page */
 
 	//***************************************************
 	//***************************************************
@@ -3058,7 +3058,7 @@ void POD_Load_VGA_Memory( std::istream& stream )
 
 
 	// - pure data
-	READ_POD_SIZE( vga.mem.linear, sizeof(uint8_t) * vga.mem.memsize);
+	if (!savestate_lean) { READ_POD_SIZE( vga.mem.linear, sizeof(uint8_t) * vga.mem.memsize); }
 
 	//***************************************************
 	//***************************************************

@@ -3795,12 +3795,16 @@ static void DMA_DAC_Event(Bitu val) {
 
 	if (psingle_sample && !sb[ci].single_sample_dma) {
 		// WARNING: This assumes Sound Blaster Pro emulation!
-		LOG(LOG_SB,LOG_NORMAL)("Goldplay mode unexpectedly switched off, normal DMA playback follows");
-		sb[ci].dma_dac_mode = 0;
 		sb[ci].dma_dac_srcrate = sb[ci].freq / (sb[ci].mixer.stereo ? 2 : 1);
 		sb[ci].chan->SetFreq(sb[ci].dma_dac_srcrate);
 		sb[ci].updateSoundBlasterFilter(sb[ci].dma_dac_srcrate);
-		return;
+		/* "force goldplay" (RollbackNet needs it): stay on these timer events, now at the normal rate. Normal DMA
+		 * playback is paced by what the mixer asks for, which a rolled back machine cannot repeat exactly. */
+		if (!sb[ci].dsp.force_goldplay) {
+			LOG(LOG_SB,LOG_NORMAL)("Goldplay mode unexpectedly switched off, normal DMA playback follows");
+			sb[ci].dma_dac_mode = 0;
+			return;
+		}
 	}
 
 	/* NTS: chan->Read() deals with DMA unit transfers.
@@ -4811,6 +4815,18 @@ void *SB_DSP_DMA_CallBack_Func = (void*)((uintptr_t)DSP_DMA_CallBack);
 void *SB_DSP_ADC_CallBack_Func = (void*)((uintptr_t)DSP_ADC_CallBack);
 void *SB_DSP_E2_DMA_CallBack_Func = (void*)((uintptr_t)DSP_E2_DMA_CallBack);
 
+
+/* RollbackNet desync hunting (inputnet NN_RB_TRACE): the first card's playback state in one line */
+void SBLASTER_DebugState(char *out, size_t n) {
+	const SB_INFO &c = sb[0];
+	if (!c.chan) { snprintf(out, n, "sb=none"); return; }
+	const DmaChannel *d = c.dma.chan;
+	snprintf(out, n, "sb f=%u tc=%02x mode=%u dmamode=%u left=%u dacmode=%u force=%u single=%u dsp=%u cmd=%02x irq8=%u | dma ca=%u cc=%u msk=%u req=%u tc=%u tm=%u",
+		(unsigned)c.freq, (unsigned)c.timeconst, (unsigned)c.mode, (unsigned)c.dma.mode, (unsigned)c.dma.left,
+		(unsigned)c.dma_dac_mode, (unsigned)c.dsp.force_goldplay, (unsigned)c.single_sample_dma, (unsigned)c.dsp.state, (unsigned)c.dsp.cmd, (unsigned)c.irq.pending_8bit,
+		d ? (unsigned)d->curraddr : 0u, d ? (unsigned)d->currcnt : 0u, d ? (unsigned)d->masked : 0u,
+		d ? (unsigned)d->request : 0u, d ? (unsigned)d->tcount : 0u, d ? (unsigned)d->transfer_mode : 9u);
+}
 
 void POD_Save_Sblaster( std::ostream& stream )
 {

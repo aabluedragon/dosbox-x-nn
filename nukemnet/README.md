@@ -18,6 +18,9 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   so the joining player needs neither the game nor matching settings. `[inputnet] stream fps` caps
   the frame rate to save upload bandwidth. `mode = lockstep` keeps the older mode in which every
   player runs an identical machine.
+- RollbackNet (`[inputnet] mode = rollback`, capability `rollbackNet`): every player runs the game, and the
+  machines exchange only input and stay identical, with each player's own input used at once. See
+  [RollbackNet](#rollbacknet) below.
 - Remote play guard (capability `inputnetShellGuard`): a viewer's keyboard and mouse go straight to
   the emulated keyboard and mouse (never to DOSBox-X's hotkeys or menus), and only while a DOS program
   other than a command shell runs, or a guest system was booted. At the DOS prompt (DOSBox-X's shell,
@@ -384,6 +387,101 @@ Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, e
   libraries), run by the *NukemNet Linux packages* workflow.
 - Windows (MinGW x64 and x86, Visual Studio ARM64) and macOS (Intel and Apple silicon): the
   standard workflows in `.github/workflows`, repackaged by NukemNet with the capability file.
+
+## RollbackNet
+
+`[inputnet] mode = rollback` (capability `rollbackNet`; NukemNet's "RollbackNet" Net choice, next to Inputnet). For
+the games remote play is for (two or more players on one PC), but every player runs the game, and only input crosses
+the network, so nobody waits for a picture: each player's own keys and mouse reach their machine in the next frame,
+whatever the distance to the others.
+
+How it works:
+
+- The session uses the lockstep join: the server's whole machine is handed to the joining player at the DOS prompt
+  (and the server reloads its own copy), then every machine counts the same frames of `frame` emulated milliseconds
+  (10). A frame starts right after a timer tick (`INPUTNET_RollbackTick`, called from `Normal_Loop`).
+- At every frame start the machine is saved: a lean save state of the devices (no RAM, video memory, TLB, renderer,
+  MIDI; the PIC queue, the VGA line drawer and the VGA frame clock exactly, without the rounding the save state
+  format has) and the RAM and video memory pages that changed since the last frame start (an undo log against a
+  copy). Guest RAM pages are found by the host's page protection: RAM is write-protected, the first write to a page
+  faults once and marks it (`mprotect` and a SIGSEGV/SIGBUS handler, `VirtualProtect` and a vectored exception
+  handler on Windows); pages unchanged for 8 frames are protected again. Video memory is compared whole. A frame
+  start costs about 0.3 ms with 64 MB of RAM (it was 1.3 ms with 16 MB, comparing all of it).
+- Every frame runs at once with the input that is there; another player's input that has not arrived is predicted
+  as "nothing new". When it arrives and had something in it, the machine goes back to that frame start and runs the
+  frames again at full speed before going on (nothing of them is drawn or played; with vsync, presenting each would
+  wait for the display). The window is `rollback window` frames (16); a machine that runs further ahead than that
+  waits. Machines that run ahead of the others drop a tick now and then, so all stay near the same frame.
+- Machine checksums (RAM and video memory pages, CPU registers) of final frames (everybody's input there, and no
+  wrong guess before them waiting for its correction) are compared all the time. Should they differ, the server saves
+  its machine in the save state format at a frame start where its host stack is steady, loads that copy itself and
+  sends it; the joining machine loads it at such a frame start too and replays to real time (both stand still).
+- `delay` (0 to 8 frames, 0 by default in this mode): how long a player's own input waits before it is used. Each
+  frame more makes their own input 10 ms later and the corrections of the others' moves 10 ms smaller.
+
+What has to be the same everywhere, checked when a player joins (refused, naming what differs): the precision of the
+timing arithmetic (80-bit `long double` on x86 builds: Linux, macOS Intel and the MinGW Windows builds play together;
+ARM builds do not play with them), `cpu core`, `cputype`, `cycles`, `machine`, `memsize`, the Sound Blaster's type,
+port, IRQ, DMA and OPL settings and `force goldplay`, GUS, PC speaker, Tandy, Disney, the joystick type and the mixer
+rate. Settings that would make machines differ are forced in this mode: the mixer runs at 48000 Hz (a whole number of
+samples per millisecond), there is no emulated disk speed (its delay idles in nested emulation loops), cycles never
+adjust themselves (`max`/`auto` stay at the speed the session started with: give a fixed value), mouse motion is
+applied as relative motion whatever each computer's window does, and the forced Goldplay Sound Blaster stays on its
+timer driven DMA. NukemNet passes `core=normal`, fixed cycles, `force goldplay=true` and `joysticktype=none`.
+
+The disk is part of the machine too: every file a game reads has to be the same on every computer. With the state,
+the server sends the list of the files on its mounted folders (drive, DOS path, size, hash; FILEMOUNT mappings as the
+guest sees them, 8.3 names only). The joining machine asks for every file that differs or is missing and maps what it
+gets over its own for the session (FILEMOUNT /K, from a folder in the system's temporary folder, deleted when the
+session ends): its own files stay as they are. A file over 16 MB that differs means another version of the game and
+the join is refused, naming it.
+
+Host stack: host code runs nested emulation loops (a program's EXEC from the shell, DOS waiting for a key through
+`CALLBACK_Idle`, a page fault the normal core runs the guest's handler for, every BIOS call DOS's console makes through
+`CALLBACK_RunRealInt`), and their state is on the host's stack, not in a save state. Each run of `DOSBOX_RunMachine`
+gets a number (`dosbox_runmachine_context` in `dosbox.cpp`, plus the shell's command line reads): a saved frame can be
+loaded only while the same innermost loop runs. A rollback goes back to the newest such frame at or before the first
+wrong one (the replay makes the nested loops again); found at a frame start inside a nested loop of a moment (Bonus,
+which reads keys and writes the console through DOS, starts a frame inside a BIOS call now and then), the correction
+waits for the next frame start. Where no frame back to the oldest one with unknown input can be loaded at two frame
+starts in a row (the DOS prompt, DOS waiting for a key), the frames run in lockstep with a longer input delay; input
+beyond any rollback is applied late and the machines are made equal again from the server's state.
+
+Other state that had to join the lean snapshots or stop depending on the host: the console device's own state (ANSI
+parser, read cache, binary mode), the CMOS clock itself (only its registers were saved), device files in the DOS file
+table (by name), open files (kept, with their position; reopening them leaked a host handle per rollback), the VGA's
+frame timing (a frame the host's renderer refused, while its window was made again after a mode change, moved the
+guest's retrace timing), mouse motion (applied as relative motion), the Sound Blaster with forced Goldplay (stays on
+its timer events when a game's DMA turns Goldplay off). Nothing of a replayed frame is drawn, and the whole picture is
+drawn again afterwards.
+
+For NukemNet: `[inputnet] players` and `autorun` make the server type a command at the DOS prompt once that many
+participants are in, as its own input, so every machine starts the game at the same moment (NukemNet's
+`C:\NNRBGO.BAT`); at the DOS prompt nobody's key presses reach the machines (they would run a command on every
+computer, `DEL` included). A server started with env `NN_RP_AUTH_SECRET` takes only participants whose HELLO
+carries the room token for the name they give (env `USERNAME`/`USER` and `NN_RP_AUTH_TOKEN`, as for the remote play
+viewer).
+
+Debugging (environment variables): `NN_RB_TRACE=1` logs every frame start (`RBTRACE` with the frame, tick, host
+context, PIC ticks, registers, memory hash and machine hash, `RBSB` with the Sound Blaster's state; compare two
+participants' logs line by line, the last line of each frame counts); `NN_RB_SELFTEST=<n>` goes back 4 frames every
+n frames and checks that every replayed frame start equals the original (it reports the differing component and
+bytes); `NN_RB_DUMP=<frame>` writes that frame start's RAM, video memory and devices to the working folder;
+`NN_RB_PROFILE=1` logs each component's size and time once; `NN_RB_NOTRACK=1` compares all of RAM instead of the
+write tracking; `NN_RB_FORCE_RESYNC=<frame>` makes the server send its state at that frame; `NN_RB_CTXLOG=1` (Linux)
+logs who starts nested emulation loops during a session, away from the DOS prompt (`addr2line -f -e dosbox-x` the
+offsets). The statistics line every 5 s also says how many frames ran in lockstep and how often the host context
+changed.
+
+Tested November 2026 on Linux between two copies through a delay proxy, with random input on both: Epic Pinball
+(Sound Blaster digital sound, keys) with 0 desyncs at 0, 60 and 160 ms round trip (over 6,000 frames each,
+rollbacks up to 16 frames deep, replays 3-12 ms on average), and Bonus (FM music, keys and mouse, console output and
+key reads through DOS) with 0 desyncs at 20, 40 and 80 ms round trip; the self-test replayed about 450 times per run
+without a difference, and a forced resync left both identical. Through two NukemNet instances, the joining one
+routed through NukemNet's relay (12-25 ms round trip): Bonus with keys, mouse and clicks from both players, about
+80 rollbacks a minute on each side, 0 desyncs, both screens pixel for pixel identical.
+Not tested yet: Windows and macOS builds, a game with Gravis or MIDI sound, CD images (`IMGMOUNT` files are not in the
+file list), more than two players.
 
 ## Publishing a release
 

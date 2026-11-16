@@ -82,6 +82,9 @@
 #include "parport.h"
 #include "keyboard.h"
 #include "inputnet.h"
+#if defined(__linux__) && defined(__GLIBC__)
+#include <execinfo.h>
+#endif
 #include "clockdomain.h"
 
 #if __APPLE__ && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
@@ -531,10 +534,15 @@ static Bitu Normal_Loop(void) {
                     return 0;
 #endif
             } else {
-                GFX_Events();
+                /* RollbackNet replays frames at full speed after a correction: host events (input, window) wait
+                 * until it has caught up with real time again. */
+                if (!inputnet_rollback_resim) GFX_Events();
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
                     TIMER_AddTick();
                     ticksRemain--;
+                    /* Every emulated millisecond starts here: a clean point (all tick handlers done, the mixer has
+                     * finished the previous millisecond) to save, restore and replay frames. */
+                    if (inputnet_rollback_active) INPUTNET_RollbackTick();
                 } else {
                     increaseticks();
                     return 0;
@@ -616,6 +624,15 @@ bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters) {
 # define TICKS_GAP_PANIC 15
 #endif
 
+/* RollbackNet: replaying frames runs extra emulated milliseconds without waiting for real time; slowing down to let
+ * the other participants catch up skips one. */
+void DOSBOX_AddTicksRemain(uint32_t n) { ticksRemain += n; }
+bool DOSBOX_DropTickRemain(void) {
+    if (ticksRemain == 0) return false;
+    ticksRemain--;
+    return true;
+}
+
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;
@@ -690,6 +707,10 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
 
     // Is the system in auto cycle mode guessing? If not just exit. (It can be temporarily disabled)
     if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust)
+        return;
+    // RollbackNet: the speed is part of the shared machine. A guess from this computer's own timing would differ on
+    // every computer (cycles=max/auto stay at the speed the session started with).
+    if (inputnet_rollback_active)
         return;
 
     if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > TICKS_GAP_PANIC && ticksScheduled >= 5)) {
@@ -839,6 +860,15 @@ void DOSBOX_SetNormalLoop() {
 volatile int runmachine_recursion = 0;
 #endif
 
+/* The emulation loop that runs now: each run of DOSBOX_RunMachine gets a number of its own, and this is the number of
+ * the innermost one still running (0 outside any). Host code runs nested loops for a program's EXEC from the shell, DOS
+ * waiting for a key (CALLBACK_Idle), a page fault the normal core runs the guest's handler for, and every BIOS call DOS
+ * makes for the console (CALLBACK_RunRealInt). Two moments with the same number have the same host stack, so a machine
+ * state saved at the first can be loaded at the second (RollbackNet, inputnet.cpp); a nested loop that started and
+ * ended in between changes nothing. */
+uint32_t dosbox_runmachine_context = 0;
+static uint32_t dosbox_runmachine_next = 0;
+
 void DOSBOX_RunMachine(void){
     Bitu ret;
 #if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
@@ -853,9 +883,32 @@ void DOSBOX_RunMachine(void){
         LOG_MSG("RunMachine recursion");
 #endif
 
+    const uint32_t outer_context = dosbox_runmachine_context;
+    dosbox_runmachine_context = ++dosbox_runmachine_next;
+    if (dosbox_runmachine_context == 0) dosbox_runmachine_context = ++dosbox_runmachine_next;
+#if defined(__linux__) && defined(__GLIBC__)
+    {
+        /* RollbackNet debugging (NN_RB_CTXLOG=1): who runs nested emulation loops during a session (resolve the
+         * offsets with addr2line -f -e dosbox-x) */
+        static const bool ctxlog = getenv("NN_RB_CTXLOG") != NULL && *getenv("NN_RB_CTXLOG");
+        static unsigned logged = 0;
+        extern bool dos_shell_reading_input;
+        if (ctxlog && inputnet_rollback_active && !dos_shell_reading_input && logged < 60) {
+            void *frames[6];
+            const int n = backtrace(frames, 6);
+            char **names = backtrace_symbols(frames, n);
+            if (names != NULL) {
+                LOG_MSG("RBCTX nested loop #%u: %s | %s | %s | %s", ++logged, n > 1 ? names[1] : "", n > 2 ? names[2] : "",
+                    n > 3 ? names[3] : "", n > 4 ? names[4] : "");
+                free(names);
+            }
+        }
+    }
+#endif
     do {
         ret=(*loop)();
     } while (!ret);
+    dosbox_runmachine_context = outer_context;
 
 #ifdef DEBUG_RECURSION
     if (--runmachine_recursion < 0)
@@ -1560,7 +1613,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char* sbtypes[] = { "sb1", "sb1.0", "sb1.5", "sb2", "sb2.0", "sb2.01", "sbpro1", "sbpro2", "sb16", "sb16vibra", "awe32", "gb", "ess688", "ess1688", "reveal_sc400", "pas", "pasplus", "pas16", "none", nullptr };
     const char* cms_settings[] = { "on", "off", "auto", nullptr };
     const char* oplmodes[] = { "auto", "opl2", "dualopl2", "opl3", "opl3gold", "none", "hardware", "hardwaregb", "esfm", nullptr };
-    const char* serials[] = { "dummy", "disabled", "modem", "nullmodem", "serialmouse", "directserial", "log", "file", nullptr };
+    const char* serials[] = { "dummy", "disabled", "modem", "nullmodem", "rbnullmodem", "serialmouse", "directserial", "log", "file", nullptr };
     const char* acpi_rsd_ptr_settings[] = { "auto", "bios", "ebda", nullptr };
     const char* cpm_compat_modes[] = { "auto", "off", "msdos2", "msdos5", "direct", nullptr };
     const char* dosv_settings[] = { "off", "jp", "ko", "chs", "cht", "cn", "tw", nullptr };
@@ -5369,7 +5422,7 @@ void DOSBOX_SetupConfigSections(void) {
                     "used; see the \"cycle sync\" option below.");
     Pbool->SetBasic(true);
 
-    const char* inputnetmodes[] = { "remote", "lockstep", 0 };
+    const char* inputnetmodes[] = { "remote", "lockstep", "rollback", 0 };
     const char* inputnetpresent[] = { "flip", "retrace", "scanout", nullptr };
     const char* inputnetscaling[] = { "nearest", "bilinear", "sharp", nullptr };
     Pstring = secprop->Add_string("mode",Property::Changeable::WhenIdle, "remote");
@@ -5382,7 +5435,14 @@ void DOSBOX_SetupConfigSections(void) {
                       "            system, never the DOS prompt or DOSBox-X's own commands (MOUNT, ...).\n"
                       "  lockstep: every player runs the same machine and receives everyone's input. Uses\n"
                       "            little bandwidth, but every session must have identical files, DOSBox-X\n"
-                      "            version and configuration, or the machines drift apart.");
+                      "            version and configuration, or the machines drift apart.\n"
+                      "  rollback: like lockstep, every player runs the same machine with everyone's input, but\n"
+                      "            nobody waits for the others' input: it is predicted (nothing new is pressed),\n"
+                      "            and when the real input differs, the machine goes back to that frame and runs\n"
+                      "            the frames since again. Lowest latency; needs identical files, version and\n"
+                      "            configuration, a fixed \"cycles\" value, and is best with core=normal. The\n"
+                      "            mixer runs at 48000 Hz, and the participants compare machine hashes and resync\n"
+                      "            from the server if they ever differ.");
 
     Pint = secprop->Add_int("stream fps",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("Remote play: the most frames per second the host sends. 0 sends every frame the\n"
@@ -5459,7 +5519,41 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->Set_help("Number of frames local input is delayed by before it is applied, so that it can reach the\n"
                    "other sessions in time. This must cover the network latency between the sessions or the\n"
                    "emulation will stutter: frame*delay milliseconds should exceed the round trip time.\n"
-                   "Valid range is 1 to 64.");
+                   "Valid range is 1 to 64. With mode=rollback, 0 to 8: 0 applies local input in the next frame, and a\n"
+                   "frame or two of delay means fewer corrections when the other players press something.");
+
+    Pint = secprop->Add_int("rollback window",Property::Changeable::WhenIdle, 16);
+    Pint->Set_help("mode=rollback: how many frames a session may run ahead of the other participants' input before it\n"
+                   "waits for them. Each frame is saved for this long. Valid range is 2 to 48.");
+
+    Pint = secprop->Add_int("cluster",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("mode=rollback: IPX/NullModem-over-RollbackNet. Every computer runs a copy of the game for every\n"
+                   "player (this many), linked by IPX or a null modem, and RollbackNet keeps all of them the same on every\n"
+                   "computer. One copy per computer is the cluster's leader (the one its player plays, which also talks to\n"
+                   "the other computers); the others follow it over 127.0.0.1. 0: no cluster. Valid range is 0 to 8.");
+
+    Pint = secprop->Add_int("cluster copy",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("mode=rollback with a cluster: which player's copy of the game this is (0 is the server's player).");
+
+    Pstring = secprop->Add_string("cluster role",Property::Changeable::WhenIdle, "follower");
+    Pstring->Set_help("mode=rollback with a cluster: \"leader\" (the copy this computer's player plays) or \"follower\".");
+
+    Pint = secprop->Add_int("cluster port",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("mode=rollback with a cluster: the local UDP port the leader listens on for its followers.");
+
+    Pbool = secprop->Add_bool("cluster hide window",Property::Changeable::WhenIdle,false);
+    Pbool->Set_help("mode=rollback with a cluster: a follower opens no window (another player plays its copy; NukemNet starts\n"
+                    "one copy per player on every computer and shows only the local player's).");
+
+    Pint = secprop->Add_int("players",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("mode=rollback, server: how many participants (this one included) the session waits for at the DOS\n"
+                   "prompt before it types \"autorun\". 0: no autorun. Valid range is 0 to 8.");
+
+    Pstring = secprop->Add_string("autorun",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("mode=rollback, server: a DOS command typed at the prompt once \"players\" participants are in the\n"
+                   "session. It is typed as this machine's input, so every participant's machine runs it at the same\n"
+                   "moment (start the game this way, never from each machine's own AUTOEXEC). Letters, digits, spaces and\n"
+                   "the usual punctuation.");
 
     Pint = secprop->Add_int("redundancy",Property::Changeable::WhenIdle, 4);
     Pint->Set_help("Number of past input frames repeated in every packet, so that a lost UDP datagram does not\n"

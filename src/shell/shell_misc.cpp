@@ -461,9 +461,13 @@ uint8_t temp_lead_byte;
  * input feature (inputnet) uses this as a quiescent point where the emulator
  * state can safely be replaced. */
 bool dos_shell_reading_input = false;
+/* Bumped whenever the shell starts or stops reading a command line. The shell is native code: its line buffer
+ * and its place on the host stack are not part of the emulated machine, so RollbackNet never puts the machine back
+ * across such a change (inputnet.cpp). */
+uint32_t dos_shell_input_generation = 0;
 namespace { struct ShellInputScope {
-	ShellInputScope() { dos_shell_reading_input = true; }
-	~ShellInputScope() { dos_shell_reading_input = false; }
+	ShellInputScope() { dos_shell_reading_input = true; dos_shell_input_generation++; }
+	~ShellInputScope() { dos_shell_reading_input = false; dos_shell_input_generation++; }
 }; }
 
 /* NTS: buffer pointed to by "line" must be at least CMD_MAXLINE+1 large */

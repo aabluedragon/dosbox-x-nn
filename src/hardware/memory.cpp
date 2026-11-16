@@ -1981,6 +1981,8 @@ void ShutDownRAM(Section * sec) {
             GameLink::FreeRAM(MemBase);
 #elif C_HAVE_MMAP
             munmap(MemBase,MemSize);
+#elif defined(WIN32)
+            VirtualFree(MemBase,0,MEM_RELEASE);
 #else
             delete [] MemBase;
 #endif
@@ -2375,6 +2377,8 @@ void Init_RAM() {
 #elif C_HAVE_MMAP
         MemBase = (uint8_t*)mmap(NULL,memory.pages*4096u,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,0,0);
         if (MemBase == (uint8_t*)MAP_FAILED) E_Exit("Failed to mmap allocate memory");
+#elif defined(WIN32) // page aligned, for RollbackNet's write tracking (inputnet.cpp)
+        MemBase = (uint8_t*)VirtualAlloc(NULL,memory.pages*4096u,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
 #else // C_GAMELINK
         MemBase = new(std::nothrow) uint8_t[memory.pages*4096];
 #endif // C_GAMELINK
@@ -2854,7 +2858,7 @@ private:
 		WRITE_POD( &memory, memory );
 
 		// - static 'new' ptr
-		WRITE_POD_SIZE( MemBase, memory.pages*4096 );
+		if (!savestate_lean) { WRITE_POD_SIZE( MemBase, memory.pages*4096 ); } /* RollbackNet keeps RAM page by page */
 
 		//***********************************************
 		//***********************************************
@@ -2869,7 +2873,8 @@ private:
 				WRITE_POD_SIZE( &m, sizeof(MemHandle) );
 			}
 		}
-		WRITE_POD( &pagehandler_idx, pagehandler_idx );
+		if (savestate_lean) { WRITE_POD_SIZE( &pagehandler_idx, memory.pages ); }
+		else { WRITE_POD( &pagehandler_idx, pagehandler_idx ); }
 	}
 
 	void setBytes(std::istream& stream) override
@@ -2892,7 +2897,7 @@ private:
 		READ_POD( &memory, memory );
 
 		// - static 'new' ptr
-		READ_POD_SIZE( MemBase, memory.pages*4096 );
+		if (!savestate_lean) { READ_POD_SIZE( MemBase, memory.pages*4096 ); }
 
 		//***********************************************
 		//***********************************************
@@ -2913,7 +2918,8 @@ private:
 				READ_POD_SIZE( &m, sizeof(MemHandle) );
 			}
 		}
-		READ_POD( &pagehandler_idx, pagehandler_idx );
+		if (savestate_lean) { READ_POD_SIZE( &pagehandler_idx, memory.pages ); }
+		else { READ_POD( &pagehandler_idx, pagehandler_idx ); }
 
 
 		for( unsigned int lcv=0; lcv<memory.pages; lcv++ ) {

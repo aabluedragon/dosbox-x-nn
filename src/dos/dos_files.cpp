@@ -2711,6 +2711,12 @@ void POD_Save_DOS_Files( std::ostream& stream )
 			if( file_valid == 0xff ) continue;
 			if( file_valid == 0xfe ) {
 				WRITE_POD( &Files[lcv]->refCtr, Files[lcv]->refCtr );
+				if (savestate_lean) {   /* RollbackNet: which device, so that a slot can be given it back */
+					const char *dn = Files[lcv]->GetName();
+					uint8_t dl = (uint8_t)std::min<size_t>(strlen(dn), 15);
+					WRITE_POD( &dl, dl );
+					WRITE_POD_SIZE( dn, dl );
+				}
 				continue;
 			}
 
@@ -2803,6 +2809,81 @@ void unmount(int lcv) {
  * keeps the host folders and images it mounted itself, rather than the server's paths,
  * which usually do not exist here (another computer, often another operating system). */
 bool savestate_keep_local_drives = false;
+
+/* Lean loads (RollbackNet): file objects a load replaced. Their host handles are closed at once; the objects stay
+ * allocated until the session ends (LEAN_FreeRetiredFiles), since nothing says no pointer to them is left. */
+static std::vector<DOS_File*> lean_retired_files;
+
+static void LeanRetireFile(unsigned int lcv) {
+	DOS_File *f = Files[lcv];
+	Files[lcv] = nullptr;
+	if (f == nullptr) return;
+	LocalFile *lf = dynamic_cast<LocalFile*>(f);
+	if (lf != nullptr && lf->fhandle != nullptr) { fclose(lf->fhandle); lf->fhandle = nullptr; }
+	lean_retired_files.push_back(f);
+}
+
+void LEAN_FreeRetiredFiles(void) {
+	for (size_t i = 0; i < lean_retired_files.size(); i++) delete lean_retired_files[i];
+	lean_retired_files.clear();
+}
+
+/* One slot of a lean load. Returns true when it was handled here (the stream is then past the slot's data); false
+ * leaves the stream at the slot's name for the usual code. */
+static bool LeanLoadFile(unsigned int lcv, uint8_t file_valid, std::istream& stream) {
+	DOS_File *live = Files[lcv];
+	if (live != nullptr && live->GetName() == NULL) live = nullptr;
+	if (file_valid == 0xfe) {               /* a device (NUL, CON...): its count, and which one */
+		Bits ref = 0;
+		uint8_t dl = 0;
+		char dn[16] = {0};
+		READ_POD( &ref, ref );
+		READ_POD( &dl, dl );
+		if (dl > 15) dl = 15;
+		READ_POD_SIZE( dn, dl );
+		dn[dl] = 0;
+		if (live == nullptr || strcmp(live->GetName(), dn) != 0) {
+			if (live != nullptr) LeanRetireFile(lcv);
+			const uint8_t devnum = DOS_FindDevice(dn);
+			if (devnum < DOS_DEVICES && Devices[devnum] != NULL) {
+				if (Devices[devnum]->GetInformation() & DeviceInfoFlags::ExternalDevice)
+					Files[lcv] = new DOS_ExtDevice(*(DOS_ExtDevice*)Devices[devnum]);
+				else
+					Files[lcv] = new DOS_Device(*Devices[devnum]);
+			}
+			else LOG_MSG("WARNING: RollbackNet restore could not find device %s for handle %u", dn, lcv);
+		}
+		if (Files[lcv] != nullptr) Files[lcv]->refCtr = ref;
+		return true;
+	}
+	if (file_valid == 0xff) {               /* no file in this slot at that time (a device opened since goes too) */
+		if (live != nullptr) LeanRetireFile(lcv);
+		return true;
+	}
+	uint8_t file_namelen, file_drive, file_flags;
+	READ_POD( &file_namelen, file_namelen );
+	char *file_name = (char *) alloca( (size_t)file_namelen + 1u );
+	READ_POD_SIZE( file_name, file_namelen );
+	file_name[file_namelen] = 0;
+	READ_POD( &file_drive, file_drive );
+	READ_POD( &file_flags, file_flags );
+	if (live != nullptr && !strcmp(live->name, file_name) && live->GetDrive() == file_drive && live->flags == file_flags) {
+		live->LoadState(stream, false);     /* the same file: its saved state, the position included */
+		return true;
+	}
+	if (live != nullptr) LeanRetireFile(lcv);
+	if (file_drive < DOS_DRIVES && Drives[file_drive] != nullptr)
+		Drives[file_drive]->FileOpen( &Files[lcv], file_name, file_flags );
+	if (Files[lcv] != nullptr) {
+		Files[lcv]->LoadState(stream, false);
+	} else {
+		LOG_MSG("WARNING: RollbackNet restore could not reopen '%s' (drive %u) for handle %u",
+			file_name, (unsigned int)file_drive, lcv);
+		LocalFile skip;                     /* pop its data */
+		skip.LoadState(stream, true);
+	}
+	return true;
+}
 
 void POD_Load_DOS_Files( std::istream& stream )
 {
@@ -2985,12 +3066,15 @@ void POD_Load_DOS_Files( std::istream& stream )
 
 			// - reloc ptr
 			READ_POD( &file_valid, file_valid );
+			// RollbackNet (lean states, loaded many times a second in one session): an open file that is still
+			// the same file keeps its object and host handle and only gets its saved position and counts back.
+			// Reopening it every time, as below, leaked a host file handle per open file per load.
+			if( savestate_lean && LeanLoadFile( lcv, file_valid, stream ) ) continue;
 			// ignore system files
 			if( file_valid == 0xfe ) {
 				READ_POD( &Files[lcv]->refCtr, Files[lcv]->refCtr );
 				continue;
 			}
-
 			// Detach any live pre-restore file object from this slot before loading
 			// the saved entry. Closing/deleting the current object here can crash
 			// during same-session restore for active protected-mode titles.

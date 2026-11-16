@@ -395,6 +395,12 @@ public:
 
     void registerComponent(const std::string& uniqueName, Component& comp); //comp must have global lifetime!
 
+    /* RollbackNet (inputnet "mode = rollback") snapshots, in memory: every component except the ones that only
+     * hold host state (window, renderer, MIDI device), and without guest RAM and video memory, which the caller
+     * keeps page by page. For the same build and process only. */
+    void saveLean(std::string& out);
+    bool loadLean(const std::string& in);
+
 private:
     SaveState() {}
     SaveState(const SaveState&);
@@ -421,6 +427,10 @@ void readPOD(std::istream& stream, T& data);
 void writeString(std::ostream& stream, const std::string& data);
 void readString(std::istream& stream, std::string& data);
 
+
+/* true while SaveState::saveLean()/loadLean() runs: components leave out guest RAM and video memory and do not
+ * touch host state (main loop timing, mixer output buffer) */
+extern bool savestate_lean;
 
 //Implementation of SaveState::Component for saving POD types only
 class SerializeGlobalPOD : public SaveState::Component

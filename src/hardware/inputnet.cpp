@@ -58,6 +58,11 @@
  * not need to know whether networking support was compiled in at all. */
 bool inputnet_capture_active = false;
 
+/* RollbackNet ("mode = rollback"): a session is running, and frames are being replayed after a correction. Checked by
+ * the main loop (dosbox.cpp) and the mixer. */
+bool inputnet_rollback_active = false;
+bool inputnet_rollback_resim = false;
+
 #if C_INPUTNET
 
 #include <stdio.h>
@@ -66,6 +71,13 @@ bool inputnet_capture_active = false;
 #include <errno.h>
 
 #include <algorithm>
+#include <functional>
+#if defined(__linux__) && defined(__GLIBC__)
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+#include <cfloat>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -77,13 +89,17 @@ bool inputnet_capture_active = false;
 #include "mouse.h"
 #include "cpu.h"
 #include "mem.h"
+#include "paging.h"
+#include "vga.h"
 #include "pic.h"
+#include <zlib.h>
 #include "regs.h"
 #include "programs.h"
 #include "setup.h"
 #include "support.h"
 #include "timer.h"
 #include "video.h"
+#include "../dos/drives.h"
 
 #if defined(USE_TTF)
 # include "render.h"
@@ -97,6 +113,18 @@ bool inputnet_capture_active = false;
 
 #ifndef SDLNet_GetError
 # define SDLNet_GetError SDL_GetError
+#endif
+
+/* RollbackNet's guest RAM write tracking (RBT_*) uses the host's page protection */
+#if defined(WIN32)
+# ifndef NOMINMAX
+#  define NOMINMAX
+# endif
+# include <windows.h>
+#else
+# include <signal.h>
+# include <sys/mman.h>
+# include <unistd.h>
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -140,7 +168,7 @@ static void INPUTNET_ClearHostVolumeLabels(void) {
 
 #define INPUTNET_DEFAULT_PORT   2130u   /* not an assigned port, but adjacent to IPX's 213 */
 #define INPUTNET_MAX_PEERS      8u
-#define INPUTNET_RING           256u    /* input frames kept per peer, power of two */
+#define INPUTNET_RING           1024u   /* input frames kept per peer, power of two (RollbackNet replays after a resync) */
 #define INPUTNET_MAX_PACKET     1400u   /* stay below the usual 1500 byte MTU */
 #define INPUTNET_MAX_EVENT_SIZE 18u     /* the largest an encoded event can get */
 #define INPUTNET_MAX_FRAME_EVENTS 64u   /* so that one frame always fits a datagram */
@@ -163,7 +191,21 @@ enum {
     INPKT_STATEACK  = 8,    /* client -> server: cumulative save state acknowledge */
     INPKT_READY     = 9,    /* client -> server: state applied, ready to run */
     INPKT_START     = 10,   /* server -> client: (re)start lockstep at frame 0 */
-    INPKT_CHECK     = 11    /* any: machine checksum for a frame, to detect a desync */
+    INPKT_CHECK     = 11,   /* any: machine checksum for a frame, to detect a desync */
+    INPKT_RBINPUT   = 12,   /* any, mode=rollback: input frames, acknowledgements, frame and machine hash */
+    INPKT_RESYNC    = 13,   /* server -> client, mode=rollback: take this machine state over (after a desync) */
+    INPKT_FILEREQ   = 14,   /* client -> server, mode=rollback, joining: the server's game files it needs */
+    INPKT_FILES     = 15,   /* server -> client, mode=rollback, joining: those files (chunks, acknowledged like the state) */
+    /* mode=rollback clusters, between a computer's leader and its followers over 127.0.0.1 */
+    INPKT_CL_HELLO  = 16,   /* follower -> leader: u8 copy */
+    INPKT_CL_WELCOME= 17,   /* leader -> follower */
+    INPKT_CL_CMD    = 18,   /* leader -> follower: u32 seq, u8 command (a blob with id seq follows some) */
+    INPKT_CL_CMDACK = 19,   /* follower -> leader: u32 seq */
+    INPKT_CL_BULK   = 20,   /* either: u32 blob id, u32 total, u32 offset, u16 length, bytes */
+    INPKT_CL_BULKACK= 21,   /* either: u32 blob id, u32 bytes received in order */
+    INPKT_CL_AT     = 22,   /* follower -> leader: u32 frame, u32 epoch, u32 hash hi, lo, u16 packets, (u16 len, bytes)... */
+    INPKT_CL_GO     = 23,   /* leader -> follower: u32 frame, u32 epoch, u16 events, events, u16 packets, (u16 len, bytes)... */
+    INPKT_CL_REWIND = 24    /* leader -> follower: u32 target frame, u32 real-time frame, u32 epoch */
 };
 
 /* Input event types */
@@ -321,6 +363,11 @@ struct InputNetPeer {
 /* Configuration */
 static bool inputnet_enabled = false;
 static bool inputnet_remote = false;        /* "mode = remote": stream from the host instead of lockstep */
+static bool inputnet_rollback = false;      /* "mode = rollback": predict the others' input, correct by rolling back */
+static unsigned int inputnet_rbwindow = 16; /* mode=rollback: frames that may run ahead of the others' input */
+static unsigned int inputnet_rbplayers = 0; /* mode=rollback server: participants to wait for before typing autorun */
+static std::string inputnet_rbautorun;      /* mode=rollback server: the command typed then */
+static bool inputnet_rbautorun_done = false;
 static bool inputnet_share_keyboard = true;
 static bool inputnet_share_mouse = true;
 static bool inputnet_sync_state = true;
@@ -393,6 +440,33 @@ extern bool SDLNetInited;
 static void INPUTNET_EndSession(const char *reason,bool notify_peers);
 static void INPUTNET_CloseLink(const char *reason,bool notify_peers);
 static void INPUTNET_PollSocket(void);
+static void RB_HandleInput(InputNetPeer &p,unsigned peerid,InputNetReader &r);
+static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned peerid);
+static std::string RB_Fingerprint(void);
+static std::string RB_FingerprintDiff(const std::string &theirs, const std::string &mine);
+/* clusters (IPX/NullModem-over-RollbackNet) */
+static unsigned int rbc_copies = 0;       /* copies of the game per computer, 0: no cluster */
+static unsigned int rbc_copy = 0;         /* the player this copy plays for (its peer id) */
+static bool rbc_leader = false;
+static unsigned int rbc_port = 0;
+static bool rbc_attached = false;         /* IPX_ClusterAttach done */
+static bool rbc_ready = false;            /* leader: every follower is here */
+static bool rb_joining = false;           /* a joining computer, until it has taken the server's machines over */
+static uint32_t rb_start_frame = 0;       /* the frame a session starts at (a joining computer starts at the server's) */
+static bool rbj_server_prompt = true;     /* joining: the server's game was at the DOS prompt when we joined */
+static std::string rbj_autorun;           /* joining: what the server typed to start the game */
+extern void IPX_ClusterAttach(unsigned int copy);
+static void RBC_PollLeader(void);
+static void RBC_ApplyInputs(uint32_t frame);
+static void RBC_LeaderRewind(uint32_t target);
+static bool RBC_FollowersCanLoad(uint32_t f, uint32_t now);
+static void RBC_ServerDrop(unsigned id, const char *why);
+static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsigned copies, unsigned want);
+static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welcomed_at, std::string &errmsg);
+static void RBC_FollowerTick(void);
+static void RBC_LeaderGather(void);
+static void RB_SessionStarted(void);
+static void RB_SessionEnded(void);
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                              */
@@ -490,13 +564,17 @@ static InputNetFrame *INPUTNET_FrameSlotIfValid(InputNetPeer &p,uint32_t frame) 
  * that is "current frame + input delay", but we must never add input to a frame
  * we have already published (the other instances may have executed it), which
  * can happen for events picked up while emulation is stalled. */
+static unsigned int RB_EffectiveDelay(void);
+
 static uint32_t INPUTNET_ScheduleFrame(void) {
-    uint32_t f = inputnet_frame + inputnet_delay;
+    uint32_t f = inputnet_frame + (inputnet_rollback ? RB_EffectiveDelay() : inputnet_delay);
     if (f <= inputnet_local_confirmed) f = inputnet_local_confirmed + 1u;
     return f;
 }
 
 static void INPUTNET_QueueLocal(const InputNetEvent &ev) {
+    /* a cluster's follower is played by somebody elsewhere (RBC_ApplyInputs); a joining computer waits for the machines */
+    if (rbc_copies && (!rbc_leader || rb_joining)) return;
     InputNetPeer &self = inputnet_peers[inputnet_selfid];
     InputNetFrame &slot = INPUTNET_FrameSlot(self,INPUTNET_ScheduleFrame());
 
@@ -588,10 +666,10 @@ bool INPUTNET_InterceptMouseWheel(int32_t scroll) {
 
 static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
     switch (ev.type) {
-        case INEV_KEY:
+        case INEV_KEY:  /* "pressed": bit 0 down, bit 1 typed by the RollbackNet server's autorun */
             if (ev.key < (uint16_t)KBD_LAST) {
-                inputnet_keydown[ev.key] = (ev.pressed != 0);
-                KEYBOARD_AddKeyRaw((KBD_KEYS)ev.key,ev.pressed != 0);
+                inputnet_keydown[ev.key] = (ev.pressed & 1u) != 0;
+                KEYBOARD_AddKeyRaw((KBD_KEYS)ev.key,(ev.pressed & 1u) != 0);
             }
             break;
         case INEV_MOUSEBUTTON:
@@ -605,7 +683,16 @@ static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
             }
             break;
         case INEV_MOUSEMOVE:
-            Mouse_CursorMovedRaw(ev.xrel,ev.yrel,ev.x,ev.y,ev.emulate != 0);
+            if (inputnet_rollback) {
+                /* RollbackNet: as motion from a remote play viewer, relative only. Otherwise the motion would be
+                 * applied by this computer's own state (whether its window has the mouse, fullscreen, where its host
+                 * pointer is), which differs on every computer. */
+                extern bool mouse_motion_is_relative;
+                mouse_motion_is_relative = true;
+                Mouse_CursorMovedRaw(ev.xrel,ev.yrel,ev.x,ev.y,true);
+                mouse_motion_is_relative = false;
+            }
+            else Mouse_CursorMovedRaw(ev.xrel,ev.yrel,ev.x,ev.y,ev.emulate != 0);
             break;
         case INEV_MOUSEWHEEL:
             Mouse_WheelMovedRaw(ev.wheel);
@@ -1053,6 +1140,12 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
     if (ok && ttf.inUse) resetFontSize();
 #endif
 
+    /* The save state keeps each memory page's handler only when it is one of a short list; the video memory window's
+     * others (unmapped, the slow, text and other modes' variants) would stay whatever this machine had before the load,
+     * a machine that was in another video mode (a joining computer at its DOS prompt, say) then maps it differently. The
+     * VGA state that was loaded says how it is mapped. */
+    if (ok) VGA_SetupHandlers();
+    if (ok) { extern void RENDER_EndUpdate(bool abort); RENDER_EndUpdate(true); }   /* (the window's frame in progress was another machine's) */
     if (ok) INPUTNET_ClearHostVolumeLabels();
     if (ok && inputnet_have_pending_clock) {
         CMOS_SetSharedClock(inputnet_pending_clock);
@@ -1078,8 +1171,368 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
 
 /* Server side: push the snapshot to one joining client. Emulation is frozen for
  * the duration - the state must not move on before the client has it. */
-static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &state) {
+/* --- RollbackNet: the server's game files ---------------------------------------------------------------------
+ * The disk is part of the machine: every file a game reads (its configuration with the player names and controls,
+ * high scores, saved games) has to be the same on every computer, or the machines go apart as soon as it is read.
+ * So the server's files are used: with the state, the server sends a list of the files on its mounted folders (drive,
+ * DOS path, size, hash; FILEMOUNT mappings as the guest sees them). The joining machine compares it with its own,
+ * asks for every file that differs or is missing, and maps what it gets over its own (FILEMOUNT /K, from a temporary
+ * folder): its own files stay as they are. A file that differs and is over RB_SYNC_FILE_MAX means another version of
+ * the game: the join is refused, naming it. Only 8.3 names are compared (what DOS programs use). */
+
+host_cnv_char_t *CodePageGuestToHost(const char *s);     /* dos/drives.cpp */
+char *CodePageHostToGuest(const host_cnv_char_t *s);
+
+#define RB_SYNC_FILE_MAX   (16u << 20)
+#define RB_SYNC_TOTAL_MAX  (64u << 20)
+#define RB_MANIFEST_MAGIC  0x4D464252u  /* "RBFM" */
+#define RB_MANIFEST_END    0x45464252u  /* "RBFE", the trailer after the save state */
+
+struct RBFile {
+    uint8_t drive = 0;
+    std::string path;           /* DOS path without the drive, upper case: "SUB\\FILE.EXT" */
+    uint64_t size = 0, hash = 0;
+    std::string host;           /* where to read it: a guest code page path, or a mapped file's host path */
+    bool mapped = false;
+};
+
+static std::vector<RBFile> rb_srv_manifest;         /* server: the list sent to the joining participant */
+static std::vector<uint8_t> rb_filereq_bits;        /* server: what it asked for (one bit per manifest entry) */
+static std::vector<bool> rb_filereq_part;           /* server: which request packets arrived */
+static bool rb_filereq_ready = false;
+static std::vector<RBFile> rb_cli_need;             /* client: the server's files it asked for */
+static std::vector<std::pair<int,std::string> > rb_sync_mapped;   /* client: (drive, DOS path) mapped for the session */
+static std::vector<std::string> rb_sync_temp;       /* client: their temporary copies */
+static std::string rb_sync_dir;                     /* client: the temporary folder they are in */
+static std::vector<std::pair<int,std::string> > rb_sync_dirs;     /* client: (drive, DOS folder) made for them */
+
+static bool RB_Is83(const char *n) {
+    size_t base = 0, ext = 0;
+    bool dot = false;
+    if (!*n || !strcmp(n, ".") || !strcmp(n, "..")) return false;
+    for (const char *c = n; *c; c++) {
+        const unsigned char ch = (unsigned char)*c;
+        if (ch == '.') { if (dot || base == 0) return false; dot = true; continue; }
+        if (ch <= ' ' || ch >= 0x7f || strchr("\"*+,/:;<=>?[\\]|", ch)) return false;
+        if (dot) { if (++ext > 3) return false; } else if (++base > 8) return false;
+    }
+    return true;
+}
+
+static FILE *RB_OpenRead(const RBFile &e) {
+    if (e.mapped) return fopen(e.host.c_str(), "rb");
+    const host_cnv_char_t *h = CodePageGuestToHost(e.host.c_str());
+    if (h == NULL) return NULL;
+#if defined(host_cnv_use_wchar)
+    return _wfopen(h, L"rb");
+#else
+    return fopen(h, "rb");
+#endif
+}
+
+/* 64-bit hash of a file: all of it up to 8 MB, else its first and last megabyte (enough to tell versions apart). */
+static bool RB_HashFile(const RBFile &e, uint64_t &size, uint64_t &hash) {
+    FILE *f = RB_OpenRead(e);
+    if (f == NULL) return false;
+    fseek(f, 0, SEEK_END);
+    const long end = ftell(f);
+    if (end < 0) { fclose(f); return false; }
+    size = (uint64_t)end;
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
+    std::vector<uint8_t> buf(1u << 16);
+    auto eat = [&](uint64_t from, uint64_t len) {
+        fseek(f, (long)from, SEEK_SET);
+        while (len > 0) {
+            const size_t want = (size_t)std::min<uint64_t>(len, buf.size());
+            const size_t got = fread(&buf[0], 1, want, f);
+            if (got == 0) break;
+            for (size_t i = 0; i < got; i++) h = (h ^ buf[i]) * 0x100000001B3ull;
+            len -= got;
+        }
+    };
+    if (size <= (8u << 20)) eat(0, size);
+    else { eat(0, 1u << 20); eat(size - (1u << 20), 1u << 20); }
+    fclose(f);
+    hash = h;
+    return true;
+}
+
+static void RB_WalkDir(uint8_t drive, const std::string &guestdir, const std::string &dosprefix, int depth, std::vector<RBFile> &out) {
+    if (depth > 8 || out.size() > 20000u) return;
+    const host_cnv_char_t *hd = CodePageGuestToHost(guestdir.c_str());
+    if (hd == NULL) return;
+    dir_information *dir = open_directoryw(hd);
+    if (dir == NULL) return;
+    host_cnv_char_t name[CROSS_LEN * 2], sname[CROSS_LEN * 2];
+    bool isdir = false;
+    std::vector<std::pair<std::string,bool> > entries;
+    for (bool more = read_directory_firstw(dir, name, sname, isdir); more; more = read_directory_nextw(dir, name, sname, isdir)) {
+        const char *g = CodePageHostToGuest(name);
+        if (g == NULL) continue;
+        entries.push_back(std::make_pair(std::string(g), isdir));
+    }
+    close_directory(dir);
+    for (size_t i = 0; i < entries.size(); i++) {
+        const std::string &n = entries[i].first;
+        if (!RB_Is83(n.c_str())) continue;
+        std::string up = n;
+        for (size_t k = 0; k < up.size(); k++) up[k] = (char)toupper((unsigned char)up[k]);
+        const std::string dos = dosprefix.empty() ? up : dosprefix + "\\" + up;
+        const std::string guest = guestdir + n;
+        if (entries[i].second) { RB_WalkDir(drive, guest + CROSS_FILESPLIT, dos, depth + 1, out); continue; }
+        RBFile e;
+        e.drive = drive; e.path = dos; e.host = guest;
+        if (RB_HashFile(e, e.size, e.hash)) out.push_back(e);
+    }
+}
+
+/* The files of every mounted folder, as the guest sees them, sorted. */
+static void RB_BuildManifest(std::vector<RBFile> &out) {
+    out.clear();
+    for (int d = 0; d < DOS_DRIVES; d++) {
+        if (Drives[d] == NULL || d == 25) continue;                     /* Z: is DOSBox-X's own */
+        localDrive *ld = dynamic_cast<localDrive*>(Drives[d]);
+        if (ld == NULL || strncmp(Drives[d]->GetInfo(), "local directory", 15) != 0) continue;
+        std::string base = ld->getBasedir();
+        if (!base.empty() && base[base.size() - 1] != CROSS_FILESPLIT) base += CROSS_FILESPLIT;
+        const size_t first = out.size();
+        RB_WalkDir((uint8_t)d, base, "", 0, out);
+        for (auto it = ld->GetMountedFiles().begin(); it != ld->GetMountedFiles().end(); ++it) {
+            RBFile e;
+            e.drive = (uint8_t)d; e.path = it->first; e.host = it->second; e.mapped = true;
+            if (!RB_HashFile(e, e.size, e.hash)) continue;      /* a /K file the guest has not created yet */
+            bool replaced = false;
+            for (size_t k = first; k < out.size(); k++)
+                if (out[k].drive == e.drive && out[k].path == e.path) { out[k] = e; replaced = true; break; }
+            if (!replaced) out.push_back(e);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const RBFile &a, const RBFile &b) {
+        return a.drive != b.drive ? a.drive < b.drive : a.path < b.path; });
+}
+
+static void RB_PutManifest(std::vector<uint8_t> &out, const std::vector<RBFile> &m) {
+    auto put = [&out](const void *v, size_t n) { const uint8_t *b = (const uint8_t*)v; out.insert(out.end(), b, b + n); };
+    const size_t start = out.size();
+    const uint32_t magic = RB_MANIFEST_MAGIC, count = (uint32_t)m.size();
+    put(&magic, 4); put(&count, 4);
+    for (size_t i = 0; i < m.size(); i++) {
+        const uint16_t len = (uint16_t)m[i].path.size();
+        put(&m[i].drive, 1); put(&len, 2); put(m[i].path.data(), len); put(&m[i].size, 8); put(&m[i].hash, 8);
+    }
+    const uint32_t mlen = (uint32_t)(out.size() - start), endmagic = RB_MANIFEST_END;
+    put(&mlen, 4); put(&endmagic, 4);
+}
+
+/* Splits "blob" (save state + manifest + trailer) into the save state, left in "blob", and the manifest. */
+static bool RB_TakeManifest(std::vector<uint8_t> &blob, std::vector<RBFile> &m) {
+    m.clear();
+    if (blob.size() < 16) return false;
+    uint32_t mlen, endmagic;
+    memcpy(&mlen, &blob[blob.size() - 8], 4); memcpy(&endmagic, &blob[blob.size() - 4], 4);
+    if (endmagic != RB_MANIFEST_END || mlen + 8u > blob.size() || mlen < 8u) return false;
+    const size_t start = blob.size() - 8u - mlen;
+    size_t pos = start;
+    auto get = [&blob, &pos, start, mlen](void *v, size_t n) -> bool {
+        if (pos + n > start + mlen) return false;
+        memcpy(v, &blob[pos], n); pos += n; return true; };
+    uint32_t magic, count;
+    if (!get(&magic, 4) || !get(&count, 4) || magic != RB_MANIFEST_MAGIC || count > 100000u) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        RBFile e; uint16_t len;
+        if (!get(&e.drive, 1) || !get(&len, 2) || pos + len > start + mlen) return false;
+        e.path.assign((const char*)&blob[pos], len); pos += len;
+        if (!get(&e.size, 8) || !get(&e.hash, 8)) return false;
+        m.push_back(e);
+    }
+    blob.resize(start);
+    return true;
+}
+
+/* Client: which of the server's files it needs (bits), or false with "err" when one cannot be taken over. "mine": our
+ * own files (of the same copy, in a cluster). */
+static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std::vector<RBFile> &mine, std::vector<uint8_t> &bits, uint64_t &total, std::string &err) {
+    bits.assign((theirs.size() + 7u) / 8u, 0);
+    total = 0;
+    unsigned differ = 0, missing = 0;
+    for (size_t i = 0; i < theirs.size(); i++) {
+        const RBFile &t = theirs[i];
+        const RBFile *my = NULL;
+        for (size_t k = 0; k < mine.size(); k++) if (mine[k].drive == t.drive && mine[k].path == t.path) { my = &mine[k]; break; }
+        if (my != NULL && my->size == t.size && my->hash == t.hash) continue;
+        if (t.size > RB_SYNC_FILE_MAX) {
+            err = std::string(1, (char)('A' + t.drive)) + ":\\" + t.path + " (" + std::to_string((unsigned long long)(t.size >> 10)) +
+                " KB) " + (my ? "differs from the server's" : "is missing here") + ": every computer needs the same version of the game";
+            return false;
+        }
+        if (my) differ++; else missing++;
+        total += t.size;
+        bits[i / 8u] |= (uint8_t)(1u << (i % 8u));
+    }
+    if (total > RB_SYNC_TOTAL_MAX) { err = "the files that differ from the server's are too large to take over: every computer needs the same version of the game"; return false; }
+    unsigned extra = 0;
+    for (size_t k = 0; k < mine.size(); k++) {
+        bool found = false;
+        for (size_t i = 0; i < theirs.size() && !found; i++) found = (theirs[i].drive == mine[k].drive && theirs[i].path == mine[k].path);
+        if (!found) extra++;
+    }
+    LOG_MSG("INPUTNET: the server's files: %u, %u differ here and %u are missing (%llu KB to take over); %u files only here",
+        (unsigned)theirs.size(), differ, missing, (unsigned long long)(total >> 10), extra);
+    return true;
+}
+
+static bool RB_CompareManifests(const std::vector<RBFile> &theirs, std::vector<uint8_t> &bits, uint64_t &total, std::string &err) {
+    std::vector<RBFile> mine;
+    RB_BuildManifest(mine);
+    return RB_CompareManifestsWith(theirs, mine, bits, total, err);
+}
+
+static std::vector<uint8_t> rb_cli_bits;
+static uint32_t rb_cli_manifest_count = 0;
+
+/* Client: (again) the request for the files it needs. */
+static void RB_SendFileRequest(void) {
+    const size_t per = 1000u;   /* bytes of bits per packet */
+    for (size_t off = 0; off < rb_cli_bits.size() || off == 0; off += per) {
+        const size_t n = std::min(per, rb_cli_bits.size() - std::min(off, rb_cli_bits.size()));
+        uint8_t buf[1100];
+        InputNetWriter w(buf, sizeof(buf));
+        INPUTNET_BeginPacket(w, INPKT_FILEREQ);
+        w.u32(rb_cli_manifest_count);
+        w.u32((uint32_t)off);
+        w.u16((uint16_t)n);
+        if (n) w.bytes(&rb_cli_bits[off], n);
+        INPUTNET_SendRaw(inputnet_server_addr, buf, w.size());
+        if (rb_cli_bits.empty()) break;
+    }
+}
+
+/* Server: a part of a joining participant's file request. */
+static void RB_HandleFileRequest(InputNetReader &r) {
+    const uint32_t count = r.u32(), off = r.u32();
+    const unsigned n = r.u16();
+    const uint8_t *b = n ? r.bytes(n) : NULL;
+    if (r.bad() || count != rb_srv_manifest.size() || rb_filereq_ready) return;
+    const size_t need = (count + 7u) / 8u;
+    if (rb_filereq_bits.size() != need) {
+        rb_filereq_bits.assign(need, 0);
+        rb_filereq_part.assign(std::max<size_t>(1u, (need + 999u) / 1000u), false);
+    }
+    if ((off % 1000u) != 0 || off > need || n > need - off || (n == 0 && need != 0)) return;
+    if (n) memcpy(&rb_filereq_bits[off], b, n);
+    rb_filereq_part[off / 1000u] = true;
+    bool all = true;
+    for (size_t i = 0; i < rb_filereq_part.size(); i++) all = all && rb_filereq_part[i];
+    rb_filereq_ready = all;
+}
+
+/* Server: the requested files, one after the other in the list's order. */
+static bool RB_BuildFileBlob(std::vector<uint8_t> &out) {
+    out.clear();
+    for (size_t i = 0; i < rb_srv_manifest.size(); i++) {
+        if (!(rb_filereq_bits[i / 8u] & (1u << (i % 8u)))) continue;
+        const RBFile &e = rb_srv_manifest[i];
+        FILE *f = RB_OpenRead(e);
+        if (f == NULL) return false;
+        const size_t at = out.size();
+        out.resize(at + (size_t)e.size);
+        const size_t got = e.size ? fread(&out[at], 1, (size_t)e.size, f) : 0;
+        fclose(f);
+        if (got != e.size) return false;
+    }
+    return true;
+}
+
+/* Client: write the files that came and map each over its DOS path for the session. In a cluster an entry's drive
+ * byte carries its copy in bits 5-7: the other copies' files are written and listed in "others" (their followers map
+ * them: RBC_CMD_FILEMAP). */
+static bool RB_MapReceivedFiles(const std::vector<uint8_t> &blob, std::string &err, std::vector<std::vector<RBFile> > *others = NULL) {
+    /* the system's temporary folder (the save folder can be the game's own) */
+    std::string dir;
+#if defined(WIN32)
+    char tmp[MAX_PATH + 1];
+    const DWORD tl = GetTempPathA(sizeof(tmp), tmp);
+    dir = (tl > 0 && tl < sizeof(tmp)) ? std::string(tmp) : std::string(".\\");
+#else
+    const char *tmp = getenv("TMPDIR");
+    dir = (tmp != NULL && *tmp) ? std::string(tmp) : std::string("/tmp");
+#endif
+    if (!dir.empty() && dir[dir.size() - 1] != '/' && dir[dir.size() - 1] != '\\') dir += CROSS_FILESPLIT;
+    char sub[64];
+    snprintf(sub, sizeof(sub), "dosbox-x-nn-rollbacknet-%u", (unsigned)(GetTicks() ^ (uint32_t)(uintptr_t)&blob));
+    dir += sub;
+    Cross::CreateDir(dir);
+    rb_sync_dir = dir;
+    size_t pos = 0;
+    for (size_t i = 0; i < rb_cli_need.size(); i++) {
+        RBFile e = rb_cli_need[i];
+        const unsigned copy = e.drive >> 5;
+        e.drive &= 31u;
+        const bool elsewhere = others != NULL && copy != rbc_copy && copy < others->size();
+        localDrive *ld = (e.drive < DOS_DRIVES) ? dynamic_cast<localDrive*>(Drives[e.drive]) : NULL;
+        if ((ld == NULL && !elsewhere) || pos + e.size > blob.size()) { err = "the server's files did not arrive whole"; return false; }
+        const size_t bs = e.path.find_last_of('\\');
+        const std::string name = (bs == std::string::npos) ? e.path : e.path.substr(bs + 1);
+        const std::string host = dir + CROSS_FILESPLIT + std::to_string((unsigned long)i) + "-" + name;
+        FILE *f = fopen(host.c_str(), "wb");
+        if (f == NULL) { err = "cannot write " + host; return false; }
+        const size_t put = e.size ? fwrite(&blob[pos], 1, (size_t)e.size, f) : 0;
+        fclose(f);
+        if (put != e.size) { err = "cannot write " + host; return false; }
+        pos += (size_t)e.size;
+        rb_sync_temp.push_back(host);
+        if (elsewhere) { e.host = host; e.mapped = true; (*others)[copy].push_back(e); continue; }
+        /* its folder has to exist for real */
+        if (bs != std::string::npos) {
+            std::string parent;
+            size_t from = 0;
+            while (from <= bs) {
+                const size_t next = e.path.find('\\', from);
+                if (next == std::string::npos || next > bs) break;
+                parent = e.path.substr(0, next);
+                if (!ld->TestDir(parent.c_str()) && ld->MakeDir(parent.c_str()))
+                    rb_sync_dirs.push_back(std::make_pair((int)e.drive, parent));
+                from = next + 1;
+            }
+        }
+        if (!ld->AddMountedFile(e.path.c_str(), host.c_str(), true)) { err = "cannot map " + e.path; return false; }
+        rb_sync_mapped.push_back(std::make_pair((int)e.drive, e.path));
+    }
+    return true;
+}
+
+/* Client, session over: the server's files are unmapped and their copies deleted. */
+static void RB_UnmapReceivedFiles(void) {
+    for (size_t i = 0; i < rb_sync_mapped.size(); i++) {
+        const int d = rb_sync_mapped[i].first;
+        localDrive *ld = (d >= 0 && d < DOS_DRIVES) ? dynamic_cast<localDrive*>(Drives[d]) : NULL;
+        if (ld != NULL) ld->RemoveMountedFile(rb_sync_mapped[i].second.c_str());
+    }
+    rb_sync_mapped.clear();
+    for (size_t i = 0; i < rb_sync_temp.size(); i++) remove(rb_sync_temp[i].c_str());
+    rb_sync_temp.clear();
+    if (!rb_sync_dir.empty()) {
+#if defined(WIN32)
+        RemoveDirectoryA(rb_sync_dir.c_str());
+#else
+        rmdir(rb_sync_dir.c_str());
+#endif
+        rb_sync_dir.clear();
+    }
+    /* folders made for them, newest first, where still empty */
+    for (size_t i = rb_sync_dirs.size(); i-- > 0; ) {
+        const int d = rb_sync_dirs[i].first;
+        if (d >= 0 && d < DOS_DRIVES && Drives[d] != NULL) Drives[d]->RemoveDir(rb_sync_dirs[i].second.c_str());
+    }
+    rb_sync_dirs.clear();
+}
+
+static uint8_t inputnet_xfer_type = 7;  /* INPKT_STATE or INPKT_FILES: the transfer acknowledgements count for */
+
+static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &state,uint8_t type = INPKT_STATE) {
     const uint32_t total = (uint32_t)state.size();
+    inputnet_xfer_type = type;
+    p.confirmed = 0;
     uint32_t acked = 0;
     uint32_t lastprogress = GetTicks();
     uint32_t last_events = GetTicks();
@@ -1093,7 +1546,7 @@ static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &sta
 
             uint8_t buf[INPUTNET_STATE_CHUNK+32u];
             InputNetWriter w(buf,sizeof(buf));
-            INPUTNET_BeginPacket(w,INPKT_STATE);
+            INPUTNET_BeginPacket(w,type);
             w.u32(total);
             w.u32(off);
             w.u16((uint16_t)n);
@@ -1127,8 +1580,9 @@ static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &sta
 }
 
 /* Client side: collect the snapshot the server is pushing at us. */
-static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total) {
+static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,void (*nudge)(void) = NULL,uint8_t type = INPKT_STATE) {
     if (total == 0) return true;
+    uint32_t lastnudge = 0;
 
     state.assign(total,0);
 
@@ -1149,10 +1603,10 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total) {
             InputNetReader r((const uint8_t*)inputnet_recvpkt->data,(size_t)inputnet_recvpkt->len);
             if (r.u32() != INPUTNET_MAGIC) continue;
             if (r.u8() != (uint8_t)INPUTNET_PROTOVER) continue;
-            const uint8_t type = r.u8();
+            const uint8_t ptype = r.u8();
             r.u8(); /* peer id */
             r.u8(); /* reserved */
-            if (r.bad() || type != INPKT_STATE) continue;
+            if (r.bad() || ptype != type) continue;
 
             const uint32_t pkttotal = r.u32();
             const uint32_t off = r.u32();
@@ -1185,11 +1639,15 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total) {
             InputNetWriter w(buf,sizeof(buf));
             INPUTNET_BeginPacket(w,INPKT_STATEACK);
             w.u32(have);
+            w.u8(type);
             INPUTNET_SendRaw(inputnet_server_addr,buf,w.size());
             lastack = now;
         }
 
         if (have >= total) break;
+
+        /* until the first bytes come: repeat what made the server send them */
+        if (nudge != NULL && have == 0 && (now - lastnudge) >= 300u) { nudge(); lastnudge = now; }
 
         if ((GetTicks() - lastprogress) > inputnet_timeout) {
             LOG_MSG("INPUTNET: timed out receiving the emulator state (%u of %u bytes)",
@@ -1206,6 +1664,7 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total) {
         InputNetWriter w(buf,sizeof(buf));
         INPUTNET_BeginPacket(w,INPKT_STATEACK);
         w.u32(total);
+        w.u8(type);
         INPUTNET_SendRaw(inputnet_server_addr,buf,w.size());
     }
 
@@ -1245,6 +1704,7 @@ static void INPUTNET_StartSession(void) {
 
     LOG_MSG("INPUTNET: session running with %u participant(s), %u ms frames, %u frame input delay",
         INPUTNET_PeerCount(),inputnet_frame_ms,inputnet_delay);
+    if (inputnet_rollback) RB_SessionStarted();
 }
 
 static void INPUTNET_EndSession(const char *reason,bool notify_peers) {
@@ -1260,6 +1720,7 @@ static void INPUTNET_EndSession(const char *reason,bool notify_peers) {
         inputnet_capture_active = false;
         INPUTNET_ReleaseHeldInput();
     }
+    RB_SessionEnded();
 
     inputnet_capture_active = false;
 
@@ -1378,7 +1839,17 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         return;
     }
 
-    uint8_t welcome[128];
+    /* RollbackNet: the list of our files goes after the save state (the joining machine takes what differs) */
+    rb_filereq_ready = false;
+    rb_filereq_bits.clear();
+    rb_filereq_part.clear();
+    if (inputnet_rollback && !state.empty()) {
+        RB_BuildManifest(rb_srv_manifest);
+        RB_PutManifest(state, rb_srv_manifest);
+        LOG_MSG("INPUTNET: %u files on the mounted folders listed for the joining participant",(unsigned)rb_srv_manifest.size());
+    }
+
+    uint8_t welcome[1024];   /* RollbackNet adds its settings fingerprint */
     InputNetWriter w(welcome,sizeof(welcome));
     INPUTNET_BeginPacket(w,INPKT_WELCOME);
     w.u8(peerid);
@@ -1406,6 +1877,13 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         w.u32((uint32_t)(fps >> 32u)); w.u32((uint32_t)fps);
         w.u32((uint32_t)(base >> 32u)); w.u32((uint32_t)base);
         w.u32((uint32_t)vga_mode_frames_since_time_base);
+    }
+    w.u8(inputnet_rollback ? 1 : 0);
+    w.u8((uint8_t)inputnet_rbwindow);
+    if (inputnet_rollback) {    /* what has to be the same on every computer for the machines to run identically */
+        const std::string fp = RB_Fingerprint();
+        w.u16((uint16_t)fp.size());
+        w.bytes((const uint8_t*)fp.data(), fp.size());
     }
     const size_t welcomelen = w.size();
     INPUTNET_SendRaw(p->addr,welcome,welcomelen);
@@ -1438,9 +1916,23 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         uint32_t lastwelcome = GetTicks();
         const uint32_t waitstart = GetTicks();
 
+        bool files_sent = false;
         while (!p->ready) {
             INPUTNET_PollSocket();
             if (p->ready) break;
+
+            if (rb_filereq_ready && !files_sent) {     /* RollbackNet: the files it asked for */
+                files_sent = true;
+                std::vector<uint8_t> files;
+                if (!RB_BuildFileBlob(files)) {
+                    LOG_MSG("INPUTNET: could not read the game files \"%s\" asked for",p->name.c_str());
+                    ok = false;
+                    break;
+                }
+                LOG_MSG("INPUTNET: sending %u KB of game files to \"%s\"",(unsigned)(files.size() >> 10),p->name.c_str());
+                if (!INPUTNET_SendStateTo(*p,files,INPKT_FILES)) { ok = false; break; }
+                continue;
+            }
 
             if ((GetTicks() - waitstart) > inputnet_timeout) {
                 LOG_MSG("INPUTNET: participant \"%s\" never became ready",p->name.c_str());
@@ -1517,9 +2009,32 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
             const uint8_t *nb = r.bytes(namelen);
             if (nb != NULL) name.assign((const char*)nb,namelen);
             if (r.bad()) return;
+            std::string token;
+            if (r.remain() >= 1) { const unsigned tl = r.u8(); const uint8_t *tb = r.bytes(tl); if (tb != NULL) token.assign((const char*)tb,tl); }
+            unsigned copies = 0, want = 0;  /* a cluster's computer: its copies, and the one its player plays */
+            if (!r.bad() && r.remain() >= 2) { copies = r.u8(); want = r.u8(); }
+            {
+                /* NukemNet's room token (see REMOTEPLAY_AuthToken): only the room's players may join */
+                extern std::string REMOTEPLAY_AuthToken(const std::string &secret,const std::string &name);
+                extern bool REMOTEPLAY_SameSecret(const std::string &a,const std::string &b);
+                static const char *secret_env = getenv("NN_RP_AUTH_SECRET");
+                static const std::string secret = (secret_env != NULL) ? secret_env : "";
+                if (secret.size() >= 16) {
+                    if (name.empty() || !REMOTEPLAY_SameSecret(token,REMOTEPLAY_AuthToken(secret,name))) {
+                        static uint32_t last_told = 0;
+                        if ((GetTicks() - last_told) > 5000u) {
+                            LOG_MSG("INPUTNET: refused a join as \"%s\": not invited to this room (no valid token)",name.c_str());
+                            last_told = GetTicks();
+                        }
+                        return;
+                    }
+                }
+            }
             /* Only take joins between timer ticks, where the state is saved and
              * reloaded on both sides at the same point; the client says hello
              * again until it is answered. */
+            if (rbc_copies) { RBC_ServerHello(from,name,copies,want); break; }
+            if (copies != 0) return;        /* a cluster's computer: this session is not one */
             if (!inputnet_in_tick) return;
             INPUTNET_ServerAcceptClient(from,name);
             break;
@@ -1531,7 +2046,17 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
             if (p == NULL) return;
             const uint32_t ack = r.u32();
             if (r.bad()) return;
+            if (r.remain() >= 1 && r.u8() != inputnet_xfer_type) return;    /* the other transfer's, late */
             if (!p->ready && ack > p->confirmed) p->confirmed = ack;
+            p->lastheard = GetTicks();
+            break;
+        }
+
+        case INPKT_FILEREQ: {
+            if (!inputnet_is_server || !inputnet_rollback) return;
+            InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            if (p == NULL || p->ready) return;
+            RB_HandleFileRequest(r);
             p->lastheard = GetTicks();
             break;
         }
@@ -1631,6 +2156,34 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
             break;
         }
 
+        case INPKT_RBINPUT: {
+            if (!inputnet_rollback || !inputnet_session) return;
+            if (peerid >= INPUTNET_MAX_PEERS || peerid == inputnet_selfid) return;
+            InputNetPeer &p = inputnet_peers[peerid];
+            if (!p.active) {
+                if (inputnet_is_server) return;
+                p.active = true;
+                p.local = false;
+                p.ready = true;
+                p.addr = inputnet_server_addr;
+                p.resetFrames();
+            }
+            p.lastheard = GetTicks();
+            RB_HandleInput(p,peerid,r);
+            if (inputnet_is_server) {   /* the hub: pass it on to the other clients */
+                InputNetPeer *src = INPUTNET_PeerByAddr(from);
+                INPUTNET_SendToPeers(data,len,src);
+            }
+            break;
+        }
+
+        case INPKT_RESYNC: {
+            if (!inputnet_rollback || !inputnet_session) return;
+            if (!inputnet_is_server && !INPUTNET_SameAddr(from,inputnet_server_addr)) return;
+            RB_HandleResync(r,from,peerid);
+            break;
+        }
+
         case INPKT_CHECK: {
             if (peerid >= INPUTNET_MAX_PEERS || peerid == inputnet_selfid) return;
             InputNetPeer &p = inputnet_peers[peerid];
@@ -1677,6 +2230,7 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
             if (inputnet_is_server) {
                 InputNetPeer *p = INPUTNET_PeerByAddr(from);
                 if (p == NULL) break;
+                if (rbc_copies) { RBC_ServerDrop((unsigned)(p - inputnet_peers), "left"); break; }
 
                 LOG_MSG("INPUTNET: participant \"%s\" left",p->name.c_str());
                 p->active = false;
@@ -1701,6 +2255,7 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
 }
 
 static void INPUTNET_PollSocket(void) {
+    RBC_PollLeader();
     if (inputnet_socket == NULL || inputnet_recvpkt == NULL) return;
 
     /* Bound the amount of work per call so a flood cannot lock us up. */
@@ -1800,6 +2355,8 @@ static bool INPUTNET_StartServer(uint16_t port) {
 
     INPUTNET_ClearHostVolumeLabels();
     LOG_MSG("INPUTNET: waiting for participants on UDP port %u",(unsigned)port);
+    /* a cluster's copies run from now on, nobody else there or not (the others join it: RBC_ServerHello) */
+    if (rbc_copies) { rb_start_frame = 0; INPUTNET_StartSession(); }
     return true;
 }
 
@@ -1819,15 +2376,27 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
     inputnet_link_up = true;
     inputnet_selfid = 0xFF; /* until the server assigns one */
 
-    /* Say hello until the server answers. */
-    uint8_t buf[64];
+    /* Say hello until the server answers. The name and the room token come from NukemNet (as for the remote play
+     * viewer): a server started with NN_RP_AUTH_SECRET takes only a name with its token. */
+    extern std::string REMOTEPLAY_CleanName(const std::string &name);
+    uint8_t buf[160];
     InputNetWriter w(buf,sizeof(buf));
     INPUTNET_BeginPacket(w,INPKT_HELLO);
-    const char *me = "client";
-    w.u8((uint8_t)strlen(me));
-    w.bytes(me,strlen(me));
+    std::string me = "client";
+    {
+        const char *u = getenv("USERNAME");
+        if (u == NULL || !*u) u = getenv("USER");
+        if (u != NULL && *u) { const std::string clean = REMOTEPLAY_CleanName(u); if (!clean.empty()) me = clean; }
+    }
+    const char *tok = getenv("NN_RP_AUTH_TOKEN");
+    const std::string token = (tok != NULL) ? std::string(tok).substr(0, 64) : std::string();
+    w.u8((uint8_t)me.size());
+    w.bytes(me.data(),me.size());
+    w.u8((uint8_t)token.size());
+    if (!token.empty()) w.bytes(token.data(),token.size());
+    if (rbc_copies) { w.u8((uint8_t)rbc_copies); w.u8((uint8_t)rbc_copy); }   /* a cluster: the copy our player plays */
 
-    uint32_t total = 0;
+    uint32_t total = 0, server_frame = 0, welcomed_at = 0;
     bool welcomed = false;
     uint32_t last_events = GetTicks();
     const uint32_t start = GetTicks();
@@ -1886,11 +2455,58 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                             inputnet_pending_vga_base = INPUTNET_BitsDouble(base);
                             inputnet_have_pending_vga = !r.bad();
                         }
+                        {
+                            /* RollbackNet and the lockstep cannot share a session */
+                            uint8_t theirs_rb = 0, win = 0;
+                            if (!r.bad() && r.remain() >= 2) { theirs_rb = r.u8(); win = r.u8(); }
+                            if (theirs_rb != (inputnet_rollback ? 1 : 0)) {
+                                errmsg = theirs_rb ? "the server runs mode=rollback, this DOSBox-X does not"
+                                                   : "this DOSBox-X runs mode=rollback, the server does not";
+                                LOG_MSG("INPUTNET: %s",errmsg.c_str());
+                                INPUTNET_CloseLink(NULL,false);
+                                return false;
+                            }
+                            if (inputnet_rollback && win >= 2 && win <= 48) inputnet_rbwindow = win;
+                            if (inputnet_rollback) {
+                                std::string theirs;
+                                if (!r.bad() && r.remain() >= 2) {
+                                    const unsigned n = r.u16();
+                                    const uint8_t *b = r.bytes(n);
+                                    if (b != NULL) theirs.assign((const char*)b, n);
+                                }
+                                const std::string mine = RB_Fingerprint();
+                                if (theirs != mine) {
+                                    errmsg = "RollbackNet needs the same emulator and settings on every computer; different here: " +
+                                        RB_FingerprintDiff(theirs, mine);
+                                    LOG_MSG("INPUTNET: %s",errmsg.c_str());
+                                    INPUTNET_CloseLink(NULL,false);
+                                    return false;
+                                }
+                                if (rbc_copies) {   /* a cluster: the server's runs as many copies */
+                                    unsigned theirs_c = 0;
+                                    if (!r.bad() && r.remain() >= 1) theirs_c = r.u8();
+                                    if (theirs_c != rbc_copies) {
+                                        errmsg = "the server runs " + std::to_string(theirs_c) + " copies of the game, this computer " + std::to_string(rbc_copies);
+                                        LOG_MSG("INPUTNET: %s",errmsg.c_str());
+                                        INPUTNET_CloseLink(NULL,false);
+                                        return false;
+                                    }
+                                    server_frame = r.u32();
+                                    rbj_server_prompt = r.u8() != 0;
+                                    const unsigned al = r.u16();
+                                    const uint8_t *ab = r.bytes(al);
+                                    rbj_autorun = (ab != NULL) ? std::string((const char*)ab, al) : std::string();
+                                    /* (the machines bring their own clock etc. later: RBCExtras) */
+                                    inputnet_have_pending_clock = inputnet_have_pending_tsc = inputnet_have_pending_vga = false;
+                                    welcomed_at = GetTicks();
+                                }
+                            }
+                        }
                         if (!r.bad() && myid < INPUTNET_MAX_PEERS) {
                             /* Clamp: these drive our ring buffer and packet sizes. */
                             inputnet_selfid = myid;
                             inputnet_frame_ms = (fms >= 1 && fms <= 100) ? fms : 10u;
-                            inputnet_delay = (dly >= 1 && dly <= 64) ? dly : 3u;
+                            inputnet_delay = (dly <= 64 && (dly >= 1 || inputnet_rollback)) ? dly : 3u;
                             inputnet_redundancy = (red >= 1 && red <= 32) ? red : 4u;
                             inputnet_share_keyboard = (shk != 0);
                             inputnet_share_mouse = (shm != 0);
@@ -1937,6 +2553,15 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
     LOG_MSG("INPUTNET: joined as peer %u, %u ms frames, %u frame input delay",
         (unsigned)inputnet_selfid,inputnet_frame_ms,inputnet_delay);
 
+    if (rbc_copies) {
+        if (!RBC_ClientJoin(total, server_frame, welcomed_at, errmsg)) {
+            LOG_MSG("INPUTNET: %s", errmsg.c_str());
+            INPUTNET_CloseLink(NULL, true);
+            return false;
+        }
+        return true;
+    }
+
     if (total != 0) {
         LOG_MSG("INPUTNET: receiving %u bytes of emulator state from the server",(unsigned)total);
         std::vector<uint8_t> state;
@@ -1944,6 +2569,35 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
             errmsg = "the emulator state transfer failed";
             INPUTNET_CloseLink(NULL,true);
             return false;
+        }
+        if (inputnet_rollback) {
+            /* RollbackNet: the server's game files, wherever ours differ */
+            std::vector<RBFile> theirs;
+            std::vector<uint8_t> bits;
+            uint64_t need = 0;
+            std::string err;
+            if (!RB_TakeManifest(state,theirs)) err = "the server sent no list of its game files";
+            else if (RB_CompareManifests(theirs,bits,need,err)) {
+                rb_cli_need.clear();
+                for (size_t i = 0; i < theirs.size(); i++)
+                    if (bits[i / 8u] & (1u << (i % 8u))) rb_cli_need.push_back(theirs[i]);
+                rb_cli_bits.swap(bits);
+                rb_cli_manifest_count = (uint32_t)theirs.size();
+                if (!rb_cli_need.empty()) {
+                    std::vector<uint8_t> files;
+                    RB_SendFileRequest();
+                    if (!INPUTNET_ReceiveState(files,(uint32_t)need,RB_SendFileRequest,INPKT_FILES))
+                        err = "the server's game files did not arrive";
+                    else if (RB_MapReceivedFiles(files,err))
+                        LOG_MSG("INPUTNET: using %u of the server's files in place of ours for this session",(unsigned)rb_cli_need.size());
+                }
+            }
+            if (!err.empty()) {
+                errmsg = err;
+                LOG_MSG("INPUTNET: %s",errmsg.c_str());
+                INPUTNET_CloseLink(NULL,true);
+                return false;
+            }
         }
         /* The state cannot be applied from here: we are running as a DOS
          * program inside the machine that is about to be replaced. Hand it to
@@ -2006,6 +2660,13 @@ static void INPUTNET_TickHandler(void) {
     inputnet_busy = true;
     struct InTick { InTick() { inputnet_in_tick = true; } ~InTick() { inputnet_in_tick = false; } } in_tick;
 
+    if (rbc_copies) {               /* a cluster: the copies find each other at their DOS prompts first */
+        extern bool dos_shell_reading_input;
+        if (!rbc_attached && dos_shell_reading_input && rbc_copies >= 2) { IPX_ClusterAttach(rbc_copy); rbc_attached = true; }
+        if (!rbc_leader) { RBC_FollowerTick(); inputnet_busy = false; return; }
+        if (!rbc_ready) { RBC_LeaderGather(); if (!rbc_ready) { inputnet_busy = false; return; } }
+    }
+
     /* Deferred start from the config file or the command line. Wait until the
      * shell sits idle at its prompt: joining swaps in the server's emulator
      * state, which only unwinds safely when this machine is parked in the
@@ -2052,6 +2713,12 @@ static void INPUTNET_TickHandler(void) {
         return;
     }
 
+    /* RollbackNet saves, restores and runs its frames from the main loop (INPUTNET_RollbackTick). */
+    if (inputnet_rollback) {
+        inputnet_busy = false;
+        return;
+    }
+
     if (++inputnet_tickaccum < inputnet_frame_ms) {
         INPUTNET_PollSocket();
         inputnet_busy = false;
@@ -2080,11 +2747,3297 @@ static void INPUTNET_TickHandler(void) {
 void *INPUTNET_TickHandler_PIC_Timer = (void*)((uintptr_t)INPUTNET_TickHandler);
 
 /* ------------------------------------------------------------------------- */
+/* RollbackNet ("mode = rollback")                                            */
+/* ------------------------------------------------------------------------- */
+
+/* Every participant runs the same machine with everyone's input, like the
+ * lockstep, but nobody waits for the others' input. A frame whose input from
+ * another participant has not arrived yet runs with a prediction: that player
+ * pressed nothing new, so the keys they hold stay held (input is a list of key
+ * and button events, and "no events" is exactly that). When their real input
+ * for such a frame arrives and does hold events, the machine goes back to the
+ * start of that frame and the frames since run again with the real input, at
+ * full speed and without queueing their sound, before the next real-time frame
+ * starts. Local input is applied after "delay" frames (0: in the next frame),
+ * so a player never waits for the network to see their own input.
+ *
+ * Every frame start is saved: the devices as a lean save state (no guest RAM,
+ * no video memory) and, as an undo log, the RAM and video memory pages that
+ * changed during the frame before. Pages are found by comparing against a
+ * shadow copy rather than by trapping writes, because some emulator code writes
+ * guest memory directly. Per-page hashes, updated only for changed pages, give a
+ * whole-machine hash for every frame at little cost: the participants compare it
+ * for frames whose input everybody has, and a client whose machine differs takes
+ * the server's state over (RESYNC), so the machines can never stay apart.
+ *
+ * Saving, restoring and replaying happen at the start of an emulated
+ * millisecond (INPUTNET_RollbackTick, called by the main loop right after
+ * TIMER_AddTick): every tick handler has run, the mixer has finished the
+ * millisecond before, and no device is half way through anything. */
+
+#define RB_RING 64u                 /* saved frames; more than the largest window */
+#define RB_PAGE 4096u
+#define RB_RESYNC_CHUNK 1024u
+
+extern void MIXER_SetRollbackDiscard(bool on);
+
+struct RBRegion {
+    uint8_t *base = NULL;
+    size_t pages = 0;
+    std::vector<uint8_t> shadow;    /* the region at the newest saved frame start */
+    std::vector<uint64_t> hash;     /* per page hash of shadow */
+};
+
+struct RBSnap {
+    bool valid = false;
+    uint32_t frame = 0;
+    uint32_t tick = 0;
+    uint64_t context = 0;           /* RB_HostContext() when saved */
+    uint64_t hash = 0;              /* the whole machine at this frame start (a cluster's leader: all its copies) */
+    uint64_t own = 0;               /* this copy's alone */
+    std::string devices;            /* lean save state */
+    std::string ipx;                /* a cluster copy's links: IPX driver and null modem (RB_SaveLinks) */
+    std::vector<uint32_t> undo_page;/* (region << 28) | page: changed during the frame before this one */
+    std::vector<uint64_t> undo_hash;/* their hashes before */
+    std::vector<uint8_t> undo_data; /* their contents before, RB_PAGE each */
+};
+
+struct RBCheck {
+    uint32_t frame = 0;
+    uint64_t hash = 0;
+    bool valid = false;
+};
+
+static RBRegion rb_region[2];       /* 0: guest RAM, 1: video memory */
+static uint32_t rb_last_load_frame = UINT32_MAX;    /* the frame of the newest resync state loaded (NN_RB_DUMP=+n) */
+bool rb_evlog_on = false;           /* NN_RB_EVLOG: pic.cpp logs every event of the two frames after a resync's load */
+static RBSnap rb_snap[RB_RING];
+static uint64_t rb_memhash = 0;     /* sum over every page of RB_Mix(key, page hash) */
+static uint32_t rb_tick = 0;        /* emulated ms since the session started (restored with the machine) */
+static bool rb_have_first = false;
+static uint32_t rb_target = 0;      /* the frame a replay ends at */
+static uint32_t rb_realframe = 0;   /* the frame real time is at */
+static uint32_t rb_predicted[INPUTNET_MAX_PEERS][RB_RING]; /* frame+1 that ran with predicted input from this peer */
+static uint32_t rb_have[INPUTNET_MAX_PEERS];      /* frames 0..rb_have-1 of this peer's input are here */
+static uint32_t rb_checked[INPUTNET_MAX_PEERS];   /* frames below this were checked against what we predicted */
+static uint32_t rb_acked[INPUTNET_MAX_PEERS];     /* frames 0..rb_acked-1 of OUR input this peer has */
+static uint32_t rb_peerframe[INPUTNET_MAX_PEERS]; /* the real-time frame the peer last said it was at */
+static uint32_t rb_peerframe_at[INPUTNET_MAX_PEERS]; /* host ms when that arrived */
+static uint32_t rb_peerstamp[INPUTNET_MAX_PEERS]; /* the peer's send time in its newest packet, echoed back */
+static uint32_t rb_peerstamp_at[INPUTNET_MAX_PEERS];
+static uint32_t rb_rtt[INPUTNET_MAX_PEERS];
+static RBCheck rb_peercheck[INPUTNET_MAX_PEERS][INPUTNET_CHECK_RING];
+static double rb_advantage = 0;     /* smoothed: how many frames we run ahead of the others */
+static uint32_t rb_last_slowdown = 0;
+static bool rb_desynced = false;    /* client: asked for, or receiving, the server's state */
+static uint16_t rb_epoch = 0;       /* resyncs loaded: checksums from before one are never compared */
+static uint32_t rb_resync_last_sent = 0;
+/* RESYNC transfer (client side) */
+static std::vector<uint8_t> rb_resync_buf;
+static uint32_t rb_resync_id = 0, rb_resync_total = 0, rb_resync_got = 0, rb_resync_frame = 0;
+static std::vector<bool> rb_resync_have;
+
+/* statistics, logged every few seconds */
+static uint32_t rb_stat_rollbacks = 0, rb_stat_replayed = 0, rb_stat_maxdepth = 0, rb_stat_slowdowns = 0;
+static uint32_t rb_stat_stalls = 0, rb_stat_checks = 0, rb_stat_desyncs = 0, rb_stat_resyncs = 0;
+static uint64_t rb_stat_capture_us = 0, rb_stat_captures = 0, rb_stat_pages = 0;
+static uint64_t rb_replay_started = 0;  /* host us when the running replay began */
+static uint64_t rb_stat_scan_us = 0, rb_stat_lean_us = 0;
+static uint32_t rb_stat_lockstep = 0;   /* frames run in lockstep since the last log (see RB_UpdateLockstep) */
+static uint32_t rb_stat_ctxchanges = 0; /* host context changes seen at frame starts since the last log */
+static uint64_t rb_stat_replay_us = 0, rb_stat_replay_max_us = 0, rb_stat_replays = 0;
+static uint32_t rb_stat_last_log = 0;
+
+extern bool dos_shell_reading_input;
+extern uint32_t dos_shell_input_generation;
+extern uint32_t dosbox_runmachine_context;
+
+/* What the host's own stack is doing: the innermost emulation loop that runs (dosbox.cpp) and how often the DOS shell
+ * started or stopped reading a command line. The same value at two frame starts means the same host stack, so a
+ * machine state saved at the first can be loaded at the second. */
+static inline uint64_t RB_HostContext(void) { return ((uint64_t)dos_shell_input_generation << 32u) | dosbox_runmachine_context; }
+
+/* Frames run with everybody's real input (no prediction, so nothing to roll back) where a rollback could not correct a
+ * guess: at the DOS prompt, and while no saved frame from the oldest one whose input is still unknown back to the
+ * window's start was saved in the host context that runs now (DOS waiting for a key: every wait is a new nested
+ * emulation loop; a program that has just started). */
+static bool rb_lockstep = false;
+static uint64_t rb_lockstep_ctx = 0;
+static uint32_t rb_unrestorable = 0;    /* frame starts in a row at which nothing could be rolled back to */
+static uint32_t RB_MinHave(void);
+static uint32_t RB_RestorableAtOrBefore(uint32_t frame, uint32_t lowest);
+static void RB_UpdateLockstep(uint32_t frame) {
+    const uint64_t ctx = RB_HostContext();
+    if (ctx != rb_lockstep_ctx) { rb_lockstep_ctx = ctx; rb_stat_ctxchanges++; }
+    const uint32_t oldest = std::min(RB_MinHave(), frame);
+    const uint32_t lowest = (frame > inputnet_rbwindow) ? frame - inputnet_rbwindow : 0;
+    if (RB_RestorableAtOrBefore(oldest, lowest) == UINT32_MAX) rb_unrestorable++;
+    else rb_unrestorable = 0;
+    /* One such frame start alone is a nested loop of a moment (a BIOS call DOS makes for the console): the next one is
+     * back where it was, and a correction waits for it (RB_Correct). Two in a row: DOS waits for a key, a program has
+     * just started. */
+    rb_lockstep = dos_shell_reading_input || rb_unrestorable >= 2;
+    if (rb_lockstep) rb_stat_lockstep++;
+}
+
+/* Remote frames that ran with a prediction their real input contradicts (RB_FindMisprediction): applied late when no
+ * rollback can reach them. */
+struct RBLate { unsigned peer; uint32_t frame; };
+static std::vector<RBLate> rb_late;
+/* The earliest frame a wrong guess was found for and that is not corrected yet, or UINT32_MAX (RB_Correct). */
+static uint32_t rb_pending_wrong = UINT32_MAX;
+
+static uint64_t RB_MicroTicks(void) {
+#if defined(C_SDL2)
+    return (uint64_t)((double)SDL_GetPerformanceCounter() * 1000000.0 / (double)SDL_GetPerformanceFrequency());
+#else
+    return (uint64_t)SDL_GetTicks() * 1000u;
+#endif
+}
+
+static inline uint64_t RB_HashPage(const uint8_t *p) {
+    uint64_t h1 = 0x9E3779B97F4A7C15ull, h2 = 0xC2B2AE3D27D4EB4Full;
+    for (size_t i = 0; i < RB_PAGE; i += 16) {
+        uint64_t a, b;
+        memcpy(&a, p + i, 8);
+        memcpy(&b, p + i + 8, 8);
+        h1 = (h1 ^ a) * 0xff51afd7ed558ccdull; h1 ^= h1 >> 29;
+        h2 = (h2 ^ b) * 0xc4ceb9fe1a85ec53ull; h2 ^= h2 >> 31;
+    }
+    return h1 ^ (h2 * 0x9E3779B97F4A7C15ull);
+}
+
+static inline uint64_t RB_Mix(uint32_t key, uint64_t h) {
+    uint64_t x = h ^ ((uint64_t)key * 0x9E3779B97F4A7C15ull);
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+static size_t RB_RegionPages(unsigned r) {
+    if (r == 0) return (MemBase != NULL) ? (size_t)MEM_TotalPages() : 0u;
+    return (vga.mem.linear != NULL) ? (size_t)(vga.mem.memsize / RB_PAGE) : 0u;
+}
+
+static uint8_t *RB_RegionBase(unsigned r) {
+    return (r == 0) ? MemBase : vga.mem.linear;
+}
+
+/* --- Guest RAM write tracking -----------------------------------------------------------------------------------
+ * Comparing all of guest RAM with its copy at every frame start took most of a frame's saving time (16 MB: about
+ * 1.2 ms of 1.4). Instead the host's page protection tells which pages were written: guest RAM is write-protected,
+ * the first write to a page faults, and the handler makes the page writable again and notes it. Written pages stay
+ * writable and are compared at every frame start; one unchanged for RBT_IDLE frame starts is protected again. Every
+ * kind of write is caught: the CPU's, DMA's, the DOS kernel's and BIOS's (host code), loading devices. Only system
+ * calls must not write into guest RAM while it is protected (they would fail instead of faulting): none do once the
+ * machine has started (ROM images are read at boot). Video memory (a megabyte or so) is still compared whole.
+ * Off, so that everything is compared, where the host cannot do it (guest RAM not aligned to host pages) or with
+ * NN_RB_NOTRACK=1. */
+static const uint16_t RBT_IDLE = 8;
+static bool rbt_on = false;
+static uint8_t *rbt_lo = NULL, *rbt_hi = NULL;   /* the protected part of guest RAM: whole host pages */
+static size_t rbt_hp = 4096, rbt_n = 0;          /* host page size; host pages in [rbt_lo, rbt_hi) */
+static volatile uint8_t *rbt_state = NULL;       /* per host page: 0 write-protected, 1 writable */
+static uint32_t *rbt_fault = NULL;               /* host pages made writable since they were last collected */
+static volatile size_t rbt_nfault = 0;
+static std::vector<uint32_t> rbt_work;           /* writable host pages: compared at every frame start */
+static std::vector<uint16_t> rbt_idle;           /* frame starts a writable host page has been unchanged */
+
+static bool RBT_SetWritable(size_t p, size_t count, bool writable) {
+#if defined(WIN32)
+    DWORD old;
+    return VirtualProtect(rbt_lo + p * rbt_hp, count * rbt_hp, writable ? PAGE_READWRITE : PAGE_READONLY, &old) != 0;
+#else
+    return mprotect(rbt_lo + p * rbt_hp, count * rbt_hp, writable ? (PROT_READ | PROT_WRITE) : PROT_READ) == 0;
+#endif
+}
+
+/* A write fault at "addr" (in the fault handler): true when it was one of ours and the page is writable now. */
+static bool RBT_Fault(void *addr) {
+    uint8_t *a = (uint8_t*)addr;
+    if (!rbt_on || a < rbt_lo || a >= rbt_hi) return false;
+    const size_t p = (size_t)(a - rbt_lo) / rbt_hp;
+    if (rbt_state[p] != 0 || !RBT_SetWritable(p, 1, true)) return false;
+    rbt_state[p] = 1;
+    const size_t k = rbt_nfault;
+    rbt_fault[k] = (uint32_t)p;
+    rbt_nfault = k + 1u;
+    return true;
+}
+
+#if defined(WIN32)
+static LONG CALLBACK RBT_Exception(PEXCEPTION_POINTERS ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 && er->ExceptionInformation[0] == 1 &&
+        RBT_Fault((void*)er->ExceptionInformation[1]))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+static struct sigaction rbt_old_segv, rbt_old_bus;
+static void RBT_Signal(int sig, siginfo_t *si, void *uc) {
+    if (RBT_Fault(si->si_addr)) return;
+    /* not ours: whoever had the signal before, or the default action (the fault repeats once we return) */
+    const struct sigaction &old = (sig == SIGBUS) ? rbt_old_bus : rbt_old_segv;
+    if ((old.sa_flags & SA_SIGINFO) && old.sa_sigaction != NULL) { old.sa_sigaction(sig, si, uc); return; }
+    if (!(old.sa_flags & SA_SIGINFO) && old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN && old.sa_handler != NULL) {
+        old.sa_handler(sig);
+        return;
+    }
+#if defined(__linux__) && defined(__GLIBC__)
+    {   /* a real crash: where (to the console log, which NukemNet keeps) */
+        static bool told = false;
+        if (!told) {
+            told = true;
+            void *bt[64];
+            const int n = backtrace(bt, 64);
+            static const char m[] = "\n*** DOSBox-X-NN crashed (segmentation fault); backtrace:\n";
+            if (write(2, m, sizeof(m) - 1) < 0) { /* nothing to do */ }
+            backtrace_symbols_fd(bt, n, 2);
+        }
+    }
+#endif
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+}
+#endif
+
+static bool RBT_InstallHandler(void) {
+    static bool installed = false, ok = false;
+    if (installed) return ok;
+    installed = true;
+#if defined(WIN32)
+    ok = AddVectoredExceptionHandler(1, RBT_Exception) != NULL;
+#else
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = RBT_Signal;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    ok = sigaction(SIGSEGV, &sa, &rbt_old_segv) == 0 && sigaction(SIGBUS, &sa, &rbt_old_bus) == 0;   /* macOS: SIGBUS */
+#endif
+    return ok;
+}
+
+/* Everything writable again, tracking off (before a whole machine is loaded, and at the end of a session). */
+static void RBT_Stop(void) {
+    if (rbt_on) {
+        rbt_on = false;
+        RBT_SetWritable(0, rbt_n, true);
+    }
+    rbt_work.clear();
+    rbt_nfault = 0;
+}
+
+/* Guest RAM equals its copy now (RB_InitRegions): protect all of it. */
+static void RBT_Start(uint8_t *base, size_t bytes) {
+    RBT_Stop();
+    const char *off = getenv("NN_RB_NOTRACK");
+    if ((off != NULL && *off) || base == NULL || bytes == 0) return;
+#if defined(WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    rbt_hp = si.dwPageSize;
+#else
+    rbt_hp = (size_t)sysconf(_SC_PAGESIZE);
+#endif
+    if (rbt_hp == 0 || (rbt_hp % RB_PAGE) != 0 || ((uintptr_t)base % rbt_hp) != 0) {
+        static bool told = false;
+        if (!told) LOG_MSG("INPUTNET: guest RAM is not aligned to host pages; every page is compared at every frame start");
+        told = true;
+        return;
+    }
+    const size_t n = bytes / rbt_hp;
+    if (n == 0 || !RBT_InstallHandler()) return;
+    if (n != rbt_n || rbt_state == NULL) {
+        free((void*)rbt_state); free(rbt_fault);
+        rbt_state = (volatile uint8_t*)calloc(n, 1);
+        rbt_fault = (uint32_t*)calloc(n, sizeof(uint32_t));
+        if (rbt_state == NULL || rbt_fault == NULL) { rbt_n = 0; return; }
+    }
+    rbt_n = n;
+    rbt_lo = base;
+    rbt_hi = base + n * rbt_hp;
+    memset((void*)rbt_state, 0, n);
+    rbt_idle.assign(n, 0);
+    rbt_work.clear();
+    rbt_work.reserve(n);
+    rbt_nfault = 0;
+    rbt_on = true;
+    if (!RBT_SetWritable(0, n, false)) {
+        rbt_on = false;
+        LOG_MSG("INPUTNET: cannot write-protect guest RAM; every page is compared at every frame start");
+    }
+}
+
+/* Pages that became writable since the last call join the compared ones. */
+static void RBT_Collect(void) {
+    const size_t nf = rbt_nfault;
+    for (size_t k = 0; k < nf; k++) {
+        rbt_work.push_back(rbt_fault[k]);
+        rbt_idle[rbt_fault[k]] = 0;
+    }
+    rbt_nfault = 0;
+}
+
+/* A guest RAM page we are about to write ourselves (restoring): writable now, and compared from now on. */
+static inline void RBT_Touch(size_t pg) {
+    if (!rbt_on) return;
+    const size_t p = pg * RB_PAGE / rbt_hp;
+    if (p >= rbt_n || rbt_state[p] != 0 || !RBT_SetWritable(p, 1, true)) return;
+    rbt_state[p] = 1;
+    const size_t k = rbt_nfault;
+    rbt_fault[k] = (uint32_t)p;
+    rbt_nfault = k + 1u;
+}
+
+static void RB_InitRegions(void) {
+    rb_memhash = 0;
+    for (unsigned r = 0; r < 2; r++) {
+        RBRegion &g = rb_region[r];
+        g.base = RB_RegionBase(r);
+        g.pages = RB_RegionPages(r);
+        if (g.pages == 0) { g.shadow.clear(); g.hash.clear(); continue; }
+        g.shadow.assign(g.base, g.base + g.pages * RB_PAGE);
+        g.hash.resize(g.pages);
+        for (size_t pg = 0; pg < g.pages; pg++) {
+            g.hash[pg] = RB_HashPage(g.base + pg * RB_PAGE);
+            rb_memhash += RB_Mix(((uint32_t)r << 28) | (uint32_t)pg, g.hash[pg]);
+        }
+    }
+    for (unsigned i = 0; i < RB_RING; i++) rb_snap[i].valid = false;
+    RBT_Start(rb_region[0].base, rb_region[0].pages * RB_PAGE);
+}
+
+static bool RB_RegionsMoved(void) {
+    for (unsigned r = 0; r < 2; r++)
+        if (rb_region[r].base != RB_RegionBase(r) || rb_region[r].pages != RB_RegionPages(r)) return true;
+    return false;
+}
+
+/* The registers are hashed field by field: the structures hold host-sized fields and padding. */
+static uint64_t RB_MachineHash(void) {
+    uint64_t f = 1469598103934665603ull;
+    auto add = [&f](uint32_t v) { for (unsigned b = 0; b < 4; b++) { f ^= (v >> (8u * b)) & 0xFFu; f *= 1099511628211ull; } };
+    for (unsigned i = 0; i < 8; i++) add(cpu_regs.regs[i].dword[0]);
+    add(cpu_regs.ip.dword[0]);
+    add((uint32_t)cpu_regs.flags);
+    for (unsigned i = 0; i < 6; i++) {
+        add((uint32_t)Segs.val[i]);
+        add((uint32_t)Segs.phys[i]);
+        add((uint32_t)Segs.limit[i]);
+        add(Segs.expanddown[i] ? 1u : 0u);
+    }
+    return rb_memhash ^ RB_Mix(0x7FFFFFFFu, f);
+}
+
+/* A cluster copy's links to the others as a saved frame holds them: its IPX driver and its RollbackNet null modem. */
+extern void IPX_SaveLean(std::string &out);
+extern bool IPX_LoadLean(const uint8_t *&p, const uint8_t *end);
+extern bool SERIAL_RBPresent(void);
+extern void SERIAL_RBTakeOutbox(std::vector<uint8_t> &bytes, uint8_t &lines);
+extern void SERIAL_RBDeliver(const uint8_t *data, size_t n, uint8_t lines);
+extern void SERIAL_RBSave(std::string &out);
+extern bool SERIAL_RBLoad(const uint8_t *&p, const uint8_t *end);
+
+static void RB_SaveLinks(std::string &out) {
+    std::string a, b;
+    IPX_SaveLean(a);
+    SERIAL_RBSave(b);
+    out.clear();
+    if (a.empty() && b.empty()) return;
+    const uint32_t la = (uint32_t)a.size(), lb = (uint32_t)b.size();
+    out.append((const char*)&la, 4); out.append(a);
+    out.append((const char*)&lb, 4); out.append(b);
+}
+
+static bool RB_LoadLinks(const uint8_t *p, size_t n) {
+    if (n == 0) return true;
+    const uint8_t *end = p + n;
+    uint32_t la = 0, lb = 0;
+    if (n < 4) return false;
+    memcpy(&la, p, 4); p += 4;
+    if ((size_t)(end - p) < la) return false;
+    const uint8_t *a = p; p += la;
+    if ((size_t)(end - p) < 4) return false;
+    memcpy(&lb, p, 4); p += 4;
+    if ((size_t)(end - p) < lb) return false;
+    const uint8_t *b = p;
+    bool ok = true;
+    if (la) { const uint8_t *q = a; ok = IPX_LoadLean(q, a + la) && ok; }
+    if (lb) { const uint8_t *q = b; ok = SERIAL_RBLoad(q, b + lb) && ok; }
+    return ok;
+}
+
+/* Save the start of "frame". */
+/* One page at a frame start: when it differs from its copy of the last frame start, the copy goes into the frame's
+ * undo log and the page's hash is updated. Returns whether it differed. */
+static inline bool RB_DiffPage(RBSnap &s, unsigned r, size_t pg) {
+    RBRegion &g = rb_region[r];
+    const uint8_t *cur = g.base + pg * RB_PAGE;
+    uint8_t *sh = &g.shadow[pg * RB_PAGE];
+    if (memcmp(cur, sh, RB_PAGE) == 0) return false;
+    const uint32_t key = ((uint32_t)r << 28) | (uint32_t)pg;
+    s.undo_page.push_back(key);
+    s.undo_hash.push_back(g.hash[pg]);
+    s.undo_data.insert(s.undo_data.end(), sh, sh + RB_PAGE);
+    memcpy(sh, cur, RB_PAGE);
+    const uint64_t nh = RB_HashPage(cur);
+    rb_memhash += RB_Mix(key, nh) - RB_Mix(key, g.hash[pg]);
+    g.hash[pg] = nh;
+    return true;
+}
+
+/* Guest RAM with write tracking: only the writable pages can differ. */
+static void RBT_DiffRAM(RBSnap &s) {
+    RBT_Collect();
+    const size_t per = rbt_hp / RB_PAGE;
+    size_t keep = 0;
+    for (size_t w = 0; w < rbt_work.size(); w++) {
+        const uint32_t p = rbt_work[w];
+        bool changed = false;
+        for (size_t q = 0; q < per; q++) changed |= RB_DiffPage(s, 0, (size_t)p * per + q);
+        if (changed) rbt_idle[p] = 0;
+        else if (++rbt_idle[p] >= RBT_IDLE && RBT_SetWritable(p, 1, false)) { rbt_state[p] = 0; continue; }
+        rbt_work[keep++] = p;
+    }
+    rbt_work.resize(keep);
+    for (size_t pg = rbt_n * per; pg < rb_region[0].pages; pg++) RB_DiffPage(s, 0, pg);   /* past the last whole host page */
+}
+
+static void RB_Capture(uint32_t frame) {
+    const uint64_t t0 = RB_MicroTicks();
+    if (rb_evlog_on && rb_last_load_frame != UINT32_MAX && frame >= rb_last_load_frame + 2u) rb_evlog_on = false;
+    if (RB_RegionsMoved()) RB_InitRegions();    /* video memory reallocated etc.: older frames are gone */
+
+    RBSnap &s = rb_snap[frame % RB_RING];
+    s.valid = true;
+    s.frame = frame;
+    s.tick = rb_tick;
+    s.context = RB_HostContext();
+    s.undo_page.clear();
+    s.undo_hash.clear();
+    s.undo_data.clear();
+
+    if (rbt_on) RBT_DiffRAM(s);
+    for (unsigned r = rbt_on ? 1u : 0u; r < 2; r++) {
+        RBRegion &g = rb_region[r];
+        for (size_t pg = 0; pg < g.pages; pg++) RB_DiffPage(s, r, pg);
+    }
+
+    const uint64_t t1 = RB_MicroTicks();
+    SaveState::instance().saveLean(s.devices);
+    if (rbc_copies) RB_SaveLinks(s.ipx);
+    const uint64_t t2 = RB_MicroTicks();
+    rb_stat_scan_us += t1 - t0;
+    rb_stat_lean_us += t2 - t1;
+    s.own = s.hash = RB_MachineHash();
+
+    /* debugging desyncs: NN_RB_TRACE=1 logs every frame start (compare two participants' logs line by line) */
+    static const bool trace = getenv("NN_RB_TRACE") != NULL && *getenv("NN_RB_TRACE");
+    if (trace) {
+        extern void SBLASTER_DebugState(char *out, size_t n);
+        char sbs[200];
+        SBLASTER_DebugState(sbs, sizeof(sbs));
+        LOG_MSG("RBSB f=%u %s%s", (unsigned)frame, sbs, inputnet_rollback_resim ? " replay" : "");
+        uint64_t devh = 1469598103934665603ull;
+        LOG_MSG("RBTRACE f=%u t=%u ctx=%u pic=%u cs:eip=%04x:%08x eax=%08x ebx=%08x ecx=%08x edx=%08x esp=%08x fl=%08x mem=%08x%08x h=%08x%08x%s",
+            (unsigned)frame,(unsigned)rb_tick,(unsigned)(s.context & 0xFFFFFFFFu),(unsigned)PIC_Ticks,(unsigned)Segs.val[cs],(unsigned)cpu_regs.ip.dword[0],
+            (unsigned)cpu_regs.regs[0].dword[0],(unsigned)cpu_regs.regs[3].dword[0],(unsigned)cpu_regs.regs[1].dword[0],(unsigned)cpu_regs.regs[2].dword[0],
+            (unsigned)cpu_regs.regs[4].dword[0],(unsigned)cpu_regs.flags,(unsigned)(rb_memhash >> 32u),(unsigned)rb_memhash,
+            (unsigned)(s.hash >> 32u),(unsigned)s.hash,inputnet_rollback_resim ? " replay" : "");
+        (void)devh;
+    }
+
+    /* debugging desyncs: NN_RB_DUMP=<frame> writes that frame start (RAM, video memory, devices) to the working dir;
+     * NN_RB_DUMP=+<n>: the n-th frame after the newest resync's frame (each load of a resync's state) */
+    static const char *dump_env = getenv("NN_RB_DUMP");
+    if (dump_env != NULL && *dump_env && (*dump_env == '+' ? (rb_last_load_frame != UINT32_MAX && rb_last_load_frame + (uint32_t)strtoul(dump_env + 1, NULL, 10) == frame)
+                                                          : (uint32_t)strtoul(dump_env, NULL, 10) == frame)) {
+        char name[64];
+        for (unsigned r = 0; r < 2; r++) {
+            snprintf(name, sizeof(name), "rbdump-%u-%s.bin", (unsigned)frame, r ? "vram" : "ram");
+            FILE *f = fopen(name, "wb");
+            if (f) { fwrite(rb_region[r].base, 1, rb_region[r].pages * RB_PAGE, f); fclose(f); }
+        }
+        snprintf(name, sizeof(name), "rbdump-%u-devices.bin", (unsigned)frame);
+        FILE *f = fopen(name, "wb");
+        if (f) { fwrite(s.devices.data(), 1, s.devices.size(), f); fclose(f); }
+        LOG_MSG("INPUTNET: dumped frame %u (hash %08x%08x)", (unsigned)frame, (unsigned)(s.hash >> 32u), (unsigned)s.hash);
+    }
+
+    /* debugging: NN_RB_FULLDUMP=+<n>[,+<m>...] also writes the portable save state of the frames that many after the newest
+     * resync's (compare the computers' files component by component) */
+    static const char *fulldump_env = getenv("NN_RB_FULLDUMP");
+    if (fulldump_env != NULL && *fulldump_env && rb_last_load_frame != UINT32_MAX) {
+        for (const char *q = fulldump_env; q != NULL && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : NULL) {
+            if (*q != '+' || rb_last_load_frame + (uint32_t)strtoul(q + 1, NULL, 10) != frame) continue;
+            std::vector<uint8_t> st;
+            if (INPUTNET_SnapshotState(st)) {
+                char name[64];
+                snprintf(name, sizeof(name), "rbfull-%u.sav", (unsigned)frame);
+                FILE *f = fopen(name, "wb");
+                if (f) { fwrite(&st[0], 1, st.size(), f); fclose(f); }
+            }
+        }
+    }
+
+    rb_stat_capture_us += RB_MicroTicks() - t0;
+    rb_stat_captures++;
+    rb_stat_pages += s.undo_page.size();
+}
+
+/* Put the machine back to the start of "target"; "newest" is the newest saved frame (saved just now). */
+static bool RB_Restore(uint32_t target, uint32_t newest) {
+    for (uint32_t f = target; f <= newest; f++) {
+        const RBSnap &s = rb_snap[f % RB_RING];
+        if (!s.valid || s.frame != f) return false;
+    }
+    /* The frame we load has to have been saved with the host's stack as it is now (the frames in between only give
+     * back memory pages; the replay makes their nested loops again). */
+    if (rb_snap[target % RB_RING].context != RB_HostContext()) {
+        LOG_MSG("INPUTNET: frame %u was saved in another host context",(unsigned)target);
+        return false;
+    }
+
+    for (uint32_t f = newest; f > target; f--) {
+        RBSnap &s = rb_snap[f % RB_RING];
+        for (size_t k = 0; k < s.undo_page.size(); k++) {
+            const uint32_t key = s.undo_page[k];
+            RBRegion &g = rb_region[key >> 28];
+            const size_t pg = key & 0x0FFFFFFFu;
+            const uint8_t *old = &s.undo_data[k * RB_PAGE];
+            if ((key >> 28) == 0) RBT_Touch(pg);
+            memcpy(g.base + pg * RB_PAGE, old, RB_PAGE);
+            memcpy(&g.shadow[pg * RB_PAGE], old, RB_PAGE);
+            rb_memhash += RB_Mix(key, s.undo_hash[k]) - RB_Mix(key, g.hash[pg]);
+            g.hash[pg] = s.undo_hash[k];
+        }
+        s.valid = false;
+    }
+
+    if (!SaveState::instance().loadLean(rb_snap[target % RB_RING].devices)) {
+        LOG_MSG("INPUTNET: rollback could not load the saved devices of frame %u",(unsigned)target);
+        return false;
+    }
+    VGA_SetupHandlers();            /* (the video memory window's handlers: see INPUTNET_ApplyStateSnapshot) */
+    {   /* the window's frame in progress belongs to the frames gone: the next one starts over (no more lines than it has) */
+        extern void RENDER_EndUpdate(bool abort);
+        RENDER_EndUpdate(true);
+    }
+    if (rbc_copies) {
+        const std::string &ln = rb_snap[target % RB_RING].ipx;
+        if (!RB_LoadLinks((const uint8_t*)ln.data(), ln.size())) LOG_MSG("INPUTNET: rollback could not load the links of frame %u",(unsigned)target);
+    }
+    /* Loading devices may touch guest memory (video modes, fonts): make it exactly the saved frame again. With write
+     * tracking only writable pages can differ. */
+    auto put_back = [](unsigned r, size_t pg) {
+        RBRegion &g = rb_region[r];
+        uint8_t *cur = g.base + pg * RB_PAGE;
+        const uint8_t *sh = &g.shadow[pg * RB_PAGE];
+        if (memcmp(cur, sh, RB_PAGE) != 0) memcpy(cur, sh, RB_PAGE);
+    };
+    if (rbt_on) {
+        RBT_Collect();
+        const size_t per = rbt_hp / RB_PAGE;
+        for (size_t w = 0; w < rbt_work.size(); w++)
+            for (size_t q = 0; q < per; q++) put_back(0, (size_t)rbt_work[w] * per + q);
+        for (size_t pg = rbt_n * per; pg < rb_region[0].pages; pg++) put_back(0, pg);
+    }
+    for (unsigned r = rbt_on ? 1u : 0u; r < 2; r++)
+        for (size_t pg = 0; pg < rb_region[r].pages; pg++) put_back(r, pg);
+
+    rb_tick = rb_snap[target % RB_RING].tick;
+    PAGING_ClearTLB();
+
+    /* self-test: loading and saving again must give the same bytes, or a component does not restore exactly */
+    if (getenv("NN_RB_SELFTEST") != NULL && *getenv("NN_RB_SELFTEST")) {
+        static const char *names[] = { "CMOS","CPU","DMA","Dos","EMS","FPU","IO handler","Int10","IntTimer10","Joystick",
+            "Keyboard","Memory","Mixer","Mouse","Pic","Vga","XMS" };
+        std::string again;
+        SaveState::instance().saveLean(again);
+        const std::string &x = rb_snap[target % RB_RING].devices;
+        size_t px = 0, py = 0; unsigned idx = 0;
+        while (px + 4 <= x.size() && py + 4 <= again.size()) {
+            uint32_t lx, ly; memcpy(&lx, x.data() + px, 4); memcpy(&ly, again.data() + py, 4);
+            px += 4; py += 4;
+            if (lx != ly || memcmp(x.data() + px, again.data() + py, lx) != 0) {
+                size_t first = 0;
+                while (first < lx && first < ly && x[px + first] == again[py + first]) first++;
+                LOG_MSG("RBSELFTEST round trip: %s differs after load+save (%u/%u bytes), first at byte %u: %02x%02x%02x%02x -> %02x%02x%02x%02x",
+                    idx < 17 ? names[idx] : "?", (unsigned)lx, (unsigned)ly, (unsigned)first,
+                    (uint8_t)x[px+first], (uint8_t)x[px+first+1], (uint8_t)x[px+first+2], (uint8_t)x[px+first+3],
+                    (uint8_t)again[py+first], (uint8_t)again[py+first+1], (uint8_t)again[py+first+2], (uint8_t)again[py+first+3]);
+            }
+            px += lx; py += ly; idx++;
+        }
+    }
+    return true;
+}
+
+/* Apply everyone's input for "frame"; remote input that has not arrived yet is predicted as "nothing new". */
+static void RB_ApplyInputs(uint32_t frame) {
+    if (rbc_copies && rbc_leader) { RBC_ApplyInputs(frame); return; }
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready) continue;
+        if (!p.local) {
+            if (frame >= rb_have[i]) {
+                rb_predicted[i][frame % RB_RING] = frame + 1u;
+                continue;
+            }
+            rb_predicted[i][frame % RB_RING] = 0;
+        }
+        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p,frame);
+        if (slot == NULL) continue;
+        for (size_t e = 0; e < slot->events.size(); e++) {
+            const InputNetEvent &ev = slot->events[e];
+            /* At the DOS prompt every machine would run what anybody types (DEL included, in everybody's game
+             * folder): only the server's autorun types there. Releases always go. */
+            if (dos_shell_reading_input && ev.type == INEV_KEY && (ev.pressed & 1u) && !(ev.pressed & 2u)) continue;
+            INPUTNET_ApplyEvent(ev);
+        }
+    }
+}
+
+/* The earliest frame before "frame" that ran with a prediction the real input now contradicts, or UINT32_MAX. */
+static uint32_t RB_FindMisprediction(uint32_t frame) {
+    uint32_t earliest = UINT32_MAX;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        const uint32_t upto = std::min(rb_have[i], frame);   /* frames below "frame" have run */
+        for (uint32_t f = rb_checked[i]; f < upto; f++) {
+            if (rb_predicted[i][f % RB_RING] != f + 1u) continue;
+            rb_predicted[i][f % RB_RING] = 0;
+            InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p,f);
+            if (slot != NULL && !slot->events.empty()) {
+                if (f < earliest) earliest = f;
+                rb_late.push_back(RBLate{ i, f });
+            }
+        }
+        if (upto > rb_checked[i]) rb_checked[i] = upto;
+    }
+    return earliest;
+}
+
+static uint32_t RB_MinHave(void) {
+    uint32_t m = UINT32_MAX;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        m = std::min(m, rb_have[i]);
+    }
+    return m;
+}
+
+/* The newest frame at or before "frame" (not before "lowest") saved in the host context that runs now, or UINT32_MAX. */
+static uint32_t RB_RestorableAtOrBefore(uint32_t frame, uint32_t lowest) {
+    const uint64_t ctx = RB_HostContext();
+    for (uint32_t f = frame + 1u; f-- > lowest; ) {
+        const RBSnap &s = rb_snap[f % RB_RING];
+        if (s.valid && s.frame == f && s.context == ctx && (!rbc_copies || !rbc_leader || RBC_FollowersCanLoad(f, inputnet_frame))) return f;
+        if (f == 0) break;
+    }
+    return UINT32_MAX;
+}
+
+static bool RB_Rollback(uint32_t target, uint32_t frame) {
+    /* A frame saved inside a nested emulation loop that has ended since (a BIOS call DOS made for the console, say)
+     * cannot be loaded: go back to the newest one before it that can, and replay a little more. */
+    const uint32_t lowest = (frame > inputnet_rbwindow + 2u) ? frame - (inputnet_rbwindow + 2u) : 0;
+    const uint32_t usable = RB_RestorableAtOrBefore(target, lowest);
+    if (usable != UINT32_MAX) target = usable;
+    else if (rbc_copies && rbc_leader) return false;    /* (a frame some copy cannot load) */
+    if (frame - target > inputnet_rbwindow + 2u || !RB_Restore(target, frame)) {
+        LOG_MSG("INPUTNET: cannot roll back from frame %u to %u",(unsigned)frame,(unsigned)target);
+        return false;
+    }
+    const uint32_t depth = frame - target;
+    rb_stat_rollbacks++;
+    rb_stat_replayed += depth;
+    if (depth > rb_stat_maxdepth) rb_stat_maxdepth = depth;
+
+    inputnet_rollback_resim = true;
+    rb_target = frame;
+    rb_replay_started = RB_MicroTicks();
+    MIXER_SetRollbackDiscard(true);
+    DOSBOX_AddTicksRemain(depth * inputnet_frame_ms);
+    inputnet_frame = target;
+    if (rbc_copies && rbc_leader) RBC_LeaderRewind(target);
+    RB_ApplyInputs(target);
+    return true;
+}
+
+/* The local input delay. At the DOS prompt the frames run with everybody's real input only (RB_WaitForInputs), so
+ * our input goes out far enough ahead to arrive before the others need it: typing a command does not need the lowest
+ * latency, and nobody waits a round trip for every frame. */
+static unsigned int RB_EffectiveDelay(void) {
+    if (!rb_lockstep) return inputnet_delay;
+    uint32_t rtt = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
+    const unsigned int need = (unsigned int)((rtt / 2u + 15u) / inputnet_frame_ms) + 1u;
+    return std::min(std::max(inputnet_delay, need), 32u);
+}
+
+/* Our input up to frame+delay is final now: send it, from the oldest frame anybody lacks. */
+static void RB_SendInput(uint32_t frame) {
+    if (rb_joining) return;         /* (nothing of ours counts before we have the server's machines) */
+    InputNetPeer &self = inputnet_peers[inputnet_selfid];
+    const uint32_t newest = std::max(frame + RB_EffectiveDelay(), inputnet_local_confirmed);
+    INPUTNET_FrameSlot(self,newest);
+    self.confirmed = newest;
+    inputnet_local_confirmed = newest;
+
+    uint32_t lack = newest;     /* the oldest frame of ours somebody does not have */
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        lack = std::min(lack, rb_acked[i]);
+    }
+    if (newest - lack >= INPUTNET_RING / 2u) lack = newest - (INPUTNET_RING / 2u - 1u);
+
+    /* newest first, as many older frames as fit */
+    size_t budget = INPUTNET_MAX_PACKET - 96u;
+    uint32_t first = newest;
+    for (uint32_t f = newest + 1u; f-- > lack; ) {
+        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(self,f);
+        const size_t need = 1u + ((slot != NULL) ? slot->events.size() * INPUTNET_MAX_EVENT_SIZE : 0u);
+        if (f != newest && need > budget) break;
+        budget = (need < budget) ? (budget - need) : 0u;
+        first = f;
+        if (f == 0) break;
+    }
+
+    uint8_t buf[INPUTNET_MAX_PACKET];
+    InputNetWriter w(buf,sizeof(buf));
+    INPUTNET_BeginPacket(w,INPKT_RBINPUT);
+    w.u32(newest);
+    w.u32(rb_realframe);
+    w.u32(GetTicks());
+    w.u16((uint16_t)std::min<uint32_t>(newest - first + 1u, 0xFFFFu));
+    for (uint32_t f = first; f <= newest; f++) {
+        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(self,f);
+        const size_t n = (slot != NULL) ? slot->events.size() : 0u;
+        w.u8((uint8_t)n);
+        for (size_t e = 0; e < n; e++) INPUTNET_WriteEvent(w,slot->events[e]);
+    }
+
+    /* what we have of everybody else's input, and when their newest packet was sent (for their round trip time) */
+    uint8_t nacks = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
+        if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) nacks++;
+    w.u8(nacks);
+    const uint32_t now = GetTicks();
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        w.u8((uint8_t)i);
+        w.u32(rb_have[i]);
+        w.u32(rb_peerstamp[i] + (now - rb_peerstamp_at[i]));  /* their clock, plus how long we held it */
+    }
+
+    /* the newest frame whose input everybody has, and our machine's hash at its start; the number of resyncs we
+     * loaded, since a checksum from before one compares machines that were made equal since */
+    w.u16(rb_epoch);
+    /* (frames after a wrong guess that waits for its correction are not final either) */
+    const uint32_t final_frame = std::min(std::min(RB_MinHave(), frame), rb_pending_wrong);
+    const RBSnap &cs = rb_snap[final_frame % RB_RING];
+    if (final_frame != UINT32_MAX && cs.valid && cs.frame == final_frame) {
+        w.u32(final_frame);
+        w.u32((uint32_t)(cs.hash >> 32u));
+        w.u32((uint32_t)cs.hash);
+    }
+    else {
+        w.u32(UINT32_MAX); w.u32(0); w.u32(0);
+    }
+
+    if (w.overflow()) {
+        LOG(LOG_MISC,LOG_WARN)("INPUTNET: rollback input packet overflow");
+        return;
+    }
+    INPUTNET_SendToPeers(buf,w.size());
+}
+
+static void RB_Desync(InputNetPeer &p, unsigned peerid, uint32_t frame, uint64_t mine, uint64_t theirs);
+
+static void RB_CompareCheck(InputNetPeer &p, unsigned peerid, uint32_t frame) {
+    const RBCheck &c = rb_peercheck[peerid][frame % INPUTNET_CHECK_RING];
+    if (!c.valid || c.frame != frame) return;
+    if (frame >= std::min(RB_MinHave(), rb_realframe) + 1u) return;  /* not final here yet */
+    /* Final only once the input of every frame before it was compared with what ran (RB_FindMisprediction, at a frame
+     * start) and a rollback, if one was needed, has replayed it: input that has merely arrived may still contradict
+     * the prediction this frame start was computed with. */
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &q = inputnet_peers[i];
+        if (q.active && q.ready && !q.local && rb_checked[i] < frame) return;
+    }
+    if (inputnet_rollback_resim) return;
+    if (rb_pending_wrong != UINT32_MAX && frame > rb_pending_wrong) return;   /* waits for its correction */
+    const RBSnap &s = rb_snap[frame % RB_RING];
+    if (!s.valid || s.frame != frame) return;
+    rb_stat_checks++;
+    if (s.hash != c.hash) RB_Desync(p, peerid, frame, s.hash, c.hash);
+    rb_peercheck[peerid][frame % INPUTNET_CHECK_RING].valid = false;
+}
+
+static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) {
+    const uint32_t newest = r.u32();
+    const uint32_t theirframe = r.u32();
+    const uint32_t stamp = r.u32();
+    const unsigned nframes = r.u16();
+    if (r.bad() || nframes == 0 || nframes > newest + 1u) return;
+
+    const uint32_t first = newest + 1u - nframes;
+    for (uint32_t f = first; f <= newest; f++) {
+        const unsigned n = r.u8();
+        if (r.bad()) return;
+        const bool have = (f < rb_have[peerid]) || (INPUTNET_FrameSlotIfValid(p,f) != NULL);
+        const bool absurd = (f > rb_realframe + INPUTNET_RING / 2u);
+        if (have || absurd) {
+            for (unsigned e = 0; e < n; e++) { InputNetEvent ev; if (!INPUTNET_ReadEvent(r,ev)) return; }
+            continue;
+        }
+        InputNetFrame &slot = INPUTNET_FrameSlot(p,f);
+        for (unsigned e = 0; e < n; e++) {
+            InputNetEvent ev;
+            if (!INPUTNET_ReadEvent(r,ev)) return;
+            slot.events.push_back(ev);
+        }
+    }
+    while (INPUTNET_FrameSlotIfValid(p,rb_have[peerid]) != NULL) rb_have[peerid]++;
+    if (newest > p.confirmed) p.confirmed = newest;
+
+    const uint32_t now = GetTicks();
+    rb_peerframe[peerid] = theirframe;
+    rb_peerframe_at[peerid] = now;
+    rb_peerstamp[peerid] = stamp;
+    rb_peerstamp_at[peerid] = now;
+
+    const unsigned nacks = r.u8();
+    for (unsigned k = 0; k < nacks; k++) {
+        const uint8_t who = r.u8();
+        const uint32_t have = r.u32();
+        const uint32_t echo = r.u32();
+        if (r.bad()) return;
+        if (who == inputnet_selfid) {
+            if (have > rb_acked[peerid]) rb_acked[peerid] = have;
+            const uint32_t rtt = now - echo;
+            if (rtt < 5000u) rb_rtt[peerid] = rb_rtt[peerid] ? (rb_rtt[peerid] * 7u + rtt) / 8u : rtt;
+        }
+    }
+
+    const uint16_t epoch = r.u16();
+    const uint32_t cframe = r.u32();
+    const uint32_t chi = r.u32(), clo = r.u32();
+    if (!r.bad() && cframe != UINT32_MAX && epoch == rb_epoch) {
+        RBCheck &c = rb_peercheck[peerid][cframe % INPUTNET_CHECK_RING];
+        c.frame = cframe;
+        c.hash = ((uint64_t)chi << 32u) | clo;
+        c.valid = true;
+        RB_CompareCheck(p, peerid, cframe);
+    }
+}
+
+/* Wait while we are more than the window ahead of somebody's input. */
+static bool RB_WaitForWindow(uint32_t frame) {
+    uint32_t start = 0, last_events = 0, lastresend = GetTicks();
+    for (;;) {
+        bool ok = true;
+        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+            InputNetPeer &p = inputnet_peers[i];
+            if (!p.active || !p.ready || p.local) continue;
+            if (frame >= rb_have[i] + inputnet_rbwindow) { ok = false; break; }
+        }
+        if (ok) break;
+        if (start == 0) { start = GetTicks(); last_events = start; rb_stat_stalls++; }
+        if (!inputnet_session) return false;
+        if ((GetTicks() - start) > inputnet_timeout && inputnet_is_server && rbc_copies) {
+            for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+                InputNetPeer &p = inputnet_peers[i];
+                if (p.active && p.ready && !p.local && frame >= rb_have[i] + inputnet_rbwindow) RBC_ServerDrop(i, "fell too far behind");
+            }
+            continue;
+        }
+        if ((GetTicks() - lastresend) >= 30u) { RB_SendInput(frame); lastresend = GetTicks(); }  /* (they may wait for ours) */
+        if ((GetTicks() - start) > inputnet_timeout) {
+            if (inputnet_is_server)
+                INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
+            else
+                INPUTNET_CloseLink("timed out waiting for the server",true);
+            return false;
+        }
+        INPUTNET_Stall(last_events);
+        const uint32_t before = GetTicks();
+        INPUTNET_PollSocket();
+        if (GetTicks() - before > 500u) start = GetTicks();     /* (a resync's transfer came meanwhile) */
+    }
+    if (start != 0) inputnet_stat_stallms += GetTicks() - start;
+    return true;
+}
+
+/* Run no further ahead of the others than the network makes us: one emulated millisecond is skipped now and then
+ * while we are ahead, and the others do the same when they are. */
+static void RB_TimeSync(uint32_t frame) {
+    double worst = 0;
+    bool any = false;
+    const uint32_t now = GetTicks();
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local || rb_peerframe_at[i] == 0) continue;
+        const double theirs = (double)rb_peerframe[i] +
+            ((double)(now - rb_peerframe_at[i]) + (double)rb_rtt[i] / 2.0) / (double)inputnet_frame_ms;
+        const double adv = (double)frame - theirs;
+        if (!any || adv > worst) worst = adv;
+        any = true;
+    }
+    if (!any) return;
+    rb_advantage = rb_advantage * 0.9 + worst * 0.1;
+    if (rb_advantage > 0.75 && (frame - rb_last_slowdown) >= 2u) {
+        if (DOSBOX_DropTickRemain()) { rb_stat_slowdowns++; rb_last_slowdown = frame; }
+    }
+}
+
+/* At the DOS prompt the shell (native code) reads the keys: frames there run with everybody's real input only, so
+ * no correction ever has to put the machine back into the prompt. */
+static bool RB_WaitForInputs(uint32_t frame) {
+    uint32_t start = 0, last_events = 0, lastresend = GetTicks();
+    while (RB_MinHave() <= frame) {
+        if (start == 0) { start = GetTicks(); last_events = start; }
+        if (!inputnet_session) return false;
+        if ((GetTicks() - start) > inputnet_timeout && inputnet_is_server && rbc_copies) {
+            for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+                InputNetPeer &p = inputnet_peers[i];
+                if (p.active && p.ready && !p.local && rb_have[i] <= frame) RBC_ServerDrop(i, "fell too far behind");
+            }
+            continue;
+        }
+        if ((GetTicks() - lastresend) >= 30u) { RB_SendInput(frame); lastresend = GetTicks(); }  /* (they may wait for ours) */
+        if ((GetTicks() - start) > inputnet_timeout) {
+            if (inputnet_is_server)
+                INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
+            else
+                INPUTNET_CloseLink("timed out waiting for the server",true);
+            return false;
+        }
+        INPUTNET_Stall(last_events);
+        const uint32_t before = GetTicks();
+        INPUTNET_PollSocket();
+        if (GetTicks() - before > 500u) start = GetTicks();     /* (a resync's transfer came meanwhile) */
+    }
+    return true;
+}
+
+static void RB_LogStats(void) {
+    const uint32_t now = GetTicks();
+    if ((now - rb_stat_last_log) < 5000u) return;
+    rb_stat_last_log = now;
+    uint32_t rtt = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
+    LOG_MSG("INPUTNET: rollback frame %u: %u rollbacks (%u frames replayed, deepest %u), %u slowdowns, %u stalls, "
+        "%u checks, %u desyncs, %u resyncs; rtt %u ms, ahead %.2f frames; saving a frame takes %.0f us, %.1f pages; "
+        "a replay takes %.1f ms (at most %.1f); memory scan %.0f us, devices %.0f us; %u frames in lockstep, %u host context changes",
+        (unsigned)rb_realframe,(unsigned)rb_stat_rollbacks,(unsigned)rb_stat_replayed,(unsigned)rb_stat_maxdepth,
+        (unsigned)rb_stat_slowdowns,(unsigned)rb_stat_stalls,(unsigned)rb_stat_checks,(unsigned)rb_stat_desyncs,
+        (unsigned)rb_stat_resyncs,(unsigned)rtt,rb_advantage,
+        rb_stat_captures ? (double)rb_stat_capture_us / (double)rb_stat_captures : 0.0,
+        rb_stat_captures ? (double)rb_stat_pages / (double)rb_stat_captures : 0.0,
+        rb_stat_replays ? (double)rb_stat_replay_us / (double)rb_stat_replays / 1000.0 : 0.0, (double)rb_stat_replay_max_us / 1000.0,
+        rb_stat_captures ? (double)rb_stat_scan_us / (double)rb_stat_captures : 0.0,
+        rb_stat_captures ? (double)rb_stat_lean_us / (double)rb_stat_captures : 0.0,
+        (unsigned)rb_stat_lockstep, (unsigned)rb_stat_ctxchanges);
+    rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
+    rb_stat_capture_us = 0; rb_stat_captures = 0; rb_stat_pages = 0;
+    rb_stat_replay_us = 0; rb_stat_replays = 0; rb_stat_replay_max_us = 0;
+}
+
+/* --- Desync handling ---------------------------------------------------------
+ * The server's machine is the reference. When a frame's hashes differ (either
+ * side may notice), the server waits at a frame start until it has every
+ * participant's input for the frames before it, which makes that frame start
+ * final, saves the machine in the portable save state format (the one the join
+ * uses: the lean snapshots hold host pointers), loads that state itself and
+ * sends it. The client loads it and replays the frames from there to its
+ * real-time frame with the input it already has, so both run from the same
+ * state again. Both machines stand still while this happens. */
+
+static bool rb_resync_wanted = false;   /* server: a client asked for our state, or we saw a desync */
+static std::vector<uint8_t> rb_resync_ready;    /* client: the server's state, complete, waiting for a frame start */
+static uint32_t rb_resync_ready_raw = 0;
+static uint32_t rb_resync_acked = 0;    /* server: chunks acknowledged */
+static bool rb_resync_applied = false;  /* client: the server's state was just loaded */
+
+static void RB_Desync(InputNetPeer &p, unsigned peerid, uint32_t frame, uint64_t mine, uint64_t theirs) {
+    (void)peerid;
+    rb_stat_desyncs++;
+    LOG_MSG("INPUTNET: RollbackNet machines differ at frame %u (%08x%08x here, %08x%08x at \"%s\"); %s",
+        (unsigned)frame,(unsigned)(mine >> 32u),(unsigned)mine,(unsigned)(theirs >> 32u),(unsigned)theirs,
+        p.name.empty() ? "peer" : p.name.c_str(),
+        inputnet_is_server ? "sending our state" : "taking the server's state over");
+    if (inputnet_is_server) rb_resync_wanted = true;
+    else { rb_desynced = true; rb_resync_last_sent = 0; }
+}
+
+static void RB_SendResyncAck(uint32_t id, uint32_t count) {
+    uint8_t buf[32];
+    InputNetWriter w(buf,sizeof(buf));
+    INPUTNET_BeginPacket(w,INPKT_RESYNC);
+    w.u8(3);
+    w.u32(id);
+    w.u32(count);
+    INPUTNET_SendToPeers(buf,w.size());
+}
+
+/* What a resync carries besides the save state: the frame it is, the session's tick, and the VGA frame clock the save
+ * state format does not hold (INPUTNET_ApplyStateSnapshot's join sets the same from the WELCOME). */
+struct RBResyncInfo {
+    uint32_t frame = 0, tick = 0;
+    double vfps = 0, vbase = 0;
+    int32_t vframes = 0;
+    uint16_t epoch = 0;             /* the server's resyncs, this one included (rb_epoch) */
+};
+static const size_t RB_RESYNC_INFO_SIZE = 4 + 4 + 8 + 8 + 4 + 2;
+
+static void RB_PutResyncInfo(std::vector<uint8_t> &raw, const RBResyncInfo &h) {
+    auto put = [&raw](const void *v, size_t n) { const uint8_t *b = (const uint8_t*)v; raw.insert(raw.end(), b, b + n); };
+    put(&h.frame, 4); put(&h.tick, 4); put(&h.vfps, 8); put(&h.vbase, 8); put(&h.vframes, 4); put(&h.epoch, 2);  /* little-endian hosts */
+}
+
+static bool RB_GetResyncInfo(const std::vector<uint8_t> &raw, RBResyncInfo &h) {
+    if (raw.size() < RB_RESYNC_INFO_SIZE) return false;
+    const uint8_t *b = &raw[0];
+    memcpy(&h.frame, b, 4); memcpy(&h.tick, b + 4, 4); memcpy(&h.vfps, b + 8, 8); memcpy(&h.vbase, b + 16, 8); memcpy(&h.vframes, b + 24, 4);
+    memcpy(&h.epoch, b + 28, 2);
+    return true;
+}
+
+/* Both ends of a resync: load the save state, then start the saved frames over from it. The server loads the very
+ * state it sends, so both go on from identical machines (the save state format rounds some values, the PIC's event
+ * times among them). Nothing before this frame can be rolled back to afterwards. */
+static bool RB_LoadResyncState(const RBResyncInfo &h, const std::vector<uint8_t> &state, const std::function<void()> &after = std::function<void()>()) {
+    RBT_Stop();                     /* the load writes all of guest RAM */
+    if (!INPUTNET_ApplyStateSnapshot(state)) { RB_InitRegions(); return false; }
+    vga_fps = h.vfps;
+    vga_mode_time_base = h.vbase;
+    vga_mode_frames_since_time_base = (int)h.vframes;
+    if (after) after();             /* (a cluster copy's clock, time stamp counter, IPX driver) */
+    PAGING_ClearTLB();
+    rb_tick = h.tick;
+    rb_epoch = h.epoch;
+    rb_last_load_frame = h.frame;
+    rb_evlog_on = getenv("NN_RB_EVLOG") != NULL;
+    RB_InitRegions();               /* every older frame start is gone */
+    inputnet_frame = h.frame;
+    RB_Capture(h.frame);
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
+        rb_checked[i] = h.frame;    /* frames before this one are never compared again */
+        for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/* RollbackNet clusters: IPX/NullModem-over-RollbackNet                      */
+/* ------------------------------------------------------------------------- */
+/* For the games played over IPX (or a null modem) between computers. Every computer runs one copy of the game for
+ * every player, the copies linked by IPX as on a LAN, and the copies run identically on every computer: the whole
+ * LAN is the machine RollbackNet keeps in step. Copy c is played by participant c (the host's is copy 0): that
+ * participant's input goes to copy c on every computer, and a copy whose player is not there (yet) runs without
+ * input. So a player can join later and take a free copy over, as with IPX-over-InputNet.
+ *
+ * On each computer one copy is the leader (the one its player plays: the RollbackNet participant, with the input,
+ * the predictions, the rollbacks and the checksums); the others are its followers, driven over 127.0.0.1 ("cluster
+ * port"). Every copy saves every frame start. At a frame start each follower tells the leader what it sent over IPX
+ * during the frame before, its checksum, and which saved frames it could load (AT); the leader routes the packets (in
+ * copy order, then in the order sent) and sends every follower the packets addressed to it and its player's input
+ * for the frame (GO). Packets sent during a frame so reach their addressees at the start of the next one: the same
+ * moment on every computer. A rollback restores every copy (REWIND) and they replay together; the packets routed at
+ * the frame gone back to are kept by the leader and delivered again, the later ones are routed again.
+ *
+ * Joining: the host's session runs from the start, alone if need be. A computer that joins gets the host's game
+ * files where its own differ (per copy), starts the game on its copies itself when the host's game is running
+ * already (so that every copy's emulator is inside the same nested loops as the host's when it takes the host's
+ * machine over), then asks for the host's state: at a frame start the host saves all of its copies, loads them back
+ * (a save state rounds a few values), and sends them to every computer of the session, which all load them
+ * (RB_ServerResync); the joining computer's player is a participant from that frame on. A participant who leaves is
+ * taken out the same way, and the same transfer puts every computer back on the host's machines should a checksum
+ * ever differ. */
+
+enum { RBC_CMD_SAVE = 1, RBC_CMD_MANIFEST = 2, RBC_CMD_FILEMAP = 3, RBC_CMD_LOADRESYNC = 4, RBC_CMD_START = 5, RBC_CMD_END = 6 };
+enum { RBC_ROUTE = 0, RBC_REWIND = 1, RBC_HOLD = 2 };
+#define RBC_CHUNK      1200u
+#define RBC_MAXPKT     65000
+#define RBC_AT_STABLE  1u           /* the copy's host stack is as it was at the frame start before */
+#define RBC_AT_PROMPT  2u           /* its DOS shell is reading a command line */
+#define RBC_CLX_MAGIC  0x58434252u  /* "RBCX": the cluster's copies, after the leader's save state */
+#define RBC_CLX_END    0x45434252u  /* "RBCE" */
+
+extern void IPX_ClusterTakeOutbox(std::vector<std::vector<uint8_t> > &out);
+extern void IPX_ClusterDeliver(const uint8_t *data, size_t len);
+extern uint64_t rdtsc_count_base;
+extern pic_tickindex_t rdtsc_pic_base;
+
+static UDPsocket rbc_sock = NULL;
+static UDPpacket *rbc_in = NULL, *rbc_out = NULL;
+static SDLNet_SocketSet rbc_set = NULL;
+static IPaddress rbc_leader_addr;
+static uint32_t rbc_epoch = 0;              /* rewinds and loads so far: an AT or GO of an earlier one is old */
+static uint32_t rbc_last_heard = 0;         /* follower: the leader's newest packet (host ms) */
+static uint32_t rbc_last_beat = 0;          /* leader: its newest heartbeat */
+
+struct RBCFollower {
+    bool present = false;
+    IPaddress addr;
+    uint32_t at_frame = UINT32_MAX, at_epoch = 0;
+    uint8_t at_flags = 0;
+    uint64_t at_loadable = 0, at_hash = 0;
+    std::vector<std::vector<uint8_t> > at_out;  /* its packets of the frame before at_frame */
+    std::vector<uint8_t> at_ser;                /* ...and what its null modem sent, and its RTS/DTR (SERIAL_RBTakeOutbox) */
+    uint8_t at_lines = 0;
+    uint32_t got = 0, done = 0;                 /* the newest command it received, carried out */
+    std::vector<uint8_t> go;                    /* the newest GO sent to it, again should its AT repeat */
+    uint32_t go_frame = UINT32_MAX, go_epoch = 0;
+};
+static RBCFollower rbc_f[INPUTNET_MAX_PEERS];   /* leader: by copy */
+static uint32_t rbc_seq = 0;
+static std::vector<std::vector<uint8_t> > rbc_inbox[RB_RING][INPUTNET_MAX_PEERS];  /* leader: each copy's packets at a frame start */
+static uint32_t rbc_inbox_frame[RB_RING];
+static std::vector<uint8_t> rbc_ser_inbox[RB_RING][INPUTNET_MAX_PEERS];  /* leader: what each copy's null modem receives */
+static uint8_t rbc_ser_lines[RB_RING][INPUTNET_MAX_PEERS];               /* ...and the other side's RTS/DTR */
+
+/* a blob coming in (either side) */
+static uint32_t rbc_blob_id = 0, rbc_blob_total = 0, rbc_blob_have = 0;
+static std::vector<uint8_t> rbc_blob;
+static std::vector<bool> rbc_blob_got;
+static bool rbc_blob_done = false;
+static IPaddress rbc_blob_from;
+static uint32_t rbc_ack_id = 0, rbc_ack_have = 0;  /* a blob going out: how much of it the other end has */
+
+/* follower */
+struct RBCCmd { uint32_t seq; uint8_t cmd; uint32_t a, b, c; };
+static bool rbcf_welcomed = false;
+static std::vector<RBCCmd> rbcf_cmds;           /* received, not carried out yet */
+static uint32_t rbcf_last_cmd = 0;
+static uint32_t rbcf_cur = UINT32_MAX;          /* the frame start it waits at */
+static bool rbcf_go = false;
+static uint32_t rbcf_go_frame = 0, rbcf_go_epoch = 0;
+static std::vector<InputNetEvent> rbcf_go_events;
+static std::vector<std::vector<uint8_t> > rbcf_go_packets;
+static std::vector<uint8_t> rbcf_go_ser;
+static uint8_t rbcf_go_lines = 0;
+static bool rbcf_rewind = false;
+static uint32_t rbcf_rw_target = 0, rbcf_rw_real = 0, rbcf_rw_epoch = 0;
+static bool rbcf_reloaded = false;              /* SAVE or LOADRESYNC made the frame start over */
+
+/* a joining computer's leader */
+static bool rbj_typed = false;
+static uint32_t rbj_steady = 0;                 /* frames in a row every copy has been where it can take the state */
+static uint32_t rbj_last_request = 0;
+static std::vector<std::vector<InputNetEvent> > rbj_typing;     /* our own typing on our copies, a frame each */
+static size_t rbj_typing_pos = 0;
+
+/* client: the server's machines (uncompressed) until they can be loaded */
+static std::vector<uint8_t> rbc_resync_raw;
+static uint8_t rbc_resync_prompt[INPUTNET_MAX_PEERS];
+static uint32_t rbc_resync_since = 0;
+
+/* server: joining and leaving participants */
+static bool rbs_joining[INPUTNET_MAX_PEERS];    /* asked to join, not in the session yet */
+static bool rbs_wants[INPUTNET_MAX_PEERS];      /* ...and ready to take the machines over */
+static std::vector<uint8_t> rbs_left;           /* left since the last transfer */
+static int rbs_filereq_peer = -1;               /* whose file request rb_filereq_* hold */
+
+/* What a save state leaves out of a copy: its clock, the processor's time stamp counter, the VGA frame clock. */
+struct RBCExtras {
+    uint8_t clock[16];
+    uint16_t year = 0;
+    uint8_t month = 0, day = 0;
+    uint64_t tsc = 0;
+    double picbase = 0, vfps = 0, vbase = 0;
+    int32_t vframes = 0;
+};
+static const size_t RBC_EXTRAS_SIZE = 16 + 2 + 1 + 1 + 8 + 8 + 8 + 8 + 4;
+
+static void RBC_GetExtras(RBCExtras &x) {
+    CMOS_GetSharedClock(x.clock);
+    x.year = dos.date.year; x.month = dos.date.month; x.day = dos.date.day;
+    x.tsc = rdtsc_count_base;
+    x.picbase = (double)rdtsc_pic_base;
+    x.vfps = vga_fps; x.vbase = vga_mode_time_base; x.vframes = (int32_t)vga_mode_frames_since_time_base;
+}
+
+static void RBC_SetExtras(const RBCExtras &x) {
+    CMOS_SetSharedClock(x.clock);
+    dos.date.year = x.year; dos.date.month = x.month; dos.date.day = x.day;
+    rdtsc_count_base = x.tsc;
+    rdtsc_pic_base = (pic_tickindex_t)x.picbase;
+    vga_fps = x.vfps; vga_mode_time_base = x.vbase; vga_mode_frames_since_time_base = (int)x.vframes;
+}
+
+static void RBC_Put(std::vector<uint8_t> &out, const void *v, size_t n) { const uint8_t *b = (const uint8_t*)v; out.insert(out.end(), b, b + n); }
+static bool RBC_Get(const uint8_t *&p, const uint8_t *end, void *v, size_t n) { if ((size_t)(end - p) < n) return false; memcpy(v, p, n); p += n; return true; }
+
+static void RBC_PutExtras(std::vector<uint8_t> &out, const RBCExtras &x) {
+    RBC_Put(out, x.clock, 16); RBC_Put(out, &x.year, 2); RBC_Put(out, &x.month, 1); RBC_Put(out, &x.day, 1);
+    RBC_Put(out, &x.tsc, 8); RBC_Put(out, &x.picbase, 8); RBC_Put(out, &x.vfps, 8); RBC_Put(out, &x.vbase, 8); RBC_Put(out, &x.vframes, 4);
+}
+
+static bool RBC_GetExtrasFrom(const uint8_t *&p, const uint8_t *end, RBCExtras &x) {
+    return RBC_Get(p, end, x.clock, 16) && RBC_Get(p, end, &x.year, 2) && RBC_Get(p, end, &x.month, 1) && RBC_Get(p, end, &x.day, 1) &&
+        RBC_Get(p, end, &x.tsc, 8) && RBC_Get(p, end, &x.picbase, 8) && RBC_Get(p, end, &x.vfps, 8) && RBC_Get(p, end, &x.vbase, 8) &&
+        RBC_Get(p, end, &x.vframes, 4);
+}
+
+/* ---- the link between a computer's copies ---- */
+
+static bool RBC_Send(const IPaddress &to, const uint8_t *data, size_t len) {
+    if (rbc_sock == NULL || rbc_out == NULL || len > (size_t)rbc_out->maxlen) return false;
+    memcpy(rbc_out->data, data, len);
+    rbc_out->len = (int)len;
+    rbc_out->address = to;
+    return SDLNet_UDP_Send(rbc_sock, -1, rbc_out) != 0;
+}
+
+static void RBC_BeginPacket(InputNetWriter &w, uint8_t type) {
+    w.u32(INPUTNET_MAGIC);
+    w.u8((uint8_t)INPUTNET_PROTOVER);
+    w.u8(type);
+    w.u8((uint8_t)rbc_copy);
+    w.u8(0);
+}
+
+static void RBC_Dispatch(void);
+
+/* Everything that has come in; with "wait_ms", waits up to that long for the first packet. */
+static void RBC_Poll(unsigned int wait_ms = 0) {
+    if (rbc_sock == NULL) return;
+    if (wait_ms && rbc_set != NULL) SDLNet_CheckSockets(rbc_set, wait_ms);
+    while (SDLNet_UDP_Recv(rbc_sock, rbc_in) > 0) RBC_Dispatch();
+}
+
+/* Leader: the followers know it is there (a follower gives up after a long silence). */
+static void RBC_Beat(void) {
+    const uint32_t now = GetTicks();
+    if (now - rbc_last_beat < 500u) return;
+    rbc_last_beat = now;
+    uint8_t buf[16];
+    InputNetWriter w(buf, sizeof(buf));
+    RBC_BeginPacket(w, INPKT_CL_WELCOME);
+    for (unsigned c = 0; c < rbc_copies; c++) if (c != rbc_copy && rbc_f[c].present) RBC_Send(rbc_f[c].addr, buf, w.size());
+}
+
+static void RBC_PollLeader(void) {
+    if (!rbc_copies || !rbc_leader || rbc_sock == NULL) return;
+    RBC_Poll();
+    RBC_Beat();
+}
+
+static void RBC_SendBlobAck(const IPaddress &to) {
+    uint8_t buf[32];
+    InputNetWriter w(buf, sizeof(buf));
+    RBC_BeginPacket(w, INPKT_CL_BULKACK);
+    w.u32(rbc_blob_id);
+    w.u32(rbc_blob_have);
+    RBC_Send(to, buf, w.size());
+}
+
+static void RBC_Dispatch(void) {
+    InputNetReader r((const uint8_t*)rbc_in->data, (size_t)rbc_in->len);
+    if (r.u32() != INPUTNET_MAGIC || r.u8() != (uint8_t)INPUTNET_PROTOVER) return;
+    const uint8_t type = r.u8();
+    const unsigned from = r.u8();
+    r.u8();
+    if (r.bad()) return;
+    const IPaddress addr = rbc_in->address;
+    if (addr.host != 0x0100007Fu) return;               /* 127.0.0.1 only */
+    if (!rbc_leader) {
+        if (addr.port != rbc_leader_addr.port) return;  /* the leader only */
+        rbc_last_heard = GetTicks();
+    }
+    switch (type) {
+        case INPKT_CL_HELLO: {
+            if (!rbc_leader || from >= rbc_copies || from == rbc_copy) return;
+            RBCFollower &f = rbc_f[from];
+            if (!f.present) LOG_MSG("INPUTNET: cluster: the copy for player %u is here", from + 1u);
+            f.present = true;
+            f.addr = addr;
+            uint8_t buf[16];
+            InputNetWriter w(buf, sizeof(buf));
+            RBC_BeginPacket(w, INPKT_CL_WELCOME);
+            RBC_Send(addr, buf, w.size());
+            break;
+        }
+        case INPKT_CL_WELCOME:                          /* (also the leader's heartbeat) */
+            if (!rbc_leader) rbcf_welcomed = true;
+            break;
+        case INPKT_CL_CMD: {
+            RBCCmd c;
+            c.seq = r.u32(); c.cmd = r.u8(); c.a = r.u32(); c.b = r.u32(); c.c = r.u32();
+            if (r.bad() || rbc_leader) return;
+            if (c.seq > rbcf_last_cmd) { rbcf_cmds.push_back(c); rbcf_last_cmd = c.seq; }
+            uint8_t buf[24];
+            InputNetWriter w(buf, sizeof(buf));
+            RBC_BeginPacket(w, INPKT_CL_CMDACK);
+            w.u32(c.seq);
+            w.u8(0);                                    /* received */
+            RBC_Send(addr, buf, w.size());
+            break;
+        }
+        case INPKT_CL_CMDACK: {
+            const uint32_t seq = r.u32();
+            const uint8_t done = r.u8();
+            if (r.bad() || !rbc_leader || from >= rbc_copies) return;
+            if (seq > rbc_f[from].got) rbc_f[from].got = seq;
+            if (done && seq > rbc_f[from].done) rbc_f[from].done = seq;
+            break;
+        }
+        case INPKT_CL_BULK: {
+            const uint32_t id = r.u32(), total = r.u32(), off = r.u32();
+            const unsigned len = r.u16();
+            const uint8_t *data = len ? r.bytes(len) : NULL;
+            if (r.bad() || total > (512u << 20) || off > total || len > total - off || (off % RBC_CHUNK) != 0) return;
+            if (id != rbc_blob_id) {                    /* a new blob */
+                rbc_blob_id = id; rbc_blob_total = total; rbc_blob_have = 0; rbc_blob_done = (total == 0);
+                rbc_blob.assign(total, 0);
+                rbc_blob_got.assign((total + RBC_CHUNK - 1u) / RBC_CHUNK, false);
+            }
+            if (total != rbc_blob_total) return;
+            rbc_blob_from = addr;
+            const uint32_t idx = off / RBC_CHUNK;
+            if (idx < rbc_blob_got.size() && !rbc_blob_got[idx]) {
+                if (len) memcpy(&rbc_blob[off], data, len);
+                rbc_blob_got[idx] = true;
+                while (rbc_blob_have < rbc_blob_total && rbc_blob_got[rbc_blob_have / RBC_CHUNK])
+                    rbc_blob_have = std::min(rbc_blob_total, rbc_blob_have + RBC_CHUNK);
+                if (rbc_blob_have >= rbc_blob_total) rbc_blob_done = true;
+            }
+            RBC_SendBlobAck(addr);
+            break;
+        }
+        case INPKT_CL_BULKACK: {
+            const uint32_t id = r.u32(), have = r.u32();
+            if (r.bad()) return;
+            if (id == rbc_ack_id && have > rbc_ack_have) rbc_ack_have = have;
+            break;
+        }
+        case INPKT_CL_AT: {
+            const uint32_t frame = r.u32(), epoch = r.u32(), hi = r.u32(), lo = r.u32();
+            const uint8_t flags = r.u8();
+            const uint32_t lhi = r.u32(), llo = r.u32();
+            const unsigned n = r.u16();
+            if (r.bad() || !rbc_leader || from >= rbc_copies || from == rbc_copy) return;
+            RBCFollower &f = rbc_f[from];
+            if (!f.present || epoch < rbc_epoch) return;
+            if (f.go_frame == frame && f.go_epoch == epoch && !f.go.empty()) {   /* its GO was lost: again */
+                RBC_Send(f.addr, &f.go[0], f.go.size());
+                return;
+            }
+            std::vector<std::vector<uint8_t> > out;
+            for (unsigned i = 0; i < n; i++) {
+                const unsigned len = r.u16();
+                const uint8_t *b = r.bytes(len);
+                if (r.bad() || b == NULL) return;
+                out.push_back(std::vector<uint8_t>(b, b + len));
+            }
+            std::vector<uint8_t> ser;
+            uint8_t lines = 0;
+            if (r.remain() >= 3) {
+                const unsigned ns = r.u16();
+                const uint8_t *b = ns ? r.bytes(ns) : NULL;
+                lines = r.u8();
+                if (r.bad()) return;
+                if (ns) ser.assign(b, b + ns);
+            }
+            f.at_ser.swap(ser); f.at_lines = lines;
+            f.at_frame = frame; f.at_epoch = epoch; f.at_flags = flags;
+            f.at_hash = ((uint64_t)hi << 32u) | lo;
+            f.at_loadable = ((uint64_t)lhi << 32u) | llo;
+            f.at_out.swap(out);
+            break;
+        }
+        case INPKT_CL_GO: {
+            const uint32_t frame = r.u32(), epoch = r.u32();
+            if (r.bad() || rbc_leader) return;
+            std::vector<InputNetEvent> evs;
+            const unsigned ne = r.u16();
+            for (unsigned i = 0; i < ne; i++) { InputNetEvent ev; if (!INPUTNET_ReadEvent(r, ev)) return; evs.push_back(ev); }
+            std::vector<std::vector<uint8_t> > pk;
+            const unsigned np = r.u16();
+            for (unsigned i = 0; i < np; i++) {
+                const unsigned len = r.u16();
+                const uint8_t *b = r.bytes(len);
+                if (r.bad() || b == NULL) return;
+                pk.push_back(std::vector<uint8_t>(b, b + len));
+            }
+            std::vector<uint8_t> ser;
+            uint8_t lines = 0;
+            if (r.remain() >= 3) {
+                const unsigned ns = r.u16();
+                const uint8_t *b = ns ? r.bytes(ns) : NULL;
+                lines = r.u8();
+                if (r.bad()) return;
+                if (ns) ser.assign(b, b + ns);
+            }
+            rbcf_go = true; rbcf_go_frame = frame; rbcf_go_epoch = epoch;
+            rbcf_go_events.swap(evs); rbcf_go_packets.swap(pk);
+            rbcf_go_ser.swap(ser); rbcf_go_lines = lines;
+            break;
+        }
+        case INPKT_CL_REWIND: {
+            const uint32_t target = r.u32(), real = r.u32(), epoch = r.u32();
+            if (r.bad() || rbc_leader || epoch <= rbc_epoch) return;
+            rbcf_rewind = true; rbcf_rw_target = target; rbcf_rw_real = real; rbcf_rw_epoch = epoch;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/* A blob to the other end, in chunks it acknowledges. */
+static bool RBC_SendBlob(const IPaddress &to, uint32_t id, const std::vector<uint8_t> &blob) {
+    const uint32_t total = (uint32_t)blob.size();
+    rbc_ack_id = id;
+    rbc_ack_have = 0;
+    uint32_t lastprogress = GetTicks(), last_events = GetTicks();
+    const uint32_t nchunks = std::max(1u, (total + RBC_CHUNK - 1u) / RBC_CHUNK);
+    bool first = true;
+    while (rbc_ack_have < total || (total == 0 && first)) {
+        const uint32_t from = rbc_ack_have / RBC_CHUNK;
+        for (uint32_t c = from; c < nchunks && c < from + 64u; c++) {
+            const uint32_t off = c * RBC_CHUNK, len = (total > off) ? std::min(RBC_CHUNK, total - off) : 0u;
+            static uint8_t buf[RBC_CHUNK + 64];
+            InputNetWriter w(buf, sizeof(buf));
+            RBC_BeginPacket(w, INPKT_CL_BULK);
+            w.u32(id); w.u32(total); w.u32(off); w.u16((uint16_t)len);
+            if (len) w.bytes(&blob[off], len);
+            RBC_Send(to, buf, w.size());
+        }
+        first = false;
+        if (total == 0) break;
+        const uint32_t before = rbc_ack_have, t0 = GetTicks();
+        while (GetTicks() - t0 < 30u && rbc_ack_have == before) RBC_Poll(2);
+        if (rbc_ack_have != before) lastprogress = GetTicks();
+        if (GetTicks() - lastprogress > 15000u) { LOG_MSG("INPUTNET: cluster: a transfer between the copies timed out"); return false; }
+        if (GetTicks() - last_events >= 10u) { GFX_Events(); last_events = GetTicks(); }
+    }
+    return true;
+}
+
+/* Waits for the blob "id" from the other end. */
+static bool RBC_ReceiveBlob(uint32_t id, std::vector<uint8_t> &out, uint32_t timeout_ms) {
+    const uint32_t start = GetTicks();
+    uint32_t last_events = start, lastack = 0;
+    for (;;) {
+        RBC_Poll(2);
+        if (rbc_blob_id == id && rbc_blob_done) {
+            out.swap(rbc_blob);
+            std::vector<uint8_t>().swap(rbc_blob);
+            rbc_blob_done = false;
+            return true;
+        }
+        const uint32_t now = GetTicks();
+        if (now - start > timeout_ms) { LOG_MSG("INPUTNET: cluster: a transfer between the copies timed out"); return false; }
+        if (rbc_blob_id == id && now - lastack > 50u) { RBC_SendBlobAck(rbc_blob_from); lastack = now; }
+        if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
+    }
+}
+
+/* Leader: a command for follower "c" (a, b, cc its numbers). The payload blob goes after the follower received the
+ * command, the reply blob comes back under the command's number. True once it has carried the command out. */
+static bool RBC_Command(unsigned c, uint8_t cmd, uint32_t a, uint32_t b, uint32_t cc, const std::vector<uint8_t> *payload, std::vector<uint8_t> *reply) {
+    RBCFollower &f = rbc_f[c];
+    if (!f.present) return false;
+    const uint32_t seq = ++rbc_seq;
+    uint32_t start = GetTicks(), lastsend = 0, last_events = start;
+    while (f.got < seq) {
+        const uint32_t now = GetTicks();
+        if (lastsend == 0 || now - lastsend > 50u) {
+            uint8_t buf[40];
+            InputNetWriter w(buf, sizeof(buf));
+            RBC_BeginPacket(w, INPKT_CL_CMD);
+            w.u32(seq); w.u8(cmd); w.u32(a); w.u32(b); w.u32(cc);
+            RBC_Send(f.addr, buf, w.size());
+            lastsend = now ? now : 1u;
+        }
+        if (now - start > 20000u) { LOG_MSG("INPUTNET: cluster: the copy for player %u does not answer", c + 1u); return false; }
+        RBC_Poll(2);
+        if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
+    }
+    if (payload != NULL && !RBC_SendBlob(f.addr, seq, *payload)) return false;
+    if (reply != NULL && !RBC_ReceiveBlob(seq, *reply, 60000u)) return false;
+    start = GetTicks();
+    while (f.done < seq) {
+        if (GetTicks() - start > 60000u) { LOG_MSG("INPUTNET: cluster: the copy for player %u did not finish", c + 1u); return false; }
+        RBC_Poll(2);
+        if (GetTicks() - last_events >= 10u) { GFX_Events(); last_events = GetTicks(); }
+    }
+    return true;
+}
+
+static bool RBC_OpenSocket(uint16_t port) {
+    if (rbc_sock != NULL) return true;
+    if (!SDLNetInited) {
+        if (SDLNet_Init() == -1) { LOG_MSG("INPUTNET: cluster: SDLNet_Init failed: %s", SDLNet_GetError()); return false; }
+        SDLNetInited = true;
+    }
+    rbc_sock = SDLNet_UDP_Open(port);
+    if (rbc_sock == NULL) { LOG_MSG("INPUTNET: cluster: cannot open UDP port %u: %s", (unsigned)port, SDLNet_GetError()); return false; }
+    if (rbc_in == NULL) rbc_in = SDLNet_AllocPacket(RBC_MAXPKT);
+    if (rbc_out == NULL) rbc_out = SDLNet_AllocPacket(RBC_MAXPKT);
+    if (rbc_set == NULL) rbc_set = SDLNet_AllocSocketSet(1);
+    if (rbc_set != NULL) SDLNet_UDP_AddSocket(rbc_set, rbc_sock);
+    return rbc_in != NULL && rbc_out != NULL;
+}
+
+/* Leader, at its DOS prompt before the network session: the followers come (RBC_FollowerTick). */
+static void RBC_LeaderGather(void) {
+    if (rbc_copies < 2) { rbc_ready = true; return; }   /* (the game alone: nobody to wait for) */
+    static bool failed = false;
+    if (rbc_sock == NULL) {
+        if (failed) return;
+        if (!RBC_OpenSocket((uint16_t)rbc_port)) { failed = true; return; }
+        for (unsigned k = 0; k < RB_RING; k++) rbc_inbox_frame[k] = UINT32_MAX;
+        LOG_MSG("INPUTNET: cluster: player %u's copy waits for the other %u on port %u", rbc_copy + 1u, rbc_copies - 1u, rbc_port);
+    }
+    RBC_Poll();
+    unsigned here = 1;
+    for (unsigned c = 0; c < rbc_copies; c++) if (c != rbc_copy && rbc_f[c].present) here++;
+    if (here < rbc_copies) return;
+    rbc_ready = true;
+    LOG_MSG("INPUTNET: cluster of %u copies ready (this one is player %u's)", rbc_copies, rbc_copy + 1u);
+}
+
+/* Leader: copy c's input and packets at "frame". */
+static void RBC_SendGo(unsigned c, uint32_t frame, const std::vector<InputNetEvent> &events, const std::vector<std::vector<uint8_t> > &packets,
+                       const std::vector<uint8_t> &ser, uint8_t lines) {
+    RBCFollower &f = rbc_f[c];
+    if (!f.present) return;
+    std::vector<uint8_t> buf(RBC_MAXPKT);
+    InputNetWriter w(&buf[0], buf.size());
+    RBC_BeginPacket(w, INPKT_CL_GO);
+    w.u32(frame); w.u32(rbc_epoch);
+    w.u16((uint16_t)events.size());
+    for (size_t i = 0; i < events.size(); i++) INPUTNET_WriteEvent(w, events[i]);
+    w.u16((uint16_t)packets.size());
+    for (size_t i = 0; i < packets.size(); i++) { w.u16((uint16_t)packets[i].size()); w.bytes(&packets[i][0], packets[i].size()); }
+    w.u16((uint16_t)ser.size());
+    if (!ser.empty()) w.bytes(&ser[0], ser.size());
+    w.u8(lines);
+    if (w.overflow()) { LOG_MSG("INPUTNET: cluster: too much for one frame of the copy for player %u", c + 1u); return; }
+    buf.resize(w.size());
+    f.go.swap(buf);
+    f.go_frame = frame; f.go_epoch = rbc_epoch;
+    RBC_Send(f.addr, &f.go[0], f.go.size());
+}
+
+/* (At the DOS prompt only the server's autorun types: RB_ApplyInputs.) */
+static inline bool RB_GuardDrops(const InputNetEvent &e) {
+    return dos_shell_reading_input && e.type == INEV_KEY && (e.pressed & 1u) && !(e.pressed & 2u);
+}
+
+/* Leader: everyone's input for "frame", participant c's to copy c (the server's autorun typing to every copy), then
+ * this copy's packets and input, and every follower's GO. A joining computer runs its own typing only. */
+static void RBC_ApplyInputs(uint32_t frame) {
+    std::vector<InputNetEvent> ev[INPUTNET_MAX_PEERS];
+    if (rb_joining) {
+        if (rbj_typing_pos < rbj_typing.size()) {
+            for (unsigned c = 0; c < rbc_copies; c++) ev[c] = rbj_typing[rbj_typing_pos];
+            rbj_typing_pos++;
+        }
+    }
+    else for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready) continue;
+        if (!p.local) {
+            if (frame >= rb_have[i]) { rb_predicted[i][frame % RB_RING] = frame + 1u; continue; }
+            rb_predicted[i][frame % RB_RING] = 0;
+        }
+        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p, frame);
+        if (slot == NULL) continue;
+        for (size_t e = 0; e < slot->events.size(); e++) {
+            const InputNetEvent &x = slot->events[e];
+            if (x.type == INEV_KEY && (x.pressed & 2u)) { for (unsigned c = 0; c < rbc_copies; c++) ev[c].push_back(x); }
+            else if (rbc_copies == 1) ev[0].push_back(x);   /* (the game alone: everybody plays it) */
+            else if (i < rbc_copies) ev[i].push_back(x);
+        }
+    }
+    const unsigned k = frame % RB_RING;
+    static const std::vector<std::vector<uint8_t> > none;
+    static const std::vector<uint8_t> noser;
+    const bool have = (rbc_inbox_frame[k] == frame);
+    if (have) {
+        for (size_t i = 0; i < rbc_inbox[k][rbc_copy].size(); i++) IPX_ClusterDeliver(&rbc_inbox[k][rbc_copy][i][0], rbc_inbox[k][rbc_copy][i].size());
+        const std::vector<uint8_t> &ser = rbc_ser_inbox[k][rbc_copy];
+        if (!ser.empty() || rbc_ser_lines[k][rbc_copy]) SERIAL_RBDeliver(ser.empty() ? NULL : &ser[0], ser.size(), rbc_ser_lines[k][rbc_copy]);
+    }
+    for (size_t i = 0; i < ev[rbc_copy].size(); i++) if (!RB_GuardDrops(ev[rbc_copy][i])) INPUTNET_ApplyEvent(ev[rbc_copy][i]);
+    for (unsigned c = 0; c < rbc_copies; c++)
+        if (c != rbc_copy) RBC_SendGo(c, frame, ev[c], have ? rbc_inbox[k][c] : none, have ? rbc_ser_inbox[k][c] : noser, have ? rbc_ser_lines[k][c] : 0);
+}
+
+/* Which saved frames before "frame" this copy could load now (bit i: frame - 1 - i). */
+static uint64_t RBC_Loadable(uint32_t frame) {
+    const uint64_t ctx = RB_HostContext();
+    uint64_t bits = 0;
+    for (uint32_t i = 0; i < 64u && i < frame; i++) {
+        const uint32_t f = frame - 1u - i;
+        const RBSnap &s = rb_snap[f % RB_RING];
+        if (s.valid && s.frame == f && s.context == ctx) bits |= 1ull << i;
+    }
+    return bits;
+}
+
+/* Leader: whether every follower could load frame "f" (they said so at the frame start "now"). */
+static bool RBC_FollowersCanLoad(uint32_t f, uint32_t now) {
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy || !rbc_f[c].present) continue;
+        if (rbc_f[c].at_frame != now) return false;
+        if (f == now) continue;
+        if (f > now) return false;
+        const uint32_t i = now - 1u - f;
+        if (i >= 64u || !((rbc_f[c].at_loadable >> i) & 1u)) return false;
+    }
+    return true;
+}
+
+/* This copy's host stack is as it was at the frame start before "frame" (a machine saved now can be loaded by one
+ * that is inside the same loops). */
+static bool RBC_SelfStable(uint32_t frame) {
+    if (frame == 0) return false;
+    const RBSnap &s = rb_snap[(frame - 1u) % RB_RING];
+    return s.valid && s.frame == frame - 1u && s.context == RB_HostContext();
+}
+
+/* Leader: every copy at "frame" is stable; "prompt" gets whether each is at its DOS prompt. */
+static bool RBC_AllStable(uint32_t frame, uint8_t *prompt = NULL) {
+    if (!RBC_SelfStable(frame)) return false;
+    if (prompt != NULL) prompt[rbc_copy] = dos_shell_reading_input ? 1 : 0;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy) continue;
+        if (!rbc_f[c].present || rbc_f[c].at_frame != frame || !(rbc_f[c].at_flags & RBC_AT_STABLE)) return false;
+        if (prompt != NULL) prompt[c] = (rbc_f[c].at_flags & RBC_AT_PROMPT) ? 1 : 0;
+    }
+    return true;
+}
+
+/* Leader, at a frame start: every follower there (RBC_REWIND: put back to "frame" first; RBC_HOLD: at the epoch it
+ * moved to by a command), their packets of the frame before routed (RBC_ROUTE only), and the cluster's checksum.
+ * False when a copy stopped answering (the session is over then). */
+static bool RBC_LeaderBarrier(uint32_t frame, int mode) {
+    std::vector<std::vector<uint8_t> > own;
+    std::vector<uint8_t> own_ser;
+    uint8_t own_lines = 0;
+    if (mode == RBC_ROUTE) { IPX_ClusterTakeOutbox(own); SERIAL_RBTakeOutbox(own_ser, own_lines); }
+    const uint32_t start = GetTicks();
+    uint32_t last_events = start, lastrw = 0;
+    for (;;) {
+        bool all = true;
+        for (unsigned c = 0; c < rbc_copies; c++) {
+            if (c == rbc_copy || !rbc_f[c].present) continue;
+            if (rbc_f[c].at_frame != frame || rbc_f[c].at_epoch != rbc_epoch) { all = false; break; }
+        }
+        if (all) break;
+        const uint32_t now = GetTicks();
+        if (mode == RBC_REWIND && (lastrw == 0 || now - lastrw >= 5u)) {
+            for (unsigned c = 0; c < rbc_copies; c++) {
+                if (c == rbc_copy || !rbc_f[c].present || rbc_f[c].at_epoch == rbc_epoch) continue;
+                uint8_t buf[32];
+                InputNetWriter w(buf, sizeof(buf));
+                RBC_BeginPacket(w, INPKT_CL_REWIND);
+                w.u32(frame); w.u32(inputnet_rollback_resim ? rb_target : frame); w.u32(rbc_epoch);
+                RBC_Send(rbc_f[c].addr, buf, w.size());
+            }
+            lastrw = now ? now : 1u;
+        }
+        if (now - start > 20000u) {
+            LOG_MSG("INPUTNET: cluster: a copy stopped at frame %u", (unsigned)frame);
+            INPUTNET_EndSession("a copy of the game stopped answering", true);
+            return false;
+        }
+        RBC_Poll(1);
+        RBC_Beat();
+        if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
+    }
+    const unsigned k = frame % RB_RING;
+    if (mode == RBC_ROUTE) {
+        for (unsigned c = 0; c < rbc_copies; c++) { rbc_inbox[k][c].clear(); rbc_ser_inbox[k][c].clear(); rbc_ser_lines[k][c] = 0; }
+        if (!rb_joining && rbc_copies >= 2) {   /* the null modem links copies 0 and 1 */
+            for (unsigned src = 0; src < 2; src++) {
+                const unsigned dst = 1u - src;
+                rbc_ser_inbox[k][dst] = (src == rbc_copy) ? own_ser : rbc_f[src].at_ser;
+                rbc_ser_lines[k][dst] = (src == rbc_copy) ? own_lines : rbc_f[src].at_lines;
+            }
+        }
+        if (!rb_joining) {                  /* (a joining computer's copies stay apart until they take the server's) */
+            for (unsigned src = 0; src < rbc_copies; src++) {
+                const std::vector<std::vector<uint8_t> > &out = (src == rbc_copy) ? own : rbc_f[src].at_out;
+                for (size_t i = 0; i < out.size(); i++) {
+                    const std::vector<uint8_t> &pkt = out[i];
+                    if (pkt.size() < 30) continue;
+                    const uint8_t *node = &pkt[10];          /* the IPX header's destination node */
+                    bool bcast = true;
+                    for (unsigned b = 0; b < 6; b++) if (node[b] != 0xFF) bcast = false;
+                    for (unsigned dst = 0; dst < rbc_copies; dst++) {
+                        if (dst == src) continue;   /* (the sender has its own broadcasts already: ipx.cpp sendPacket) */
+                        const bool mine = node[0] == 10 && node[1] == 0 && node[2] == 0 && node[3] == dst + 1u && node[4] == 0x55 && node[5] == 0x55;
+                        if (bcast || mine) rbc_inbox[k][dst].push_back(pkt);
+                    }
+                }
+            }
+        }
+        rbc_inbox_frame[k] = frame;
+    }
+    RBSnap &s = rb_snap[k];
+    if (s.valid && s.frame == frame) {
+        uint64_t h = 1469598103934665603ull;
+        for (unsigned c = 0; c < rbc_copies; c++) {
+            const uint64_t hc = (c == rbc_copy) ? s.own : (rbc_f[c].present ? rbc_f[c].at_hash : 0u);
+            h = (h ^ hc) * 1099511628211ull;
+            h ^= h >> 29u;
+        }
+        s.hash = h;
+    }
+    return true;
+}
+
+/* Leader, having gone back to "target" itself: the followers too. */
+static void RBC_LeaderRewind(uint32_t target) {
+    rbc_epoch++;
+    RBC_LeaderBarrier(target, RBC_REWIND);
+}
+
+/* Leader: the session starts at "frame"; so do the followers. */
+static void RBC_LeaderStart(uint32_t frame, bool joining) {
+    rbc_epoch = 0;
+    for (unsigned k = 0; k < RB_RING; k++) rbc_inbox_frame[k] = UINT32_MAX;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy) continue;
+        RBCFollower &f = rbc_f[c];
+        f.at_frame = UINT32_MAX; f.at_epoch = 0; f.go_frame = UINT32_MAX; f.go.clear(); f.at_out.clear();
+        if (f.present && !RBC_Command(c, RBC_CMD_START, frame, joining ? 1u : 0u, 0, NULL, NULL))
+            LOG_MSG("INPUTNET: cluster: the copy for player %u did not start", c + 1u);
+    }
+}
+
+/* Leader: the session is over; so it is for the followers (they do not wait for it). */
+static void RBC_LeaderEnd(void) {
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy || !rbc_f[c].present) continue;
+        const uint32_t seq = ++rbc_seq;
+        uint8_t buf[40];
+        InputNetWriter w(buf, sizeof(buf));
+        RBC_BeginPacket(w, INPKT_CL_CMD);
+        w.u32(seq); w.u8(RBC_CMD_END); w.u32(0); w.u32(0); w.u32(0);
+        for (unsigned i = 0; i < 3; i++) RBC_Send(rbc_f[c].addr, buf, w.size());
+    }
+}
+
+/* ---- follower ---- */
+
+static void RBC_FollowerDone(uint32_t seq) {
+    uint8_t buf[24];
+    InputNetWriter w(buf, sizeof(buf));
+    RBC_BeginPacket(w, INPKT_CL_CMDACK);
+    w.u32(seq); w.u8(1);
+    for (unsigned i = 0; i < 3; i++) RBC_Send(rbc_leader_addr, buf, w.size());
+}
+
+/* A manifest with each file's host path (for the other copies on the same computer). */
+static void RBC_PutManifestFull(std::vector<uint8_t> &out, const std::vector<RBFile> &m) {
+    const uint32_t count = (uint32_t)m.size();
+    RBC_Put(out, &count, 4);
+    for (size_t i = 0; i < m.size(); i++) {
+        const uint16_t len = (uint16_t)m[i].path.size(), hlen = (uint16_t)m[i].host.size();
+        const uint8_t mapped = m[i].mapped ? 1 : 0;
+        RBC_Put(out, &m[i].drive, 1); RBC_Put(out, &len, 2); RBC_Put(out, m[i].path.data(), len);
+        RBC_Put(out, &m[i].size, 8); RBC_Put(out, &m[i].hash, 8);
+        RBC_Put(out, &mapped, 1); RBC_Put(out, &hlen, 2); RBC_Put(out, m[i].host.data(), hlen);
+    }
+}
+
+static bool RBC_TakeManifestFull(const uint8_t *&p, const uint8_t *end, std::vector<RBFile> &m) {
+    uint32_t count = 0;
+    if (!RBC_Get(p, end, &count, 4) || count > 100000u) return false;
+    m.clear();
+    for (uint32_t i = 0; i < count; i++) {
+        RBFile e; uint16_t len = 0, hlen = 0; uint8_t mapped = 0;
+        if (!RBC_Get(p, end, &e.drive, 1) || !RBC_Get(p, end, &len, 2) || (size_t)(end - p) < len) return false;
+        e.path.assign((const char*)p, len); p += len;
+        if (!RBC_Get(p, end, &e.size, 8) || !RBC_Get(p, end, &e.hash, 8) || !RBC_Get(p, end, &mapped, 1) ||
+            !RBC_Get(p, end, &hlen, 2) || (size_t)(end - p) < hlen) return false;
+        e.host.assign((const char*)p, hlen); p += hlen;
+        e.mapped = mapped != 0;
+        m.push_back(e);
+    }
+    return true;
+}
+
+/* Loads a copy's machine at "h.frame" (the leader's, or a follower's), then saves that frame start: the extras and
+ * the IPX driver's state go back after the save state. */
+static bool RBC_LoadCopy(const RBResyncInfo &h, const std::vector<uint8_t> &state, const uint8_t *ipx, size_t ipxlen, const RBCExtras &x) {
+    RBResyncInfo hh = h;
+    hh.vfps = x.vfps; hh.vbase = x.vbase; hh.vframes = x.vframes;
+    return RB_LoadResyncState(hh, state, [&]() {
+        RBC_SetExtras(x);
+        if (!RB_LoadLinks(ipx, ipxlen)) LOG_MSG("INPUTNET: cluster: the links' state (IPX, null modem) did not load");
+    });
+}
+
+/* Follower: the leader's commands. At a frame start ("rbcf_cur" set) or, outside a session, between timer ticks. */
+static void RBC_FollowerCommands(void) {
+    while (!rbcf_cmds.empty()) {
+        const RBCCmd c = rbcf_cmds.front();
+        rbcf_cmds.erase(rbcf_cmds.begin());
+        switch (c.cmd) {
+            case RBC_CMD_SAVE: {            /* at frame start c.a: this copy's machine, then the same loaded back */
+                if (!inputnet_session || rbcf_cur != c.a) { LOG_MSG("INPUTNET: cluster: asked to save frame %u at %u", (unsigned)c.a, (unsigned)rbcf_cur); break; }
+                std::vector<uint8_t> state, blob;
+                if (!INPUTNET_SnapshotState(state)) state.clear();
+                std::string ipx;
+                RB_SaveLinks(ipx);
+                RBCExtras x;
+                RBC_GetExtras(x);
+                const uint32_t sl = (uint32_t)state.size(), il = (uint32_t)ipx.size();
+                const uint8_t prompt = dos_shell_reading_input ? 1 : 0;
+                RBC_Put(blob, &sl, 4); if (sl) RBC_Put(blob, &state[0], sl);
+                RBC_Put(blob, &il, 4); if (il) RBC_Put(blob, ipx.data(), il);
+                RBC_Put(blob, &prompt, 1);
+                RBC_PutExtras(blob, x);
+                RBC_SendBlob(rbc_leader_addr, c.seq, blob);
+                if (sl) {
+                    RBResyncInfo h;
+                    h.frame = c.a; h.tick = rb_tick; h.epoch = c.c;
+                    if (!RBC_LoadCopy(h, state, (const uint8_t*)ipx.data(), ipx.size(), x)) LOG_MSG("INPUTNET: cluster: could not load this copy's own state");
+                }
+                rbc_epoch = c.b;
+                rbcf_reloaded = true;
+                break;
+            }
+            case RBC_CMD_MANIFEST: {        /* this copy's files */
+                std::vector<RBFile> m;
+                std::vector<uint8_t> blob;
+                RB_BuildManifest(m);
+                RBC_PutManifestFull(blob, m);
+                RBC_SendBlob(rbc_leader_addr, c.seq, blob);
+                break;
+            }
+            case RBC_CMD_FILEMAP: {         /* the server's files for this copy, written by the leader */
+                std::vector<uint8_t> blob;
+                if (!RBC_ReceiveBlob(c.seq, blob, 60000u)) break;
+                const uint8_t *p = blob.empty() ? NULL : &blob[0], *end = p + blob.size();
+                std::vector<RBFile> m;
+                if (p == NULL || !RBC_TakeManifestFull(p, end, m)) break;
+                for (size_t i = 0; i < m.size(); i++) {
+                    localDrive *ld = (m[i].drive < DOS_DRIVES) ? dynamic_cast<localDrive*>(Drives[m[i].drive]) : NULL;
+                    if (ld == NULL) continue;
+                    const size_t bs = m[i].path.find_last_of('\\');
+                    if (bs != std::string::npos) {
+                        size_t from = 0;
+                        while (from <= bs) {
+                            const size_t next = m[i].path.find('\\', from);
+                            if (next == std::string::npos || next > bs) break;
+                            const std::string parent = m[i].path.substr(0, next);
+                            if (!ld->TestDir(parent.c_str()) && ld->MakeDir(parent.c_str()))
+                                rb_sync_dirs.push_back(std::make_pair((int)m[i].drive, parent));
+                            from = next + 1;
+                        }
+                    }
+                    if (ld->AddMountedFile(m[i].path.c_str(), m[i].host.c_str(), true))
+                        rb_sync_mapped.push_back(std::make_pair((int)m[i].drive, m[i].path));
+                }
+                LOG_MSG("INPUTNET: cluster: using %u of the server's files in this copy", (unsigned)m.size());
+                break;
+            }
+            case RBC_CMD_LOADRESYNC: {      /* at a frame start: the server's machine for this copy at frame c.a */
+                std::vector<uint8_t> blob;
+                if (!RBC_ReceiveBlob(c.seq, blob, 120000u)) break;
+                const uint8_t *p = blob.empty() ? NULL : &blob[0], *end = p + blob.size();
+                RBResyncInfo h;
+                uint32_t sl = 0, il = 0;
+                RBCExtras x;
+                std::vector<uint8_t> raw(p, end);
+                if (p == NULL || !RB_GetResyncInfo(raw, h)) break;
+                p += RB_RESYNC_INFO_SIZE;
+                if (!RBC_Get(p, end, &sl, 4) || (size_t)(end - p) < sl) break;
+                const std::vector<uint8_t> state(p, p + sl); p += sl;
+                if (!RBC_Get(p, end, &il, 4) || (size_t)(end - p) < il) break;
+                const uint8_t *ipx = p; p += il;
+                if (!RBC_GetExtrasFrom(p, end, x)) break;
+                if (!RBC_LoadCopy(h, state, ipx, il, x)) { LOG_MSG("INPUTNET: cluster: could not load the server's copy"); break; }
+                const uint32_t real = c.b;
+                if (real > h.frame) {       /* replay to where real time is, with the leader */
+                    inputnet_rollback_resim = true;
+                    rb_target = real;
+                    MIXER_SetRollbackDiscard(true);
+                    DOSBOX_AddTicksRemain((real - h.frame) * inputnet_frame_ms);
+                }
+                rbc_epoch = c.c;
+                rbcf_cur = h.frame;
+                rbcf_reloaded = true;
+                LOG_MSG("INPUTNET: cluster: took the server's copy for player %u over at frame %u", rbc_copy + 1u, (unsigned)h.frame);
+                break;
+            }
+            case RBC_CMD_START:             /* the session starts at frame c.a */
+                if (inputnet_session) { inputnet_session = false; RB_SessionEnded(); }
+                for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) { inputnet_peers[i].active = false; inputnet_peers[i].ready = false; }
+                rb_start_frame = c.a;
+                rbc_epoch = 0;
+                rbcf_go = false; rbcf_rewind = false;
+                inputnet_session = true;
+                inputnet_capture_active = true;  /* this window's own input goes nowhere (INPUTNET_QueueLocal) */
+                RB_SessionStarted();
+                break;
+            case RBC_CMD_END:
+                if (inputnet_session) { inputnet_session = false; inputnet_capture_active = false; RB_SessionEnded(); }
+                break;
+            default:
+                break;
+        }
+        RBC_FollowerDone(c.seq);
+    }
+}
+
+/* Follower, between timer ticks outside a session: the leader, once the DOS prompt is reached, then its commands. */
+static void RBC_FollowerTick(void) {
+    if (inputnet_session) return;           /* (in a session everything happens at the frame starts) */
+    if (rbc_sock == NULL) {
+        if (!dos_shell_reading_input) return;
+        if (!RBC_OpenSocket(0)) { rbc_copies = 0; return; }
+        SDLNet_ResolveHost(&rbc_leader_addr, "127.0.0.1", (uint16_t)rbc_port);
+        rbc_last_heard = GetTicks();
+        LOG_MSG("INPUTNET: cluster: player %u's copy looks for its leader on port %u", rbc_copy + 1u, rbc_port);
+    }
+    static uint32_t lasthello = 0;
+    if (!rbcf_welcomed && GetTicks() - lasthello > 200u) {
+        uint8_t buf[16];
+        InputNetWriter w(buf, sizeof(buf));
+        RBC_BeginPacket(w, INPKT_CL_HELLO);
+        RBC_Send(rbc_leader_addr, buf, w.size());
+        lasthello = GetTicks();
+    }
+    RBC_Poll();
+    RBC_FollowerCommands();
+}
+
+/* Follower, at a frame start: tell the leader, then do what it says. */
+static void RBC_FollowerBoundary(uint32_t frame) {
+    inputnet_frame = frame;
+    if (inputnet_rollback_resim && frame >= rb_target) {
+        inputnet_rollback_resim = false;
+        MIXER_SetRollbackDiscard(false);
+        extern void RENDER_RedrawAll(void);
+        RENDER_RedrawAll();
+    }
+    RB_Capture(frame);
+    std::vector<std::vector<uint8_t> > out;
+    IPX_ClusterTakeOutbox(out);
+    std::vector<uint8_t> ser;
+    uint8_t lines = 0;
+    SERIAL_RBTakeOutbox(ser, lines);
+    rbcf_cur = frame;
+    rbcf_reloaded = false;
+    bool with_packets = true;
+    uint32_t lastsend = 0, last_events = GetTicks();
+    for (;;) {
+        const uint32_t now = GetTicks();
+        if (lastsend == 0 || now - lastsend >= 4u) {
+            std::vector<uint8_t> buf(RBC_MAXPKT);
+            InputNetWriter w(&buf[0], buf.size());
+            RBC_BeginPacket(w, INPKT_CL_AT);
+            const RBSnap &s = rb_snap[rbcf_cur % RB_RING];
+            const uint64_t lb = RBC_Loadable(rbcf_cur);
+            const uint8_t flags = (RBC_SelfStable(rbcf_cur) ? RBC_AT_STABLE : 0u) | (dos_shell_reading_input ? RBC_AT_PROMPT : 0u);
+            w.u32(rbcf_cur); w.u32(rbc_epoch); w.u32((uint32_t)(s.own >> 32u)); w.u32((uint32_t)s.own);
+            w.u8(flags); w.u32((uint32_t)(lb >> 32u)); w.u32((uint32_t)lb);
+            const size_t n = with_packets ? out.size() : 0u;
+            w.u16((uint16_t)n);
+            for (size_t i = 0; i < n; i++) { w.u16((uint16_t)out[i].size()); w.bytes(&out[i][0], out[i].size()); }
+            const size_t ns = with_packets ? ser.size() : 0u;
+            w.u16((uint16_t)ns);
+            if (ns) w.bytes(&ser[0], ns);
+            w.u8(lines);
+            if (!w.overflow()) RBC_Send(rbc_leader_addr, &buf[0], w.size());
+            lastsend = now ? now : 1u;
+        }
+        RBC_Poll(1);
+        RBC_FollowerCommands();
+        if (!inputnet_session) { rbcf_cur = UINT32_MAX; return; }   /* END */
+        if (rbcf_reloaded) { rbcf_reloaded = false; with_packets = false; lastsend = 0; continue; }
+        if (rbcf_rewind && rbcf_rw_epoch > rbc_epoch) {
+            rbcf_rewind = false;
+            rbc_epoch = rbcf_rw_epoch;
+            const uint32_t target = rbcf_rw_target;
+            if (target <= rbcf_cur && RB_Restore(target, rbcf_cur)) {
+                if (rbcf_rw_real > target) {
+                    inputnet_rollback_resim = true;
+                    rb_target = rbcf_rw_real;
+                    MIXER_SetRollbackDiscard(true);
+                    DOSBOX_AddTicksRemain((rbcf_rw_real - rbcf_cur) * inputnet_frame_ms + (rbcf_cur - target) * inputnet_frame_ms);
+                }
+                inputnet_frame = target;
+                rbcf_cur = target;
+            }
+            else LOG_MSG("INPUTNET: cluster: the copy for player %u cannot go back to frame %u", rbc_copy + 1u, (unsigned)target);
+            with_packets = false;           /* the leader keeps what was routed at "target" */
+            lastsend = 0;
+            continue;
+        }
+        if (rbcf_go && rbcf_go_frame == rbcf_cur && rbcf_go_epoch == rbc_epoch) {
+            rbcf_go = false;
+            for (size_t i = 0; i < rbcf_go_packets.size(); i++) IPX_ClusterDeliver(&rbcf_go_packets[i][0], rbcf_go_packets[i].size());
+            if (!rbcf_go_ser.empty() || rbcf_go_lines) SERIAL_RBDeliver(rbcf_go_ser.empty() ? NULL : &rbcf_go_ser[0], rbcf_go_ser.size(), rbcf_go_lines);
+            for (size_t i = 0; i < rbcf_go_events.size(); i++) if (!RB_GuardDrops(rbcf_go_events[i])) INPUTNET_ApplyEvent(rbcf_go_events[i]);
+            rbcf_cur = UINT32_MAX;
+            return;
+        }
+        if (GetTicks() - rbc_last_heard > 15000u) {   /* (a command may have taken a while since "now") */
+            LOG_MSG("INPUTNET: cluster: the leader is gone");
+            inputnet_session = false;
+            inputnet_capture_active = false;
+            RB_SessionEnded();
+            rbcf_cur = UINT32_MAX;
+            return;
+        }
+        if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
+    }
+}
+
+static void RBC_FollowerRollbackTick(void) {
+    if (!inputnet_rollback_active || !inputnet_session) return;
+    if (!rb_have_first) {
+        rb_have_first = true;
+        rb_tick = rb_start_frame * inputnet_frame_ms;
+        RBC_FollowerBoundary(rb_start_frame);
+        return;
+    }
+    rb_tick++;
+    if ((rb_tick % inputnet_frame_ms) == 0) RBC_FollowerBoundary(rb_tick / inputnet_frame_ms);
+}
+
+/* ---- the machines of a cluster, for the transfer (RB_ServerResync) ---- */
+
+/* Server, at frame start "frame" (every copy there and stable): every copy's machine, each loaded back (RBC_LoadCopy),
+ * as the resync's raw blob: info, this copy's save state, then the cluster block (RBC_CLX_*). */
+static bool RBC_BuildMachines(uint32_t frame, uint16_t epoch, std::vector<uint8_t> &raw) {
+    RBResyncInfo info;
+    std::vector<uint8_t> main_state;
+    if (!INPUTNET_SnapshotState(main_state)) return false;
+    info.frame = frame; info.tick = rb_tick; info.epoch = epoch;
+    info.vfps = vga_fps; info.vbase = vga_mode_time_base; info.vframes = (int32_t)vga_mode_frames_since_time_base;
+    std::string own_ipx;
+    RB_SaveLinks(own_ipx);
+    RBCExtras own_x;
+    RBC_GetExtras(own_x);
+
+    std::vector<uint8_t> clx;
+    const uint32_t magic = RBC_CLX_MAGIC;
+    const uint8_t copies = (uint8_t)rbc_copies, me = (uint8_t)rbc_copy;
+    RBC_Put(clx, &magic, 4); RBC_Put(clx, &copies, 1); RBC_Put(clx, &me, 1);
+    const uint32_t newepoch = rbc_epoch + 1u;
+    const unsigned k = frame % RB_RING;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        std::vector<uint8_t> state, ipx;
+        uint8_t prompt = 0;
+        RBCExtras x;
+        if (c == rbc_copy) {
+            prompt = dos_shell_reading_input ? 1 : 0;
+            ipx.assign(own_ipx.begin(), own_ipx.end());
+            x = own_x;
+        }
+        else {
+            std::vector<uint8_t> reply;
+            if (!RBC_Command(c, RBC_CMD_SAVE, frame, newepoch, epoch, NULL, &reply)) return false;
+            const uint8_t *p = reply.empty() ? NULL : &reply[0], *end = p + reply.size();
+            uint32_t sl = 0, il = 0;
+            if (p == NULL || !RBC_Get(p, end, &sl, 4) || sl == 0 || (size_t)(end - p) < sl) return false;
+            state.assign(p, p + sl); p += sl;
+            if (!RBC_Get(p, end, &il, 4) || (size_t)(end - p) < il) return false;
+            ipx.assign(p, p + il); p += il;
+            if (!RBC_Get(p, end, &prompt, 1) || !RBC_GetExtrasFrom(p, end, x)) return false;
+        }
+        const uint32_t sl = (uint32_t)state.size(), il = (uint32_t)ipx.size();
+        RBC_Put(clx, &prompt, 1);
+        RBC_Put(clx, &sl, 4); if (sl) RBC_Put(clx, &state[0], sl);
+        RBC_Put(clx, &il, 4); if (il) RBC_Put(clx, &ipx[0], il);
+        RBC_PutExtras(clx, x);
+        const std::vector<std::vector<uint8_t> > &in = rbc_inbox[k][c];
+        const bool have = (rbc_inbox_frame[k] == frame);
+        const uint16_t np = have ? (uint16_t)in.size() : 0;
+        RBC_Put(clx, &np, 2);
+        for (uint16_t i = 0; i < np; i++) { const uint16_t len = (uint16_t)in[i].size(); RBC_Put(clx, &len, 2); RBC_Put(clx, &in[i][0], len); }
+        const uint16_t ns = have ? (uint16_t)rbc_ser_inbox[k][c].size() : 0;
+        const uint8_t slines = have ? rbc_ser_lines[k][c] : 0;
+        RBC_Put(clx, &ns, 2);
+        if (ns) RBC_Put(clx, &rbc_ser_inbox[k][c][0], ns);
+        RBC_Put(clx, &slines, 1);
+    }
+    const uint32_t clxlen = (uint32_t)clx.size(), endmagic = RBC_CLX_END;
+    RBC_Put(clx, &clxlen, 4); RBC_Put(clx, &endmagic, 4);
+
+    raw.clear();
+    RB_PutResyncInfo(raw, info);
+    raw.insert(raw.end(), main_state.begin(), main_state.end());
+    raw.insert(raw.end(), clx.begin(), clx.end());
+
+    /* this copy goes on from the very bytes it sends (the followers did the same) */
+    if (!RBC_LoadCopy(info, main_state, (const uint8_t*)own_ipx.data(), own_ipx.size(), own_x)) return false;
+    rbc_epoch = newepoch;
+    return RBC_LeaderBarrier(frame, RBC_HOLD);
+}
+
+struct RBCMachine {
+    uint8_t prompt = 0;
+    const uint8_t *state = NULL; size_t statelen = 0;
+    const uint8_t *ipx = NULL; size_t ipxlen = 0;
+    RBCExtras x;
+    std::vector<std::vector<uint8_t> > inbox;
+    std::vector<uint8_t> ser;
+    uint8_t ser_lines = 0;
+};
+
+/* Splits the resync's raw blob of a cluster: the info, and every copy's machine (pointers into "raw"). */
+static bool RBC_ParseMachines(const std::vector<uint8_t> &raw, RBResyncInfo &info, std::vector<RBCMachine> &m) {
+    if (!RB_GetResyncInfo(raw, info) || raw.size() < RB_RESYNC_INFO_SIZE + 8u) return false;
+    uint32_t clxlen = 0, endmagic = 0;
+    memcpy(&clxlen, &raw[raw.size() - 8u], 4); memcpy(&endmagic, &raw[raw.size() - 4u], 4);
+    if (endmagic != RBC_CLX_END || (size_t)clxlen + 8u + RB_RESYNC_INFO_SIZE > raw.size()) return false;
+    const uint8_t *base = &raw[0];
+    const uint8_t *main_state = base + RB_RESYNC_INFO_SIZE;
+    const uint8_t *p = base + raw.size() - 8u - clxlen, *end = base + raw.size() - 8u;
+    const size_t mainlen = (size_t)(p - main_state);
+    uint32_t magic = 0; uint8_t copies = 0, srv = 0;
+    if (!RBC_Get(p, end, &magic, 4) || magic != RBC_CLX_MAGIC || !RBC_Get(p, end, &copies, 1) || !RBC_Get(p, end, &srv, 1)) return false;
+    if (copies != rbc_copies || srv >= copies) return false;
+    m.assign(copies, RBCMachine());
+    for (unsigned c = 0; c < copies; c++) {
+        RBCMachine &x = m[c];
+        uint32_t sl = 0, il = 0;
+        uint16_t np = 0;
+        if (!RBC_Get(p, end, &x.prompt, 1) || !RBC_Get(p, end, &sl, 4) || (size_t)(end - p) < sl) return false;
+        x.state = p; x.statelen = sl; p += sl;
+        if (!RBC_Get(p, end, &il, 4) || (size_t)(end - p) < il) return false;
+        x.ipx = p; x.ipxlen = il; p += il;
+        if (!RBC_GetExtrasFrom(p, end, x.x) || !RBC_Get(p, end, &np, 2)) return false;
+        for (uint16_t i = 0; i < np; i++) {
+            uint16_t len = 0;
+            if (!RBC_Get(p, end, &len, 2) || (size_t)(end - p) < len) return false;
+            x.inbox.push_back(std::vector<uint8_t>(p, p + len));
+            p += len;
+        }
+        uint16_t ns = 0;
+        if (!RBC_Get(p, end, &ns, 2) || (size_t)(end - p) < ns) return false;
+        x.ser.assign(p, p + ns); p += ns;
+        if (!RBC_Get(p, end, &x.ser_lines, 1)) return false;
+        if (c == srv) { x.state = main_state; x.statelen = mainlen; }
+        if (x.statelen == 0) return false;
+    }
+    return true;
+}
+
+/* Client, at frame start "frame" (every copy stable and at the DOS prompt where the server's was): every copy takes
+ * the server's machine over, then the frames replay to real time. */
+static bool RBC_ApplyMachines(uint32_t frame, bool joining) {
+    RBResyncInfo info;
+    std::vector<RBCMachine> m;
+    if (!RBC_ParseMachines(rbc_resync_raw, info, m)) { LOG_MSG("INPUTNET: resync: the server's machines did not arrive whole"); return false; }
+    const RBCMachine &own = m[rbc_copy];
+    if (!RBC_LoadCopy(info, std::vector<uint8_t>(own.state, own.state + own.statelen), own.ipx, own.ipxlen, own.x)) return false;
+    /* (a joining computer goes on from the machines' frame: its own count was a guess) */
+    const uint32_t real = joining ? info.frame : std::max(rb_realframe, frame);
+    const uint32_t newepoch = rbc_epoch + 1u;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy) continue;
+        std::vector<uint8_t> payload;
+        RB_PutResyncInfo(payload, info);
+        const uint32_t sl = (uint32_t)m[c].statelen, il = (uint32_t)m[c].ipxlen;
+        RBC_Put(payload, &sl, 4); RBC_Put(payload, m[c].state, sl);
+        RBC_Put(payload, &il, 4); if (il) RBC_Put(payload, m[c].ipx, il);
+        RBC_PutExtras(payload, m[c].x);
+        if (!RBC_Command(c, RBC_CMD_LOADRESYNC, info.frame, real, newepoch, &payload, NULL)) return false;
+    }
+    rbc_epoch = newepoch;
+    const unsigned k = info.frame % RB_RING;
+    for (unsigned c = 0; c < rbc_copies; c++) { rbc_inbox[k][c] = m[c].inbox; rbc_ser_inbox[k][c] = m[c].ser; rbc_ser_lines[k][c] = m[c].ser_lines; }
+    rbc_inbox_frame[k] = info.frame;
+    std::vector<uint8_t>().swap(rbc_resync_raw);
+    if (!RBC_LeaderBarrier(info.frame, RBC_HOLD)) return false;
+    return true;
+}
+
+/* Client: whether the server's machines can be loaded at "frame": every copy stable, and each at the DOS prompt
+ * exactly where the server's was (else its emulator is inside other nested loops). */
+static bool RBC_CanApplyMachines(uint32_t frame) {
+    uint8_t prompt[INPUTNET_MAX_PEERS];
+    if (!RBC_AllStable(frame, prompt)) return false;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (prompt[c] == rbc_resync_prompt[c]) continue;
+        if (rbc_resync_since && GetTicks() - rbc_resync_since > 10000u) {
+            static uint32_t told = 0;
+            if (GetTicks() - told > 10000u) {
+                LOG_MSG("INPUTNET: resync: the copy for player %u is %s, the server's was %s", c + 1u,
+                    prompt[c] ? "at the DOS prompt" : "running a program", rbc_resync_prompt[c] ? "at the DOS prompt" : "running a program");
+                told = GetTicks();
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+/* The DOS prompt flags of the machines in "raw" (read when the transfer is complete). */
+static void RBC_NoteMachines(void) {
+    RBResyncInfo info;
+    std::vector<RBCMachine> m;
+    memset(rbc_resync_prompt, 0, sizeof(rbc_resync_prompt));
+    if (RBC_ParseMachines(rbc_resync_raw, info, m))
+        for (unsigned c = 0; c < m.size(); c++) rbc_resync_prompt[c] = m[c].prompt;
+    rbc_resync_since = GetTicks();
+}
+
+/* ---- joining ---- */
+
+/* The key events that type "text" and Enter, a frame per character (the autorun flag set: RB_ApplyInputs). */
+static void RB_TypingFrames(const std::string &text, std::vector<std::vector<InputNetEvent> > &frames) {
+    static const char *plain = "`1234567890-=[]\\;',./";
+    static const char *shifted = "~!@#$%^&*()_+{}|:\"<>?";
+    static const KBD_KEYS punct[] = { KBD_grave,KBD_1,KBD_2,KBD_3,KBD_4,KBD_5,KBD_6,KBD_7,KBD_8,KBD_9,KBD_0,KBD_minus,KBD_equals,
+        KBD_leftbracket,KBD_rightbracket,KBD_backslash,KBD_semicolon,KBD_quote,KBD_comma,KBD_period,KBD_slash };
+    static const KBD_KEYS letters[26] = { KBD_a,KBD_b,KBD_c,KBD_d,KBD_e,KBD_f,KBD_g,KBD_h,KBD_i,KBD_j,KBD_k,KBD_l,KBD_m,
+        KBD_n,KBD_o,KBD_p,KBD_q,KBD_r,KBD_s,KBD_t,KBD_u,KBD_v,KBD_w,KBD_x,KBD_y,KBD_z };
+    auto press = [&frames](KBD_KEYS k, bool shift) {
+        std::vector<InputNetEvent> f;
+        InputNetEvent ev;
+        ev.type = INEV_KEY;
+        if (shift) { ev.key = (uint16_t)KBD_leftshift; ev.pressed = 3; f.push_back(ev); }
+        ev.key = (uint16_t)k; ev.pressed = 3; f.push_back(ev);
+        ev.pressed = 2; f.push_back(ev);
+        if (shift) { ev.key = (uint16_t)KBD_leftshift; ev.pressed = 2; f.push_back(ev); }
+        frames.push_back(f);
+    };
+    for (size_t i = 0; i < text.size(); i++) {
+        const char c = text[i];
+        if (c >= 'a' && c <= 'z') press(letters[c - 'a'], false);
+        else if (c >= 'A' && c <= 'Z') press(letters[c - 'A'], true);
+        else if (c == ' ') press(KBD_space, false);
+        else for (unsigned j = 0; plain[j]; j++) {
+            if (plain[j] == c) { press(punct[j], false); break; }
+            if (shifted[j] == c) { press(punct[j], true); break; }
+        }
+    }
+    press(KBD_enter, false);
+}
+
+/* Joining computer, at a frame start before it has the server's machines: start the game on every copy when the
+ * server's runs already, and once every copy has been where the server's machines can be loaded for a while, ask for
+ * them (again every few seconds until they come). */
+static void RBC_JoinStep(uint32_t frame) {
+    uint8_t prompt[INPUTNET_MAX_PEERS];
+    memset(prompt, 0, sizeof(prompt));
+    const bool stable = RBC_AllStable(frame, prompt);
+    /* (where each copy is, stable or not: the followers' newest frame start) */
+    bool all_prompt = dos_shell_reading_input, all_game = !dos_shell_reading_input, here = true;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy) continue;
+        if (rbc_f[c].at_frame != frame) { here = false; continue; }
+        if (rbc_f[c].at_flags & RBC_AT_PROMPT) all_game = false; else all_prompt = false;
+    }
+    if (!here) all_prompt = all_game = false;
+    if (!rbj_server_prompt && !rbj_typed && stable && all_prompt) {
+        if (rbj_autorun.empty()) LOG_MSG("INPUTNET: joining: the server's game runs, but it did not say what starts it");
+        else {
+            LOG_MSG("INPUTNET: joining: starting the game on our copies (\"%s\") to take the server's machines over", rbj_autorun.c_str());
+            RB_TypingFrames(rbj_autorun, rbj_typing);
+        }
+        rbj_typed = true;
+    }
+    /* the machines can come once every copy is where the server's are: at the DOS prompt, or in the game for a while
+     * (they are loaded at a frame start where every copy's host stack is steady: RBC_CanApplyMachines) */
+    const bool ready = rbj_server_prompt ? all_prompt : (rbj_typed && all_game);
+    rbj_steady = ready ? rbj_steady + 1u : 0u;
+    static uint32_t told = 0;
+    if (GetTicks() - told > 2000u) {
+        LOG_MSG("INPUTNET: joining: frame %u, copies %s%s, steady for %u frames", (unsigned)frame,
+            all_prompt ? "at the DOS prompt" : all_game ? "in the game" : "in between", stable ? " (stable)" : "", (unsigned)rbj_steady);
+        told = GetTicks();
+    }
+    if (!rb_resync_ready.empty()) return;  /* (the machines are here, waiting for a frame start they can load at) */
+    if (rbj_steady >= (rbj_server_prompt ? 5u : 150u) && (rbj_last_request == 0 || GetTicks() - rbj_last_request > 3000u)) {
+        uint8_t buf[32];
+        InputNetWriter w(buf, sizeof(buf));
+        INPUTNET_BeginPacket(w, INPKT_RESYNC);
+        w.u8(0);                            /* request */
+        w.u8(1);                            /* ...to join (repeated: void once we are in) */
+        INPUTNET_SendToPeers(buf, w.size());
+        rbj_last_request = GetTicks();
+        LOG_MSG("INPUTNET: joining: asking for the server's machines at frame %u", (unsigned)frame);
+    }
+}
+
+/* Client (cluster): split the server's list of files per copy, compare each with that copy's own files here, and
+ * take the server's over where they differ. Then the session starts, joining (RBC_JoinStep). */
+static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welcomed_at, std::string &errmsg) {
+    std::vector<uint8_t> blob;
+    if (total == 0 || !INPUTNET_ReceiveState(blob, total)) { errmsg = "the server's list of game files did not arrive"; return false; }
+    std::vector<RBFile> theirs;
+    if (!RB_TakeManifest(blob, theirs)) { errmsg = "the server sent no list of its game files"; return false; }
+    std::vector<std::vector<RBFile> > mine(rbc_copies);
+    RB_BuildManifest(mine[rbc_copy]);
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        if (c == rbc_copy) continue;
+        std::vector<uint8_t> reply;
+        if (!RBC_Command(c, RBC_CMD_MANIFEST, 0, 0, 0, NULL, &reply)) { errmsg = "a copy of the game here did not answer"; return false; }
+        const uint8_t *p = reply.empty() ? NULL : &reply[0], *end = p + reply.size();
+        if (p == NULL || !RBC_TakeManifestFull(p, end, mine[c])) { errmsg = "a copy of the game here sent no list of its files"; return false; }
+    }
+    std::vector<uint8_t> bits((theirs.size() + 7u) / 8u, 0);
+    uint64_t need = 0;
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        std::vector<RBFile> part;
+        std::vector<size_t> at;
+        for (size_t i = 0; i < theirs.size(); i++) {
+            if ((unsigned)(theirs[i].drive >> 5) != c) continue;
+            RBFile e = theirs[i];
+            e.drive &= 31u;
+            part.push_back(e);
+            at.push_back(i);
+        }
+        std::vector<uint8_t> pb;
+        uint64_t pn = 0;
+        std::string err;
+        if (!RB_CompareManifestsWith(part, mine[c], pb, pn, err)) { errmsg = err; return false; }
+        for (size_t j = 0; j < part.size(); j++)
+            if (pb[j / 8u] & (1u << (j % 8u))) bits[at[j] / 8u] |= (uint8_t)(1u << (at[j] % 8u));
+        need += pn;
+    }
+    rb_cli_need.clear();
+    for (size_t i = 0; i < theirs.size(); i++) if (bits[i / 8u] & (1u << (i % 8u))) rb_cli_need.push_back(theirs[i]);
+    rb_cli_bits.swap(bits);
+    rb_cli_manifest_count = (uint32_t)theirs.size();
+    RB_SendFileRequest();                   /* (always: the server learns that we need nothing) */
+    if (need > 0) {
+        if (need > RB_SYNC_TOTAL_MAX) { errmsg = "the files that differ from the server's are too large to take over: every computer needs the same version of the game"; return false; }
+        std::vector<uint8_t> files;
+        if (!INPUTNET_ReceiveState(files, (uint32_t)need, RB_SendFileRequest, INPKT_FILES)) { errmsg = "the server's game files did not arrive"; return false; }
+        std::vector<std::vector<RBFile> > others(rbc_copies);
+        std::string err;
+        if (!RB_MapReceivedFiles(files, err, &others)) { errmsg = err; return false; }
+        for (unsigned c = 0; c < rbc_copies; c++) {
+            if (c == rbc_copy || others[c].empty()) continue;
+            std::vector<uint8_t> payload;
+            RBC_PutManifestFull(payload, others[c]);
+            if (!RBC_Command(c, RBC_CMD_FILEMAP, 0, 0, 0, &payload, NULL)) { errmsg = "a copy of the game here did not take the server's files"; return false; }
+        }
+        LOG_MSG("INPUTNET: using %u of the server's files in place of ours for this session", (unsigned)rb_cli_need.size());
+    }
+    else RB_SendFileRequest();
+
+    rb_joining = true;
+    rbj_typed = false; rbj_steady = 0; rbj_last_request = 0;
+    rbj_typing.clear(); rbj_typing_pos = 0;
+    std::vector<uint8_t>().swap(rbc_resync_raw);
+    rb_start_frame = server_frame + (GetTicks() - welcomed_at) / inputnet_frame_ms;
+    LOG_MSG("INPUTNET: joining the session at frame %u (the server's game %s)", (unsigned)rb_start_frame,
+        rbj_server_prompt ? "is at the DOS prompt" : "runs");
+    INPUTNET_StartSession();
+    return true;
+}
+
+/* Server: the list of every copy's files (each entry's drive byte carries its copy in bits 5-7) for a joining
+ * participant, then its file request is answered at a frame start (RBC_ServerFiles). */
+static bool RBC_ServerManifest(std::vector<uint8_t> &out) {
+    rb_srv_manifest.clear();
+    for (unsigned c = 0; c < rbc_copies; c++) {
+        std::vector<RBFile> m;
+        if (c == rbc_copy) RB_BuildManifest(m);
+        else {
+            std::vector<uint8_t> reply;
+            if (!RBC_Command(c, RBC_CMD_MANIFEST, 0, 0, 0, NULL, &reply)) return false;
+            const uint8_t *p = reply.empty() ? NULL : &reply[0], *end = p + reply.size();
+            if (p == NULL || !RBC_TakeManifestFull(p, end, m)) return false;
+        }
+        for (size_t i = 0; i < m.size(); i++) { m[i].drive = (uint8_t)(m[i].drive | (c << 5)); rb_srv_manifest.push_back(m[i]); }
+    }
+    out.clear();
+    RB_PutManifest(out, rb_srv_manifest);
+    rb_filereq_ready = false;
+    rb_filereq_bits.clear();
+    rb_filereq_part.clear();
+    return true;
+}
+
+/* Server: someone asks to join (HELLO). Its player's copy is the one it names (the host plays copy 0); it gets the
+ * game files now and the machines when it asks for them (RBC_JoinStep). */
+static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsigned copies, unsigned want) {
+    if (inputnet_accepting) return;
+    InputNetPeer *p = INPUTNET_PeerByAddr(addr);
+    if (p != NULL && p->ready) return;                  /* in the session already */
+    if (p != NULL && rbs_joining[p - inputnet_peers]) return;   /* has its WELCOME (a hello sent before it came) */
+    static uint32_t last_told = 0;
+    const bool tell = GetTicks() - last_told > 5000u;
+    if (copies != rbc_copies) {
+        if (tell) { LOG_MSG("INPUTNET: refused \"%s\": it runs %u copies of the game, the session %u", name.c_str(), copies, rbc_copies); last_told = GetTicks(); }
+        return;
+    }
+    if (rbc_copies == 1) {          /* the game alone: any free participant number */
+        want = 0;
+        for (unsigned i = 1; i < INPUTNET_MAX_PEERS && want == 0; i++) if (!inputnet_peers[i].active) want = i;
+        if (want == 0) {
+            if (tell) { LOG_MSG("INPUTNET: refused \"%s\": the session is full", name.c_str()); last_told = GetTicks(); }
+            return;
+        }
+    }
+    else if (want == 0 || want >= rbc_copies || want >= INPUTNET_MAX_PEERS || inputnet_peers[want].active) {
+        if (tell) { LOG_MSG("INPUTNET: refused \"%s\": player %u's copy is %s", name.c_str(), want + 1u, want == 0 ? "the host's" : "taken"); last_told = GetTicks(); }
+        return;
+    }
+    inputnet_accepting = true;
+    p = &inputnet_peers[want];
+    p->active = true; p->local = false; p->ready = false; p->addr = addr; p->name = name; p->lastheard = GetTicks();
+    p->resetFrames();
+    rbs_joining[want] = true; rbs_wants[want] = false;
+    LOG_MSG("INPUTNET: \"%s\" joins from %d.%d.%d.%d as player %u", name.c_str(),
+        (int)(addr.host & 0xFF), (int)((addr.host >> 8u) & 0xFF), (int)((addr.host >> 16u) & 0xFF), (int)((addr.host >> 24u) & 0xFF), want + 1u);
+
+    std::vector<uint8_t> manifest;
+    bool ok = RBC_ServerManifest(manifest);
+    if (ok) {
+        rbs_filereq_peer = (int)want;
+        uint8_t welcome[1400];
+        InputNetWriter w(welcome, sizeof(welcome));
+        INPUTNET_BeginPacket(w, INPKT_WELCOME);
+        w.u8((uint8_t)want);
+        w.u16((uint16_t)inputnet_frame_ms);
+        w.u16((uint16_t)inputnet_delay);
+        w.u16((uint16_t)inputnet_redundancy);
+        w.u8(inputnet_share_keyboard ? 1 : 0);
+        w.u8(inputnet_share_mouse ? 1 : 0);
+        w.u8((uint8_t)inputnet_cyclesync);
+        w.u32((uint32_t)manifest.size());
+        w.u32(CALLBACK_LayoutSignature());
+        {   /* (the machines come later, with what a save state leaves out of them: RBCExtras) */
+            uint8_t clock[16];
+            CMOS_GetSharedClock(clock);
+            w.bytes(clock, sizeof(clock));
+            w.u16(dos.date.year); w.u8(dos.date.month); w.u8(dos.date.day);
+            w.u32((uint32_t)(rdtsc_count_base >> 32u)); w.u32((uint32_t)rdtsc_count_base);
+            const uint64_t fps = INPUTNET_DoubleBits(vga_fps), base = INPUTNET_DoubleBits(vga_mode_time_base);
+            w.u32((uint32_t)(fps >> 32u)); w.u32((uint32_t)fps);
+            w.u32((uint32_t)(base >> 32u)); w.u32((uint32_t)base);
+            w.u32((uint32_t)vga_mode_frames_since_time_base);
+        }
+        w.u8(1);
+        w.u8((uint8_t)inputnet_rbwindow);
+        const std::string fp = RB_Fingerprint();
+        w.u16((uint16_t)fp.size());
+        w.bytes((const uint8_t*)fp.data(), fp.size());
+        /* the cluster */
+        w.u8((uint8_t)rbc_copies);
+        w.u32(rb_realframe);
+        w.u8(dos_shell_reading_input ? 1 : 0);
+        const std::string ar = inputnet_rbautorun.substr(0, 200);
+        w.u16((uint16_t)ar.size());
+        w.bytes((const uint8_t*)ar.data(), ar.size());
+        const size_t wl = w.size();
+        p->confirmed = 0;
+        uint32_t last_events = GetTicks();
+        const uint32_t wstart = GetTicks(), heard = p->lastheard;
+        while (p->lastheard == heard && GetTicks() - wstart < 1500u) {     /* (STATEACK: it waits for the list) */
+            INPUTNET_SendRaw(p->addr, welcome, wl);
+            const uint32_t round = GetTicks();
+            while (GetTicks() - round < 100u && p->lastheard == heard) { INPUTNET_PollSocket(); INPUTNET_Stall(last_events); }
+        }
+        ok = INPUTNET_SendStateTo(*p, manifest, INPKT_STATE);
+    }
+    if (!ok) {
+        LOG_MSG("INPUTNET: \"%s\" could not join", name.c_str());
+        p->active = false;
+        rbs_joining[want] = false;
+        rbs_filereq_peer = -1;
+    }
+    inputnet_accepting = false;
+}
+
+/* Server, at a frame start: the files a joining participant asked for. */
+static void RBC_ServerFiles(void) {
+    if (!rb_filereq_ready || rbs_filereq_peer < 0) return;
+    const unsigned id = (unsigned)rbs_filereq_peer;
+    rb_filereq_ready = false;
+    rbs_filereq_peer = -1;
+    InputNetPeer &p = inputnet_peers[id];
+    if (!p.active || !rbs_joining[id]) return;
+    bool any = false;
+    for (size_t i = 0; i < rb_filereq_bits.size(); i++) any = any || rb_filereq_bits[i] != 0;
+    if (!any) return;
+    std::vector<uint8_t> files;
+    if (!RB_BuildFileBlob(files)) { LOG_MSG("INPUTNET: could not read the game files \"%s\" asked for", p.name.c_str()); return; }
+    LOG_MSG("INPUTNET: sending %u KB of game files to \"%s\"", (unsigned)(files.size() >> 10), p.name.c_str());
+    inputnet_accepting = true;
+    if (!INPUTNET_SendStateTo(p, files, INPKT_FILES)) {
+        LOG_MSG("INPUTNET: \"%s\" did not take the game files", p.name.c_str());
+        p.active = false;
+        rbs_joining[id] = false;
+    }
+    inputnet_accepting = false;
+}
+
+/* Server: a participant is gone (BYE, or too far behind): its copy runs on without input, and every computer takes
+ * the server's machines over (the others may have run with different amounts of its input). */
+static void RBC_ServerDrop(unsigned id, const char *why) {
+    InputNetPeer &p = inputnet_peers[id];
+    if (!p.active || p.local) return;
+    LOG_MSG("INPUTNET: \"%s\" (player %u) %s", p.name.c_str(), id + 1u, why);
+    const bool was_in = p.ready;
+    p.active = false; p.ready = false; p.resetFrames();
+    rbs_joining[id] = false; rbs_wants[id] = false;
+    if (was_in) { rbs_left.push_back((uint8_t)id); rb_resync_wanted = true; }
+}
+
+/* Server: the machine at the start of "frame" (= now) in the portable save state format, compressed; "state" gets the
+ * save state alone. The live machine must be at that frame start. */
+static bool RB_BuildResyncBlob(uint32_t frame, std::vector<uint8_t> &out, uint32_t &rawsize, std::vector<uint8_t> &state, RBResyncInfo &h) {
+    if (!INPUTNET_SnapshotState(state)) return false;
+    h.frame = frame;
+    h.tick = rb_tick;
+    h.epoch = (uint16_t)(rb_epoch + 1u);
+    h.vfps = vga_fps;
+    h.vbase = vga_mode_time_base;
+    h.vframes = (int32_t)vga_mode_frames_since_time_base;
+    std::vector<uint8_t> raw;
+    RB_PutResyncInfo(raw, h);
+    raw.insert(raw.end(), state.begin(), state.end());
+    rawsize = (uint32_t)raw.size();
+    uLongf clen = compressBound((uLong)raw.size());
+    out.resize(clen);
+    if (compress2(&out[0], &clen, &raw[0], (uLong)raw.size(), 1) != Z_OK) return false;
+    out.resize(clen);
+    return true;
+}
+
+static uint32_t rb_resync_acked_by[INPUTNET_MAX_PEERS];   /* server: chunks each participant acknowledged */
+
+/* Server: the resync's blob to every participant, each at its own pace. "joined" and "left" tell the clients who plays
+ * from this frame on (a cluster's joins and leaves). */
+static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint32_t rawsize, const std::vector<uint8_t> &joined, const std::vector<uint8_t> &left) {
+    const uint32_t id = (uint32_t)(GetTicks() ^ (frame * 2654435761u)) | 1u;
+    const uint32_t nchunks = (uint32_t)((blob.size() + RB_RESYNC_CHUNK - 1u) / RB_RESYNC_CHUNK);
+    bool to[INPUTNET_MAX_PEERS];
+    uint32_t next[INPUTNET_MAX_PEERS], lastsend[INPUTNET_MAX_PEERS], seen[INPUTNET_MAX_PEERS], progress[INPUTNET_MAX_PEERS];
+    unsigned n = 0;
+    const uint32_t t0 = GetTicks();
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        to[i] = p.active && p.ready && !p.local;
+        next[i] = 0; lastsend[i] = 0; seen[i] = 0; progress[i] = t0;
+        rb_resync_acked_by[i] = 0;
+        if (to[i]) n++;
+    }
+    rb_resync_acked = 0;
+    LOG_MSG("INPUTNET: resync: sending frame %u to %u participant(s), %u KB (%u KB before compression)",
+        (unsigned)frame, n, (unsigned)(blob.size() / 1024u), (unsigned)(rawsize / 1024u));
+    uint8_t hb[64];
+    InputNetWriter hw(hb, sizeof(hb));
+    INPUTNET_BeginPacket(hw, INPKT_RESYNC);
+    hw.u8(1); hw.u32(id); hw.u32(frame); hw.u32((uint32_t)blob.size()); hw.u32(rawsize);
+    hw.u8((uint8_t)joined.size());
+    for (size_t j = 0; j < joined.size(); j++) hw.u8(joined[j]);
+    hw.u8((uint8_t)left.size());
+    for (size_t j = 0; j < left.size(); j++) hw.u8(left[j]);
+    inputnet_accepting = true;      /* (no join meanwhile) */
+    uint32_t last_events = t0;
+    for (;;) {
+        if (!inputnet_session) { inputnet_accepting = false; return false; }
+        bool done = true;
+        const uint32_t now = GetTicks();
+        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+            if (!to[i]) continue;
+            InputNetPeer &p = inputnet_peers[i];
+            if (!p.active) { to[i] = false; continue; }
+            const uint32_t acked = std::min(rb_resync_acked_by[i], nchunks);
+            if (acked >= nchunks) continue;
+            done = false;
+            if (acked > seen[i]) { seen[i] = acked; progress[i] = now; }
+            if (now - progress[i] > 30000u) {
+                LOG_MSG("INPUTNET: resync: \"%s\" took nothing for 30 seconds", p.name.c_str());
+                to[i] = false;
+                if (rbc_copies) RBC_ServerDrop(i, "did not take the machines");
+                continue;
+            }
+            if (lastsend[i] == 0 || now - lastsend[i] > 300u) {     /* (again) from what it has */
+                next[i] = acked;
+                lastsend[i] = now ? now : 1u;
+                if (acked == 0) INPUTNET_SendRaw(p.addr, hb, hw.size());
+            }
+            if (next[i] < acked) next[i] = acked;
+            while (next[i] < nchunks && next[i] < acked + 256u) {
+                const size_t off = (size_t)next[i] * RB_RESYNC_CHUNK;
+                const size_t len = std::min((size_t)RB_RESYNC_CHUNK, blob.size() - off);
+                uint8_t cb[RB_RESYNC_CHUNK + 48];
+                InputNetWriter w(cb, sizeof(cb));
+                INPUTNET_BeginPacket(w, INPKT_RESYNC);
+                w.u8(2); w.u32(id); w.u32(next[i]); w.u16((uint16_t)len); w.bytes(&blob[off], len);
+                INPUTNET_SendRaw(p.addr, cb, w.size());
+                next[i]++;
+            }
+        }
+        if (done) break;
+        INPUTNET_PollSocket();
+        if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
+        SDL_Delay(1);
+    }
+    inputnet_accepting = false;
+    rb_stat_resyncs++;
+    LOG_MSG("INPUTNET: resync: frame %u sent in %u ms", (unsigned)frame, (unsigned)(GetTicks() - t0));
+    return true;
+}
+
+/* Server, at a real-time frame start: send our state to the clients. Returns false if a correction came first. */
+static bool RB_ServerResync(uint32_t frame) {
+    /* this frame start is final once every input before it is here */
+    uint32_t start = GetTicks(), last_events = start;
+    while (RB_MinHave() < frame) {
+        if (!inputnet_session) return false;
+        if ((GetTicks() - start) > inputnet_timeout) { LOG_MSG("INPUTNET: resync: no input from the client(s)"); return false; }
+        INPUTNET_Stall(last_events);
+        INPUTNET_PollSocket();
+        const uint32_t g = RB_FindMisprediction(frame);
+        if (g != UINT32_MAX) {                  /* correct it first; try again when the replay is done */
+            if (RB_Rollback(g, frame)) { rb_late.clear(); rb_pending_wrong = UINT32_MAX; }
+            else rb_pending_wrong = std::min(rb_pending_wrong, g);
+            return false;
+        }
+    }
+    std::vector<uint8_t> blob, state;
+    uint32_t rawsize = 0;
+    std::vector<uint8_t> joined, left;
+    if (rbc_copies) {
+        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
+            if (rbs_joining[i] && rbs_wants[i] && inputnet_peers[i].active) joined.push_back((uint8_t)i);
+        std::vector<uint8_t> raw;
+        if (!RBC_BuildMachines(frame, (uint16_t)(rb_epoch + 1u), raw)) {
+            LOG_MSG("INPUTNET: resync: cannot save the cluster's machines at frame %u",(unsigned)frame);
+            return false;
+        }
+        left.swap(rbs_left);
+        rawsize = (uint32_t)raw.size();
+        uLongf clen = compressBound((uLong)raw.size());
+        blob.resize(clen);
+        if (compress2(&blob[0], &clen, &raw[0], (uLong)raw.size(), 1) != Z_OK) return false;
+        blob.resize(clen);
+        for (size_t j = 0; j < joined.size(); j++) {   /* in the session from this frame on */
+            const unsigned i = joined[j];
+            InputNetPeer &p = inputnet_peers[i];
+            p.ready = true;
+            p.lastheard = GetTicks();
+            rbs_joining[i] = false; rbs_wants[i] = false;
+            rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame;
+            rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_rtt[i] = 0;
+            for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
+            for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+            LOG_MSG("INPUTNET: \"%s\" plays copy %u from frame %u", p.name.c_str(), i + 1u, (unsigned)frame);
+        }
+    }
+    else {
+        RBResyncInfo info;
+        if (!RB_BuildResyncBlob(frame, blob, rawsize, state, info)) { LOG_MSG("INPUTNET: resync: cannot save the machine at frame %u",(unsigned)frame); return false; }
+        if (!RB_LoadResyncState(info, state)) { LOG_MSG("INPUTNET: resync: cannot load our own state of frame %u",(unsigned)frame); return false; }
+    }
+    return RB_SendResync(frame, blob, rawsize, joined, left);
+}
+
+/* Client: load the server's machine at "frame", then replay to where real time is. */
+static bool RB_ApplyResyncBlob(const std::vector<uint8_t> &comp, uint32_t rawsize) {
+    std::vector<uint8_t> raw(rawsize);
+    uLongf rlen = rawsize;
+    if (rawsize == 0 || uncompress(&raw[0], &rlen, &comp[0], (uLong)comp.size()) != Z_OK || rlen != rawsize) return false;
+    RBResyncInfo h;
+    if (!RB_GetResyncInfo(raw, h)) return false;
+    const std::vector<uint8_t> state(raw.begin() + RB_RESYNC_INFO_SIZE, raw.end());
+    if (!RB_LoadResyncState(h, state)) return false;
+    rb_desynced = false;
+    rb_stat_resyncs++;
+
+    const uint32_t frame = h.frame;
+    if (rb_realframe > frame) {     /* replay to real time with the input we have */
+        const uint32_t depth = rb_realframe - frame;
+        inputnet_rollback_resim = true;
+        rb_target = rb_realframe;
+        MIXER_SetRollbackDiscard(true);
+        DOSBOX_AddTicksRemain(depth * inputnet_frame_ms);
+    }
+    else rb_realframe = frame;
+    RB_ApplyInputs(frame);
+    LOG_MSG("INPUTNET: resync: took the server's state at frame %u over",(unsigned)frame);
+    return true;
+}
+
+/* Client (cluster): every copy takes the server's machine over (RBC_ApplyMachines), then the frames replay to real
+ * time. A joining computer plays from here on. */
+static bool RB_ApplyClusterResync(uint32_t frame) {
+    const bool joining = rb_joining;
+    if (!RBC_ApplyMachines(frame, joining)) return false;
+    const uint32_t r0 = inputnet_frame;     /* the frame the machines are at (RB_LoadResyncState) */
+    if (joining) rb_realframe = r0;         /* (our own count was a guess; RB_TimeSync does the rest) */
+    rb_desynced = false;
+    rb_stat_resyncs++;
+    if (joining) {
+        rb_joining = false;
+        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+            InputNetPeer &p = inputnet_peers[i];
+            if (!p.active || p.local) continue;
+            if (rb_have[i] < r0) rb_have[i] = r0;
+            while (INPUTNET_FrameSlotIfValid(p, rb_have[i]) != NULL) rb_have[i]++;
+            rb_acked[i] = r0;
+        }
+        inputnet_local_confirmed = r0;
+        if (rbc_copies >= 2) LOG_MSG("INPUTNET: joined: playing copy %u from frame %u", rbc_copy + 1u, (unsigned)r0);
+        else LOG_MSG("INPUTNET: joined: playing as player %u from frame %u", (unsigned)inputnet_selfid + 1u, (unsigned)r0);
+    }
+    if (rb_realframe > r0) {
+        inputnet_rollback_resim = true;
+        rb_target = rb_realframe;
+        MIXER_SetRollbackDiscard(true);
+        DOSBOX_AddTicksRemain((rb_realframe - r0) * inputnet_frame_ms);
+    }
+    else rb_realframe = r0;
+    RB_ApplyInputs(r0);
+    LOG_MSG("INPUTNET: resync: took the server's machines over at frame %u", (unsigned)r0);
+    return true;
+}
+
+static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned peerid) {
+    const uint8_t sub = r.u8();
+    if (r.bad()) return;
+    if (sub == 0) {                 /* request from a client (a cluster's joining computer: it is ready for the machines) */
+        if (!inputnet_is_server) return;
+        const bool join = r.remain() >= 1 && r.u8() == 1;
+        if (rbc_copies) {
+            InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            const bool joining = p != NULL && rbs_joining[p - inputnet_peers];
+            if (join && !joining) return;   /* in already: a repeat of its request to join */
+            if (joining) rbs_wants[p - inputnet_peers] = true;
+        }
+        rb_resync_wanted = true;
+        return;
+    }
+    if (sub == 3) {                 /* acknowledgement */
+        if (!inputnet_is_server) return;
+        r.u32();
+        const uint32_t count = r.u32();
+        if (r.bad()) return;
+        if (count > rb_resync_acked) rb_resync_acked = count;
+        if (peerid < INPUTNET_MAX_PEERS && count > rb_resync_acked_by[peerid]) rb_resync_acked_by[peerid] = count;
+        return;
+    }
+    if (inputnet_is_server) return;
+    if (sub == 1) {                 /* header: receive everything now */
+        const uint32_t id = r.u32(), frame = r.u32(), total = r.u32(), rawsize = r.u32();
+        if (r.bad() || total == 0 || total > (256u << 20) || rawsize > (1024u << 20)) return;
+        if (id == rb_resync_id) return;     /* a repeated header of a transfer we already have */
+        std::vector<uint8_t> joined, left;  /* who plays from this frame on */
+        if (r.remain() >= 1) { const unsigned nj = r.u8(); for (unsigned j = 0; j < nj; j++) joined.push_back(r.u8()); }
+        if (r.remain() >= 1) { const unsigned nl = r.u8(); for (unsigned j = 0; j < nl; j++) left.push_back(r.u8()); }
+        if (r.bad()) return;
+        for (size_t j = 0; j < joined.size(); j++) {
+            const unsigned i = joined[j];
+            if (i >= INPUTNET_MAX_PEERS || i == inputnet_selfid) continue;
+            InputNetPeer &p = inputnet_peers[i];
+            p.active = true; p.ready = true; p.local = false; p.addr = inputnet_server_addr; p.lastheard = GetTicks();
+            p.resetFrames();
+            rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame; rb_peerframe_at[i] = 0; rb_rtt[i] = 0;
+            for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
+            for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+            LOG_MSG("INPUTNET: player %u joins at frame %u", i + 1u, (unsigned)frame);
+        }
+        for (size_t j = 0; j < left.size(); j++) {
+            const unsigned i = left[j];
+            if (i >= INPUTNET_MAX_PEERS || i == inputnet_selfid) continue;
+            inputnet_peers[i].active = false; inputnet_peers[i].ready = false; inputnet_peers[i].resetFrames();
+            LOG_MSG("INPUTNET: player %u left at frame %u", i + 1u, (unsigned)frame);
+        }
+        rb_resync_id = id;
+        rb_resync_frame = frame;
+        rb_resync_total = total;
+        rb_resync_buf.assign(total, 0);
+        const uint32_t nchunks = (total + RB_RESYNC_CHUNK - 1u) / RB_RESYNC_CHUNK;
+        rb_resync_have.assign(nchunks, false);
+        rb_resync_got = 0;
+        uint32_t contiguous = 0;
+        const uint32_t start = GetTicks();
+        uint32_t last_events = start, lastack = 0;
+        while (contiguous < nchunks) {
+            if (!inputnet_link_up || (GetTicks() - start) > 30000u) { LOG_MSG("INPUTNET: resync: transfer failed"); rb_resync_id = 0; return; }
+            INPUTNET_PollSocket();              /* chunks land in rb_resync_buf (sub == 2 below) */
+            while (contiguous < nchunks && rb_resync_have[contiguous]) contiguous++;
+            if ((GetTicks() - lastack) >= 20u) { RB_SendResyncAck(id, contiguous); lastack = GetTicks(); }
+            INPUTNET_Stall(last_events);
+        }
+        RB_SendResyncAck(id, contiguous);
+        RB_SendResyncAck(id, contiguous);
+        /* loaded at the next frame start where the host's stack is as it was at the one before (RB_FrameBoundary) */
+        rb_resync_ready.swap(rb_resync_buf);
+        rb_resync_ready_raw = rawsize;
+        std::vector<uint8_t>().swap(rb_resync_buf);
+        if (rbc_copies) {           /* (the copies' DOS prompt flags say where it can be loaded) */
+            rbc_resync_raw.assign(rawsize, 0);
+            uLongf rlen = rawsize;
+            if (rawsize == 0 || uncompress(&rbc_resync_raw[0], &rlen, &rb_resync_ready[0], (uLong)rb_resync_ready.size()) != Z_OK || rlen != rawsize) {
+                LOG_MSG("INPUTNET: resync: the server's machines did not unpack");
+                std::vector<uint8_t>().swap(rbc_resync_raw);
+                std::vector<uint8_t>().swap(rb_resync_ready);
+                return;
+            }
+            RBC_NoteMachines();
+        }
+        return;
+    }
+    if (sub == 2) {                 /* chunk */
+        const uint32_t id = r.u32(), index = r.u32();
+        const unsigned len = r.u16();
+        const uint8_t *data = r.bytes(len);
+        if (r.bad() || data == NULL || id != rb_resync_id || index >= rb_resync_have.size()) return;
+        const size_t off = (size_t)index * RB_RESYNC_CHUNK;
+        if (off + len > rb_resync_buf.size() || rb_resync_have[index]) return;
+        memcpy(&rb_resync_buf[off], data, len);
+        rb_resync_have[index] = true;
+        rb_resync_got++;
+    }
+}
+
+
+/* Self-test (NN_RB_SELFTEST=<period>): every <period> frames, put the machine back a few frames whose input is all
+ * known and replay them; every replayed frame start must equal the original one, or some state is missing from the
+ * snapshot. Logs which part differs. */
+static uint32_t rb_selftest_period = 0, rb_selftest_end = 0, rb_selftest_first = 0;
+static uint64_t rb_selftest_hash[RB_RING];
+static uint64_t rb_selftest_mem[RB_RING];
+static std::string rb_selftest_dev[RB_RING];
+static uint32_t rb_selftest_regs[RB_RING][12];
+static uint32_t rb_selftest_fails = 0, rb_selftest_runs = 0;
+
+static void RB_SelfTestRegs(uint32_t *out) {
+    for (unsigned i = 0; i < 8; i++) out[i] = cpu_regs.regs[i].dword[0];
+    out[8] = cpu_regs.ip.dword[0]; out[9] = (uint32_t)cpu_regs.flags; out[10] = (uint32_t)Segs.val[cs]; out[11] = (uint32_t)PIC_Ticks;
+}
+
+extern void POD_Save_Adlib(std::ostream& stream);
+extern void POD_Save_Disney(std::ostream& stream);
+extern void POD_Save_Gameblaster(std::ostream& stream);
+extern void POD_Save_GUS(std::ostream& stream);
+extern void POD_Save_MPU401(std::ostream& stream);
+extern void POD_Save_PCSpeaker(std::ostream& stream);
+extern void POD_Save_Sblaster(std::ostream& stream);
+extern void POD_Save_Tandy_Sound(std::ostream& stream);
+
+static size_t rb_mixerpart_start = 0;
+/* Which sound device a byte of the mixer component belongs to (self-test reports); rb_mixerpart_start = its start. */
+static const char *RB_MixerPart(size_t at) {
+    static const char *names[] = { "Adlib", "Disney", "Gameblaster", "GUS", "MPU401", "PCSpeaker", "Sblaster", "Tandy" };
+    void (*savers[])(std::ostream&) = { POD_Save_Adlib, POD_Save_Disney, POD_Save_Gameblaster, POD_Save_GUS,
+        POD_Save_MPU401, POD_Save_PCSpeaker, POD_Save_Sblaster, POD_Save_Tandy_Sound };
+    savestate_lean = true;
+    size_t pos = 0;
+    const char *found = "?";
+    for (unsigned i = 0; i < 8; i++) {
+        std::ostringstream os;
+        savers[i](os);
+        const size_t len = os.str().size();
+        if (at >= pos && at < pos + len && found[0] == '?') { found = names[i]; rb_mixerpart_start = pos; }
+        pos += len;
+    }
+    savestate_lean = false;
+    return found;
+}
+
+static void RB_SelfTestCompare(uint32_t frame) {
+    const unsigned k = frame % RB_RING;
+    const RBSnap &s = rb_snap[k];
+    if (s.hash == rb_selftest_hash[k]) return;
+    rb_selftest_fails++;
+    uint32_t regs[12]; RB_SelfTestRegs(regs);
+    LOG_MSG("RBSELFTEST frame %u differs after replay: memory %s, cs:eip %04x:%08x (was %04x:%08x), eax %08x (was %08x), pic %u (was %u)",
+        (unsigned)frame, s.hash == rb_selftest_hash[k] ? "same" : ((rb_memhash == rb_selftest_mem[k]) ? "same" : "DIFFERS"),
+        regs[10], regs[8], rb_selftest_regs[k][10], rb_selftest_regs[k][8], regs[0], rb_selftest_regs[k][0], regs[11], rb_selftest_regs[k][11]);
+    /* the components, in saveLean order: length-prefixed blobs */
+    const std::string &x = rb_selftest_dev[k], &y = s.devices;
+    size_t px = 0, py = 0; unsigned idx = 0;
+    while (px + 4 <= x.size() && py + 4 <= y.size()) {
+        uint32_t lx, ly; memcpy(&lx, x.data() + px, 4); memcpy(&ly, y.data() + py, 4);
+        px += 4; py += 4;
+        if (lx != ly || memcmp(x.data() + px, y.data() + py, lx) != 0) {
+            size_t first = 0;
+            while (first < lx && first < ly && x[px + first] == y[py + first]) first++;
+            LOG_MSG("RBSELFTEST   component #%u differs (%u/%u bytes), first at byte %u%s%s", idx, (unsigned)lx, (unsigned)ly, (unsigned)first,
+                idx == 12 ? ", in " : "", idx == 12 ? RB_MixerPart(first) : "");
+            if (idx != 12) {
+                unsigned shown = 0;
+                for (size_t b = first; b < lx && b < ly && shown < 16; b++)
+                    if (x[px + b] != y[py + b]) {
+                        LOG_MSG("RBSELFTEST     byte %u: %02x -> %02x", (unsigned)b, (uint8_t)x[px + b], (uint8_t)y[py + b]);
+                        shown++;
+                    }
+            }
+            if (idx == 12 && strcmp(RB_MixerPart(first), "Sblaster") == 0) {
+                /* every differing byte of the Sound Blaster struct (after its 32 byte name) */
+                const size_t base = rb_mixerpart_start + 32u;
+                unsigned shown = 0;
+                for (size_t b = base; b < lx && b < ly && shown < 12; b++)
+                    if (x[px + b] != y[py + b]) {
+                        LOG_MSG("RBSELFTEST     SB_INFO+%u: %02x -> %02x", (unsigned)(b - base), (uint8_t)x[px + b], (uint8_t)y[py + b]);
+                        shown++;
+                    }
+            }
+        }
+        px += lx; py += ly; idx++;
+    }
+}
+
+/* Input that contradicts a prediction but lies beyond what a rollback can reach (too old, or before a change of the
+ * host's context): it is applied now, late, so no key press or release is lost, and the machines are then made equal
+ * again from the server's state (the server sends it; a client asks for it). */
+static void RB_Unreachable(void) {
+    LOG_MSG("INPUTNET: input for %u earlier frame(s) arrived too late to roll back; applying it now",(unsigned)rb_late.size());
+    for (size_t k = 0; k < rb_late.size(); k++) {
+        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(inputnet_peers[rb_late[k].peer], rb_late[k].frame);
+        if (slot != NULL)
+            for (size_t e = 0; e < slot->events.size(); e++) INPUTNET_ApplyEvent(slot->events[e]);
+    }
+    rb_late.clear();
+    if (inputnet_is_server) rb_resync_wanted = true;
+    else { rb_desynced = true; rb_resync_last_sent = 0; }
+}
+
+/* Server: type "text" and Enter as this machine's input, one key a frame from the next frame our input can go into, so
+ * that every machine in the session gets the same key presses at the same frames. */
+static void RB_QueueTyping(const std::string &text) {
+    InputNetPeer &self = inputnet_peers[inputnet_selfid];
+    uint32_t f = INPUTNET_ScheduleFrame();
+    std::vector<std::vector<InputNetEvent> > frames;
+    RB_TypingFrames(text, frames);
+    for (size_t i = 0; i < frames.size(); i++) {
+        InputNetFrame &slot = INPUTNET_FrameSlot(self, f++);
+        slot.events.insert(slot.events.end(), frames[i].begin(), frames[i].end());
+    }
+}
+
+static unsigned int RB_Participants(void) {
+    unsigned int n = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
+        if (inputnet_peers[i].active && inputnet_peers[i].ready) n++;
+    return n;
+}
+
+
+/* Corrects frames that ran with a wrong guess (found now, or earlier and kept): true when a replay starts. A frame start
+ * inside a nested loop of a moment has nothing to go back to; the correction then waits for the next frame start while
+ * the frame is still in the window. Input beyond reach is applied late (RB_Unreachable). */
+static bool RB_Correct(uint32_t frame) {
+    const uint32_t found = RB_FindMisprediction(frame);
+    const uint32_t g = std::min(found, rb_pending_wrong);
+    if (g == UINT32_MAX) return false;
+    if (RB_Rollback(g, frame)) { rb_pending_wrong = UINT32_MAX; rb_late.clear(); return true; }
+    const uint32_t lowest = (frame > inputnet_rbwindow) ? frame - inputnet_rbwindow : 0;
+    if (g > lowest + 1u && RB_RestorableAtOrBefore(g, lowest) == UINT32_MAX) {
+        rb_pending_wrong = g;       /* try again at the next frame start */
+        return false;
+    }
+    rb_pending_wrong = UINT32_MAX;
+    RB_Unreachable();
+    return false;
+}
+
+/* A frame starts: save it, correct earlier frames if needed, then run it. */
+static void RB_FrameBoundary(uint32_t frame) {
+    inputnet_frame = frame;
+    RB_Capture(frame);
+    if (rbc_copies && rbc_leader && !RBC_LeaderBarrier(frame, RBC_ROUTE)) return;   /* every copy at this frame start */
+    if (rb_selftest_end != 0 && frame <= rb_selftest_end) {
+        if (frame >= rb_selftest_first) RB_SelfTestCompare(frame);   /* (a replay may start before the frames recorded) */
+        if (frame == rb_selftest_end) rb_selftest_end = 0;
+    }
+
+    if (inputnet_rollback_resim) {
+        if (frame < rb_target) { RB_ApplyInputs(frame); return; }
+        inputnet_rollback_resim = false;    /* caught up with real time */
+        MIXER_SetRollbackDiscard(false);
+        extern void RENDER_RedrawAll(void);
+        RENDER_RedrawAll();                 /* nothing of the replayed frames was shown */
+        if (rb_replay_started) {
+            const uint64_t us = RB_MicroTicks() - rb_replay_started;
+            rb_stat_replay_us += us; rb_stat_replays++;
+            if (us > rb_stat_replay_max_us) rb_stat_replay_max_us = us;
+            rb_replay_started = 0;
+        }
+    }
+    rb_realframe = frame;
+
+    INPUTNET_PollSocket();
+    if (!inputnet_session || !inputnet_rollback_active) return;
+    if (rbc_copies) {
+        if (!rb_resync_ready.empty() && !rbc_resync_raw.empty() && RBC_CanApplyMachines(frame)) {
+            /* client: the server's machines, loaded where every copy's host stack is steady */
+            if (RB_ApplyClusterResync(frame)) rb_resync_applied = true;
+            else LOG_MSG("INPUTNET: resync: could not load the server's machines");
+            std::vector<uint8_t>().swap(rb_resync_ready);
+            std::vector<uint8_t>().swap(rbc_resync_raw);
+        }
+        if (rb_resync_applied) { rb_resync_applied = false; return; }
+        if (rb_joining) {           /* not playing yet: our copies get to where they can take the machines over */
+            RBC_JoinStep(frame);
+            RB_TimeSync(frame);
+            RBC_ApplyInputs(frame);
+            return;
+        }
+    }
+    else if (!rb_resync_ready.empty() && frame > 0 && rb_snap[(frame - 1u) % RB_RING].valid &&
+        rb_snap[(frame - 1u) % RB_RING].frame == frame - 1u && rb_snap[(frame - 1u) % RB_RING].context == RB_HostContext()) {
+        /* client: the server's state, loaded where the host's stack is steady */
+        if (RB_ApplyResyncBlob(rb_resync_ready, rb_resync_ready_raw)) rb_resync_applied = true;
+        else LOG_MSG("INPUTNET: resync: could not load the server's state");
+        std::vector<uint8_t>().swap(rb_resync_ready);
+    }
+    if (rb_resync_applied) { rb_resync_applied = false; return; }   /* now replaying from the server's state */
+
+    if (rb_desynced) {
+        /* client: until the server's state arrives, keep asking for it */
+        if (!inputnet_is_server && (GetTicks() - rb_resync_last_sent) > 500u) {
+            uint8_t buf[32];
+            InputNetWriter w(buf,sizeof(buf));
+            INPUTNET_BeginPacket(w,INPKT_RESYNC);
+            w.u32(0);   /* request */
+            INPUTNET_SendToPeers(buf,w.size());
+            rb_resync_last_sent = GetTicks();
+        }
+    }
+
+    RB_UpdateLockstep(frame);
+    if (RB_Correct(frame)) return;          /* the main loop now replays the frames at full speed */
+
+    if (!RB_WaitForWindow(frame)) return;
+    if (rb_resync_applied) { rb_resync_applied = false; return; }
+    if (RB_Correct(frame)) return;          /* input that arrived while waiting */
+
+    {
+        static const char *fr = getenv("NN_RB_FORCE_RESYNC");   /* debugging: the server sends its state at this frame */
+        if (fr != NULL && *fr && inputnet_is_server && frame == (uint32_t)strtoul(fr, NULL, 10)) rb_resync_wanted = true;
+    }
+    /* (only where the host's stack is as it was at the last frame start: a state saved inside a nested loop of a
+     * moment, a BIOS call DOS makes for the console, cannot be loaded by a machine that is not inside the same call) */
+    if (rbc_copies && inputnet_is_server) RBC_ServerFiles();    /* a joining computer's file request */
+    const bool rb_stable = frame > 0 && rb_snap[(frame - 1u) % RB_RING].valid && rb_snap[(frame - 1u) % RB_RING].frame == frame - 1u &&
+        rb_snap[(frame - 1u) % RB_RING].context == RB_HostContext() && rb_pending_wrong == UINT32_MAX &&
+        (!rbc_copies || RBC_AllStable(frame));
+    if (inputnet_is_server && rb_resync_wanted && rb_stable && RB_ServerResync(frame)) rb_resync_wanted = false;
+    if (inputnet_rollback_resim) return;    /* a correction came first: send our state after the replay */
+
+    {
+        static const char *st = getenv("NN_RB_SELFTEST");
+        static uint32_t last_test = 0;
+        if (st != NULL && *st && rb_selftest_period == 0) rb_selftest_period = (uint32_t)std::max(5ul, strtoul(st, NULL, 10));
+        const uint32_t depth = 4;
+        if (rb_selftest_period && !rb_lockstep && frame > 20u && (frame % rb_selftest_period) == 0 &&
+            rb_selftest_end == 0 && frame != last_test) {
+            last_test = frame;
+            rb_selftest_first = frame - depth + 1u;
+            for (uint32_t f = frame - depth + 1u; f <= frame; f++) {
+                const unsigned k = f % RB_RING;
+                rb_selftest_hash[k] = rb_snap[k].hash;
+                rb_selftest_dev[k] = rb_snap[k].devices;
+            }
+            /* registers and memory hash of the newest frame are the live ones now */
+            RB_SelfTestRegs(rb_selftest_regs[frame % RB_RING]);
+            rb_selftest_mem[frame % RB_RING] = rb_memhash;
+            rb_selftest_runs++;
+            if (RB_Rollback(frame - depth, frame)) { rb_selftest_end = frame; rb_stat_rollbacks--; return; }
+        }
+        if (rb_selftest_period && (frame % 500u) == 7u)
+            LOG_MSG("RBSELFTEST %u replays, %u frames differed", (unsigned)rb_selftest_runs, (unsigned)rb_selftest_fails);
+    }
+
+    if (inputnet_is_server && !inputnet_rbautorun_done && inputnet_rbplayers > 0 && !inputnet_rbautorun.empty() &&
+        dos_shell_reading_input && RB_Participants() >= inputnet_rbplayers) {
+        inputnet_rbautorun_done = true;
+        LOG_MSG("INPUTNET: %u participants: typing \"%s\"", RB_Participants(), inputnet_rbautorun.c_str());
+        RB_QueueTyping(inputnet_rbautorun);
+    }
+    RB_SendInput(frame);
+    if (rb_lockstep) {
+        if (!RB_WaitForInputs(frame)) return;
+        if (rb_resync_applied) { rb_resync_applied = false; return; }
+        if (RB_Correct(frame)) return;
+    }
+    RB_ApplyInputs(frame);
+    RB_TimeSync(frame);
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++)
+            if (rb_peercheck[i][k].valid) RB_CompareCheck(p, i, rb_peercheck[i][k].frame);
+    }
+    RB_LogStats();
+}
+
+void INPUTNET_RollbackTick(void) {
+    if (rbc_copies && !rbc_leader) { RBC_FollowerRollbackTick(); return; }
+    if (!inputnet_rollback_active || !inputnet_session) return;
+    if (!rb_have_first) {
+        rb_have_first = true;
+        rb_tick = rb_start_frame * inputnet_frame_ms;
+        RB_FrameBoundary(rb_start_frame);
+        return;
+    }
+    rb_tick++;
+    if ((rb_tick % inputnet_frame_ms) == 0) RB_FrameBoundary(rb_tick / inputnet_frame_ms);
+    else if (!inputnet_rollback_resim) {
+        INPUTNET_PollSocket();
+        if (rb_resync_applied) rb_resync_applied = false;   /* replaying from the server's state already */
+    }
+}
+
+/* RollbackNet: what makes two machines run differently even from the same state. The joining machine takes the
+ * server's whole state over, but these come from each computer's own build and settings: the precision of the
+ * emulator's timing arithmetic (long double is 80 bits on x86 builds and 64 or 128 on ARM ones), the CPU core and
+ * speed, memory, sound devices (their emulation and how they are driven), the joystick (read from the host). */
+static std::string RB_Fingerprint(void) {
+    std::string fp;
+    char buf[96];
+#if defined(HAS_LONG_DOUBLE)
+    snprintf(buf, sizeof(buf), "timing=%u/%u", (unsigned)LDBL_MANT_DIG, (unsigned)sizeof(Bitu));
+#else
+    snprintf(buf, sizeof(buf), "timing=%u/%u", (unsigned)DBL_MANT_DIG, (unsigned)sizeof(Bitu));
+#endif
+    fp += buf;
+    struct Key { const char *section, *name; };
+    static const Key keys[] = {
+        { "cpu", "core" }, { "cpu", "cputype" }, { "cpu", "cycles" },
+        { "dosbox", "machine" }, { "dosbox", "memsize" },
+        { "sblaster", "sbtype" }, { "sblaster", "sbbase" }, { "sblaster", "irq" }, { "sblaster", "dma" }, { "sblaster", "hdma" },
+        { "sblaster", "oplmode" }, { "sblaster", "oplemu" }, { "sblaster", "force goldplay" },
+        { "gus", "gus" }, { "speaker", "pcspeaker" }, { "speaker", "tandy" }, { "speaker", "disney" },
+        { "joystick", "joysticktype" },
+    };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        Section_prop *sec = static_cast<Section_prop*>(control->GetSection(keys[i].section));
+        if (sec == NULL) continue;
+        Property *prop = sec->Get_prop(keys[i].name);
+        if (prop == NULL) continue;
+        fp += ' ';
+        fp += keys[i].name;
+        fp += '=';
+        fp += prop->GetValue().ToString();
+    }
+    extern Bitu MIXER_GetRate(void);
+    snprintf(buf, sizeof(buf), " mixer=%u", (unsigned)MIXER_GetRate());
+    fp += buf;
+    return fp;
+}
+
+/* The entries of two fingerprints that differ, "name (server: x, here: y)". */
+static std::string RB_FingerprintDiff(const std::string &theirs, const std::string &mine) {
+    auto split = [](const std::string &f) {
+        std::vector<std::pair<std::string, std::string> > out;
+        size_t pos = 0;
+        while (pos < f.size()) {
+            /* entries are "name=value" separated by spaces, but names and values may hold spaces themselves: an entry
+             * ends where the next known name begins, which is good enough for a message */
+            size_t eq = f.find('=', pos);
+            if (eq == std::string::npos) break;
+            size_t next = f.find('=', eq + 1);
+            size_t end = (next == std::string::npos) ? f.size() : f.rfind(' ', next);
+            if (end == std::string::npos || end <= eq) end = f.size();
+            out.push_back(std::make_pair(f.substr(pos, eq - pos), f.substr(eq + 1, end - eq - 1)));
+            pos = (end < f.size()) ? end + 1 : f.size();
+        }
+        return out;
+    };
+    const auto a = split(theirs), b = split(mine);
+    std::string diff;
+    for (size_t i = 0; i < b.size(); i++) {
+        std::string other = "(none)";
+        for (size_t j = 0; j < a.size(); j++) if (a[j].first == b[i].first) other = a[j].second;
+        if (other == b[i].second) continue;
+        if (!diff.empty()) diff += ", ";
+        diff += b[i].first + " (server: " + other + ", here: " + b[i].second + ")";
+    }
+    if (diff.empty()) diff = theirs.empty() ? "the server's DOSBox-X has no RollbackNet fingerprint (an older build)" : theirs;
+    return diff;
+}
+
+static void RB_SessionStarted(void) {
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        rb_have[i] = 0; rb_checked[i] = 0; rb_acked[i] = 0;
+        rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_peerstamp[i] = 0; rb_peerstamp_at[i] = 0; rb_rtt[i] = 0;
+        for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
+        for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+    }
+    RB_InitRegions();
+    rb_have_first = false;
+    rb_target = 0;
+    rb_realframe = 0;
+    rb_advantage = 0;
+    rb_last_slowdown = 0;
+    rb_desynced = false;
+    rb_epoch = 0;
+    rb_late.clear();
+    rb_pending_wrong = UINT32_MAX;
+    rb_unrestorable = 0;
+    rb_lockstep = false;
+    rb_lockstep_ctx = RB_HostContext();
+    rb_resync_id = 0;
+    rb_resync_wanted = false;
+    std::vector<uint8_t>().swap(rb_resync_ready);
+    rb_resync_applied = false;
+    rb_stat_rollbacks = rb_stat_replayed = rb_stat_maxdepth = rb_stat_slowdowns = 0;
+    rb_stat_stalls = rb_stat_checks = rb_stat_desyncs = rb_stat_resyncs = 0;
+    rb_stat_capture_us = rb_stat_captures = rb_stat_pages = 0;
+    rb_stat_last_log = GetTicks();
+    inputnet_rollback_resim = false;
+    MIXER_SetRollbackDiscard(false);
+    inputnet_rollback_active = true;
+    LOG_MSG("INPUTNET: RollbackNet running: %u ms frames, %u frame local delay, %u frame window, RAM %lu KB, video memory %lu KB",
+        inputnet_frame_ms,inputnet_delay,inputnet_rbwindow,
+        (unsigned long)(rb_region[0].pages * 4u),(unsigned long)(rb_region[1].pages * 4u));
+    if (rbc_copies && rbc_leader) RBC_LeaderStart(rb_start_frame, rb_joining);
+}
+
+static void RB_SessionEnded(void) {
+    if (rbc_copies && rbc_leader && inputnet_rollback_active) RBC_LeaderEnd();
+    rb_joining = false;
+    if (inputnet_rollback_active) {
+        LOG_MSG("INPUTNET: RollbackNet ended at frame %u: %u rollbacks, %u frames replayed, %u desyncs, %u resyncs",
+            (unsigned)rb_realframe,(unsigned)rb_stat_rollbacks,(unsigned)rb_stat_replayed,(unsigned)rb_stat_desyncs,(unsigned)rb_stat_resyncs);
+    }
+    inputnet_rollback_active = false;
+    inputnet_rollback_resim = false;
+    MIXER_SetRollbackDiscard(false);
+    for (unsigned i = 0; i < RB_RING; i++) {
+        rb_snap[i].valid = false;
+        std::string().swap(rb_snap[i].devices);
+        std::vector<uint8_t>().swap(rb_snap[i].undo_data);
+    }
+    for (unsigned r = 0; r < 2; r++) { std::vector<uint8_t>().swap(rb_region[r].shadow); rb_region[r].hash.clear(); }
+    extern void LEAN_FreeRetiredFiles(void);
+    LEAN_FreeRetiredFiles();
+    RBT_Stop();
+    RB_UnmapReceivedFiles();
+    rb_late.clear();
+    rb_lockstep = false;
+}
+
+
+/* ------------------------------------------------------------------------- */
 /* Public status                                                              */
 /* ------------------------------------------------------------------------- */
 
 bool INPUTNET_IsServer(void) { return inputnet_is_server && inputnet_link_up; }
-bool INPUTNET_IsConnected(void) { return inputnet_link_up; }
+/* (a cluster's copy is one of the session's machines from the start, the followers without a link of their own: they
+ * report the same fixed file times, disk and clock as the others: drive_local.cpp, cmos.cpp) */
+bool INPUTNET_IsConnected(void) { return inputnet_link_up || rbc_copies != 0; }
 
 /* ------------------------------------------------------------------------- */
 /* INPUTNET.COM                                                               */
@@ -2411,8 +6364,37 @@ public:
         v = section->Get_int("frame");
         inputnet_frame_ms = (unsigned int)((v >= 1 && v <= 100) ? v : 10);
 
+        inputnet_rollback = std::string(section->Get_string("mode")) == "rollback";
+
         v = section->Get_int("delay");
-        inputnet_delay = (unsigned int)((v >= 1 && v <= 64) ? v : 3);
+        if (inputnet_rollback) inputnet_delay = (unsigned int)((v >= 0 && v <= 8) ? v : 0);
+        else inputnet_delay = (unsigned int)((v >= 1 && v <= 64) ? v : 3);
+
+        v = section->Get_int("rollback window");
+        inputnet_rbwindow = (unsigned int)((v >= 2 && v <= 48) ? v : 16);
+        v = section->Get_int("players");
+        inputnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)INPUTNET_MAX_PEERS) ? v : 0);
+        inputnet_rbautorun = section->Get_string("autorun");
+        inputnet_rbautorun_done = false;
+        /* RollbackNet runs a "cluster" of copies on every computer: one (the game itself, every player's input to it), or
+         * one per player for IPX/NullModem-over-RollbackNet. Either way the host's session runs from the start and
+         * others join it, before or during the game (RBC_ServerHello). */
+        v = section->Get_int("cluster");
+        rbc_copies = 0; rbc_copy = 0; rbc_leader = false; rbc_port = 0;
+        if (inputnet_rollback) {
+            rbc_copies = (v >= 2 && v <= (int)INPUTNET_MAX_PEERS) ? (unsigned int)v : 1u;
+            if (rbc_copies >= 2) {
+                v = section->Get_int("cluster copy");
+                rbc_copy = (v >= 0 && v < (int)rbc_copies) ? (unsigned int)v : 0u;
+                rbc_leader = std::string(section->Get_string("cluster role")) == "leader";
+                v = section->Get_int("cluster port");
+                rbc_port = (v > 0 && v < 65536) ? (unsigned int)v : 0u;
+                if (rbc_port == 0) { LOG_MSG("INPUTNET: cluster: no \"cluster port\" set, so one copy"); rbc_copies = 1; rbc_copy = 0; }
+                else LOG_MSG("INPUTNET: cluster of %u copies: this is player %u's, the %s (port %u)", rbc_copies, rbc_copy + 1u,
+                    rbc_leader ? "leader" : "follower", rbc_port);
+            }
+            if (rbc_copies == 1) rbc_leader = true;
+        }
 
         v = section->Get_int("redundancy");
         inputnet_redundancy = (unsigned int)((v >= 1 && v <= 32) ? v : 4);
@@ -2460,7 +6442,7 @@ public:
 
         /* Remote play: only this machine runs the game; joining players watch
          * its picture and send their input (see remoteplay.cpp). */
-        inputnet_remote = std::string(section->Get_string("mode")) != "lockstep";
+        inputnet_remote = std::string(section->Get_string("mode")) == "remote";
         if (inputnet_remote) {
             REMOTEPLAY_Configure(section);
             addinputnet = true;
@@ -2540,6 +6522,7 @@ bool INPUTNET_InterceptMouseWheel(int32_t) { return false; }
 
 bool INPUTNET_IsServer(void) { return false; }
 bool INPUTNET_IsConnected(void) { return false; }
+void INPUTNET_RollbackTick(void) { }
 
 void INPUTNET_ShutDown(Section *) { }
 void INPUTNET_Setup(Section *) { }

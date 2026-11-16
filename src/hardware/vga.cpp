@@ -2294,7 +2294,8 @@ private:
 		// freshly-loaded VGA registers. The serialised drawline_idx enum covers only 14 of ~46
 		// variants and the load-side switch has no default, so without this the renderer can be
 		// left pointing at a stale function (mode 13h → vertical colour bands).
-		VGA_SetupDrawing(0);
+		/* a RollbackNet snapshot restores the drawing state exactly as it was, mid-frame: no re-derivation */
+		if (!savestate_lean) VGA_SetupDrawing(0);
 	}
 } dummy;
 }

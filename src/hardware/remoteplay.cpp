@@ -2104,6 +2104,12 @@ void Control_Poll(uint32_t now) {
 
 } /* namespace */
 
+/* The room tokens of remote play (see Auth) for InputNet's other modes: a RollbackNet server started with env
+ * NN_RP_AUTH_SECRET lets in only participants whose HELLO carries the token for the name they give. */
+std::string REMOTEPLAY_AuthToken(const std::string &secret,const std::string &name) { return RP_AuthToken(secret,name); }
+bool REMOTEPLAY_SameSecret(const std::string &a,const std::string &b) { return RP_SameSecret(a,b); }
+std::string REMOTEPLAY_CleanName(const std::string &name) { return RP_CleanName(name); }
+
 void REMOTEPLAY_Configure(Section_prop *section) {
     RP_SetBlockedKeys(section->Get_string("block keys"));
     const int report = section->Get_int("report input");
@@ -2246,7 +2252,7 @@ void REMOTEPLAY_Init(void) {
 
 bool REMOTEPLAY_HostRequested(void) {
     Section_prop *sec = static_cast<Section_prop *>(control->GetSection("inputnet"));
-    if (sec == NULL || std::string(sec->Get_string("mode")) == "lockstep") return false;
+    if (sec == NULL || std::string(sec->Get_string("mode")) != "remote") return false;   /* lockstep, rollback */
     if (control->opt_inputnet_server >= 0) return true;
     if (!control->opt_inputnet_connect.empty() || !sec->Get_bool("inputnet")) return false;
     return std::string(sec->Get_string("connect")).empty() && !std::string(sec->Get_string("startserver")).empty();
@@ -6488,7 +6494,7 @@ int REMOTEPLAY_RunViewer(const std::string &) {
 bool REMOTEPLAY_ViewerRequested(std::string &address) {
     Section_prop *sec = static_cast<Section_prop*>(control->GetSection("inputnet"));
     if (sec == NULL) return false;
-    if (std::string(sec->Get_string("mode")) == "lockstep") return false;
+    if (std::string(sec->Get_string("mode")) != "remote") return false;   /* lockstep, rollback: everybody runs the game */
     address = control->opt_inputnet_connect;
     if (address.empty() && control->opt_inputnet_server < 0 && sec->Get_bool("inputnet"))
         address = sec->Get_string("connect");
