@@ -1374,15 +1374,19 @@ std::string localDrive::MountedFileKey(const char* dosPath) {
 	return key;
 }
 
-bool localDrive::AddMountedFile(const char* dosPath, const char* hostPath) {
+bool localDrive::AddMountedFile(const char* dosPath, const char* hostPath, bool keep) {
 	std::string key = MountedFileKey(dosPath);
 	if (key.empty()) return false;
 	mounted_files[key] = hostPath;
+	if (keep) mounted_files_kept.insert(key);
+	else mounted_files_kept.erase(key);
 	return true;
 }
 
 bool localDrive::RemoveMountedFile(const char* dosPath) {
-	return mounted_files.erase(MountedFileKey(dosPath)) != 0;
+	const std::string key = MountedFileKey(dosPath);
+	mounted_files_kept.erase(key);
+	return mounted_files.erase(key) != 0;
 }
 
 const char* localDrive::GetMountedFileHost(const char* dosPath) {
@@ -1752,7 +1756,10 @@ bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
 		if (mounted_host != NULL) {
 			FILE* hand = fopen(mounted_host,((flags&0xf)==OPEN_WRITE||(flags&0xf)==OPEN_READWRITE)?"rb+":"rb");
 			if (hand == NULL) {
-				DOS_SetError(((flags&0xf)==OPEN_READ||(flags&0xf)==OPEN_READ_NO_MOD)?DOSERR_FILE_NOT_FOUND:DOSERR_ACCESS_DENIED);
+				/* (a file that is not there is "not found" for writers too: a kept mapping's file after the guest
+				 * deleted it, which programs then create) */
+				struct stat missing;
+				DOS_SetError(((flags&0xf)==OPEN_READ||(flags&0xf)==OPEN_READ_NO_MOD||stat(mounted_host,&missing)!=0)?DOSERR_FILE_NOT_FOUND:DOSERR_ACCESS_DENIED);
 				return false;
 			}
 			*file = new LocalFile(name,hand);
@@ -1907,7 +1914,27 @@ bool localDrive::FileUnlink(const char * name) {
         return false;
     }
 
-	if (GetMountedFileHost(name) != NULL) {
+	if (const char* mounted_host = GetMountedFileHost(name)) {
+		if (IsMountedFileKept(name)) {
+			/* FILEMOUNT /K: the file is the guest's own (a log, a scratch file). Deleting it removes the host file
+			 * and keeps the mapping, so the guest's next create lands at the same host path again and a real file
+			 * of that name in the mounted folder stays hidden and untouched. */
+			struct stat st;
+			if (stat(mounted_host,&st) != 0 || (st.st_mode & S_IFDIR)) {
+				DOS_SetError(DOSERR_FILE_NOT_FOUND);
+				return false;
+			}
+			if (remove(mounted_host) != 0) {
+				/* (still open on the host side, on Windows: at least empty it) */
+				FILE* hand = fopen(mounted_host,"wb");
+				if (hand == NULL) {
+					DOS_SetError(DOSERR_ACCESS_DENIED);
+					return false;
+				}
+				fclose(hand);
+			}
+			return true;
+		}
 		/* deleting a mounted file only removes the mapping; the host file is left untouched */
 		RemoveMountedFile(name);
 		return true;

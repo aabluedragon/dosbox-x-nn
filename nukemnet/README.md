@@ -367,6 +367,15 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   packets and only emptied at a quarter of a second (thrown away). Above 70 ms it is now played 3% faster (8% above
   130 ms), by interpolation, until it is back at 45 ms; the viewer's log says how long sound waits on average (over
   the real link: 127 ms after a hiccup, back to 49 ms within seconds).
+- FILEMOUNT for files a game writes itself (capability `filemountKeep`): `FILEMOUNT /K C:\DIR\NAME.EXT <host file>`
+  maps a file the game creates (a log, a scratch file) to a host path outside the mounted folder, so nothing lands
+  in the player's game folder. The host file need not exist yet (its folder must). Unlike a plain mapping, which a
+  delete drops, this one stays: when the game deletes the file the host file is removed (emptied when it cannot be
+  removed), the game sees no file, and its next create makes the file again at the same host path. A real file of that
+  name in the mounted folder stays hidden and untouched throughout. NukemNet maps Quake's `-condebug` console log
+  this way (Quake deletes that log at every start) and reads it to know when the host's server is up. A writer's open
+  of a mapped file that is not there now answers "file not found" (it answered "access denied").
+  Tests: `python3 tests/filemount_keep_tests.py`.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
 `nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true,"inputnetPredict":true,"inputnetPredictView":true}`.

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <vector>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <sys/types.h>
@@ -112,8 +113,11 @@ public:
 	/* FILEMOUNT support: map individual host files into this drive's directory tree.
 	 * The key is the uppercased DOS path relative to the drive root (e.g. "GAMES\\DATA.DAT"),
 	 * the value is the host filesystem path backing it. */
-	bool AddMountedFile(const char* dosPath, const char* hostPath);
+	bool AddMountedFile(const char* dosPath, const char* hostPath, bool keep = false);
 	bool RemoveMountedFile(const char* dosPath);
+	/* A mapping made with FILEMOUNT /K: it stays when the guest deletes the file (the host file is removed, and the
+	 * guest's next create makes it again), for files a program writes that should not land in the mounted folder. */
+	bool IsMountedFileKept(const char* dosPath) const { return mounted_files_kept.count(MountedFileKey(dosPath)) != 0; }
 	const std::map<std::string,std::string>& GetMountedFiles() const { return mounted_files; }
 	static std::string MountedFileKey(const char* dosPath);
 	struct {
@@ -137,6 +141,7 @@ protected:
 		char srch_dir[CROSS_LEN];
     } srchInfo[MAX_OPENDIRS] = {};
 	std::map<std::string,std::string> mounted_files;
+	std::set<std::string> mounted_files_kept; /* keys of mounted_files added with FILEMOUNT /K */
 	std::map<uint16_t,std::pair<std::string,size_t> > mounted_file_search; /* dirCache search id -> (DOS dir key, next entry index) */
 	const char* GetMountedFileHost(const char* dosPath);
 	bool MountedFileFindNext(DOS_DTA &dta,uint16_t id);

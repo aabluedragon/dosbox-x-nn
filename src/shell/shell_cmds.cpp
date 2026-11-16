@@ -3930,7 +3930,7 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 			localDrive * const ldp = dynamic_cast<localDrive*>(Drives[d]);
 			if (!ldp || strncmp(Drives[d]->GetInfo(),"local directory",15)) continue;
 			for (const auto &m : ldp->GetMountedFiles()) {
-				WriteOut("%c:\\%s <= %s\n",'A'+d,m.first.c_str(),m.second.c_str());
+				WriteOut("%c:\\%s <= %s%s\n",'A'+d,m.first.c_str(),m.second.c_str(),ldp->IsMountedFileKept(m.first.c_str())?" [/K]":"");
 				none = false;
 			}
 		}
@@ -3940,8 +3940,16 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 
 	command.FindCommand(1,arg1);
 	bool unmount = (arg1 == "/D" || arg1 == "/d" || arg1 == "-u" || arg1 == "-U");
+	/* /K: the mapping stays when the guest deletes the file (a file the guest writes itself, such as a log) */
+	const bool keep = (arg1 == "/K" || arg1 == "/k");
 	if (unmount) {
 		if (count != 2) {
+			WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_USAGE"));
+			return;
+		}
+		command.FindCommand(2,arg1);
+	} else if (keep) {
+		if (count != 3) {
 			WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_USAGE"));
 			return;
 		}
@@ -3971,9 +3979,24 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 		return;
 	}
 
-	command.FindCommand(2,arg2);
+	command.FindCommand(keep?3:2,arg2);
 	struct stat st;
-	if (stat(arg2.c_str(),&st) != 0) {
+	if (keep) {
+		/* The guest's own file: it need not exist yet (the guest creates it), but its folder must, and it is
+		 * never a folder or an archive entry. */
+		bool usable;
+		if (stat(arg2.c_str(),&st) == 0) usable = !(st.st_mode & S_IFDIR);
+		else {
+			const size_t slash = arg2.find_last_of("/\\");
+			const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? arg2.substr(0,1) : arg2.substr(0,slash));
+			struct stat dst;
+			usable = slash != arg2.size()-1 && stat(dir.c_str(),&dst) == 0 && (dst.st_mode & S_IFDIR);
+		}
+		if (!usable) {
+			WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_HOST_NOT_FOUND"),arg2.c_str());
+			return;
+		}
+	} else if (stat(arg2.c_str(),&st) != 0) {
 		/* Archive entries are mapped from a temporary copy (or app.asar.unpacked). */
 		std::string archive_host, archive_error;
 		bool resolved = AsarResolve(arg2,archive_host,archive_error);
@@ -3981,7 +4004,7 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 		if (resolved) arg2 = archive_host;
 		else if (!archive_error.empty()) LOG_MSG("FILEMOUNT: %s: %s",arg2.c_str(),archive_error.c_str());
 	}
-	if (stat(arg2.c_str(),&st) != 0 || (st.st_mode & S_IFDIR)) {
+	if (!keep && (stat(arg2.c_str(),&st) != 0 || (st.st_mode & S_IFDIR))) {
 		WriteOut(MSG_Get("SHELL_CMD_FILEMOUNT_HOST_NOT_FOUND"),arg2.c_str());
 		return;
 	}
@@ -4015,13 +4038,23 @@ void DOS_Shell::CMD_FILEMOUNT(char * args) {
 	char *abshost = _fullpath(NULL,arg2.c_str(),0);
 #else
 	char *abshost = realpath(arg2.c_str(),NULL);
+	if (abshost == NULL && keep) {
+		/* realpath() needs the file itself: a kept file that is not there yet gets its folder resolved */
+		const size_t slash = arg2.find_last_of('/');
+		const std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : arg2.substr(0,slash));
+		char *absdir = realpath(dir.c_str(),NULL);
+		if (absdir != NULL) {
+			hostpath = std::string(absdir) + (strcmp(absdir,"/") ? "/" : "") + arg2.substr(slash == std::string::npos ? 0 : slash+1);
+			free(absdir);
+		}
+	}
 #endif
 	if (abshost != NULL) {
 		hostpath = abshost;
 		free(abshost);
 	}
 
-	ldp->AddMountedFile(fullname,hostpath.c_str());
+	ldp->AddMountedFile(fullname,hostpath.c_str(),keep);
 	WriteOut(MSG_Get(already?"SHELL_CMD_FILEMOUNT_UPDATED":"SHELL_CMD_FILEMOUNT_SUCCESS"),(char)('A'+drive),fullname,hostpath.c_str());
 }
 #endif
