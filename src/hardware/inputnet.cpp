@@ -6335,11 +6335,21 @@ static void RB_FrameBoundary(uint32_t frame) {
     }
     {
         const uint64_t t = RB_MicroTicks();
+        static uint32_t stalls_before = 0, replays_before = 0, replayed_before = 0;
+        static uint64_t wait_before = 0;
         if (rb_hitch_last != 0 && t > rb_hitch_last) {
             const uint64_t gap = t - rb_hitch_last;
             if (gap > 30000u) rb_stat_hitches++;
             rb_stat_maxgap_us = std::max(rb_stat_maxgap_us, gap);
+            /* (debugging long hitches: what happened since the frame before) */
+            static const bool gaplog = getenv("NN_RB_GAPLOG") != NULL && *getenv("NN_RB_GAPLOG");
+            if (gaplog && gap > 300000u)
+                LOG_MSG("RBGAP frame %u: %.0f ms since the last frame: %u stalls, %u replays (%u frames, the last %u deep), "
+                    "waited %.0f ms for input; speed %u", (unsigned)frame, (double)gap / 1000.0, (unsigned)(rb_stat_stalls - stalls_before),
+                    (unsigned)(rb_stat_rollbacks - replays_before), (unsigned)(rb_stat_replayed - replayed_before), (unsigned)rb_rp_depth,
+                    (double)(rb_ml_wait - wait_before) / 1000.0, (unsigned)CPU_CycleMax);
         }
+        stalls_before = rb_stat_stalls; replays_before = rb_stat_rollbacks; replayed_before = rb_stat_replayed; wait_before = rb_ml_wait;
         rb_hitch_last = t;
     }
     RB_MaxCycles();

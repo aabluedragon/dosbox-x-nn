@@ -720,8 +720,13 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
      * clamped, so a short window here makes a game that waits on the timer
      * lose most of its elapsed time and crawl. Long slices are kept in check
      * by chunking string operations instead. */
-    if (ticksRemain > 20) {
-        ticksRemain = 20;
+    /* RollbackNet: a long replay (tens of frames after a correction) keeps the loop away for hundreds of milliseconds,
+     * and dropping that time made the shared game run behind real time: the computers' time sync then slowed the others
+     * to match, and the whole game ran in slow motion (about 75% of real time at 220 ms, Nov 2026). Catch it up instead,
+     * up to two seconds (beyond that, as after a resync's transfer, the time sync evens things out). */
+    const Bitu ticks_window = inputnet_rollback_active ? 2000u : 20u;
+    if (ticksRemain > ticks_window) {
+        ticksRemain = ticks_window;
     }
     ticksAdded = ticksRemain;
 

@@ -496,6 +496,12 @@ both players moving all the time in one shareware network match at 320x200): 43,
 56,000), the picture changing 40 to 50 times a second, 0 desyncs; before (a 20 ms replay limit, 60% load) 15,000 to
 30,000. At that distance each change of the other player's input replays about 18 frames, nothing of which is drawn:
 that, not the speed, is what keeps the picture under the refresh rate there, with about two hitches a second.
+Such a replay keeps the main loop away for hundreds of milliseconds, and DOSBox-X's `increaseticks()` dropped all but
+20 ms of that time: the game then ran behind real time and the time sync slowed the other computer to match, so the
+shared game ran in slow motion (350 to 400 frames in 5 seconds instead of 500 at 220 ms: "it feels like very low
+cycles"). In a session it now catches up to two seconds (430 to 520 frames in 5 seconds, the picture changing 50 to 60
+times a second in the same test). The room's input delay shortens every replay by its frames: 2 frames at 220 ms took
+replays from about 18 to 11 frames.
 Capability `rollbackNetMaxCycles`.
 
 ### Clusters: IPX and null modem games (IPX/NullModem-over-RollbackNet)
@@ -560,7 +566,8 @@ viewer).
 Debugging (environment variables): `NN_RB_TRACE=1` logs every frame start (`RBTRACE` with the frame, tick, host
 context, PIC ticks, registers, memory hash and machine hash, `RBSB` with the Sound Blaster's state; compare two
 participants' logs line by line, the last line of each frame counts; `RBDOS` with every INT 21h call, its result and
-the name or the file found); `NN_RB_SELFTEST=<n>` goes back 4 frames every
+the name or the file found); `NN_RB_GAPLOG=1` logs every real-time frame that came more than 300 ms after the one before
+(`RBGAP`: stalls, replays and their frames, time waited for input, the speed); `NN_RB_SELFTEST=<n>` goes back 4 frames every
 n frames and checks that every replayed frame start equals the original (it reports the differing component and
 bytes); `NN_RB_DUMP=<frame>` writes that frame start's RAM, video memory and devices to the working folder
 (`+n`: n frames after the newest load), `NN_RB_FULLDUMP=+n[,+m]` that frame start's whole state as a save state
