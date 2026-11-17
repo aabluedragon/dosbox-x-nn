@@ -5054,11 +5054,15 @@ void getBytes(std::ostream& stream) override
      * speed at cycles=max is part of the shared machine (the server sets it for everybody, INEV_CYCLEMAX), so a rollback
      * or a resync has to take it along. */
     {
+        /* (the PIC time is a long double on x86 builds: two doubles keep all of it, which one double would round, and
+         * a machine that loaded it would then read other time stamps than one that did not) */
         const int64_t cmax = (int64_t)CPU_CycleMax;
-        const double picbase = (double)rdtsc_pic_base;
+        const double pic_hi = (double)rdtsc_pic_base;
+        const double pic_lo = (double)(rdtsc_pic_base - (pic_tickindex_t)pic_hi);
         stream.write(reinterpret_cast<const char*>(&cmax), sizeof(cmax));
         stream.write(reinterpret_cast<const char*>(&rdtsc_count_base), sizeof(rdtsc_count_base));
-        stream.write(reinterpret_cast<const char*>(&picbase), sizeof(picbase));
+        stream.write(reinterpret_cast<const char*>(&pic_hi), sizeof(pic_hi));
+        stream.write(reinterpret_cast<const char*>(&pic_lo), sizeof(pic_lo));
     }
 }
 
@@ -5118,17 +5122,18 @@ void setBytes(std::istream& stream) override
     POD_Load_CPU_Flags(stream);
 	POD_Load_CPU_Paging(stream);
     {
-        int64_t cmax = 0; uint64_t count = 0; double picbase = 0;
+        int64_t cmax = 0; uint64_t count = 0; double pic_hi = 0, pic_lo = 0;
         stream.read(reinterpret_cast<char*>(&cmax), sizeof(cmax));
         const bool got = stream.gcount() == (std::streamsize)sizeof(cmax);
         if (got) {
             stream.read(reinterpret_cast<char*>(&count), sizeof(count));
-            stream.read(reinterpret_cast<char*>(&picbase), sizeof(picbase));
+            stream.read(reinterpret_cast<char*>(&pic_hi), sizeof(pic_hi));
+            stream.read(reinterpret_cast<char*>(&pic_lo), sizeof(pic_lo));
         }
-        if (got && stream.gcount() == (std::streamsize)sizeof(picbase) && inputnet_rollback_active && cmax > 0) {
+        if (got && stream.gcount() == (std::streamsize)sizeof(pic_lo) && inputnet_rollback_active && cmax > 0) {
             CPU_CycleMax = (cpu_cycles_count_t)cmax;
             rdtsc_count_base = count;
-            rdtsc_pic_base = (pic_tickindex_t)picbase;
+            rdtsc_pic_base = (pic_tickindex_t)pic_hi + (pic_tickindex_t)pic_lo;
         }
         stream.clear();
     }

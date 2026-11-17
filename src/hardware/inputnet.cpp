@@ -6149,10 +6149,11 @@ static void RB_MaxCycles(void) {
     if (tnow - rb_ml_changed_at < 1000u) return;
     const double cur = (double)CPU_CycleMax;
     double next = cur;
-    /* down by at most 40% a second (one busy second is often a burst of replays), up by 15% a second (50% while far
-     * below what everybody proposes, as at the start) */
+    /* down by at most 40% a second (one busy second is often a burst of replays), up by 15% a second, 25% while far
+     * below what everybody proposes; 50% while slow (the start: cycles=max begins at 3000) */
     if ((double)want < cur * 0.88) next = std::max((double)want, cur * 0.6);
-    else if (all && (double)want > cur * 1.12) next = std::min((double)want, (double)want > cur * 2.0 ? cur * 1.5 : cur * 1.15 + 500.0);
+    else if (all && (double)want > cur * 1.12)
+        next = std::min((double)want, (double)want > cur * 2.0 ? (cur < 20000.0 ? cur * 1.5 : cur * 1.25) : cur * 1.15 + 500.0);
     next = std::max(2000.0, std::min(next, limit));
     const uint32_t n = (uint32_t)next;
     if (n == (uint32_t)CPU_CycleMax) return;
@@ -6470,6 +6471,8 @@ bool INPUTNET_IsServer(void) { return inputnet_is_server && inputnet_link_up; }
 /* (a cluster's copy is one of the session's machines from the start, the followers without a link of their own: they
  * report the same fixed file times, disk and clock as the others: drive_local.cpp, cmos.cpp) */
 bool INPUTNET_IsConnected(void) { return inputnet_link_up || rbc_copies != 0; }
+/* NN_RB_TRACE: the frame for other components' trace lines (dos.cpp logs every INT 21h call with it) */
+uint32_t INPUTNET_TraceFrame(void) { return inputnet_frame; }
 
 /* ------------------------------------------------------------------------- */
 /* INPUTNET.COM                                                               */

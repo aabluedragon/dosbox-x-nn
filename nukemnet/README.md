@@ -437,6 +437,16 @@ gets over its own for the session (FILEMOUNT /K, from a folder in the system's t
 session ends): its own files stay as they are. A file over 16 MB that differs means another version of the game and
 the join is refused, naming it.
 
+File searches (FindFirst/FindNext) on a local folder drive during a session keep their place in the DTA, as DOS does
+(`localDrive::SessionFindNext`: `dirCluster` a key for the directory, `dirID` the index of the next entry), not in a
+host-side slot of the directory cache. The slot's number was written into the guest's DTA and depended on each
+computer's history (its replays, its own scans for the file list), and a rollback did not bring the slot's position
+back: a replay across a search found other files, or none ("DIRCACHE: FindFirst/Next failure : ID out of range").
+Found Nov 2026 with three computers (Duke Nukem 3D looks for `*.CFG` at its start): the Windows laptop, which rolled
+back most, now and then went its own way there. The listing is a directory's real entries and its mounted files
+together, sorted by name (a file can be real on one computer and mapped from the server on another), with one date
+and time and the attributes directory or archive on every system (Windows reported the file system's own).
+
 Host stack: host code runs nested emulation loops (a program's EXEC from the shell, DOS waiting for a key through
 `CALLBACK_Idle`, a page fault the normal core runs the guest's handler for, every BIOS call DOS's console makes through
 `CALLBACK_RunRealInt`), and their state is on the host's stack, not in a save state. Each run of `DOSBOX_RunMachine`
@@ -470,7 +480,7 @@ next frame starts, and a long one is a hitch), but not below half the first; a p
 quarters of the speed at once, one whose core barely runs (a halted guest) asks for no more. A cluster's hidden copies
 send their proposal to the leader with every frame message, which takes the lowest; every computer sends its lowest at
 the end of its input packets. The server sets the lowest for everybody, down by at most 40% a second and up by 15%
-(50% while far below), as an event of its own input (`INEV_CYCLEMAX`): every machine and every copy applies it at the
+(25% while far below, 50% while slow), as an event of its own input (`INEV_CYCLEMAX`): every machine and every copy applies it at the
 same frame, in replays too. `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
 read only in a RollbackNet session), so rollbacks and joins carry the speed along. The log says where it stands every
 5 seconds ("speed N cycles per ms (cycles=max), this computer N% busy (CPU core N%), replays allow N, proposing N",
@@ -537,7 +547,8 @@ viewer).
 
 Debugging (environment variables): `NN_RB_TRACE=1` logs every frame start (`RBTRACE` with the frame, tick, host
 context, PIC ticks, registers, memory hash and machine hash, `RBSB` with the Sound Blaster's state; compare two
-participants' logs line by line, the last line of each frame counts); `NN_RB_SELFTEST=<n>` goes back 4 frames every
+participants' logs line by line, the last line of each frame counts; `RBDOS` with every INT 21h call, its result and
+the name or the file found); `NN_RB_SELFTEST=<n>` goes back 4 frames every
 n frames and checks that every replayed frame start equals the original (it reports the differing component and
 bytes); `NN_RB_DUMP=<frame>` writes that frame start's RAM, video memory and devices to the working folder
 (`+n`: n frames after the newest load), `NN_RB_FULLDUMP=+n[,+m]` that frame start's whole state as a save state
