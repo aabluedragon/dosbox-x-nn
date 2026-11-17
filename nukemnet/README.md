@@ -593,8 +593,17 @@ and nobody dropped meanwhile), then all three played: 35,700 checks each, 0 desy
 At that seat change the laptop (only it) found its machines different at the change's own frame; the automatic resync
 five frames later made them equal, and 13,000 frames of play afterwards had no difference. Not reproduced on Linux or
 in any other seat change; the cause is not found yet (a traced run on Windows is next).
+cycles=max (with every player moving at the same time, one input loop per player): the same three computers, three
+copies each, all three starting together: before the file search fix the laptop went its own way at Duke's start in 3
+of 6 starts (traced: its replay across Duke's `*.CFG` search, "ID out of range"), after it 6 of 6 clean starts and a
+5-minute session, about 69,000 checks per computer, 0 desyncs; the speed held near 30,000 during play (the replay limit:
+three players 69 ms apart) and rose to 66,000 when play stopped. Harness, three computers on Linux: 4 minutes of all
+three moving (screenshots: all in the match), 20,000 checks each, 0 desyncs. Two computers through 60 ms: cycles=max had
+1 to 2 hitches a second, mostly 35 to 50 ms, where fixed 60000 had 5.5 with gaps up to 700 ms (this PC was busy with
+other work: its slow seconds lower the speed for a few seconds). Bonus (plain RollbackNet) and NullModem-over-RollbackNet
+joined mid-game at cycles=max: 0 desyncs.
 Not tested yet: macOS builds, a game with Gravis or MIDI sound, CD images (`IMGMOUNT` files are not in the file list),
-more than two computers.
+more than three computers.
 
 ## Publishing a release
 
