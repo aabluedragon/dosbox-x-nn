@@ -425,10 +425,10 @@ timing arithmetic (80-bit `long double` on x86 builds: Linux, macOS Intel and th
 ARM builds do not play with them), `cpu core`, `cputype`, `cycles`, `machine`, `memsize`, the Sound Blaster's type,
 port, IRQ, DMA and OPL settings and `force goldplay`, GUS, PC speaker, Tandy, Disney, the joystick type and the mixer
 rate. Settings that would make machines differ are forced in this mode: the mixer runs at 48000 Hz (a whole number of
-samples per millisecond), there is no emulated disk speed (its delay idles in nested emulation loops), cycles never
-adjust themselves (`max`/`auto` stay at the speed the session started with: give a fixed value), mouse motion is
-applied as relative motion whatever each computer's window does, and the forced Goldplay Sound Blaster stays on its
-timer driven DMA. NukemNet passes `core=normal`, fixed cycles, `force goldplay=true` and `joysticktype=none`.
+samples per millisecond), there is no emulated disk speed (its delay idles in nested emulation loops), no computer
+adjusts the speed by itself (see "cycles=max" below), mouse motion is applied as relative motion whatever each
+computer's window does, and the forced Goldplay Sound Blaster stays on its timer driven DMA. NukemNet passes
+`core=normal`, the game's fixed cycles or `cycles=max`, `force goldplay=true` and `joysticktype=none`.
 
 The disk is part of the machine too: every file a game reads has to be the same on every computer. With the state,
 the server sends the list of the files on its mounted folders (drive, DOS path, size, hash; FILEMOUNT mappings as the
@@ -455,6 +455,26 @@ frame timing (a frame the host's renderer refused, while its window was made aga
 guest's retrace timing), mouse motion (applied as relative motion), the Sound Blaster with forced Goldplay (stays on
 its timer events when a game's DMA turns Goldplay off). Nothing of a replayed frame is drawn, and the whole picture is
 drawn again afterwards.
+
+### cycles=max
+
+The speed is part of the shared machine, so `cycles=max` cannot mean what it means elsewhere (each computer guessing
+from its own timing would run its machines differently). Instead every process measures itself once a second
+(`RB_MeasureLoad`): how busy it was (wall time less what `increaseticks()` slept, `dosbox_sleep_us`, and what it waited
+for other computers' input or for its cluster's copies), how much of that the CPU core took (`dosbox_core_ns`, timed
+around `cpudecoder` while this runs: drawing, sound and saving frames take the same time at any speed), and the speed
+meanwhile. From averages over a few seconds it proposes a speed (`RB_Propose`): the one at which the core gets what
+`[inputnet] rollback max load` (60% by default) leaves after the rest, lowered to what lets all but 5 replays of the
+last 10 seconds finish within 20 ms (`RB_ReplayCap`: a replay runs the frames since the corrected one again before the
+next frame starts, and a long one is a hitch), but not below half the first; a process over 90% busy asks for three
+quarters of the speed at once, one whose core barely runs (a halted guest) asks for no more. A cluster's hidden copies
+send their proposal to the leader with every frame message, which takes the lowest; every computer sends its lowest at
+the end of its input packets. The server sets the lowest for everybody, down by at most 40% a second and up by 15%
+(50% while far below), as an event of its own input (`INEV_CYCLEMAX`): every machine and every copy applies it at the
+same frame, in replays too. `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
+read only in a RollbackNet session), so rollbacks and joins carry the speed along. The log says where it stands every
+5 seconds ("speed N cycles per ms (cycles=max), this computer N% busy (CPU core N%), replays allow N, proposing N",
+"N hitches (frames more than 30 ms late)"). Capability `rollbackNetMaxCycles`.
 
 ### Clusters: IPX and null modem games (IPX/NullModem-over-RollbackNet)
 

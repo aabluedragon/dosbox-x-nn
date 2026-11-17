@@ -124,6 +124,7 @@ bool inputnet_rollback_resim = false;
 #else
 # include <signal.h>
 # include <sys/mman.h>
+# include <time.h>
 # include <unistd.h>
 #endif
 
@@ -367,6 +368,39 @@ static bool inputnet_enabled = false;
 static bool inputnet_remote = false;        /* "mode = remote": stream from the host instead of lockstep */
 static bool inputnet_rollback = false;      /* "mode = rollback": predict the others' input, correct by rolling back */
 static unsigned int inputnet_rbwindow = 16; /* mode=rollback: frames that may run ahead of the others' input */
+/* mode=rollback, cycles=max (RB_MaxCycles): the load the busiest computer runs at, in percent; this computer's speed
+ * proposal (cycles per ms, 0: none yet), what the server heard from the others, and the measurement under way */
+static unsigned int rb_maxload = 60;
+static uint32_t rb_cap_local = 0;
+static uint32_t rb_cap_peer[INPUTNET_MAX_PEERS], rb_cap_peer_at[INPUTNET_MAX_PEERS];
+static uint64_t rb_ml_t0 = 0, rb_ml_wait = 0, rb_ml_sleep0 = 0, rb_ml_core0 = 0;
+static uint32_t rb_ml_changed_at = 0, rb_ml_told_at = 0;
+/* the last second's load, the CPU core's share of it and the average speed meanwhile; averages over a few seconds of
+ * the core's time per cycle and of the rest of the load (which does not change with the speed) */
+static double rb_ml_load = 0, rb_ml_core = 0, rb_ml_speed = 0, rb_ml_cost_s = -1, rb_ml_fixed_s = -1;
+static double rb_ml_csum = 0;
+static uint32_t rb_ml_cn = 0;
+/* the CPU time the emulation thread got, at the start of the measurement, and the share of the busy time it ran (the
+ * rest, other programs had the CPU: not a cost of this speed) */
+static uint64_t rb_ml_cpu0 = 0;
+static double rb_ml_run = 1;
+/* the latest replays (RB_Propose's second limit): frames replayed, time taken, the CPU core's part of it, the speed,
+ * when it ended */
+struct RBReplayRec { uint32_t depth, us, core_us, speed, at; };
+static RBReplayRec rb_rp[64];
+static unsigned rb_rp_n = 0, rb_rp_pos = 0;
+static uint64_t rb_rp_t0 = 0, rb_rp_core0 = 0;
+static uint32_t rb_rp_depth = 0;
+static const double RB_REPLAY_BUDGET_US = 20000.0;  /* a replay should fit in this (with its frame: 3 frames)... */
+static const unsigned RB_REPLAY_WINDOW_MS = 10000u, RB_REPLAY_LONG_ALLOWED = 5u;  /* ...all but 5 in 10 seconds */
+static void RB_ReplayBegin(uint32_t depth);
+static void RB_ReplayEnd(void);
+/* hitches: real-time frames that started more than 30 ms after the one before (a long replay, a wait for the others) */
+static uint64_t rb_hitch_last = 0, rb_stat_maxgap_us = 0;
+static uint32_t rb_stat_hitches = 0;
+extern uint64_t dosbox_core_ns;             /* dosbox.cpp: what the CPU core ran, while dosbox_core_timing */
+extern bool dosbox_core_timing;
+extern uint64_t dosbox_sleep_us;            /* dosbox.cpp: what increaseticks() slept */
 static unsigned int inputnet_rbplayers = 0; /* mode=rollback server: participants to wait for before typing autorun */
 static std::string inputnet_rbautorun;      /* mode=rollback server: the command typed then */
 static bool inputnet_rbautorun_done = false;
@@ -3477,6 +3511,7 @@ static bool RB_Rollback(uint32_t target, uint32_t frame) {
     inputnet_rollback_resim = true;
     rb_target = frame;
     rb_replay_started = RB_MicroTicks();
+    RB_ReplayBegin(depth);
     MIXER_SetRollbackDiscard(true);
     DOSBOX_AddTicksRemain(depth * inputnet_frame_ms);
     inputnet_frame = target;
@@ -3568,6 +3603,8 @@ static void RB_SendInput(uint32_t frame) {
         w.u32(UINT32_MAX); w.u32(0); w.u32(0);
     }
 
+    w.u32(rb_cap_local);            /* this computer's speed proposal at cycles=max (RB_MaxCycles; 0: none) */
+
     if (w.overflow()) {
         LOG(LOG_MISC,LOG_WARN)("INPUTNET: rollback input packet overflow");
         return;
@@ -3653,6 +3690,10 @@ static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) 
         c.valid = true;
         RB_CompareCheck(p, peerid, cframe);
     }
+    if (r.remain() >= 4) {
+        const uint32_t cap = r.u32();
+        if (!r.bad() && cap != 0) { rb_cap_peer[peerid] = cap; rb_cap_peer_at[peerid] = now; }
+    }
 }
 
 /* Wait while we are more than the window ahead of somebody's input. */
@@ -3667,7 +3708,125 @@ static bool RB_ClientWaitsOn(uint32_t start) {
     return srv.active && now - srv.lastheard < inputnet_timeout && now - start < 6u * inputnet_timeout;
 }
 
+/* Time spent waiting for the other computers' input: not this computer's load (RB_MaxCycles). */
+struct RBWaitTimer {
+    uint64_t t0;
+    RBWaitTimer() : t0(RB_MicroTicks()) {}
+    ~RBWaitTimer() { rb_ml_wait += RB_MicroTicks() - t0; }
+};
+
+/* How busy this process was over the last second: wall time less what increaseticks() slept and what it waited for
+ * other computers or other copies (RB_MaxCycles). True when a new value is in rb_ml_load. */
+/* The CPU time this thread has had, in microseconds (0: not known here). */
+static uint64_t RB_ThreadCpuUs(void) {
+#if defined(WIN32)
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    const uint64_t kt = ((uint64_t)k.dwHighDateTime << 32u) | k.dwLowDateTime, ut = ((uint64_t)u.dwHighDateTime << 32u) | u.dwLowDateTime;
+    return (kt + ut) / 10u;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#else
+    return 0;
+#endif
+}
+
+static bool RB_MeasureLoad(void) {
+    dosbox_core_timing = true;
+    const uint64_t now = RB_MicroTicks();
+    if (rb_ml_t0 == 0 || now < rb_ml_t0) {
+        rb_ml_t0 = now; rb_ml_wait = 0; rb_ml_sleep0 = dosbox_sleep_us; rb_ml_core0 = dosbox_core_ns;
+        rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = RB_ThreadCpuUs();
+        return false;
+    }
+    rb_ml_csum += (double)CPU_CycleMax; rb_ml_cn++;     /* (the speed can change during the second) */
+    const uint64_t wall = now - rb_ml_t0;
+    if (wall < 1000000u) return false;
+    const uint64_t idle = (dosbox_sleep_us - rb_ml_sleep0) + rb_ml_wait;
+    rb_ml_load = (idle >= wall) ? 0.0 : (double)(wall - idle) / (double)wall;
+    rb_ml_core = std::min(rb_ml_load, (double)(dosbox_core_ns - rb_ml_core0) / 1000.0 / (double)wall);
+    rb_ml_speed = rb_ml_cn ? rb_ml_csum / (double)rb_ml_cn : (double)CPU_CycleMax;
+    const uint64_t cpu = RB_ThreadCpuUs();
+    rb_ml_run = (cpu > rb_ml_cpu0 && rb_ml_cpu0 != 0 && rb_ml_load > 0.02)
+        ? std::max(0.05, std::min(1.0, (double)(cpu - rb_ml_cpu0) / ((double)wall * rb_ml_load))) : 1.0;
+    rb_ml_t0 = now; rb_ml_wait = 0; rb_ml_sleep0 = dosbox_sleep_us; rb_ml_core0 = dosbox_core_ns;
+    rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = cpu;
+    return true;
+}
+
+/* This process's speed proposal (rb_cap_local) from the last measurement: the speed at which the CPU core would get
+ * what "rollback max load" leaves after the rest (at least a third of it, should the rest take more). The core's time
+ * per cycle and the rest are averaged over a few seconds: replays come and go with the players' input, and another
+ * program on the computer can take a second or two (lowering the speed for every player for longer would not make that
+ * second any better). Only a process that could not keep up (over 90% busy) asks for less at once. While the core
+ * barely runs (a halted guest) its time says little about faster speeds: no higher proposal then. */
+static void RB_ReplayBegin(uint32_t depth) {
+    rb_rp_t0 = (CPU_CycleAutoAdjust && depth > 0) ? RB_MicroTicks() : 0;
+    rb_rp_core0 = dosbox_core_ns;
+    rb_rp_depth = depth;
+}
+
+static void RB_ReplayEnd(void) {
+    if (rb_rp_t0 == 0) return;
+    const uint64_t now = RB_MicroTicks();
+    RBReplayRec &r = rb_rp[rb_rp_pos];
+    r.depth = rb_rp_depth;
+    r.us = (uint32_t)std::min<uint64_t>(now - rb_rp_t0, 10000000u);
+    r.core_us = (uint32_t)std::min<uint64_t>((dosbox_core_ns - rb_rp_core0) / 1000u, r.us);
+    r.speed = (uint32_t)CPU_CycleMax;
+    r.at = GetTicks();
+    rb_rp_pos = (rb_rp_pos + 1u) % 64u;
+    if (rb_rp_n < 64u) rb_rp_n++;
+    rb_rp_t0 = 0;
+}
+
+/* The speed at which every replay of the last RB_REPLAY_WINDOW_MS but the RB_REPLAY_LONG_ALLOWED deepest takes
+ * RB_REPLAY_BUDGET_US: a replay runs the frames since the corrected one again before the next real-time frame, and a
+ * long one is a hitch (a few now and then are fine, many are not). Per frame, saving it and the rest take the same time
+ * at any speed, the CPU core's part follows the speed (from all the latest replays). 0: no limit. */
+static double RB_ReplayCap(void) {
+    uint32_t depths[64];
+    unsigned n = 0;
+    double frames = 0, fixed_us = 0, core_per_cycle = 0;
+    const uint32_t now = GetTicks();
+    for (unsigned i = 0; i < rb_rp_n; i++) {
+        const RBReplayRec &r = rb_rp[i];
+        frames += r.depth;
+        fixed_us += (double)(r.us - r.core_us);
+        core_per_cycle += (double)r.core_us / (double)std::max<uint32_t>(r.speed, 1000u);
+        if (now - r.at < RB_REPLAY_WINDOW_MS) depths[n++] = r.depth;
+    }
+    if (n <= RB_REPLAY_LONG_ALLOWED || frames <= 0) return 0;
+    std::sort(depths, depths + n);
+    const double depth = std::max(1.0, (double)depths[n - 1u - RB_REPLAY_LONG_ALLOWED]);
+    /* (as for the load: time another program had the CPU is not this speed's cost) */
+    const double per_frame_fixed = fixed_us / frames * rb_ml_run, per_frame_core = core_per_cycle / frames * rb_ml_run;
+    const double room = RB_REPLAY_BUDGET_US / depth - per_frame_fixed;
+    if (per_frame_core <= 0) return 0;
+    return std::max(room, 0.0) / per_frame_core;
+}
+
+static void RB_Propose(void) {
+    /* (what ran while another program had the CPU took no CPU of its own: count only the share that ran) */
+    const double fixed = std::max(0.0, rb_ml_load - rb_ml_core) * rb_ml_run;
+    const double cost = rb_ml_core * rb_ml_run / std::max(rb_ml_speed, 1000.0);
+    rb_ml_cost_s = (rb_ml_cost_s < 0) ? cost : rb_ml_cost_s * 0.6 + cost * 0.4;
+    rb_ml_fixed_s = (rb_ml_fixed_s < 0) ? fixed : rb_ml_fixed_s * 0.6 + fixed * 0.4;
+    const double target = (double)rb_maxload / 100.0;
+    const double avail = std::max(target - rb_ml_fixed_s, target / 3.0);
+    const double limit = (CPU_CycleLimit > 0) ? (double)CPU_CycleLimit : 1000000.0;
+    double cap = avail / std::max(rb_ml_cost_s, 1e-9);
+    const double rcap = RB_ReplayCap();         /* (not below half the other: some games need the speed) */
+    if (rcap > 0) cap = std::min(cap, std::max(rcap, cap * 0.5));
+    if (rb_ml_core < 0.03) cap = std::min(cap, (double)CPU_CycleMax);
+    if (rb_ml_load > 0.9) cap = std::min(cap, (double)CPU_CycleMax * 0.75);
+    rb_cap_local = (uint32_t)std::max(2000.0, std::min(cap, limit));
+}
+
 static bool RB_WaitForWindow(uint32_t frame) {
+    RBWaitTimer waited;
     uint32_t start = 0, last_events = 0, lastresend = GetTicks();
     for (;;) {
         bool ok = true;
@@ -3728,6 +3887,7 @@ static void RB_TimeSync(uint32_t frame) {
 /* At the DOS prompt the shell (native code) reads the keys: frames there run with everybody's real input only, so
  * no correction ever has to put the machine back into the prompt. */
 static bool RB_WaitForInputs(uint32_t frame) {
+    RBWaitTimer waited;
     uint32_t start = 0, last_events = 0, lastresend = GetTicks();
     while (RB_MinHave() <= frame) {
         if (start == 0) { start = GetTicks(); last_events = start; }
@@ -3773,6 +3933,11 @@ static void RB_LogStats(void) {
         rb_stat_captures ? (double)rb_stat_scan_us / (double)rb_stat_captures : 0.0,
         rb_stat_captures ? (double)rb_stat_lean_us / (double)rb_stat_captures : 0.0,
         (unsigned)rb_stat_lockstep, (unsigned)rb_stat_ctxchanges);
+    if (CPU_CycleAutoAdjust) LOG_MSG("INPUTNET: speed %u cycles per ms (cycles=max), this computer %.0f%% busy (CPU core %.0f%%, "
+        "running %.0f%% of it), replays allow %.0f, proposing %u", (unsigned)CPU_CycleMax, rb_ml_load * 100.0, rb_ml_core * 100.0,
+        rb_ml_run * 100.0, RB_ReplayCap(), rb_cap_local);
+    LOG_MSG("INPUTNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms", (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0);
+    rb_stat_hitches = 0; rb_stat_maxgap_us = 0;
     rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
     rb_stat_capture_us = 0; rb_stat_captures = 0; rb_stat_pages = 0;
     rb_stat_replay_us = 0; rb_stat_replays = 0; rb_stat_replay_max_us = 0;
@@ -3862,6 +4027,8 @@ static bool RB_LoadResyncState(const RBResyncInfo &h, const std::vector<uint8_t>
     rb_tick = h.tick;
     rb_epoch = h.epoch;
     rb_last_load_frame = h.frame;
+    rb_ml_t0 = 0;                   /* (the load's own time is not play) */
+    rb_rp_t0 = 0;
     rb_evlog_on = getenv("NN_RB_EVLOG") != NULL;
     RB_InitRegions();               /* every older frame start is gone */
     inputnet_frame = h.frame;
@@ -3936,6 +4103,7 @@ struct RBCFollower {
     uint32_t got = 0, done = 0;                 /* the newest command it received, carried out */
     std::vector<uint8_t> go;                    /* the newest GO sent to it, again should its AT repeat */
     uint32_t go_frame = UINT32_MAX, go_epoch = 0;
+    uint32_t cap = 0, cap_at = 0;               /* its speed proposal (RB_Propose, 0: none yet), and when it said */
 };
 static RBCFollower rbc_f[INPUTNET_MAX_PEERS];   /* leader: by copy */
 static uint32_t rbc_seq = 0;
@@ -4250,6 +4418,7 @@ static void RBC_Dispatch(void) {
                 if (r.bad()) return;
                 if (ns) ser.assign(b, b + ns);
             }
+            if (r.remain() >= 4) { const uint32_t cap = r.u32(); if (!r.bad()) { f.cap = cap; f.cap_at = GetTicks(); } }
             f.at_ser.swap(ser); f.at_lines = lines;
             f.at_frame = frame; f.at_epoch = epoch; f.at_flags = flags;
             f.at_hash = ((uint64_t)hi << 32u) | lo;
@@ -4460,7 +4629,7 @@ static void RBC_ApplyInputs(uint32_t frame) {
         if (slot == NULL) continue;
         for (size_t e = 0; e < slot->events.size(); e++) {
             const InputNetEvent &x = slot->events[e];
-            if (x.type == INEV_KEY && (x.pressed & 2u)) { for (unsigned c = 0; c < rbc_copies; c++) ev[c].push_back(x); }
+            if ((x.type == INEV_KEY && (x.pressed & 2u)) || x.type == INEV_CYCLEMAX) { for (unsigned c = 0; c < rbc_copies; c++) ev[c].push_back(x); }
             else if (rbc_copies == 1) ev[0].push_back(x);   /* (the game alone: everybody plays it) */
             else { const int c = RB_CopyOf(rb_seat, i); if (c >= 0) ev[c].push_back(x); }
         }
@@ -4528,6 +4697,7 @@ static bool RBC_AllStable(uint32_t frame, uint8_t *prompt = NULL) {
  * moved to by a command), their packets of the frame before routed (RBC_ROUTE only), and the cluster's checksum.
  * False when a copy stopped answering (the session is over then). */
 static bool RBC_LeaderBarrier(uint32_t frame, int mode) {
+    RBWaitTimer waited;             /* (the copies report how busy they are themselves) */
     std::vector<std::vector<uint8_t> > own;
     std::vector<uint8_t> own_ser;
     uint8_t own_lines = 0;
@@ -4838,6 +5008,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
         MIXER_SetRollbackDiscard(false);
         extern void RENDER_RedrawAll(void);
         RENDER_RedrawAll();
+        RB_ReplayEnd();
     }
     RB_Capture(frame);
     std::vector<std::vector<uint8_t> > out;
@@ -4847,6 +5018,14 @@ static void RBC_FollowerBoundary(uint32_t frame) {
     SERIAL_RBTakeOutbox(ser, lines);
     rbcf_cur = frame;
     rbcf_reloaded = false;
+    if (CPU_CycleAutoAdjust && RB_MeasureLoad()) {
+        RB_Propose();
+        static unsigned told = 0;
+        if (++told % 5u == 0)
+            LOG_MSG("INPUTNET: cluster copy %u: speed %u cycles per ms, %.0f%% busy (CPU core %.0f%%), replays allow %.0f, proposing %u",
+                rbc_copy + 1u, (unsigned)CPU_CycleMax, rb_ml_load * 100.0, rb_ml_core * 100.0, RB_ReplayCap(), rb_cap_local);
+    }
+    RBWaitTimer waited;             /* (waiting for the leader is not this copy's load) */
     bool with_packets = true;
     uint32_t lastsend = 0, last_events = GetTicks();
     for (;;) {
@@ -4867,6 +5046,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
             w.u16((uint16_t)ns);
             if (ns) w.bytes(&ser[0], ns);
             w.u8(lines);
+            w.u32(rb_cap_local);    /* this copy's speed proposal (RB_MaxCycles) */
             if (!w.overflow()) RBC_Send(rbc_leader_addr, &buf[0], w.size());
             lastsend = now ? now : 1u;
         }
@@ -4880,6 +5060,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
             const uint32_t target = rbcf_rw_target;
             if (target <= rbcf_cur && RB_Restore(target, rbcf_cur)) {
                 if (rbcf_rw_real > target) {
+                    RB_ReplayBegin(rbcf_rw_real - target);
                     inputnet_rollback_resim = true;
                     rb_target = rbcf_rw_real;
                     MIXER_SetRollbackDiscard(true);
@@ -5937,6 +6118,57 @@ static bool RB_Correct(uint32_t frame) {
     return false;
 }
 
+/* cycles=max in RollbackNet. The speed is part of the shared machine: a guess from one computer's own timing would differ
+ * on every computer. So every process measures itself each second (RB_MeasureLoad: wall time less what it slept and
+ * what it waited for other computers or copies; the CPU core's part of it) and proposes a speed (RB_Propose: "rollback
+ * max load" percent busy, and a usual deep replay within RB_REPLAY_BUDGET_US); a cluster's copies tell their leader,
+ * which takes the lowest, and every computer reports its proposal with its input. The server sets the lowest proposal
+ * for everybody as an event of its own input (INEV_CYCLEMAX: every machine and every copy applies it at the same frame,
+ * a replay too). Called at every real-time frame start of a leader. */
+static void RB_MaxCycles(void) {
+    if (!CPU_CycleAutoAdjust || rb_joining) { rb_ml_t0 = 0; return; }
+    if (!RB_MeasureLoad()) return;
+    RB_Propose();
+    for (unsigned c = 0; c < rbc_copies; c++)      /* (a cluster: as fast as its slowest copy) */
+        if (c != rbc_copy && rbc_f[c].present && rbc_f[c].cap != 0 && GetTicks() - rbc_f[c].cap_at < 5000u)
+            rb_cap_local = std::min(rb_cap_local, rbc_f[c].cap);
+    const double load = rb_ml_load;
+    const double limit = (CPU_CycleLimit > 0) ? (double)CPU_CycleLimit : 1000000.0;
+    if (!inputnet_is_server) return;
+
+    /* the server: the lowest proposal; a participant that has not proposed yet keeps the speed from rising */
+    const uint32_t tnow = GetTicks();
+    uint32_t want = rb_cap_local;
+    bool all = true;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        const InputNetPeer &p = inputnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        if (rb_cap_peer[i] != 0 && tnow - rb_cap_peer_at[i] < 5000u) want = std::min(want, rb_cap_peer[i]);
+        else all = false;
+    }
+    if (tnow - rb_ml_changed_at < 1000u) return;
+    const double cur = (double)CPU_CycleMax;
+    double next = cur;
+    /* down by at most 40% a second (one busy second is often a burst of replays), up by 15% a second (50% while far
+     * below what everybody proposes, as at the start) */
+    if ((double)want < cur * 0.88) next = std::max((double)want, cur * 0.6);
+    else if (all && (double)want > cur * 1.12) next = std::min((double)want, (double)want > cur * 2.0 ? cur * 1.5 : cur * 1.15 + 500.0);
+    next = std::max(2000.0, std::min(next, limit));
+    const uint32_t n = (uint32_t)next;
+    if (n == (uint32_t)CPU_CycleMax) return;
+    InputNetEvent ev;
+    ev.type = INEV_CYCLEMAX;
+    ev.cyclemax = n;
+    ev.pressed = 0;
+    INPUTNET_QueueLocal(ev);
+    rb_ml_changed_at = tnow;
+    if (tnow - rb_ml_told_at > 10000u || (double)n < cur * 0.8) {
+        LOG_MSG("INPUTNET: speed: %u cycles per ms for everybody (was %u; here %.0f%% busy, proposing %u)",
+            n, (unsigned)CPU_CycleMax, load * 100.0, rb_cap_local);
+        rb_ml_told_at = tnow;
+    }
+}
+
 /* A frame starts: save it, correct earlier frames if needed, then run it. */
 static void RB_FrameBoundary(uint32_t frame) {
     inputnet_frame = frame;
@@ -5953,6 +6185,7 @@ static void RB_FrameBoundary(uint32_t frame) {
         MIXER_SetRollbackDiscard(false);
         extern void RENDER_RedrawAll(void);
         RENDER_RedrawAll();                 /* nothing of the replayed frames was shown */
+        RB_ReplayEnd();
         if (rb_replay_started) {
             const uint64_t us = RB_MicroTicks() - rb_replay_started;
             rb_stat_replay_us += us; rb_stat_replays++;
@@ -6065,6 +6298,16 @@ static void RB_FrameBoundary(uint32_t frame) {
         for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++)
             if (rb_peercheck[i][k].valid) RB_CompareCheck(p, i, rb_peercheck[i][k].frame);
     }
+    {
+        const uint64_t t = RB_MicroTicks();
+        if (rb_hitch_last != 0 && t > rb_hitch_last) {
+            const uint64_t gap = t - rb_hitch_last;
+            if (gap > 30000u) rb_stat_hitches++;
+            rb_stat_maxgap_us = std::max(rb_stat_maxgap_us, gap);
+        }
+        rb_hitch_last = t;
+    }
+    RB_MaxCycles();
     RB_LogStats();
 }
 
@@ -6156,6 +6399,8 @@ static std::string RB_FingerprintDiff(const std::string &theirs, const std::stri
 
 static void RB_SessionStarted(void) {
     RB_SeatsReset();
+    rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
         rb_have[i] = 0; rb_checked[i] = 0; rb_acked[i] = 0;
         rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_peerstamp[i] = 0; rb_peerstamp_at[i] = 0; rb_rtt[i] = 0;
@@ -6559,6 +6804,8 @@ public:
 
         v = section->Get_int("rollback window");
         inputnet_rbwindow = (unsigned int)((v >= 2 && v <= 48) ? v : 16);
+        v = section->Get_int("rollback max load");
+        rb_maxload = (unsigned int)((v >= 20 && v <= 90) ? v : 60);
         v = section->Get_int("players");
         inputnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)INPUTNET_MAX_PEERS) ? v : 0);
         inputnet_rbautorun = section->Get_string("autorun");

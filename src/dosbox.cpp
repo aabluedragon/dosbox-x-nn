@@ -45,6 +45,7 @@
  *      actual leaks among the noise and to patch them up. Thus, "valgrind hunting" --J.C. */
 
 #include <assert.h>
+#include <chrono>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -434,6 +435,20 @@ extern bool DOSBox_Paused(), isDBCSCP(), InitCodePage();
 //For trying other delays
 #define wrap_delay(a) SDL_Delay(a)
 
+/* Microseconds increaseticks() slept (RollbackNet at cycles=max measures how busy this computer is with it). */
+uint64_t dosbox_sleep_us = 0;
+static uint64_t DOSBOX_MicroNow(void) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#define wrap_delay_counted(a) do { const uint64_t _t0 = DOSBOX_MicroNow(); wrap_delay(a); dosbox_sleep_us += DOSBOX_MicroNow() - _t0; } while (0)
+/* Nanoseconds the CPU core ran while dosbox_core_timing is on (RollbackNet at cycles=max: the part of the load that
+ * follows the speed; drawing, sound and saving frames take the same time at any speed). */
+uint64_t dosbox_core_ns = 0;
+bool dosbox_core_timing = false;
+static inline uint64_t DOSBOX_NanoNow(void) {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static Uint32 SDL_ticks_last = 0,SDL_ticks_next = 0;
 
 #if C_EMSCRIPTEN
@@ -493,7 +508,12 @@ static Bitu Normal_Loop(void) {
               ret = (*cpudecoder)();
               if (before > CPU_Cycles) emu_cycles_run += (uint64_t)(before - CPU_Cycles); }
 #else
-            ret = (*cpudecoder)();
+            if (GCC_UNLIKELY(dosbox_core_timing)) {
+                const uint64_t t0 = DOSBOX_NanoNow();
+                ret = (*cpudecoder)();
+                dosbox_core_ns += DOSBOX_NanoNow() - t0;
+            }
+            else ret = (*cpudecoder)();
 #endif
                 dosbox_allow_nonrecursive_page_fault = saved_allow;
 
@@ -653,7 +673,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         ticksAdded = 0;
 
         if (!CPU_CycleAutoAdjust || CPU_SkipCycleAutoAdjust || sleep1count < 3) {
-            wrap_delay(1);
+            wrap_delay_counted(1);
         }
         else {
             /* Certain configurations always give an exact sleepingtime of 1, this causes problems due to the fact that
@@ -663,7 +683,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
             static const uint32_t sleeppattern[] = { 2, 2, 3, 2, 2, 4, 2 };
             static uint32_t sleepindex = 0;
             if (ticksDone != lastsleepDone) sleepindex = 0;
-            wrap_delay(sleeppattern[sleepindex++]);
+            wrap_delay_counted(sleeppattern[sleepindex++]);
             sleepindex %= sizeof(sleeppattern) / sizeof(sleeppattern[0]);
         }
         int32_t timeslept = (int32_t)(GetTicks() - ticksNew);
@@ -5525,6 +5545,12 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("rollback window",Property::Changeable::WhenIdle, 16);
     Pint->Set_help("mode=rollback: how many frames a session may run ahead of the other participants' input before it\n"
                    "waits for them. Each frame is saved for this long. Valid range is 2 to 48.");
+
+    Pint = secprop->Add_int("rollback max load",Property::Changeable::WhenIdle, 60);
+    Pint->Set_help("mode=rollback with cycles=max: no computer guesses its own speed (the machines would differ). Each\n"
+                   "measures how busy it is and how long its replays take, and the server sets one speed for all: the\n"
+                   "busiest computer runs at about this percentage of its time, and a usual deep replay takes at most 20 ms\n"
+                   "(a longer one is a hitch). Valid range is 20 to 90.");
 
     Pint = secprop->Add_int("cluster",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("mode=rollback: IPX/NullModem-over-RollbackNet. Every computer runs a copy of the game for every\n"

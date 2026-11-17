@@ -100,6 +100,7 @@ extern bool use_dynamic_core_with_paging;
 extern bool auto_determine_dynamic_core_paging;
 
 uint64_t rdtsc_count_base = 0;
+extern bool inputnet_rollback_active;     /* inputnet.cpp (the CPU component's speed, SerializeCPU) */
 pic_tickindex_t rdtsc_pic_base = 0;
 
 bool cpu_double_fault_enable;
@@ -5049,6 +5050,16 @@ void getBytes(std::ostream& stream) override
 
     POD_Save_CPU_Flags(stream);
 	POD_Save_CPU_Paging(stream);
+    /* After the rest (older states end before it): the speed, and the time stamp counter's base. In RollbackNet the
+     * speed at cycles=max is part of the shared machine (the server sets it for everybody, INEV_CYCLEMAX), so a rollback
+     * or a resync has to take it along. */
+    {
+        const int64_t cmax = (int64_t)CPU_CycleMax;
+        const double picbase = (double)rdtsc_pic_base;
+        stream.write(reinterpret_cast<const char*>(&cmax), sizeof(cmax));
+        stream.write(reinterpret_cast<const char*>(&rdtsc_count_base), sizeof(rdtsc_count_base));
+        stream.write(reinterpret_cast<const char*>(&picbase), sizeof(picbase));
+    }
 }
 
 void setBytes(std::istream& stream) override
@@ -5106,6 +5117,21 @@ void setBytes(std::istream& stream) override
 
     POD_Load_CPU_Flags(stream);
 	POD_Load_CPU_Paging(stream);
+    {
+        int64_t cmax = 0; uint64_t count = 0; double picbase = 0;
+        stream.read(reinterpret_cast<char*>(&cmax), sizeof(cmax));
+        const bool got = stream.gcount() == (std::streamsize)sizeof(cmax);
+        if (got) {
+            stream.read(reinterpret_cast<char*>(&count), sizeof(count));
+            stream.read(reinterpret_cast<char*>(&picbase), sizeof(picbase));
+        }
+        if (got && stream.gcount() == (std::streamsize)sizeof(picbase) && inputnet_rollback_active && cmax > 0) {
+            CPU_CycleMax = (cpu_cycles_count_t)cmax;
+            rdtsc_count_base = count;
+            rdtsc_pic_base = (pic_tickindex_t)picbase;
+        }
+        stream.clear();
+    }
 
     //*******************************************
     //*******************************************
