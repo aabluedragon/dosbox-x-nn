@@ -759,6 +759,46 @@ static uint8_t vga_palette[248][3]=
 };
 VideoModeBlock * CurMode = NULL;
 
+/* Save states: CurMode as (table, entry). A state loaded without it left the BIOS believing in the mode the machine had
+ * before (RollbackNet: a computer joining a game in a VESA mode had its own text mode, and the game's VESA calls then
+ * mapped video memory differently). */
+static VideoModeBlock *INT10_ModeTable(unsigned int t) {
+	switch (t) {
+		case 0: return ModeList_VGA;
+		case 1: return ModeList_VGA_Text_200lines;
+		case 2: return ModeList_VGA_Text_350lines;
+		case 3: return ModeList_VGA_Tseng;
+		case 4: return ModeList_VGA_Paradise;
+		case 5: return ModeList_EGA_200;
+		case 6: return ModeList_EGA;
+		case 7: return ModeList_JEGA;
+		case 8: return ModeList_OTHER;
+		case 9: return ModeList_MCGA;
+		case 10: return &Hercules_Mode;
+		default: return NULL;
+	}
+}
+
+void INT10_GetCurModeRef(uint8_t &table, uint16_t &entry) {
+	table = 0xFF; entry = 0xFFFF;
+	if (CurMode == NULL) return;
+	for (unsigned int t = 0; t <= 10; t++) {
+		VideoModeBlock *list = INT10_ModeTable(t);
+		if (list == NULL) continue;
+		if (t == 10) { if (CurMode == list) { table = 10; entry = 0; } continue; }
+		for (unsigned int i = 0; list[i].mode != 0xffff && i < 0x1000; i++)
+			if (&list[i] == CurMode) { table = (uint8_t)t; entry = (uint16_t)i; return; }
+	}
+}
+
+void INT10_SetCurModeRef(uint8_t table, uint16_t entry) {
+	VideoModeBlock *list = INT10_ModeTable(table);
+	if (list == NULL) return;
+	if (table == 10) { CurMode = list; return; }
+	for (unsigned int i = 0; list[i].mode != 0xffff && i < 0x1000; i++)
+		if (i == entry) { CurMode = &list[i]; return; }
+}
+
 static bool SetCurMode(VideoModeBlock modeblock[],uint16_t mode) {
 	Bitu i=0;
 	while (modeblock[i].mode!=0xffff) {

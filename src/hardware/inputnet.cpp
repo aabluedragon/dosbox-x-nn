@@ -152,6 +152,8 @@ static bool inputnet_have_pending_tsc = false;
  * machine schedules its vertical retrace up to 0.1 ms away from the server's. */
 extern double vga_fps, vga_mode_time_base;
 extern int vga_mode_frames_since_time_base;
+uint8_t VGA_GetOnDemandFlags(void);         /* vga_draw.cpp: how frames are drawn, not in save states */
+void VGA_SetOnDemandFlags(uint8_t f);
 static double inputnet_pending_vga_fps = 0, inputnet_pending_vga_base = 0;
 static uint32_t inputnet_pending_vga_frames = 0;
 static bool inputnet_have_pending_vga = false;
@@ -1127,6 +1129,11 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
     }
 
     bool ok = true;
+    if (inputnet_have_pending_vga) {    /* (before the load too: see RB_LoadResyncState) */
+        vga_fps = inputnet_pending_vga_fps;
+        vga_mode_time_base = inputnet_pending_vga_base;
+        vga_mode_frames_since_time_base = (int)inputnet_pending_vga_frames;
+    }
     try {
         InputNetSaveStateOverride ov(path,true);
         SaveState::instance().load(0);
@@ -3211,7 +3218,11 @@ static void RBT_DiffRAM(RBSnap &s) {
 
 static void RB_Capture(uint32_t frame) {
     const uint64_t t0 = RB_MicroTicks();
-    if (rb_evlog_on && rb_last_load_frame != UINT32_MAX && frame >= rb_last_load_frame + 2u) rb_evlog_on = false;
+    if (rb_evlog_on && rb_last_load_frame != UINT32_MAX) {     /* NN_RB_EVLOG=<frames> (2 by default) */
+        static const char *ev = getenv("NN_RB_EVLOG");
+        const uint32_t n = (ev != NULL && atoi(ev) > 0) ? (uint32_t)atoi(ev) : 2u;
+        if (frame >= rb_last_load_frame + n) rb_evlog_on = false;
+    }
     if (RB_RegionsMoved()) RB_InitRegions();    /* video memory reallocated etc.: older frames are gone */
 
     RBSnap &s = rb_snap[frame % RB_RING];
@@ -3799,12 +3810,14 @@ struct RBResyncInfo {
     double vfps = 0, vbase = 0;
     int32_t vframes = 0;
     uint16_t epoch = 0;             /* the server's resyncs, this one included (rb_epoch) */
+    uint8_t draw = 0;               /* VGA_GetOnDemandFlags */
 };
-static const size_t RB_RESYNC_INFO_SIZE = 4 + 4 + 8 + 8 + 4 + 2;
+static const size_t RB_RESYNC_INFO_SIZE = 4 + 4 + 8 + 8 + 4 + 2 + 1;
 
 static void RB_PutResyncInfo(std::vector<uint8_t> &raw, const RBResyncInfo &h) {
     auto put = [&raw](const void *v, size_t n) { const uint8_t *b = (const uint8_t*)v; raw.insert(raw.end(), b, b + n); };
     put(&h.frame, 4); put(&h.tick, 4); put(&h.vfps, 8); put(&h.vbase, 8); put(&h.vframes, 4); put(&h.epoch, 2);  /* little-endian hosts */
+    put(&h.draw, 1);
 }
 
 static bool RB_GetResyncInfo(const std::vector<uint8_t> &raw, RBResyncInfo &h) {
@@ -3812,6 +3825,7 @@ static bool RB_GetResyncInfo(const std::vector<uint8_t> &raw, RBResyncInfo &h) {
     const uint8_t *b = &raw[0];
     memcpy(&h.frame, b, 4); memcpy(&h.tick, b + 4, 4); memcpy(&h.vfps, b + 8, 8); memcpy(&h.vbase, b + 16, 8); memcpy(&h.vframes, b + 24, 4);
     memcpy(&h.epoch, b + 28, 2);
+    h.draw = b[30];
     return true;
 }
 
@@ -3820,10 +3834,17 @@ static bool RB_GetResyncInfo(const std::vector<uint8_t> &raw, RBResyncInfo &h) {
  * times among them). Nothing before this frame can be rolled back to afterwards. */
 static bool RB_LoadResyncState(const RBResyncInfo &h, const std::vector<uint8_t> &state, const std::function<void()> &after = std::function<void()>()) {
     RBT_Stop();                     /* the load writes all of guest RAM */
+    /* before too: the VGA's load compares its mode's rate with vga_fps (VGA_SetupDrawing), and with this machine's own
+     * (a joining computer's text mode at 70 Hz, a game's VESA mode at 60) it would restart the frame clock and the
+     * vertical retrace where the other computers do not */
+    vga_fps = h.vfps;
+    vga_mode_time_base = h.vbase;
+    vga_mode_frames_since_time_base = (int)h.vframes;
     if (!INPUTNET_ApplyStateSnapshot(state)) { RB_InitRegions(); return false; }
     vga_fps = h.vfps;
     vga_mode_time_base = h.vbase;
     vga_mode_frames_since_time_base = (int)h.vframes;
+    VGA_SetOnDemandFlags(h.draw);
     if (after) after();             /* (a cluster copy's clock, time stamp counter, IPX driver) */
     PAGING_ClearTLB();
     rb_tick = h.tick;
@@ -3960,8 +3981,9 @@ struct RBCExtras {
     uint64_t tsc = 0;
     double picbase = 0, vfps = 0, vbase = 0;
     int32_t vframes = 0;
+    uint8_t draw = 0;               /* VGA_GetOnDemandFlags */
 };
-static const size_t RBC_EXTRAS_SIZE = 16 + 2 + 1 + 1 + 8 + 8 + 8 + 8 + 4;
+static const size_t RBC_EXTRAS_SIZE = 16 + 2 + 1 + 1 + 8 + 8 + 8 + 8 + 4 + 1;
 
 static void RBC_GetExtras(RBCExtras &x) {
     CMOS_GetSharedClock(x.clock);
@@ -3969,6 +3991,7 @@ static void RBC_GetExtras(RBCExtras &x) {
     x.tsc = rdtsc_count_base;
     x.picbase = (double)rdtsc_pic_base;
     x.vfps = vga_fps; x.vbase = vga_mode_time_base; x.vframes = (int32_t)vga_mode_frames_since_time_base;
+    x.draw = VGA_GetOnDemandFlags();
 }
 
 static void RBC_SetExtras(const RBCExtras &x) {
@@ -3977,6 +4000,7 @@ static void RBC_SetExtras(const RBCExtras &x) {
     rdtsc_count_base = x.tsc;
     rdtsc_pic_base = (pic_tickindex_t)x.picbase;
     vga_fps = x.vfps; vga_mode_time_base = x.vbase; vga_mode_frames_since_time_base = (int)x.vframes;
+    VGA_SetOnDemandFlags(x.draw);
 }
 
 static void RBC_Put(std::vector<uint8_t> &out, const void *v, size_t n) { const uint8_t *b = (const uint8_t*)v; out.insert(out.end(), b, b + n); }
@@ -3985,12 +4009,13 @@ static bool RBC_Get(const uint8_t *&p, const uint8_t *end, void *v, size_t n) { 
 static void RBC_PutExtras(std::vector<uint8_t> &out, const RBCExtras &x) {
     RBC_Put(out, x.clock, 16); RBC_Put(out, &x.year, 2); RBC_Put(out, &x.month, 1); RBC_Put(out, &x.day, 1);
     RBC_Put(out, &x.tsc, 8); RBC_Put(out, &x.picbase, 8); RBC_Put(out, &x.vfps, 8); RBC_Put(out, &x.vbase, 8); RBC_Put(out, &x.vframes, 4);
+    RBC_Put(out, &x.draw, 1);
 }
 
 static bool RBC_GetExtrasFrom(const uint8_t *&p, const uint8_t *end, RBCExtras &x) {
     return RBC_Get(p, end, x.clock, 16) && RBC_Get(p, end, &x.year, 2) && RBC_Get(p, end, &x.month, 1) && RBC_Get(p, end, &x.day, 1) &&
         RBC_Get(p, end, &x.tsc, 8) && RBC_Get(p, end, &x.picbase, 8) && RBC_Get(p, end, &x.vfps, 8) && RBC_Get(p, end, &x.vbase, 8) &&
-        RBC_Get(p, end, &x.vframes, 4);
+        RBC_Get(p, end, &x.vframes, 4) && RBC_Get(p, end, &x.draw, 1);
 }
 
 /* ---- the link between a computer's copies ---- */
@@ -4582,7 +4607,7 @@ static bool RBC_TakeManifestFull(const uint8_t *&p, const uint8_t *end, std::vec
  * the IPX driver's state go back after the save state. */
 static bool RBC_LoadCopy(const RBResyncInfo &h, const std::vector<uint8_t> &state, const uint8_t *ipx, size_t ipxlen, const RBCExtras &x) {
     RBResyncInfo hh = h;
-    hh.vfps = x.vfps; hh.vbase = x.vbase; hh.vframes = x.vframes;
+    hh.vfps = x.vfps; hh.vbase = x.vbase; hh.vframes = x.vframes; hh.draw = x.draw;
     return RB_LoadResyncState(hh, state, [&]() {
         RBC_SetExtras(x);
         if (!RB_LoadLinks(ipx, ipxlen)) LOG_MSG("INPUTNET: cluster: the links' state (IPX, null modem) did not load");
@@ -4830,6 +4855,7 @@ static bool RBC_BuildMachines(uint32_t frame, uint16_t epoch, std::vector<uint8_
     if (!INPUTNET_SnapshotState(main_state)) return false;
     info.frame = frame; info.tick = rb_tick; info.epoch = epoch;
     info.vfps = vga_fps; info.vbase = vga_mode_time_base; info.vframes = (int32_t)vga_mode_frames_since_time_base;
+    info.draw = VGA_GetOnDemandFlags();
     std::string own_ipx;
     RB_SaveLinks(own_ipx);
     RBCExtras own_x;
@@ -5308,6 +5334,7 @@ static bool RB_BuildResyncBlob(uint32_t frame, std::vector<uint8_t> &out, uint32
     h.vfps = vga_fps;
     h.vbase = vga_mode_time_base;
     h.vframes = (int32_t)vga_mode_frames_since_time_base;
+    h.draw = VGA_GetOnDemandFlags();
     std::vector<uint8_t> raw;
     RB_PutResyncInfo(raw, h);
     raw.insert(raw.end(), state.begin(), state.end());

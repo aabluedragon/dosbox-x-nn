@@ -83,6 +83,22 @@ bool enable_supermegazeux_256colortext = false;
 
 static bool is_vga_rendering_on_demand = false;
 
+/* RollbackNet: how the frame being drawn is drawn (bit 0, is_vga_rendering_on_demand) and how the mode's next frames
+ * will be (bit 1, vga_render_on_demand). Neither is in a save state, and the load's VGA_SetupDrawing takes the first
+ * from the machine as it was: a computer joining a game in a VESA mode (drawn on demand) from its own text mode (drawn
+ * line by line) then drew the rest of that frame line by line, which moved the frame clock and so the next vertical
+ * retrace. */
+uint8_t VGA_GetOnDemandFlags(void) {
+	extern bool vga_render_on_demand;
+	return (uint8_t)((is_vga_rendering_on_demand ? 1u : 0u) | (vga_render_on_demand ? 2u : 0u));
+}
+
+void VGA_SetOnDemandFlags(uint8_t f) {
+	extern bool vga_render_on_demand;
+	is_vga_rendering_on_demand = (f & 1u) != 0;
+	vga_render_on_demand = (f & 2u) != 0;
+}
+
 extern bool vga_render_on_demand;
 extern signed char vga_render_on_demand_user;
 extern bool vga_render_wait_for_changes;
@@ -9211,6 +9227,9 @@ void POD_Save_VGA_Draw( std::ostream& stream )
 		WRITE_POD( &vga_fps, vga_fps );
 		WRITE_POD( &vga_mode_time_base, vga_mode_time_base );
 		WRITE_POD( &vga_mode_frames_since_time_base, vga_mode_frames_since_time_base );
+		/* and how frames are drawn (see VGA_GetOnDemandFlags): a rollback across a mode change takes the older mode's */
+		WRITE_POD( &is_vga_rendering_on_demand, is_vga_rendering_on_demand );
+		WRITE_POD( &vga_render_on_demand, vga_render_on_demand );
 	}
 
 
@@ -9261,6 +9280,8 @@ void POD_Load_VGA_Draw( std::istream& stream )
 		READ_POD( &vga_fps, vga_fps );
 		READ_POD( &vga_mode_time_base, vga_mode_time_base );
 		READ_POD( &vga_mode_frames_since_time_base, vga_mode_frames_since_time_base );
+		READ_POD( &is_vga_rendering_on_demand, is_vga_rendering_on_demand );
+		READ_POD( &vga_render_on_demand, vga_render_on_demand );
 	}
 
 

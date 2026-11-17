@@ -1938,6 +1938,9 @@ void INT10_Init() {
 }
 
 //save state support
+void INT10_GetCurModeRef(uint8_t &table, uint16_t &entry);   /* int10_modes.cpp */
+void INT10_SetCurModeRef(uint8_t table, uint16_t entry);
+
 namespace
 {
 class SerializeInt10 : public SerializeGlobalPOD
@@ -1949,6 +1952,27 @@ public:
         //registerPOD(CurMode);
         //registerPOD(call_10);
         //registerPOD(warned_ff);
+    }
+private:
+    /* CurMode, as its table and entry, after the rest (older states end before it: CurMode stays) */
+    void getBytes(std::ostream& stream) override
+    {
+        SerializeGlobalPOD::getBytes(stream);
+        uint8_t table; uint16_t entry;
+        INT10_GetCurModeRef(table, entry);
+        stream.write(reinterpret_cast<const char*>(&table), sizeof(table));
+        stream.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+    }
+    void setBytes(std::istream& stream) override
+    {
+        SerializeGlobalPOD::setBytes(stream);
+        uint8_t table = 0xFF; uint16_t entry = 0xFFFF;
+        stream.read(reinterpret_cast<char*>(&table), sizeof(table));
+        if (stream.gcount() == (std::streamsize)sizeof(table)) {
+            stream.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+            if (stream.gcount() == (std::streamsize)sizeof(entry) && table != 0xFF) INT10_SetCurModeRef(table, entry);
+        }
+        stream.clear();
     }
 
 	 //   virtual void setBytes(std::istream& stream)
