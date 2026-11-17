@@ -493,7 +493,14 @@ and hands it to its copies with the current frame's events. The change still to 
 joining machine knows it. The log names what the corrections came from (keys, mouse, speed changes). Mouse motion
 goes to every Kth frame, gathered (`[inputnet] rollback mouse frames`, 0 = from the distance: 1 under 80 ms round trip,
 2 under 160 ms, 3 beyond): a mouse reports in almost every frame, and every frame of it the others did not predict costs
-them a replay; this computer applies it at that frame too, so it is at most K-1 frames later. Tried and dropped: gathering
+them a replay; this computer applies it at that frame too, so it is at most K-1 frames later. During a replay this computer's
+input keeps going out at real time (`INPUTNET_ReplayPublish`, every 10 ms from the main loop: the player's new input is
+read and every frame whose time has come is published, without a checksum since the frames being replayed are not
+final). Before, a replay of 100-200 ms stopped our input for that long, so the others learned it that much later,
+replayed that much deeper and stopped theirs in turn: at 220 ms replays averaged 17 to 24 frames, about the whole
+round trip; now 12 to 13 (half of it), with 20 to 30% fewer frames replayed, fewer stalls (91 and 24 instead of 183
+and 96 with keys) and more real time with mouse aiming (82 to 85% instead of 70 to 80%). The side ahead now slows by
+1 ms a frame (2 when over 4 frames ahead), not 1 ms every second frame. Tried and dropped: gathering
 corrections into fewer replays (4 frames after the previous one: as many replays, and less real time), a lower load
 target (70%: real time kept better, the picture changed 30 to 40 times a second instead of 40 to 48). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
 read only in a RollbackNet session), so rollbacks and joins carry the speed along. The log says where it stands every

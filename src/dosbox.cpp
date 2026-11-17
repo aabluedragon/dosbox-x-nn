@@ -557,6 +557,7 @@ static Bitu Normal_Loop(void) {
                 /* RollbackNet replays frames at full speed after a correction: host events (input, window) wait
                  * until it has caught up with real time again. */
                 if (!inputnet_rollback_resim) GFX_Events();
+                else INPUTNET_ReplayPublish();  /* (our input keeps going out at real time meanwhile) */
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
                     TIMER_AddTick();
                     ticksRemain--;

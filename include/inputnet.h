@@ -94,6 +94,7 @@ bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters);
 extern bool inputnet_rollback_active;
 extern bool inputnet_rollback_resim;
 void INPUTNET_RollbackTick(void);
+void INPUTNET_ReplayPublish(void);
 /* dosbox.cpp: the main loop's budget of emulated milliseconds to run before it waits for real time */
 void DOSBOX_AddTicksRemain(uint32_t n);
 bool DOSBOX_DropTickRemain(void);

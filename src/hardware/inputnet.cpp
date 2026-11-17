@@ -3624,7 +3624,31 @@ static unsigned int RB_EffectiveDelay(void) {
 }
 
 /* Our input up to frame+delay is final now: send it, from the oldest frame anybody lacks. */
-static void RB_SendInput(uint32_t frame) {
+static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe);
+static void RB_SendInput(uint32_t frame) { RB_SendInputEx(frame, true, rb_realframe); }
+
+/* During a replay our input keeps going out at real time (every 10 ms, from the main loop): the player's new input is
+ * read and every frame whose time has come is published, as if this computer were there already (it gets there when
+ * the replay is done, catching up). Before, a replay of 100-200 ms stopped our input for that long, the others then
+ * learned it that much later, replayed that much deeper, and stopped theirs in turn: replays of about the whole round
+ * trip instead of half of it. The packets carry no checksum (the frames still being replayed are not final). */
+extern void GFX_Events();
+void INPUTNET_ReplayPublish(void) {
+    if (!inputnet_rollback || !inputnet_rollback_active || !inputnet_session || rb_joining || rb_lockstep) return;
+    if (rbc_copies && !rbc_leader) return;
+    if (rb_replay_started == 0) return;     /* (a correction's replay only, RB_Rollback) */
+    static uint64_t last = 0;
+    const uint64_t now = RB_MicroTicks();
+    if (now - last < 10000u) return;
+    last = now;
+    const uint32_t elapsed = (uint32_t)((now - rb_replay_started) / 1000u / inputnet_frame_ms);
+    if (elapsed == 0) return;
+    GFX_Events();
+    if (!inputnet_session) return;
+    RB_SendInputEx(rb_target + elapsed, false, rb_target + elapsed);
+}
+
+static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe) {
     if (rb_joining) return;         /* (nothing of ours counts before we have the server's machines) */
     InputNetPeer &self = inputnet_peers[inputnet_selfid];
     const uint32_t newest = std::max(frame + RB_EffectiveDelay(), inputnet_local_confirmed);
@@ -3656,7 +3680,7 @@ static void RB_SendInput(uint32_t frame) {
     InputNetWriter w(buf,sizeof(buf));
     INPUTNET_BeginPacket(w,INPKT_RBINPUT);
     w.u32(newest);
-    w.u32(rb_realframe);
+    w.u32(realframe);
     w.u32(GetTicks());
     w.u16((uint16_t)std::min<uint32_t>(newest - first + 1u, 0xFFFFu));
     for (uint32_t f = first; f <= newest; f++) {
@@ -3686,7 +3710,7 @@ static void RB_SendInput(uint32_t frame) {
     /* (frames after a wrong guess that waits for its correction are not final either) */
     const uint32_t final_frame = std::min(std::min(RB_MinHave(), frame), rb_pending_wrong);
     const RBSnap &cs = rb_snap[final_frame % RB_RING];
-    if (final_frame != UINT32_MAX && cs.valid && cs.frame == final_frame) {
+    if (with_check && final_frame != UINT32_MAX && cs.valid && cs.frame == final_frame) {
         w.u32(final_frame);
         w.u32((uint32_t)(cs.hash >> 32u));
         w.u32((uint32_t)cs.hash);
@@ -3994,8 +4018,12 @@ static void RB_TimeSync(uint32_t frame) {
      * would then race ahead of us in turn */
     if (worst > 3.0 && DOSBOX_TrimTickRemain(inputnet_frame_ms) > 0) rb_stat_trims++;
     rb_advantage = rb_advantage * 0.9 + worst * 0.1;
-    if (rb_advantage > 0.75 && (frame - rb_last_slowdown) >= 2u) {
-        if (DOSBOX_DropTickRemain()) { rb_stat_slowdowns++; rb_last_slowdown = frame; }
+    /* (the side ahead slows down: by a millisecond a frame, two while more than 4 frames ahead. At 5% at most, a gap of 10
+     * frames after a long replay took seconds to close, and meanwhile every input of the side behind arrived that much
+     * deeper in the past: replays of about the whole round trip instead of half of it) */
+    if (rb_advantage > 0.75 && (frame - rb_last_slowdown) >= 1u) {
+        unsigned drop = rb_advantage > 4.0 ? 2u : 1u;
+        while (drop-- && DOSBOX_DropTickRemain()) { rb_stat_slowdowns++; rb_last_slowdown = frame; }
     }
 }
 
@@ -7147,6 +7175,7 @@ bool INPUTNET_RollbackSeat(const std::string &, unsigned) { return false; }
 bool INPUTNET_PendingSpeed(uint32_t &, uint32_t &) { return false; }
 void INPUTNET_ScheduleSpeed(uint32_t, uint32_t) { }
 uint32_t INPUTNET_TraceFrame(void) { return 0; }
+void INPUTNET_ReplayPublish(void) { }
 
 /* Networking support was not compiled in: the hooks stay inert. */
 
