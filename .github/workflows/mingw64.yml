@@ -156,7 +156,7 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: git make mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-libtool mingw-w64-ucrt-x86_64-nasm autoconf automake mingw-w64-ucrt-x86_64-libslirp
+          install: git make mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-libtool mingw-w64-ucrt-x86_64-nasm autoconf automake mingw-w64-ucrt-x86_64-libslirp mingw-w64-ucrt-x86_64-pkgconf
       - name: Update build info
         shell: bash
         run: |
@@ -265,7 +265,7 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: git make mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-libtool mingw-w64-ucrt-x86_64-nasm autoconf automake mingw-w64-ucrt-x86_64-libslirp
+          install: git make mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-libtool mingw-w64-ucrt-x86_64-nasm autoconf automake mingw-w64-ucrt-x86_64-libslirp mingw-w64-ucrt-x86_64-pkgconf
       - name: Update build info
         shell: bash
         run: |
