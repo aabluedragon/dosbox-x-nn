@@ -72,6 +72,7 @@ bool inputnet_rollback_resim = false;
 
 #include <algorithm>
 #include <functional>
+#include <map>
 #if defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
 #include <unistd.h>
@@ -403,6 +404,8 @@ static void RB_ReplayEnd(void);
 /* hitches: real-time frames that started more than 30 ms after the one before (a long replay, a wait for the others) */
 static uint64_t rb_hitch_last = 0, rb_stat_maxgap_us = 0;
 static uint32_t rb_stat_hitches = 0, rb_stat_trims = 0;
+/* what the frames that needed a correction held (the log: what rollbacks come from) */
+static uint32_t rb_mis_key = 0, rb_mis_mouse = 0, rb_mis_speed = 0, rb_mis_other = 0, rb_mis_speed_late = 0;
 extern uint64_t dosbox_core_ns;             /* dosbox.cpp: what the CPU core ran, while dosbox_core_timing */
 extern bool dosbox_core_timing;
 extern uint64_t dosbox_sleep_us;            /* dosbox.cpp: what increaseticks() slept */
@@ -706,6 +709,33 @@ bool INPUTNET_InterceptMouseWheel(int32_t scroll) {
 /* Applying input to the emulated machine                                     */
 /* ------------------------------------------------------------------------- */
 
+/* RollbackNet at cycles=max: a speed change applies RB_SPEED_LEAD frames after the frame whose input carries it
+ * (INEV_CYCLEMAX with pressed = 2 + the frames to wait). The others learn about it before it applies, so it never needs a
+ * correction: before, every change was input nobody could predict, and each cost the others a replay as deep as the
+ * distance (a hitch at every change, about one a second). Kept here by the frame it applies at, not in the machine
+ * (replays apply it again at that frame); a joining machine gets the one still to come with the CPU's state. */
+static const uint32_t RB_SPEED_LEAD = 40;
+static std::map<uint32_t,uint32_t> rb_speed_sched;
+/* Events the leader adds for every copy at a frame (a speed change it learned of late: RB_FindMisprediction); kept by
+ * frame, so a replay across it routes them again. */
+static std::map<uint32_t, std::vector<InputNetEvent> > rbc_injected;
+static bool RB_SpeedTrace(void) { static const bool t = getenv("NN_RB_TRACE") != NULL && *getenv("NN_RB_TRACE"); return t; }
+void INPUTNET_ScheduleSpeed(uint32_t frame, uint32_t speed) {
+    if (speed == 0) return;
+    if (RB_SpeedTrace() && rb_speed_sched[frame] != speed) LOG_MSG("RBSPEED schedule at=%u speed=%u (now frame %u)", (unsigned)frame, (unsigned)speed, (unsigned)inputnet_frame);
+    rb_speed_sched[frame] = speed;
+    while (rb_speed_sched.size() > 64) rb_speed_sched.erase(rb_speed_sched.begin());
+}
+/* The change still to come after the current frame (the CPU's saved state carries it): false when none. */
+bool INPUTNET_PendingSpeed(uint32_t &frame, uint32_t &speed);
+static void RB_ApplyScheduledSpeed(uint32_t frame) {
+    const auto it = rb_speed_sched.find(frame);
+    if (it != rb_speed_sched.end() && it->second != (uint32_t)CPU_CycleMax) {
+        if (RB_SpeedTrace()) LOG_MSG("RBSPEED apply f=%u speed=%u%s", (unsigned)frame, (unsigned)it->second, inputnet_rollback_resim ? " replay" : "");
+        DOSBOX_ApplyCycleMax((cpu_cycles_count_t)it->second, false);
+    }
+}
+
 static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
     switch (ev.type) {
         case INEV_KEY:  /* "pressed": bit 0 down, bit 1 typed by the RollbackNet server's autorun */
@@ -740,6 +770,10 @@ static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
             Mouse_WheelMovedRaw(ev.wheel);
             break;
         case INEV_CYCLEMAX:
+            if (ev.pressed >= 2u && inputnet_rollback) {     /* (RollbackNet: applies later, RB_ApplyScheduledSpeed) */
+                INPUTNET_ScheduleSpeed(inputnet_frame + (uint32_t)(ev.pressed - 2u), ev.cyclemax);
+                break;
+            }
             /* Every participant reaches this at the same emulated time, so the
              * emulated machines keep executing the same amount of guest code
              * per emulated millisecond. */
@@ -3433,6 +3467,7 @@ static bool RB_Restore(uint32_t target, uint32_t newest) {
 /* Apply everyone's input for "frame"; remote input that has not arrived yet is predicted as "nothing new". */
 static void RB_ApplyInputs(uint32_t frame) {
     if (rbc_copies && rbc_leader) { RBC_ApplyInputs(frame); return; }
+    RB_ApplyScheduledSpeed(frame);
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
         InputNetPeer &p = inputnet_peers[i];
         if (!p.active || !p.ready) continue;
@@ -3467,8 +3502,39 @@ static uint32_t RB_FindMisprediction(uint32_t frame) {
             rb_predicted[i][f % RB_RING] = 0;
             InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p,f);
             if (slot != NULL && !slot->events.empty()) {
+                /* only speed changes that apply later, at a frame still to come: learn them now, no correction */
+                bool sched_only = true;
+                for (size_t e = 0; e < slot->events.size() && sched_only; e++)
+                    sched_only = slot->events[e].type == INEV_CYCLEMAX && slot->events[e].pressed >= 2u &&
+                        f + (uint32_t)(slot->events[e].pressed - 2u) >= frame;
+                if (sched_only) {
+                    for (size_t e = 0; e < slot->events.size(); e++) {
+                        const InputNetEvent &x = slot->events[e];
+                        const uint32_t at = f + (uint32_t)(x.pressed - 2u);
+                        INPUTNET_ScheduleSpeed(at, x.cyclemax);
+                        if (rbc_copies > 1 && rbc_leader) {     /* (the copies learn it with this frame's events) */
+                            InputNetEvent y = x;
+                            y.pressed = (uint8_t)(2u + (at - frame));
+                            rbc_injected[frame].push_back(y);
+                        }
+                    }
+                    rb_mis_speed_late++;
+                    continue;
+                }
                 if (f < earliest) earliest = f;
                 rb_late.push_back(RBLate{ i, f });
+                bool k = false, m = false, c = false, o = false;
+                for (size_t e = 0; e < slot->events.size(); e++) {
+                    const uint8_t t = slot->events[e].type;
+                    if (t == INEV_KEY) k = true;
+                    else if (t == INEV_MOUSEMOVE || t == INEV_MOUSEBUTTON || t == INEV_MOUSEWHEEL) m = true;
+                    else if (t == INEV_CYCLEMAX) c = true;
+                    else o = true;
+                }
+                if (k) rb_mis_key++;
+                if (m) rb_mis_mouse++;
+                if (c) rb_mis_speed++;
+                if (o) rb_mis_other++;
             }
         }
         if (upto > rb_checked[i]) rb_checked[i] = upto;
@@ -3961,6 +4027,10 @@ static void RB_LogStats(void) {
         rb_stat_captures ? (double)rb_stat_scan_us / (double)rb_stat_captures : 0.0,
         rb_stat_captures ? (double)rb_stat_lean_us / (double)rb_stat_captures : 0.0,
         (unsigned)rb_stat_lockstep, (unsigned)rb_stat_ctxchanges);
+    LOG_MSG("INPUTNET: the others' input that needed a correction: %u frames with keys, %u with the mouse, %u with a speed change, %u other "
+        "(and %u speed changes learned in time, without one)", (unsigned)rb_mis_key, (unsigned)rb_mis_mouse, (unsigned)rb_mis_speed,
+        (unsigned)rb_mis_other, (unsigned)rb_mis_speed_late);
+    rb_mis_key = rb_mis_mouse = rb_mis_speed = rb_mis_other = rb_mis_speed_late = 0;
     if (CPU_CycleAutoAdjust) LOG_MSG("INPUTNET: speed %u cycles per ms (cycles=max), this computer %.0f%% busy (CPU core %.0f%%, "
         "running %.0f%% of it), picture %.0f a second (%.0f Hz, %.0f%% of the frames drawn changed), proposing %u", (unsigned)CPU_CycleMax,
         rb_ml_load * 100.0, rb_ml_core * 100.0, rb_ml_run * 100.0, rb_ml_pictures, rb_ml_refresh, rb_ml_changed_share * 100.0, rb_cap_local);
@@ -4651,6 +4721,11 @@ static inline bool RB_GuardDrops(const InputNetEvent &e) {
  * this copy's packets and input, and every follower's GO. A joining computer runs its own typing only. */
 static void RBC_ApplyInputs(uint32_t frame) {
     std::vector<InputNetEvent> ev[INPUTNET_MAX_PEERS];
+    {
+        const auto inj = rbc_injected.find(frame);
+        if (inj != rbc_injected.end()) for (unsigned c = 0; c < rbc_copies; c++) ev[c] = inj->second;
+        while (!rbc_injected.empty() && rbc_injected.begin()->first + 256u < frame) rbc_injected.erase(rbc_injected.begin());
+    }
     if (rb_joining) {
         if (rbj_typing_pos < rbj_typing.size()) {
             for (unsigned c = 0; c < rbc_copies; c++) ev[c] = rbj_typing[rbj_typing_pos];
@@ -4682,6 +4757,9 @@ static void RBC_ApplyInputs(uint32_t frame) {
         const std::vector<uint8_t> &ser = rbc_ser_inbox[k][rbc_copy];
         if (!ser.empty() || rbc_ser_lines[k][rbc_copy]) SERIAL_RBDeliver(ser.empty() ? NULL : &ser[0], ser.size(), rbc_ser_lines[k][rbc_copy]);
     }
+    /* (a scheduled speed change goes after the frame's packets and before its input, on the leader and on every copy alike:
+     * delivering a packet schedules emulated events in cycles, so the order is part of the machine's course) */
+    RB_ApplyScheduledSpeed(frame);
     for (size_t i = 0; i < ev[rbc_copy].size(); i++) if (!RB_GuardDrops(ev[rbc_copy][i])) INPUTNET_ApplyEvent(ev[rbc_copy][i]);
     for (unsigned c = 0; c < rbc_copies; c++)
         if (c != rbc_copy) RBC_SendGo(c, frame, ev[c], have ? rbc_inbox[k][c] : none, have ? rbc_ser_inbox[k][c] : noser, have ? rbc_ser_lines[k][c] : 0);
@@ -5117,6 +5195,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
             rbcf_go = false;
             for (size_t i = 0; i < rbcf_go_packets.size(); i++) IPX_ClusterDeliver(&rbcf_go_packets[i][0], rbcf_go_packets[i].size());
             if (!rbcf_go_ser.empty() || rbcf_go_lines) SERIAL_RBDeliver(rbcf_go_ser.empty() ? NULL : &rbcf_go_ser[0], rbcf_go_ser.size(), rbcf_go_lines);
+            RB_ApplyScheduledSpeed(rbcf_cur);
             for (size_t i = 0; i < rbcf_go_events.size(); i++) if (!RB_GuardDrops(rbcf_go_events[i])) INPUTNET_ApplyEvent(rbcf_go_events[i]);
             rbcf_cur = UINT32_MAX;
             return;
@@ -6186,6 +6265,7 @@ static void RB_MaxCycles(void) {
         else all = false;
     }
     if (tnow - rb_ml_changed_at < 1000u) return;
+    if (!rb_speed_sched.empty() && rb_speed_sched.rbegin()->first >= rb_realframe) return;   /* (one still to apply) */
     const double cur = (double)CPU_CycleMax;
     double next = cur;
     /* down by at most 40% a second (one busy second is often a burst of replays), up by 15% a second, 25% while far
@@ -6199,7 +6279,7 @@ static void RB_MaxCycles(void) {
     InputNetEvent ev;
     ev.type = INEV_CYCLEMAX;
     ev.cyclemax = n;
-    ev.pressed = 0;
+    ev.pressed = (uint8_t)(2u + RB_SPEED_LEAD);    /* applies RB_SPEED_LEAD frames later on every machine */
     INPUTNET_QueueLocal(ev);
     rb_ml_changed_at = tnow;
     if (tnow - rb_ml_told_at > 10000u || (double)n < cur * 0.8) {
@@ -6449,7 +6529,7 @@ static std::string RB_FingerprintDiff(const std::string &theirs, const std::stri
 
 static void RB_SessionStarted(void) {
     RB_SeatsReset();
-    rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_ml_share_s = 0; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
+    rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_speed_sched.clear(); rbc_injected.clear(); rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_ml_share_s = 0; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
         rb_have[i] = 0; rb_checked[i] = 0; rb_acked[i] = 0;
@@ -6522,6 +6602,12 @@ bool INPUTNET_IsServer(void) { return inputnet_is_server && inputnet_link_up; }
 bool INPUTNET_IsConnected(void) { return inputnet_link_up || rbc_copies != 0; }
 /* NN_RB_TRACE: the frame for other components' trace lines (dos.cpp logs every INT 21h call with it) */
 uint32_t INPUTNET_TraceFrame(void) { return inputnet_frame; }
+bool INPUTNET_PendingSpeed(uint32_t &frame, uint32_t &speed) {
+    const auto it = rb_speed_sched.lower_bound(inputnet_frame);   /* (saved before this frame's own change applies) */
+    if (!inputnet_rollback_active || it == rb_speed_sched.end()) return false;
+    frame = it->first; speed = it->second;
+    return true;
+}
 
 /* ------------------------------------------------------------------------- */
 /* INPUTNET.COM                                                               */
@@ -7035,6 +7121,9 @@ bool INPUTNET_RollbackSeat(const std::string &name, unsigned copy) {
 
 #include <string>
 bool INPUTNET_RollbackSeat(const std::string &, unsigned) { return false; }
+bool INPUTNET_PendingSpeed(uint32_t &, uint32_t &) { return false; }
+void INPUTNET_ScheduleSpeed(uint32_t, uint32_t) { }
+uint32_t INPUTNET_TraceFrame(void) { return 0; }
 
 /* Networking support was not compiled in: the hooks stay inert. */
 

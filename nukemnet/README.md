@@ -484,8 +484,13 @@ slow). A process over 97% busy asks for 80% of the speed at once, one whose
 core barely runs (a halted guest) asks for no more. A cluster's hidden copies
 send their proposal to the leader with every frame message, which takes the lowest; every computer sends its lowest at
 the end of its input packets. The server sets the lowest for everybody when it is under 95% or over 108% of the speed, down by at most 40% a second and up by 15%
-(25% while far below, 50% while slow), as an event of its own input (`INEV_CYCLEMAX`): every machine and every copy applies it at the
-same frame, in replays too. `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
+(25% while far below, 50% while slow), as an event of its own input (`INEV_CYCLEMAX` with `pressed` = 2 + 40): every machine and every copy applies it 40
+frames later (`RB_ApplyScheduledSpeed`, after the frame's cluster packets and before its input, on leaders and copies
+alike: delivering a packet schedules emulated events in cycles), in replays too. The others learn of it before it
+applies, so a change no longer needs a correction (before, each was input nobody could predict and cost the others a
+replay as deep as the distance); a computer that learns of one late but in time records it (`RB_FindMisprediction`)
+and hands it to its copies with the current frame's events. The change still to come travels in the CPU's state, so a
+joining machine knows it. The log names what the corrections came from (keys, mouse, speed changes). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
 read only in a RollbackNet session), so rollbacks and joins carry the speed along. The log says where it stands every
 5 seconds ("speed N cycles per ms (cycles=max), this computer N% busy (CPU core N%, running N% of it), picture N of N a second,
 proposing N", "N hitches (frames more than 30 ms late) ... the picture changed N times/s").
