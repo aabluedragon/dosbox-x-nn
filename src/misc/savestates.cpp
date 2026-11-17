@@ -6,6 +6,7 @@
 #include <string>
 #include <cstring>
 #include <fstream>
+#include <chrono>
 #include "SDL.h"
 bool NN_Lockdown(void);    /* src/hardware/remoteplay.cpp: this copy plays for a remote player and may not change the host's files */
 #include "menu.h"
@@ -419,7 +420,7 @@ void SaveState::saveLean(std::string& out) {
 		if (LeanSkipped(i->first)) continue;
 		const size_t lenpos = out.size();
 		out.append(4, '\0');
-		const uint64_t t0 = lean_profile ? SDL_GetPerformanceCounter() : 0;
+		const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();   /* (SDL 1.2 has no performance counter) */
 		{
 			LeanAppendBuf buf(out);
 			std::ostream os(&buf);
@@ -429,7 +430,7 @@ void SaveState::saveLean(std::string& out) {
 		memcpy(&out[lenpos], &len, 4);
 		if (lean_profile)
 			LOG_MSG("SAVESTATE lean: %-12s %8u bytes %8.1f us", i->first.c_str(), (unsigned)len,
-				(double)(SDL_GetPerformanceCounter() - t0) * 1000000.0 / (double)SDL_GetPerformanceFrequency());
+				std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
 	}
 	lean_profile = false;
 }
