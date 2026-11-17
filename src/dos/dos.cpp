@@ -1033,6 +1033,25 @@ void DOS_FlushSTDIN(void) {
     }
 }
 
+uint32_t INPUTNET_TraceFrame(void);
+static Bitu DOS_21TraceHandler(void) {
+    const uint16_t ax = reg_ax, bx = reg_bx, cx = reg_cx, dx = reg_dx;
+    char name[64] = {0};
+    const uint8_t ah = (uint8_t)(ax >> 8u);
+    if (ah == 0x3c || ah == 0x3d || ah == 0x41 || ah == 0x43 || ah == 0x4b || ah == 0x4e || ah == 0x5b || ah == 0x39 || ah == 0x3a || ah == 0x3b)
+        MEM_StrCopy(SegPhys(ds) + (reg_edx & (cpu.pmode ? 0xffffffffu : 0xffffu)), name, sizeof(name) - 1);
+    const Bitu r = DOS_21Handler();
+    char found[DOS_NAMELENGTH_ASCII] = {0};
+    if ((ah == 0x4e || ah == 0x4f) && !(reg_flags & 1)) {
+        DOS_DTA dta(dos.dta());
+        char lname[LFN_NAMELENGTH+1]; uint32_t size, hsize; uint16_t date, time; uint8_t attr;
+        dta.GetResult(found, lname, size, hsize, date, time, attr);
+    }
+    LOG_MSG("RBDOS f=%u ax=%04x bx=%04x cx=%04x dx=%04x -> ax=%04x cf=%u%s%s%s%s", (unsigned)INPUTNET_TraceFrame(), ax, bx, cx, dx,
+        reg_ax, (unsigned)(reg_flags & 1), name[0] ? " name=" : "", name, found[0] ? " found=" : "", found);
+    return r;
+}
+
 static Bitu DOS_21Handler(void) {
     bool unmask_irq0 = false;
 
@@ -4611,7 +4630,11 @@ public:
 		callback[0].Install(DOS_20Handler,CB_IRET,"DOS Int 20");
 		callback[0].Set_RealVec(0x20);
 
-		callback[1].Install(DOS_21Handler,CB_INT21,"DOS Int 21");
+		{
+			/* debugging RollbackNet desyncs: NN_RB_TRACE=1 also logs every INT 21h call and its result with the frame */
+			static const bool rbtrace = getenv("NN_RB_TRACE") != NULL && *getenv("NN_RB_TRACE");
+			callback[1].Install(rbtrace ? DOS_21TraceHandler : DOS_21Handler,CB_INT21,"DOS Int 21");
+		}
 		callback[1].Set_RealVec(0x21);
 		//Pseudo code for int 21
 		// sti

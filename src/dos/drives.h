@@ -146,6 +146,11 @@ protected:
 	const char* GetMountedFileHost(const char* dosPath);
 	bool MountedFileFindNext(DOS_DTA &dta,uint16_t id);
 	bool MountedFileShadows(uint16_t id,const char* entry);
+	/* searches during a shared input session (drive_local.cpp, SessionFindNext): the DTA holds the place */
+	struct SessionEntry { std::string name, lname, host; bool mounted; };
+	std::map<uint32_t,std::string> session_find_dirs;   /* directory key (in the DTA) -> DOS directory */
+	bool SessionListing(const std::string &dosdir,std::vector<SessionEntry> &out);
+	bool SessionFindNext(DOS_DTA &dta);
 };
 
 #if !defined(OSFREE)

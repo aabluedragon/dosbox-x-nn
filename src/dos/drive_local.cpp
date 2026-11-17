@@ -41,6 +41,7 @@
 #endif
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <algorithm>
 
 #include "dosbox.h"
 #include "dos_inc.h"
@@ -51,6 +52,11 @@
  * session runs, local folder drives report one fixed date and time for every file. */
 static inline void INPUTNET_FixFileTime(uint16_t &date,uint16_t &time) {
     if (INPUTNET_IsConnected()) { date = DOS_PackDate(1996,1,1); time = DOS_PackTime(12,0,0); }
+}
+/* ...and the same attributes on every system (Windows reports the file system's own: archive, read-only, hidden;
+ * other systems make them up): a directory, or an archive file. */
+static inline void INPUTNET_FixFileAttr(uint16_t &attr) {
+    if (INPUTNET_IsConnected()) attr = (attr & 0x10u) ? 0x10u : 0x20u;
 }
 #include "drives.h"
 #include "logging.h"
@@ -2023,6 +2029,33 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		strcat(tempDir,end);
 	}
 
+	if (INPUTNET_IsConnected() && lfn_filefind_handle>=LFN_FILEFIND_MAX) {
+		/* a shared input session: the DTA holds the search's place (SessionFindNext) */
+		const std::string dosdir = MountedFileKey(_dir);
+		std::vector<SessionEntry> listing;
+		if (!SessionListing(dosdir,listing)) {
+			DOS_SetError(DOSERR_PATH_NOT_FOUND);
+			return false;
+		}
+		uint32_t key = 2166136261u;
+		for (size_t i = 0; i < dosdir.size(); i++) { key ^= (uint8_t)dosdir[i]; key *= 16777619u; }
+		if (key == 0) key = 1;
+		session_find_dirs[key] = dosdir;
+		dta.SetDirIDCluster(key);
+		dta.SetDirID(0);
+		uint8_t sAttr;
+		dta.GetSearchParams(sAttr,tempDir,false);
+		if (sAttr == DOS_ATTR_VOLUME) {
+			if (strcmp(dirCache.GetLabel(), "") == 0) { DOS_SetError(DOSERR_NO_MORE_FILES); return false; }
+			dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
+			return true;
+		} else if ((sAttr & DOS_ATTR_VOLUME) && (*_dir == 0) && !fcb_findfirst && WildFileCmp(dirCache.GetLabel(),tempDir)) {
+			dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
+			return true;
+		}
+		return SessionFindNext(dta);
+	}
+
 	uint16_t id;
 	if (!dirCache.FindFirst(tempDir,id)) {
 		DOS_SetError(DOSERR_PATH_NOT_FOUND);
@@ -2074,7 +2107,108 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 
 char * DBCS_upcase(char * str);
 
+/* Shared input sessions (RollbackNet, lockstep InputNet): every machine must find the same files in the same order and
+ * store the same bytes in the guest's DTA, and a rollback must be able to go back to the middle of a search. So a
+ * search keeps its place in the DTA, as DOS does, instead of in a host-side slot (whose number depends on each
+ * computer's history: replays, host-side scans, and which a rollback does not restore): dirCluster holds a key for the
+ * directory, dirID the index of the next entry. The listing is the directory's real entries and its mounted files
+ * (FILEMOUNT: on one computer a file can be real and mounted on another) together, sorted by name. */
+bool localDrive::SessionListing(const std::string &dosdir,std::vector<SessionEntry> &out) {
+	out.clear();
+	char tempDir[CROSS_LEN];
+	strcpy(tempDir,basedir);
+	if (strlen(tempDir) + dosdir.size() + 2 >= CROSS_LEN) return false;
+	strcat(tempDir,dosdir.c_str());
+	CROSS_FILENAME(tempDir);
+	size_t len = strlen(tempDir);
+	bool lead = false;
+	for (size_t i=0;i<len;i++) {
+		if(lead) lead = false;
+		else if((IS_PC98_ARCH || isDBCSCP()) && isKanji1(tempDir[i])) lead = true;
+		else tempDir[i]=toupper(tempDir[i]);
+	}
+	if (!check_last_split_char(tempDir, len, CROSS_FILESPLIT)) {
+		char end[2]={CROSS_FILESPLIT,0};
+		strcat(tempDir,end);
+	}
+	uint16_t id;
+	if (!dirCache.FindFirst(tempDir,id)) return false;
+	char *ent, *lent;
+	while (dirCache.FindNext(id,ent,lent)) {    /* (reading to the end frees the cache's slot) */
+		SessionEntry e;
+		e.name = ent; e.lname = lent; e.mounted = false;
+		if (!mounted_files.empty() && mounted_files.count(dosdir.empty() ? MountedFileKey(ent) : dosdir + "\\" + MountedFileKey(ent))) continue;
+		out.push_back(e);
+	}
+	for (auto it = mounted_files.begin(); it != mounted_files.end(); ++it) {
+		const std::string &key = it->first;
+		const size_t slash = key.rfind('\\');
+		const std::string entry_dir = (slash == std::string::npos) ? "" : key.substr(0,slash);
+		if (entry_dir != dosdir) continue;
+		const std::string entry_name = (slash == std::string::npos) ? key : key.substr(slash+1);
+		if (entry_name.length() >= DOS_NAMELENGTH_ASCII) continue;
+		SessionEntry e;
+		e.name = entry_name; e.lname = entry_name; e.host = it->second; e.mounted = true;
+		out.push_back(e);
+	}
+	std::sort(out.begin(), out.end(), [](const SessionEntry &a, const SessionEntry &b) { return strcmp(a.name.c_str(), b.name.c_str()) < 0; });
+	return true;
+}
+
+bool localDrive::SessionFindNext(DOS_DTA &dta) {
+	uint8_t srch_attr; char srch_pattern[LFN_NAMELENGTH+1];
+	dta.GetSearchParams(srch_attr,srch_pattern,false);
+	const auto dit = session_find_dirs.find(dta.GetDirIDCluster());
+	std::vector<SessionEntry> listing;
+	if (dit == session_find_dirs.end() || !SessionListing(dit->second,listing)) {
+		DOS_SetError(DOSERR_NO_MORE_FILES);
+		return false;
+	}
+	const std::string &dosdir = dit->second;
+	for (size_t i = dta.GetDirID(); i < listing.size() && i < 0xFFFFu; i++) {
+		const SessionEntry &e = listing[i];
+		if (!WildFileCmp(e.name.c_str(),srch_pattern) && !LWildFileCmp(e.lname.c_str(),srch_pattern)) continue;
+		ht_stat_t st;
+		bool isdir = false;
+		uint64_t size = 0;
+		if (e.mounted) {
+			struct stat mst;
+			if (stat(e.host.c_str(),&mst) != 0 || (mst.st_mode & S_IFDIR)) continue;
+			size = (uint64_t)mst.st_size;
+		} else {
+			char full_name[CROSS_LEN];
+			strcpy(full_name,basedir);
+			if (strlen(full_name) + dosdir.size() + e.name.size() + 2 >= CROSS_LEN) continue;
+			strcat(full_name,dosdir.c_str());
+			if (!dosdir.empty()) strcat(full_name,"\\");
+			strcat(full_name,e.name.c_str());
+			CROSS_FILENAME(full_name);
+			char *temp_name = dirCache.GetExpandName(full_name);
+			const host_cnv_char_t* host_name = CodePageGuestToHost(temp_name);
+			if (host_name == NULL || ht_stat(host_name,&st) != 0) continue;
+			isdir = (st.st_mode & S_IFDIR) != 0;
+			size = isdir ? 0 : (uint64_t)st.st_size;
+		}
+		uint16_t attr = isdir ? DOS_ATTR_DIRECTORY : DOS_ATTR_ARCHIVE;
+		if (~srch_attr & (attr & (DOS_ATTR_HIDDEN | DOS_ATTR_SYSTEM | DOS_ATTR_DIRECTORY))) continue;
+		char find_name[DOS_NAMELENGTH_ASCII], lfind_name[LFN_NAMELENGTH+1];
+		if (e.name.size() >= DOS_NAMELENGTH_ASCII) continue;
+		strcpy(find_name,e.name.c_str());
+		if (IS_PC98_ARCH || isDBCSCP()) DBCS_upcase(find_name); else upcase(find_name);
+		strncpy(lfind_name,e.lname.c_str(),LFN_NAMELENGTH);
+		lfind_name[LFN_NAMELENGTH]=0;
+		uint16_t find_date = 0, find_time = 0;
+		INPUTNET_FixFileTime(find_date,find_time);
+		dta.SetResult(find_name,lfind_name,(uint32_t)(size % 0x100000000ull),(uint32_t)(size / 0x100000000ull),find_date,find_time,(uint8_t)attr);
+		dta.SetDirID((uint16_t)(i + 1));
+		return true;
+	}
+	DOS_SetError(DOSERR_NO_MORE_FILES);
+	return false;
+}
+
 bool localDrive::FindNext(DOS_DTA & dta) {
+	if (INPUTNET_IsConnected() && lfn_filefind_handle>=LFN_FILEFIND_MAX) return SessionFindNext(dta);
 
 	char * dir_ent, *ldir_ent;
 	ht_stat_t stat_block, special_stat_block;
@@ -2313,6 +2447,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
 #else
 				if (!(st.st_mode & S_IWUSR)) *attr |= DOS_ATTR_READ_ONLY;
 #endif
+				INPUTNET_FixFileAttr(*attr);
 				return true;
 			}
 			*attr = 0;
@@ -2343,6 +2478,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
 		return false;
 		}
 	*attr = attribs&0x3f;
+	INPUTNET_FixFileAttr(*attr);
 	return true;
 #else
 	ht_stat_t status;
@@ -2363,6 +2499,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
             if (len & 2) *attr|=DOS_ATTR_HIDDEN;
             if (len & 4) *attr|=DOS_ATTR_SYSTEM;
         }
+		INPUTNET_FixFileAttr(*attr);
 		return true;
 	}
 	*attr=0;
