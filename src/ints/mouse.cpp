@@ -1689,6 +1689,16 @@ void Mouse_Used(void) {
     }
 }
 
+/* Whether the guest sees the mouse as captured: this window's capture, a remote play host's viewers, and always in
+ * RollbackNet, where motion reaches the machine only through everybody's shared input and every computer must answer
+ * the same (the copy on a player's own screen has the mouse captured, the same copy hidden on another computer never;
+ * Duke Nukem 3D turned with the mouse on one and not on the other, and the machines differed within a second). */
+static bool Mouse_GuestLocked() {
+    extern bool remoteplay_streaming;
+    extern bool inputnet_rollback_active;
+    return inputnet_rollback_active || MOUSE_IsLocked() || remoteplay_streaming;
+}
+
 void Mouse_Read_Motion_Data() {
 #if defined(__EMSCRIPTEN__)
     /* Web worker build: pointer capture does not exist, but the motion
@@ -1698,8 +1708,7 @@ void Mouse_Read_Motion_Data() {
 #else
     /* A remote play viewer's motion counts too: it is captured on the viewer's side, and a host streaming to it
      * never captures its own window (RoTT turns by these counters and could not be turned at all). */
-    extern bool remoteplay_streaming;
-    const auto locked = MOUSE_IsLocked() || remoteplay_streaming;
+    const auto locked = Mouse_GuestLocked();
 #endif
     reg_cx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_x : 0);
     reg_dx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_y : 0);
@@ -2399,7 +2408,7 @@ static Bitu INT74_Handler(void) {
         /* Check for an active Interrupt Handler that will get called */
         if (AllowINT33RMAccess() && (mouse.sub_mask & mouse.event_queue[mouse.events].type)) {
             reg_ax=mouse.event_queue[mouse.events].type
-                  | (!MOUSE_IsLocked() ? MOUSE_ABSOLUTE & mouse.sub_mask : 0);
+                  | (!Mouse_GuestLocked() ? MOUSE_ABSOLUTE & mouse.sub_mask : 0);
             reg_bl=mouse.event_queue[mouse.events].buttons;
             reg_bh=GetWheel8bit(); /* CuteMouse wheel extension */
             reg_cx=(uint16_t)POS_X;
