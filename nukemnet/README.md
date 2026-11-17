@@ -556,6 +556,12 @@ Seats on Linux: a host taking a joining player's copy and releasing it again (ea
 the other screen's ammo stayed), 13,600 checks, 0 desyncs; three copies per computer, a player moved to a free copy and
 then the host taking that one, 29,466 frames identical on both computers, 0 desyncs; three NukemNet players, one
 killed (the other two went on), the remaining joiner moved to the free copy, 36,000 checks, 0 desyncs.
+Three computers (two Linux NukemNet copies and the laptop), Duke Nukem 3D with three copies started for the host alone:
+both other players joined the running match into the waiting copies (the laptop's 11 MB took 15 seconds through the relay,
+and nobody dropped meanwhile), then all three played: 35,700 checks each, 0 desyncs; the host then took the laptop's copy.
+At that seat change the laptop (only it) found its machines different at the change's own frame; the automatic resync
+five frames later made them equal, and 13,000 frames of play afterwards had no difference. Not reproduced on Linux or
+in any other seat change; the cause is not found yet (a traced run on Windows is next).
 Not tested yet: macOS builds, a game with Gravis or MIDI sound, CD images (`IMGMOUNT` files are not in the file list),
 more than two computers.
 
