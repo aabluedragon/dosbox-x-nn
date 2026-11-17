@@ -402,7 +402,7 @@ static void RB_ReplayBegin(uint32_t depth);
 static void RB_ReplayEnd(void);
 /* hitches: real-time frames that started more than 30 ms after the one before (a long replay, a wait for the others) */
 static uint64_t rb_hitch_last = 0, rb_stat_maxgap_us = 0;
-static uint32_t rb_stat_hitches = 0;
+static uint32_t rb_stat_hitches = 0, rb_stat_trims = 0;
 extern uint64_t dosbox_core_ns;             /* dosbox.cpp: what the CPU core ran, while dosbox_core_timing */
 extern bool dosbox_core_timing;
 extern uint64_t dosbox_sleep_us;            /* dosbox.cpp: what increaseticks() slept */
@@ -3844,7 +3844,8 @@ static void RB_Propose(void) {
         if (rb_ml_share_s >= 0.93) cap = std::min(cap, std::max(40000.0, (double)CPU_CycleMax * 0.93));
         else if (rb_ml_share_s >= 0.85) cap = std::min(cap, (double)CPU_CycleMax);
     }
-    if (rb_ml_load > 0.97) cap = std::min(cap, (double)CPU_CycleMax * 0.8);
+    /* (a fully busy second at a low speed is a game loading or the DOS prompt's own work, not too high a speed) */
+    if (rb_ml_load > 0.97) cap = std::min(cap, std::max((double)CPU_CycleMax * 0.8, 10000.0));
     rb_cap_local = (uint32_t)std::max(2000.0, std::min(cap, limit));
 }
 
@@ -3901,6 +3902,10 @@ static void RB_TimeSync(uint32_t frame) {
         any = true;
     }
     if (!any) return;
+    /* catching up after a long replay (increaseticks keeps up to two seconds) goes only as far as the others are:
+     * racing ahead of them would only end in waiting for their input (a stall, which shows), and the one that waited
+     * would then race ahead of us in turn */
+    if (worst > 3.0 && DOSBOX_TrimTickRemain(inputnet_frame_ms) > 0) rb_stat_trims++;
     rb_advantage = rb_advantage * 0.9 + worst * 0.1;
     if (rb_advantage > 0.75 && (frame - rb_last_slowdown) >= 2u) {
         if (DOSBOX_DropTickRemain()) { rb_stat_slowdowns++; rb_last_slowdown = frame; }
@@ -3965,13 +3970,13 @@ static void RB_LogStats(void) {
         static uint32_t flips_at = 0;
         const uint32_t tnow = GetTicks();
         const double secs = flips_at ? (double)(tnow - flips_at) / 1000.0 : 0.0;
-        LOG_MSG("INPUTNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms; the game showed %.1f frames/s (page flips, "
+        LOG_MSG("INPUTNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms; %u catch-ups cut short; the game showed %.1f frames/s (page flips, "
             "frames copied through the bank window), the picture changed %.1f times/s",
-            (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0, secs > 0 ? (double)(vga_shown_flips - flips_last) / secs : 0.0,
+            (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0, (unsigned)rb_stat_trims, secs > 0 ? (double)(vga_shown_flips - flips_last) / secs : 0.0,
             secs > 0 ? (double)(render_changed_frames - changed_last) / secs : 0.0);
         flips_last = vga_shown_flips; changed_last = render_changed_frames; flips_at = tnow;
     }
-    rb_stat_hitches = 0; rb_stat_maxgap_us = 0;
+    rb_stat_hitches = 0; rb_stat_maxgap_us = 0; rb_stat_trims = 0;
     rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
     rb_stat_capture_us = 0; rb_stat_captures = 0; rb_stat_pages = 0;
     rb_stat_replay_us = 0; rb_stat_replays = 0; rb_stat_replay_max_us = 0;

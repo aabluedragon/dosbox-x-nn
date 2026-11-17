@@ -4244,7 +4244,13 @@ public:
 		if (cpu_rep_max < 0) cpu_rep_max = 4;	/* compromise to help emulation speed without too much loss of accuracy */
 
 		RDTSC_rebase();
-		if(CPU_CycleMax <= 0) CPU_CycleMax = 3000;
+		if(CPU_CycleMax <= 0) {
+			/* RollbackNet at cycles=max: every machine starts at the same speed (the server then sets it from what
+			 * every computer measures); 3000 left a game crawling through its start until the speed had climbed */
+			Section_prop *in = static_cast<Section_prop*>(control->GetSection("inputnet"));
+			const bool rollback = in != NULL && std::string(in->Get_string("mode")) == "rollback";   /* (hosts and joining players set only the mode) */
+			CPU_CycleMax = (rollback && CPU_CycleAutoAdjust) ? 40000 : 3000;
+		}
 		if(CPU_CycleUp <= 0)   CPU_CycleUp = 500;
 		if(CPU_CycleDown <= 0) CPU_CycleDown = 20;
 

@@ -500,7 +500,10 @@ Such a replay keeps the main loop away for hundreds of milliseconds, and DOSBox-
 20 ms of that time: the game then ran behind real time and the time sync slowed the other computer to match, so the
 shared game ran in slow motion (350 to 400 frames in 5 seconds instead of 500 at 220 ms: "it feels like very low
 cycles"). In a session it now catches up to two seconds (430 to 520 frames in 5 seconds, the picture changing 50 to 60
-times a second in the same test). The room's input delay shortens every replay by its frames: 2 frames at 220 ms took
+times a second in the same test), but only as far as the others are (`DOSBOX_TrimTickRemain` from `RB_TimeSync` when
+this computer is 3 frames ahead): racing past them only ended in waiting for their input, and the one that had waited
+then raced ahead in turn. cycles=max in a session starts at 40,000 (3,000 left a game crawling through its start while
+the speed climbed), and a fully busy second never lowers the speed below 10,000 (that is a game loading). The room's input delay shortens every replay by its frames: 2 frames at 220 ms took
 replays from about 18 to 11 frames.
 Capability `rollbackNetMaxCycles`.
 

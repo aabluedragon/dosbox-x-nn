@@ -653,6 +653,15 @@ bool DOSBOX_DropTickRemain(void) {
     return true;
 }
 
+/* RollbackNet: drop the time still to catch up beyond "keep" milliseconds (this computer got ahead of the others: it would
+ * only race into waiting for them). Returns how many were dropped. */
+Bitu DOSBOX_TrimTickRemain(Bitu keep) {
+    if (ticksRemain <= keep) return 0;
+    const Bitu dropped = ticksRemain - keep;
+    ticksRemain = keep;
+    return dropped;
+}
+
 void increaseticks() { //Make it return ticksRemain and set it in the function above to remove the global variable.
     static int32_t lastsleepDone = -1;
     static Bitu sleep1count = 0;

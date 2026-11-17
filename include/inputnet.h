@@ -97,6 +97,7 @@ void INPUTNET_RollbackTick(void);
 /* dosbox.cpp: the main loop's budget of emulated milliseconds to run before it waits for real time */
 void DOSBOX_AddTicksRemain(uint32_t n);
 bool DOSBOX_DropTickRemain(void);
+Bitu DOSBOX_TrimTickRemain(Bitu keep);
 
 /* Session state, for the INPUTNET command and the status line. */
 bool INPUTNET_IsServer(void);
