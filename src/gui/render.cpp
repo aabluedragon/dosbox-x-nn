@@ -510,10 +510,12 @@ void AspectRatio_mapper_shortcut(bool pressed) {
 
 void VGA_DebugOverlay();
 
+unsigned int render_changed_frames = 0;   /* frames whose picture changed (RollbackNet's log: what a player sees) */
 void RENDER_EndUpdate( bool abort ) {
     //LOG_MSG("RENDER_EndUpdate called abort=%d", abort ? 1 : 0);
     if (GCC_UNLIKELY(!render.updating))
         return;
+    if (!abort && render.scale.outWrite) render_changed_frames++;
 
     if (video_debug_overlay && !abort && render.active && render.scale.outLine != 0)
         VGA_DebugOverlay();

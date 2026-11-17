@@ -4737,8 +4737,13 @@ static void VGA_Other_VertInterrupt(Bitu val) {
     else PIC_DeActivateIRQ(5);
 }
 
+unsigned int vga_shown_flips = 0;   /* display start changes outside replays: a game's own frame rate (RollbackNet's log) */
 static void VGA_DisplayStartLatch(Bitu /*val*/) {
     const Bitu old_start = vga.config.real_start;
+    {
+        extern bool inputnet_rollback_resim;
+        if (!inputnet_rollback_resim && (vga.config.display_start & vga.mem.memmask) != old_start) vga_shown_flips++;
+    }
 #if defined(__EMSCRIPTEN__)
     emw_latch_count++;
     if ((vga.config.display_start & vga.mem.memmask) != old_start) emw_flip_count++;

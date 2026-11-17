@@ -370,7 +370,7 @@ static bool inputnet_rollback = false;      /* "mode = rollback": predict the ot
 static unsigned int inputnet_rbwindow = 16; /* mode=rollback: frames that may run ahead of the others' input */
 /* mode=rollback, cycles=max (RB_MaxCycles): the load the busiest computer runs at, in percent; this computer's speed
  * proposal (cycles per ms, 0: none yet), what the server heard from the others, and the measurement under way */
-static unsigned int rb_maxload = 60;
+static unsigned int rb_maxload = 85;
 static uint32_t rb_cap_local = 0;
 static uint32_t rb_cap_peer[INPUTNET_MAX_PEERS], rb_cap_peer_at[INPUTNET_MAX_PEERS];
 static uint64_t rb_ml_t0 = 0, rb_ml_wait = 0, rb_ml_sleep0 = 0, rb_ml_core0 = 0;
@@ -384,6 +384,10 @@ static uint32_t rb_ml_cn = 0;
  * rest, other programs had the CPU: not a cost of this speed) */
 static uint64_t rb_ml_cpu0 = 0;
 static double rb_ml_run = 1;
+/* how often the picture changed meanwhile (frames a second, a window's process only) and the screen's refresh rate */
+static unsigned int rb_ml_pic0 = 0;
+static double rb_ml_pictures = 0, rb_ml_refresh = 70;
+extern unsigned int render_changed_frames;   /* render.cpp */
 /* the latest replays (RB_Propose's second limit): frames replayed, time taken, the CPU core's part of it, the speed,
  * when it ended */
 struct RBReplayRec { uint32_t depth, us, core_us, speed, at; };
@@ -3738,7 +3742,7 @@ static bool RB_MeasureLoad(void) {
     const uint64_t now = RB_MicroTicks();
     if (rb_ml_t0 == 0 || now < rb_ml_t0) {
         rb_ml_t0 = now; rb_ml_wait = 0; rb_ml_sleep0 = dosbox_sleep_us; rb_ml_core0 = dosbox_core_ns;
-        rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = RB_ThreadCpuUs();
+        rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = RB_ThreadCpuUs(); rb_ml_pic0 = render_changed_frames;
         return false;
     }
     rb_ml_csum += (double)CPU_CycleMax; rb_ml_cn++;     /* (the speed can change during the second) */
@@ -3751,8 +3755,10 @@ static bool RB_MeasureLoad(void) {
     const uint64_t cpu = RB_ThreadCpuUs();
     rb_ml_run = (cpu > rb_ml_cpu0 && rb_ml_cpu0 != 0 && rb_ml_load > 0.02)
         ? std::max(0.05, std::min(1.0, (double)(cpu - rb_ml_cpu0) / ((double)wall * rb_ml_load))) : 1.0;
+    rb_ml_pictures = (double)(render_changed_frames - rb_ml_pic0) * 1000000.0 / (double)wall;
+    rb_ml_refresh = (vga.draw.delay.vtotal > 1.0) ? 1000.0 / (double)vga.draw.delay.vtotal : 70.0;
     rb_ml_t0 = now; rb_ml_wait = 0; rb_ml_sleep0 = dosbox_sleep_us; rb_ml_core0 = dosbox_core_ns;
-    rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = cpu;
+    rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = cpu; rb_ml_pic0 = render_changed_frames;
     return true;
 }
 
@@ -3817,11 +3823,15 @@ static void RB_Propose(void) {
     const double target = (double)rb_maxload / 100.0;
     const double avail = std::max(target - rb_ml_fixed_s, target / 3.0);
     const double limit = (CPU_CycleLimit > 0) ? (double)CPU_CycleLimit : 1000000.0;
+    /* (replays are part of the load measured; how long one takes is not a limit of its own: a game at a low speed
+     * draws few frames a second, which shows far more than a replay of a few tens of milliseconds now and then.
+     * Measured Nov 2026, Duke Nukem 3D at 800x600: 3 frames a second at 20,000 cycles, 10 at 70,000, 22 at 160,000) */
     double cap = avail / std::max(rb_ml_cost_s, 1e-9);
-    const double rcap = RB_ReplayCap();         /* (not below half the other: some games need the speed) */
-    if (rcap > 0) cap = std::min(cap, std::max(rcap, cap * 0.5));
     if (rb_ml_core < 0.03) cap = std::min(cap, (double)CPU_CycleMax);
-    if (rb_ml_load > 0.9) cap = std::min(cap, (double)CPU_CycleMax * 0.75);
+    /* a game whose picture already changes at nearly every screen refresh shows nothing more at a higher speed, and
+     * every replay would take longer: no higher proposal (Duke Nukem 3D at 320x200 reaches it near 50,000 cycles) */
+    if (rb_ml_pictures >= rb_ml_refresh * 0.9) cap = std::min(cap, (double)CPU_CycleMax);
+    if (rb_ml_load > 0.97) cap = std::min(cap, (double)CPU_CycleMax * 0.8);
     rb_cap_local = (uint32_t)std::max(2000.0, std::min(cap, limit));
 }
 
@@ -3934,9 +3944,20 @@ static void RB_LogStats(void) {
         rb_stat_captures ? (double)rb_stat_lean_us / (double)rb_stat_captures : 0.0,
         (unsigned)rb_stat_lockstep, (unsigned)rb_stat_ctxchanges);
     if (CPU_CycleAutoAdjust) LOG_MSG("INPUTNET: speed %u cycles per ms (cycles=max), this computer %.0f%% busy (CPU core %.0f%%, "
-        "running %.0f%% of it), replays allow %.0f, proposing %u", (unsigned)CPU_CycleMax, rb_ml_load * 100.0, rb_ml_core * 100.0,
-        rb_ml_run * 100.0, RB_ReplayCap(), rb_cap_local);
-    LOG_MSG("INPUTNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms", (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0);
+        "running %.0f%% of it), picture %.0f of %.0f a second, proposing %u", (unsigned)CPU_CycleMax, rb_ml_load * 100.0, rb_ml_core * 100.0,
+        rb_ml_run * 100.0, rb_ml_pictures, rb_ml_refresh, rb_cap_local);
+    {
+        extern unsigned int vga_shown_flips, render_changed_frames;
+        static unsigned int flips_last = 0, changed_last = 0;
+        static uint32_t flips_at = 0;
+        const uint32_t tnow = GetTicks();
+        const double secs = flips_at ? (double)(tnow - flips_at) / 1000.0 : 0.0;
+        LOG_MSG("INPUTNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms; the game showed %.1f frames/s (page flips, "
+            "frames copied through the bank window), the picture changed %.1f times/s",
+            (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0, secs > 0 ? (double)(vga_shown_flips - flips_last) / secs : 0.0,
+            secs > 0 ? (double)(render_changed_frames - changed_last) / secs : 0.0);
+        flips_last = vga_shown_flips; changed_last = render_changed_frames; flips_at = tnow;
+    }
     rb_stat_hitches = 0; rb_stat_maxgap_us = 0;
     rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
     rb_stat_capture_us = 0; rb_stat_captures = 0; rb_stat_pages = 0;
@@ -6151,7 +6172,7 @@ static void RB_MaxCycles(void) {
     double next = cur;
     /* down by at most 40% a second (one busy second is often a burst of replays), up by 15% a second, 25% while far
      * below what everybody proposes; 50% while slow (the start: cycles=max begins at 3000) */
-    if ((double)want < cur * 0.88) next = std::max((double)want, cur * 0.6);
+    if ((double)want < cur * 0.95) next = std::max((double)want, cur * 0.6);
     else if (all && (double)want > cur * 1.12)
         next = std::min((double)want, (double)want > cur * 2.0 ? (cur < 20000.0 ? cur * 1.5 : cur * 1.25) : cur * 1.15 + 500.0);
     next = std::max(2000.0, std::min(next, limit));
@@ -6808,7 +6829,7 @@ public:
         v = section->Get_int("rollback window");
         inputnet_rbwindow = (unsigned int)((v >= 2 && v <= 48) ? v : 16);
         v = section->Get_int("rollback max load");
-        rb_maxload = (unsigned int)((v >= 20 && v <= 90) ? v : 60);
+        rb_maxload = (unsigned int)((v >= 20 && v <= 95) ? v : 85);
         v = section->Get_int("players");
         inputnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)INPUTNET_MAX_PEERS) ? v : 0);
         inputnet_rbautorun = section->Get_string("autorun");

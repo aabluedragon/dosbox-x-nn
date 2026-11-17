@@ -2540,6 +2540,15 @@ void MEM_ResetPageHandler_RAM(Bitu phys_page, Bitu pages);
 
 extern void DISP2_SetPageHandler(void);
 void VGA_SetupHandlers(void) {
+	{
+		/* a game that copies whole frames through the bank window starts each at bank 0: RollbackNet's log counts them
+		 * (with page flips) as the frame rate the game shows */
+		extern unsigned int vga_shown_flips;
+		extern bool inputnet_rollback_resim;
+		static int last_bank = -1;
+		if (!inputnet_rollback_resim && vga.svga.bank_write == 0 && last_bank > 0) vga_shown_flips++;
+		last_bank = vga.svga.bank_write;
+	}
 	/* This code inherited from DOSBox SVN confuses bank size with bank granularity.
 	 * This code is enforcing bank granularity. Bank size concerns how much memory is
 	 * mapped to A0000-BFFFF. Most cards expose a window of 64KB. Most cards also have

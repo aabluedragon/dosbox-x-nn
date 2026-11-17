@@ -5546,11 +5546,10 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->Set_help("mode=rollback: how many frames a session may run ahead of the other participants' input before it\n"
                    "waits for them. Each frame is saved for this long. Valid range is 2 to 48.");
 
-    Pint = secprop->Add_int("rollback max load",Property::Changeable::WhenIdle, 60);
+    Pint = secprop->Add_int("rollback max load",Property::Changeable::WhenIdle, 85);
     Pint->Set_help("mode=rollback with cycles=max: no computer guesses its own speed (the machines would differ). Each\n"
-                   "measures how busy it is and how long its replays take, and the server sets one speed for all: the\n"
-                   "busiest computer runs at about this percentage of its time, and a usual deep replay takes at most 20 ms\n"
-                   "(a longer one is a hitch). Valid range is 20 to 90.");
+                   "measures how busy it is (replays included), and the server sets one speed for all at which the busiest\n"
+                   "computer runs at about this percentage of its time. Valid range is 20 to 95.");
 
     Pint = secprop->Add_int("cluster",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("mode=rollback: IPX/NullModem-over-RollbackNet. Every computer runs a copy of the game for every\n"
