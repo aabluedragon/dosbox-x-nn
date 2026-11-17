@@ -5511,11 +5511,14 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
     hw.u8(seats != NULL ? (uint8_t)rbc_copies : 0);     /* who plays which copy from this frame on (rb_seat) */
     if (seats != NULL) for (unsigned c = 0; c < rbc_copies; c++) hw.u8(seats[c]);
     inputnet_accepting = true;      /* (no join meanwhile) */
-    uint32_t last_events = t0;
+    uint32_t last_events = t0, lastkeep = t0;
     for (;;) {
         if (!inputnet_session) { inputnet_accepting = false; return false; }
         bool done = true;
         const uint32_t now = GetTicks();
+        /* the others hear the server meanwhile (a transfer through a slow relay takes many seconds, and a participant
+         * that has everything, or is in the session already, waits for the server's input: RB_ClientWaitsOn) */
+        if (now - lastkeep >= 100u) { RB_SendInput(frame); lastkeep = now; }
         for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
             if (!to[i]) continue;
             InputNetPeer &p = inputnet_peers[i];
@@ -5680,6 +5683,8 @@ static bool RB_ApplyClusterResync(uint32_t frame) {
     return true;
 }
 
+static uint32_t rb_resync_done_id = 0, rb_resync_done_count = 0;  /* client: the last transfer received whole */
+
 static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned peerid) {
     const uint8_t sub = r.u8();
     if (r.bad()) return;
@@ -5708,6 +5713,7 @@ static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned pee
     if (sub == 1) {                 /* header: receive everything now */
         const uint32_t id = r.u32(), frame = r.u32(), total = r.u32(), rawsize = r.u32();
         if (r.bad() || total == 0 || total > (256u << 20) || rawsize > (1024u << 20)) return;
+        if (id == rb_resync_done_id) { RB_SendResyncAck(id, rb_resync_done_count); return; }   /* (our acks got lost) */
         if (id == rb_resync_id) return;     /* a repeated header of a transfer we already have */
         std::vector<uint8_t> joined, left;  /* who plays from this frame on */
         if (r.remain() >= 1) { const unsigned nj = r.u8(); for (unsigned j = 0; j < nj; j++) joined.push_back(r.u8()); }
@@ -5744,15 +5750,20 @@ static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned pee
         uint32_t contiguous = 0;
         const uint32_t start = GetTicks();
         uint32_t last_events = start, lastack = 0;
+        uint32_t progress_at = start;
         while (contiguous < nchunks) {
-            if (!inputnet_link_up || (GetTicks() - start) > 30000u) { LOG_MSG("INPUTNET: resync: transfer failed"); rb_resync_id = 0; return; }
+            /* (30 seconds without a piece: a slow link may take longer than that for the whole of it) */
+            if (!inputnet_link_up || (GetTicks() - progress_at) > 30000u) { LOG_MSG("INPUTNET: resync: transfer failed"); rb_resync_id = 0; return; }
             INPUTNET_PollSocket();              /* chunks land in rb_resync_buf (sub == 2 below) */
+            const uint32_t was = contiguous;
             while (contiguous < nchunks && rb_resync_have[contiguous]) contiguous++;
+            if (contiguous != was) progress_at = GetTicks();
             if ((GetTicks() - lastack) >= 20u) { RB_SendResyncAck(id, contiguous); lastack = GetTicks(); }
             INPUTNET_Stall(last_events);
         }
         RB_SendResyncAck(id, contiguous);
         RB_SendResyncAck(id, contiguous);
+        rb_resync_done_id = id; rb_resync_done_count = contiguous;     /* (acknowledged again should the server repeat it) */
         /* loaded at the next frame start where the host's stack is as it was at the one before (RB_FrameBoundary) */
         rb_resync_ready.swap(rb_resync_buf);
         rb_resync_ready_raw = rawsize;
@@ -5774,6 +5785,7 @@ static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned pee
         const uint32_t id = r.u32(), index = r.u32();
         const unsigned len = r.u16();
         const uint8_t *data = r.bytes(len);
+        if (!r.bad() && id == rb_resync_done_id) { RB_SendResyncAck(id, rb_resync_done_count); return; }
         if (r.bad() || data == NULL || id != rb_resync_id || index >= rb_resync_have.size()) return;
         const size_t off = (size_t)index * RB_RESYNC_CHUNK;
         if (off + len > rb_resync_buf.size() || rb_resync_have[index]) return;
