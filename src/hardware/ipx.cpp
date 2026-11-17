@@ -1469,3 +1469,17 @@ void IPX_Init() {
 #endif // C_IPX
 #endif // !defined(OSFREE)
 
+#if defined(OSFREE) || !C_IPX
+/* A build without IPX: RollbackNet clusters still link (an IPX game finds no driver in them, and a null modem game
+ * plays as it does elsewhere). */
+#include <stdint.h>
+#include <string>
+#include <vector>
+void IPX_ClusterAttach(unsigned int) {}
+bool IPX_ClusterActive(void) { return false; }
+void IPX_ClusterTakeOutbox(std::vector<std::vector<uint8_t> > &out) { out.clear(); }
+void IPX_ClusterDeliver(const uint8_t *, size_t) {}
+void IPX_SaveLean(std::string &out) { out.clear(); }
+bool IPX_LoadLean(const uint8_t *&, const uint8_t *) { return true; }
+#endif
+
