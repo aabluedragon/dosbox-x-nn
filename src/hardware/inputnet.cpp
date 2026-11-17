@@ -3656,6 +3656,17 @@ static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) 
 }
 
 /* Wait while we are more than the window ahead of somebody's input. */
+/* Client, waiting for input: while the server is heard (it sends its own input while it waits as well), it is another
+ * participant that is missing, and the server drops that one after its own timeout and hands the machines over. So the
+ * client waits for that (up to six timeouts) instead of leaving: with three players, the one who did not quit timed out
+ * first and left too. */
+static bool RB_ClientWaitsOn(uint32_t start) {
+    if (inputnet_is_server) return false;
+    const uint32_t now = GetTicks();
+    const InputNetPeer &srv = inputnet_peers[0];
+    return srv.active && now - srv.lastheard < inputnet_timeout && now - start < 6u * inputnet_timeout;
+}
+
 static bool RB_WaitForWindow(uint32_t frame) {
     uint32_t start = 0, last_events = 0, lastresend = GetTicks();
     for (;;) {
@@ -3676,7 +3687,7 @@ static bool RB_WaitForWindow(uint32_t frame) {
             continue;
         }
         if ((GetTicks() - lastresend) >= 30u) { RB_SendInput(frame); lastresend = GetTicks(); }  /* (they may wait for ours) */
-        if ((GetTicks() - start) > inputnet_timeout) {
+        if ((GetTicks() - start) > inputnet_timeout && !RB_ClientWaitsOn(start)) {
             if (inputnet_is_server)
                 INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
             else
@@ -3729,7 +3740,7 @@ static bool RB_WaitForInputs(uint32_t frame) {
             continue;
         }
         if ((GetTicks() - lastresend) >= 30u) { RB_SendInput(frame); lastresend = GetTicks(); }  /* (they may wait for ours) */
-        if ((GetTicks() - start) > inputnet_timeout) {
+        if ((GetTicks() - start) > inputnet_timeout && !RB_ClientWaitsOn(start)) {
             if (inputnet_is_server)
                 INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
             else
