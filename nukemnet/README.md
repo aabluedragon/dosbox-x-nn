@@ -477,8 +477,10 @@ meanwhile. From averages over a few seconds it proposes a speed (`RB_Propose`): 
 `[inputnet] rollback max load` (85% by default) leaves after the rest. Replays are part of the load measured; how long
 one replay takes is not a limit of its own (it was until Nov 2026, at 20 ms, and held Duke Nukem 3D at 15,000 to 30,000
 cycles at 220 ms: a few frames a second, which shows far more than replays do). A computer whose picture already changes
-at nearly every screen refresh (`render_changed_frames`, 90% of the refresh rate) proposes no higher speed: more cycles
-show nothing then and make every replay longer. A process over 97% busy asks for 80% of the speed at once, one whose
+in nearly every frame it draws (`render_changed_frames` of `render_frames_started`, replays draw nothing; a few seconds'
+average) needs no more speed: more cycles show nothing then and make every replay longer. Over 93% it proposes 7% less,
+over 85% it holds, down to 40,000 cycles at most this way (a game animating something all the time would otherwise stay
+slow). A process over 97% busy asks for 80% of the speed at once, one whose
 core barely runs (a halted guest) asks for no more. A cluster's hidden copies
 send their proposal to the leader with every frame message, which takes the lowest; every computer sends its lowest at
 the end of its input packets. The server sets the lowest for everybody when it is under 95% or over 108% of the speed, down by at most 40% a second and up by 15%
@@ -489,7 +491,12 @@ read only in a RollbackNet session), so rollbacks and joins carry the speed alon
 proposing N", "N hitches (frames more than 30 ms late) ... the picture changed N times/s").
 Measured on this PC (one machine, Duke Nukem 3D's demo): at 800x600 3 frames a second at 20,000 cycles, 10 at 70,000,
 22 at 160,000, and about 150,000 is all one core sustains; the shareware at 320x200 changes its picture 6 to 24 times a
-second at 20,000, 45 to 62 at 35,000 and 64 to 68 (the 70 Hz refresh) from 50,000. Capability `rollbackNetMaxCycles`.
+second at 20,000, 45 to 62 at 35,000 and 64 to 68 (the 70 Hz refresh) from 50,000. Two computers 220 ms apart (harness,
+both players moving all the time in one shareware network match at 320x200): 43,000 to 75,000 cycles (mostly 45,000 to
+56,000), the picture changing 40 to 50 times a second, 0 desyncs; before (a 20 ms replay limit, 60% load) 15,000 to
+30,000. At that distance each change of the other player's input replays about 18 frames, nothing of which is drawn:
+that, not the speed, is what keeps the picture under the refresh rate there, with about two hitches a second.
+Capability `rollbackNetMaxCycles`.
 
 ### Clusters: IPX and null modem games (IPX/NullModem-over-RollbackNet)
 

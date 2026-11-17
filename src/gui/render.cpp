@@ -424,6 +424,7 @@ void RENDER_RedrawAll(void) {
     render.scale.clearCache = true;
 }
 
+unsigned int render_frames_started = 0;   /* frames the renderer started outside RollbackNet replays */
 bool RENDER_StartUpdate(void) {
 
     if (GCC_UNLIKELY(render.updating))
@@ -484,6 +485,7 @@ bool RENDER_StartUpdate(void) {
         }
     }
     render.updating = true;
+    { extern bool inputnet_rollback_resim; if (!inputnet_rollback_resim) render_frames_started++; }
     return true;
 }
 

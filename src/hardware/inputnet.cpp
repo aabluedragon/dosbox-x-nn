@@ -385,9 +385,10 @@ static uint32_t rb_ml_cn = 0;
 static uint64_t rb_ml_cpu0 = 0;
 static double rb_ml_run = 1;
 /* how often the picture changed meanwhile (frames a second, a window's process only) and the screen's refresh rate */
-static unsigned int rb_ml_pic0 = 0;
-static double rb_ml_pictures = 0, rb_ml_refresh = 70;
-extern unsigned int render_changed_frames;   /* render.cpp */
+static unsigned int rb_ml_pic0 = 0, rb_ml_drawn0 = 0;
+static double rb_ml_pictures = 0, rb_ml_refresh = 70, rb_ml_changed_share = 0;  /* (the share of drawn frames that changed) */
+static double rb_ml_share_s = 0;                    /* ...averaged over a few seconds */
+extern unsigned int render_changed_frames, render_frames_started;   /* render.cpp */
 /* the latest replays (RB_Propose's second limit): frames replayed, time taken, the CPU core's part of it, the speed,
  * when it ended */
 struct RBReplayRec { uint32_t depth, us, core_us, speed, at; };
@@ -3743,6 +3744,7 @@ static bool RB_MeasureLoad(void) {
     if (rb_ml_t0 == 0 || now < rb_ml_t0) {
         rb_ml_t0 = now; rb_ml_wait = 0; rb_ml_sleep0 = dosbox_sleep_us; rb_ml_core0 = dosbox_core_ns;
         rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = RB_ThreadCpuUs(); rb_ml_pic0 = render_changed_frames;
+        rb_ml_drawn0 = render_frames_started;
         return false;
     }
     rb_ml_csum += (double)CPU_CycleMax; rb_ml_cn++;     /* (the speed can change during the second) */
@@ -3757,8 +3759,13 @@ static bool RB_MeasureLoad(void) {
         ? std::max(0.05, std::min(1.0, (double)(cpu - rb_ml_cpu0) / ((double)wall * rb_ml_load))) : 1.0;
     rb_ml_pictures = (double)(render_changed_frames - rb_ml_pic0) * 1000000.0 / (double)wall;
     rb_ml_refresh = (vga.draw.delay.vtotal > 1.0) ? 1000.0 / (double)vga.draw.delay.vtotal : 70.0;
+    {
+        const unsigned int drawn = render_frames_started - rb_ml_drawn0;
+        rb_ml_changed_share = (drawn >= 10u) ? std::min(1.0, (double)(render_changed_frames - rb_ml_pic0) / (double)drawn) : 0.0;
+        rb_ml_share_s = rb_ml_share_s * 0.6 + rb_ml_changed_share * 0.4;
+    }
     rb_ml_t0 = now; rb_ml_wait = 0; rb_ml_sleep0 = dosbox_sleep_us; rb_ml_core0 = dosbox_core_ns;
-    rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = cpu; rb_ml_pic0 = render_changed_frames;
+    rb_ml_csum = 0; rb_ml_cn = 0; rb_ml_cpu0 = cpu; rb_ml_pic0 = render_changed_frames; rb_ml_drawn0 = render_frames_started;
     return true;
 }
 
@@ -3828,9 +3835,15 @@ static void RB_Propose(void) {
      * Measured Nov 2026, Duke Nukem 3D at 800x600: 3 frames a second at 20,000 cycles, 10 at 70,000, 22 at 160,000) */
     double cap = avail / std::max(rb_ml_cost_s, 1e-9);
     if (rb_ml_core < 0.03) cap = std::min(cap, (double)CPU_CycleMax);
-    /* a game whose picture already changes at nearly every screen refresh shows nothing more at a higher speed, and
-     * every replay would take longer: no higher proposal (Duke Nukem 3D at 320x200 reaches it near 50,000 cycles) */
-    if (rb_ml_pictures >= rb_ml_refresh * 0.9) cap = std::min(cap, (double)CPU_CycleMax);
+    /* a game whose picture already changes in nearly every frame drawn (replays draw nothing) shows nothing more at a
+     * higher speed, and every replay would take longer (Duke Nukem 3D at 320x200 gets there near 50,000 cycles): over
+     * 93% of them (a few seconds' average) it tries 7% less, over 85% it stays. Never below 40,000 this way (a game
+     * that animates something all the time would stay as slow as it started; the shareware Duke Nukem 3D at 320x200
+     * changes its picture about 55 times a second there). */
+    if (CPU_CycleMax >= 40000) {
+        if (rb_ml_share_s >= 0.93) cap = std::min(cap, std::max(40000.0, (double)CPU_CycleMax * 0.93));
+        else if (rb_ml_share_s >= 0.85) cap = std::min(cap, (double)CPU_CycleMax);
+    }
     if (rb_ml_load > 0.97) cap = std::min(cap, (double)CPU_CycleMax * 0.8);
     rb_cap_local = (uint32_t)std::max(2000.0, std::min(cap, limit));
 }
@@ -3944,8 +3957,8 @@ static void RB_LogStats(void) {
         rb_stat_captures ? (double)rb_stat_lean_us / (double)rb_stat_captures : 0.0,
         (unsigned)rb_stat_lockstep, (unsigned)rb_stat_ctxchanges);
     if (CPU_CycleAutoAdjust) LOG_MSG("INPUTNET: speed %u cycles per ms (cycles=max), this computer %.0f%% busy (CPU core %.0f%%, "
-        "running %.0f%% of it), picture %.0f of %.0f a second, proposing %u", (unsigned)CPU_CycleMax, rb_ml_load * 100.0, rb_ml_core * 100.0,
-        rb_ml_run * 100.0, rb_ml_pictures, rb_ml_refresh, rb_cap_local);
+        "running %.0f%% of it), picture %.0f a second (%.0f Hz, %.0f%% of the frames drawn changed), proposing %u", (unsigned)CPU_CycleMax,
+        rb_ml_load * 100.0, rb_ml_core * 100.0, rb_ml_run * 100.0, rb_ml_pictures, rb_ml_refresh, rb_ml_changed_share * 100.0, rb_cap_local);
     {
         extern unsigned int vga_shown_flips, render_changed_frames;
         static unsigned int flips_last = 0, changed_last = 0;
@@ -6421,7 +6434,7 @@ static std::string RB_FingerprintDiff(const std::string &theirs, const std::stri
 
 static void RB_SessionStarted(void) {
     RB_SeatsReset();
-    rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
+    rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_ml_share_s = 0; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
         rb_have[i] = 0; rb_checked[i] = 0; rb_acked[i] = 0;
