@@ -490,7 +490,12 @@ alike: delivering a packet schedules emulated events in cycles), in replays too.
 applies, so a change no longer needs a correction (before, each was input nobody could predict and cost the others a
 replay as deep as the distance); a computer that learns of one late but in time records it (`RB_FindMisprediction`)
 and hands it to its copies with the current frame's events. The change still to come travels in the CPU's state, so a
-joining machine knows it. The log names what the corrections came from (keys, mouse, speed changes). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
+joining machine knows it. The log names what the corrections came from (keys, mouse, speed changes). Mouse motion
+goes to every Kth frame, gathered (`[inputnet] rollback mouse frames`, 0 = from the distance: 1 under 80 ms round trip,
+2 under 160 ms, 3 beyond): a mouse reports in almost every frame, and every frame of it the others did not predict costs
+them a replay; this computer applies it at that frame too, so it is at most K-1 frames later. Tried and dropped: gathering
+corrections into fewer replays (4 frames after the previous one: as many replays, and less real time), a lower load
+target (70%: real time kept better, the picture changed 30 to 40 times a second instead of 40 to 48). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
 read only in a RollbackNet session), so rollbacks and joins carry the speed along. The log says where it stands every
 5 seconds ("speed N cycles per ms (cycles=max), this computer N% busy (CPU core N%, running N% of it), picture N of N a second,
 proposing N", "N hitches (frames more than 30 ms late) ... the picture changed N times/s").

@@ -617,11 +617,25 @@ static uint32_t INPUTNET_ScheduleFrame(void) {
     return f;
 }
 
+/* RollbackNet: a player who aims with the mouse moves it in almost every frame, and every frame of motion the others
+ * did not predict costs them a replay as deep as the distance (mouse aiming at 220 ms: 20 to 24 such frames in 5
+ * seconds against 9 with keys, and the game fell to 75 to 80% of real time). Motion goes to every Kth frame instead,
+ * gathered (this computer applies it at that frame too, like everybody): K-1 frames fewer to predict wrong, at most
+ * K-1 frames (10 ms each) later. K follows the distance: 1 under 80 ms, 2 under 160 ms, then 3; "rollback mouse frames"
+ * sets it. */
+static unsigned int rb_mouse_frames = 0;    /* 0: from the distance */
+static unsigned int RB_MouseFrames(void);   /* (1: every frame, as at the DOS prompt) */
+
 static void INPUTNET_QueueLocal(const InputNetEvent &ev) {
     /* a cluster's follower is played by somebody elsewhere (RBC_ApplyInputs); a joining computer waits for the machines */
     if (rbc_copies && (!rbc_leader || rb_joining)) return;
     InputNetPeer &self = inputnet_peers[inputnet_selfid];
-    InputNetFrame &slot = INPUTNET_FrameSlot(self,INPUTNET_ScheduleFrame());
+    uint32_t at = INPUTNET_ScheduleFrame();
+    if (ev.type == INEV_MOUSEMOVE && inputnet_rollback && inputnet_rollback_active) {
+        const uint32_t k = RB_MouseFrames();
+        if (k > 1u) at = ((at + k - 1u) / k) * k;
+    }
+    InputNetFrame &slot = INPUTNET_FrameSlot(self,at);
 
     /* Only the newest speed proposal for a frame is worth keeping. */
     if (ev.type == INEV_CYCLEMAX) {
@@ -2943,6 +2957,13 @@ static inline uint64_t RB_HostContext(void) { return ((uint64_t)dos_shell_input_
  * window's start was saved in the host context that runs now (DOS waiting for a key: every wait is a new nested
  * emulation loop; a program that has just started). */
 static bool rb_lockstep = false;
+static unsigned int RB_MouseFrames(void) {
+    if (rb_lockstep) return 1;
+    if (rb_mouse_frames) return rb_mouse_frames;
+    uint32_t rtt = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) if (inputnet_peers[i].active && !inputnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
+    return rtt < 80u ? 1u : (rtt < 160u ? 2u : 3u);
+}
 static uint64_t rb_lockstep_ctx = 0;
 static uint32_t rb_unrestorable = 0;    /* frame starts in a row at which nothing could be rolled back to */
 static uint32_t RB_MinHave(void);
@@ -6944,6 +6965,8 @@ public:
         inputnet_rbwindow = (unsigned int)((v >= 2 && v <= 48) ? v : 16);
         v = section->Get_int("rollback max load");
         rb_maxload = (unsigned int)((v >= 20 && v <= 95) ? v : 85);
+        v = section->Get_int("rollback mouse frames");
+        rb_mouse_frames = (unsigned int)((v >= 1 && v <= 4) ? v : 0);
         v = section->Get_int("players");
         inputnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)INPUTNET_MAX_PEERS) ? v : 0);
         inputnet_rbautorun = section->Get_string("autorun");

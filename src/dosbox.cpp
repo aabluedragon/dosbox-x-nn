@@ -5565,6 +5565,11 @@ void DOSBOX_SetupConfigSections(void) {
                    "measures how busy it is (replays included), and the server sets one speed for all at which the busiest\n"
                    "computer runs at about this percentage of its time. Valid range is 20 to 95.");
 
+    Pint = secprop->Add_int("rollback mouse frames",Property::Changeable::WhenIdle, 0);
+    Pint->Set_help("mode=rollback: mouse motion goes to every this many frames, gathered (every computer applies it there), so\n"
+                   "the others mispredict it that much less often (each wrong frame costs them a replay). 0 chooses from the\n"
+                   "distance: 1 under 80 ms round trip, 2 under 160 ms, 3 beyond. Valid range is 0 to 4.");
+
     Pint = secprop->Add_int("cluster",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("mode=rollback: IPX/NullModem-over-RollbackNet. Every computer runs a copy of the game for every\n"
                    "player (this many), linked by IPX or a null modem, and RollbackNet keeps all of them the same on every\n"
