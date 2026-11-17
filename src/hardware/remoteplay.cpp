@@ -96,6 +96,9 @@ bool TTF_using(void);
 void ttf_switch_off(bool ss);
 #endif
 
+bool INPUTNET_RollbackSeat(const std::string &name, unsigned copy);   /* inputnet.cpp: a RollbackNet cluster's seats */
+extern bool inputnet_rollback_active;
+
 namespace {
 
 /* ------------------------------------------------------------------------- */
@@ -1970,6 +1973,10 @@ int Host_KeepaliveThread(void *) {
  *   wait <ms>               nothing for that long (up to 10000) before what follows
  *   sync <id>               answers "done <id>" to the sender, from this port, once everything before it has gone
  *                           out (the id: up to 32 characters, sent back as they came)
+ *   rbseat <copy> <player>  a RollbackNet cluster's server: that player (its name in the session, "@host" for the
+ *                           server's own) plays copy <copy> (1 = the first) from the next frame start the machines can
+ *                           be handed over at; whoever played it gets a free copy (INPUTNET_RollbackSeat)
+ * In RollbackNet key steps are dropped: typed into one machine they would put it out of step with the others.
  * Key steps go out one every 40 ms, so a game that polls the keyboard sees each of them. Anything else is ignored. */
 struct ControlStep {
     enum Kind { KEY, WAIT, SYNC } kind;
@@ -2038,6 +2045,12 @@ void Control_Command(const std::string &line,const IPaddress &from) {
         /* [inputnet] block keys from now on, for the remote players of the running game ("none": no key) */
         if (arg == "none") LOG_MSG("INPUTNET: no keys blocked for remote players any more");
         RP_SetBlockedKeys(arg == "none" ? std::string() : arg);
+    } else if (cmd == "rbseat") {
+        const size_t sp = arg.find(' ');
+        const long copy = strtol(arg.c_str(), NULL, 10);
+        if (sp != std::string::npos && copy >= 1 && copy <= 8) {
+            if (!INPUTNET_RollbackSeat(arg.substr(sp + 1), (unsigned)(copy - 1))) LOG_MSG("NUKEMNET: control channel: no seat change (%s)", arg.c_str());
+        }
     } else if (cmd == "sync" && !arg.empty() && arg.size() < sizeof(ControlStep::id)) {
         ControlStep &step = Control_Add(ControlStep::SYNC);
         step.to = from;
@@ -2087,6 +2100,13 @@ void Control_Poll(uint32_t now) {
                  * just as the game exits would otherwise run it as a command): presses wait for the guard, releases
                  * always go. */
                 if (step.down && !Guard_Allows()) break;
+                {
+                    if (inputnet_rollback_active) {
+                        static bool told = false;
+                        if (!told) { LOG_MSG("NUKEMNET: control channel: keys are not typed in RollbackNet (the machines would differ)"); told = true; }
+                        break;
+                    }
+                }
                 KEYBOARD_AddKeyRaw(step.key,step.down);
                 control_pause = 40;
                 break;
