@@ -19,8 +19,9 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   the frame rate to save upload bandwidth. `mode = lockstep` keeps the older mode in which every
   player runs an identical machine.
 - RollbackNet (`[inputnet] mode = rollback`, capability `rollbackNet`): every player runs the game, and the
-  machines exchange only input and stay identical, with each player's own input used at once. See
-  [RollbackNet](#rollbacknet) below.
+  machines exchange only input and stay identical, with each player's own input used at once. Clusters (capability
+  `rollbackNetCluster`) run one copy per player on every computer for games that play over IPX or a null modem, and
+  players can join a running game and take a free copy over. See [RollbackNet](#rollbacknet) below.
 - Remote play guard (capability `inputnetShellGuard`): a viewer's keyboard and mouse go straight to
   the emulated keyboard and mouse (never to DOSBox-X's hotkeys or menus), and only while a DOS program
   other than a command shell runs, or a guest system was booted. At the DOS prompt (DOSBox-X's shell,
@@ -397,9 +398,9 @@ whatever the distance to the others.
 
 How it works:
 
-- The session uses the lockstep join: the server's whole machine is handed to the joining player at the DOS prompt
-  (and the server reloads its own copy), then every machine counts the same frames of `frame` emulated milliseconds
-  (10). A frame starts right after a timer tick (`INPUTNET_RollbackTick`, called from `Normal_Loop`).
+- Every machine counts the same frames of `frame` emulated milliseconds (10). A frame starts right after a timer
+  tick (`INPUTNET_RollbackTick`, called from `Normal_Loop`). The server's session starts at once; players join it at
+  any time (see [Joining](#joining-at-the-dos-prompt-or-a-running-game) below).
 - At every frame start the machine is saved: a lean save state of the devices (no RAM, video memory, TLB, renderer,
   MIDI; the PIC queue, the VGA line drawer and the VGA frame clock exactly, without the rounding the save state
   format has) and the RAM and video memory pages that changed since the last frame start (an undo log against a
@@ -455,6 +456,42 @@ guest's retrace timing), mouse motion (applied as relative motion), the Sound Bl
 its timer events when a game's DMA turns Goldplay off). Nothing of a replayed frame is drawn, and the whole picture is
 drawn again afterwards.
 
+### Clusters: IPX and null modem games (IPX/NullModem-over-RollbackNet)
+
+A game that plays over IPX or a null modem runs one copy per player on every computer, all identical: copy c plays
+for participant c (the server's player has copy 0). `[inputnet] cluster = <copies>` (2 to 8), `cluster copy`,
+`cluster role = leader|follower` and `cluster port`: the leader is the copy of the computer's own player (its window,
+its sound, its network session); the followers have no window (`cluster hide window = true`) and talk to the leader
+over 127.0.0.1 on the cluster port. At every frame start each follower sends its frame, its machine checksum and what
+its game sent (IPX packets, null modem bytes and the RTS/DTR lines), and waits for the leader's go with what it
+receives; the leader routes in copy order (IPX broadcasts to every copy but the sender, unicasts by node address
+10.0.0.(c+1); null modem copy 0 to 1 and back, the lines becoming CTS/DSR/CD), so all computers deliver the same
+packets at the same frame. A rollback rewinds every copy (`REWIND`), packets included. The checksum the computers
+compare covers all copies. `ipx = true` gives each copy an IPX driver with no server behind it; `serialN=rbnullmodem`
+a null modem that sends a byte per byte time at the configured speed (NukemNet uses 57600 baud).
+
+### Joining at the DOS prompt or a running game
+
+A joining computer sends HELLO (with the copies it runs and the copy it wants: its player's own, or the first one
+nobody plays), gets WELCOME (the server's frame, whether its game runs, the autorun command), then the file lists of
+every copy (see the disk, above). At the DOS prompt it waits for the server's machines; when the server's game runs it
+types the autorun command into its own copies at once, so they load the game while it waits, and asks for the
+machines once they are steady (no input is sent or applied meanwhile). The server then saves every copy at one frame
+start (each follower saves and loads its own state back, the leader too, so the server goes on from exactly what it
+sends), and sends all of them in one compressed transfer, acknowledged per participant (256 pieces at a time, sent
+again after 300 ms, dropped after 30 s without progress), with the list of who joined and who left. Every computer
+loads them at a frame start where all its copies are steady and replays to real time. A player who leaves (BYE, or
+too far behind) frees their copy for the next one; the others go on. A joining player in a running game plays the
+copy as the game knows it (its name in the game is the one it was started with).
+
+What a save state does not hold and a joining computer has to take from the server (it would keep its own, from its
+DOS prompt): the VGA frame clock (set before the load as well, since the load compares the mode's rate with it), how
+frames are drawn (render on demand, for the frame being drawn and for the mode), the BIOS's current video mode (INT 10h
+`CurMode`), the DMA channels' transfer modes, the mixer channels' rates, the CMOS clock, the DOS date and the time stamp
+counter's base. After every load the VGA's memory handlers are set up again and the renderer's frame is dropped. Each
+was found by a game at 800x600 (a VESA mode, drawn on demand) that went out of step a few frames after a join, while
+320x200 never did: test joins in an SVGA mode too.
+
 For NukemNet: `[inputnet] players` and `autorun` make the server type a command at the DOS prompt once that many
 participants are in, as its own input, so every machine starts the game at the same moment (NukemNet's
 `C:\NNRBGO.BAT`); at the DOS prompt nobody's key presses reach the machines (they would run a command on every
@@ -466,7 +503,11 @@ Debugging (environment variables): `NN_RB_TRACE=1` logs every frame start (`RBTR
 context, PIC ticks, registers, memory hash and machine hash, `RBSB` with the Sound Blaster's state; compare two
 participants' logs line by line, the last line of each frame counts); `NN_RB_SELFTEST=<n>` goes back 4 frames every
 n frames and checks that every replayed frame start equals the original (it reports the differing component and
-bytes); `NN_RB_DUMP=<frame>` writes that frame start's RAM, video memory and devices to the working folder;
+bytes); `NN_RB_DUMP=<frame>` writes that frame start's RAM, video memory and devices to the working folder
+(`+n`: n frames after the newest load), `NN_RB_FULLDUMP=+n[,+m]` that frame start's whole state as a save state
+(`rbfull-<frame>.sav`); `NN_RB_EVLOG=<frames>` logs every PIC event (`RBEV`: its time, the handler's offset from
+`PIC_RunQueue`, PIC, Sound Blaster and DMA state) for that many frames after each load (2 by default): diff two
+computers' `RBEV` lines to find the first event that differs, and `nm` the handler;
 `NN_RB_PROFILE=1` logs each component's size and time once; `NN_RB_NOTRACK=1` compares all of RAM instead of the
 write tracking; `NN_RB_FORCE_RESYNC=<frame>` makes the server send its state at that frame; `NN_RB_CTXLOG=1` (Linux)
 logs who starts nested emulation loops during a session, away from the DOS prompt (`addr2line -f -e dosbox-x` the
@@ -480,8 +521,20 @@ key reads through DOS) with 0 desyncs at 20, 40 and 80 ms round trip; the self-t
 without a difference, and a forced resync left both identical. Through two NukemNet instances, the joining one
 routed through NukemNet's relay (12-25 ms round trip): Bonus with keys, mouse and clicks from both players, about
 80 rollbacks a minute on each side, 0 desyncs, both screens pixel for pixel identical.
-Not tested yet: Windows and macOS builds, a game with Gravis or MIDI sound, CD images (`IMGMOUNT` files are not in the
-file list), more than two players.
+Clusters and joins, November 2026, Duke Nukem 3D Atomic Edition at 800x600 with random play (moving, turning, aiming,
+firing, jumping): IPX-over-RollbackNet, a server alone with two copies and a second computer joining the running
+game through a 60 ms round trip, then 1 to 8 minutes of play: every frame after the join identical on both computers
+(traces compared frame by frame: 6,231 frames; NullModem-over-RollbackNet 47,286 frames), 0 desyncs; a 5-minute IPX
+run at 320x200 likewise. Through two NukemNet instances: IPX-over-RollbackNet joined mid-game, 7.8 minutes, 45,000
+checks, 0 desyncs; NullModem-over-RollbackNet joined mid-game, 3 minutes, 16,600 checks, 0 desyncs; plain RollbackNet
+(Bonus) joined mid-game, both screens pixel for pixel identical, the joining player's mouse started the match.
+Between this Linux PC and a Windows 11 laptop (the MinGW 64-bit build) through NukemNet's relay, about 67 ms round
+trip, each joining a running Duke Nukem 3D match: IPX-over-RollbackNet hosted on Linux with play from both computers,
+7 minutes, 41,700 checks, 0 desyncs (up to 32-frame rollbacks on the laptop); hosted on Windows (its machines sent to
+the Linux player), 3.9 minutes, 23,300 checks, 0 desyncs; NullModem-over-RollbackNet hosted on Linux, 3.6 minutes,
+21,400 checks, 0 desyncs.
+Not tested yet: macOS builds, a game with Gravis or MIDI sound, CD images (`IMGMOUNT` files are not in the file list),
+more than two computers.
 
 ## Publishing a release
 
