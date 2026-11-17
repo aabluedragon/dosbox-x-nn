@@ -470,6 +470,20 @@ packets at the same frame. A rollback rewinds every copy (`REWIND`), packets inc
 compare covers all copies. `ipx = true` gives each copy an IPX driver with no server behind it; `serialN=rbnullmodem`
 a null modem that sends a byte per byte time at the configured speed (NukemNet uses 57600 baud).
 
+### Seats: taking another copy of a running cluster
+
+Every computer keeps the same seats: the participant who plays each copy (participant c plays copy c until a seat
+changes). Input goes to a participant's copy by them. The server's control channel (env `NN_DOSBOX_CONTROL_PORT` and
+`NN_DOSBOX_CONTROL_TOKEN`, see remoteplay.cpp) takes `rbseat <copy> <player>` (the player's name in the session, `@host`
+for the server's own; capability `rollbackNetSeats`): that player plays that copy, and whoever played it gets the first
+free copy (the one the player left among them). Seats change only with a resync, which carries them, so every computer
+switches at the same frame. A computer whose player gets another copy trades machines between its leader and the
+follower that ran that copy (the follower takes the leader's former copy number, `SETCOPY`, each loads the other's
+machine, the IPX node follows the copy), so the window, the sound and the local input stay with that computer's player.
+After every join, leave and seat change the server reports who plays which copy to a local UDP port (env
+`NN_RB_SEAT_REPORT`, `{"seats":["@host","nick",null]}`). NukemNet's Instances window uses both (Take, Release, Move).
+Keys sent through the control channel are not typed in RollbackNet (one machine would differ from the others).
+
 ### Joining at the DOS prompt or a running game
 
 A joining computer sends HELLO (with the copies it runs and the copy it wants: its player's own, or the first one
@@ -481,7 +495,9 @@ start (each follower saves and loads its own state back, the leader too, so the 
 sends), and sends all of them in one compressed transfer, acknowledged per participant (256 pieces at a time, sent
 again after 300 ms, dropped after 30 s without progress), with the list of who joined and who left. Every computer
 loads them at a frame start where all its copies are steady and replays to real time. A player who leaves (BYE, or
-too far behind) frees their copy for the next one; the others go on. A joining player in a running game plays the
+too far behind) frees their copy for the next one; the others go on. A client keeps waiting for missing input while it still hears the server (which
+sends its own input while it waits), up to six timeouts: the server drops the one who is gone and hands the machines over
+(with three players, the one who stayed used to time out first and leave too). A joining player in a running game plays the
 copy as the game knows it (its name in the game is the one it was started with).
 
 What a save state does not hold and a joining computer has to take from the server (it would keep its own, from its
@@ -532,7 +548,14 @@ Between this Linux PC and a Windows 11 laptop (the MinGW 64-bit build) through N
 trip, each joining a running Duke Nukem 3D match: IPX-over-RollbackNet hosted on Linux with play from both computers,
 7 minutes, 41,700 checks, 0 desyncs (up to 32-frame rollbacks on the laptop); hosted on Windows (its machines sent to
 the Linux player), 3.9 minutes, 23,300 checks, 0 desyncs; NullModem-over-RollbackNet hosted on Linux, 3.6 minutes,
-21,400 checks, 0 desyncs.
+21,400 checks, 0 desyncs. With the laptop playing too (keys posted to its window): IPX-over-RollbackNet hosted on the
+laptop, a Linux player joining the running match, 3 minutes, then the laptop's host took the Linux player's copy (the
+Linux player got the host's), 3 more minutes: 36,300 checks, 0 desyncs, 600 to 1,100 rollbacks on each side;
+NullModem-over-RollbackNet hosted on the laptop, the same with a take: 35,000 checks, 0 desyncs.
+Seats on Linux: a host taking a joining player's copy and releasing it again (each player's keys moved their new copy:
+the other screen's ammo stayed), 13,600 checks, 0 desyncs; three copies per computer, a player moved to a free copy and
+then the host taking that one, 29,466 frames identical on both computers, 0 desyncs; three NukemNet players, one
+killed (the other two went on), the remaining joiner moved to the free copy, 36,000 checks, 0 desyncs.
 Not tested yet: macOS builds, a game with Gravis or MIDI sound, CD images (`IMGMOUNT` files are not in the file list),
 more than two computers.
 
