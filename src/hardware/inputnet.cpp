@@ -572,7 +572,8 @@ static void INPUTNET_FlushDelayed(void) {
 }
 
 static bool INPUTNET_SendRaw(const IPaddress &addr,const uint8_t *data,size_t len) {
-    if (INPUTNET_SendDelay() == 0) return INPUTNET_SendRawNow(addr, data, len);
+    /* (only once the session runs: the connection's first packets go at once, whatever loop waits for their answer) */
+    if (INPUTNET_SendDelay() == 0 || !inputnet_session) return INPUTNET_SendRawNow(addr, data, len);
     if (inputnet_socket == NULL || inputnet_sendpkt == NULL || len > (size_t)inputnet_sendpkt->maxlen) return false;
     INDelayed d; d.due = GetTicks() + INPUTNET_SendDelay(); d.addr = addr; d.data.assign(data, data + len);
     inputnet_delayed.push_back(d);
