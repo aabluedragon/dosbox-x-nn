@@ -2129,6 +2129,8 @@ void Control_Poll(uint32_t now) {
 std::string REMOTEPLAY_AuthToken(const std::string &secret,const std::string &name) { return RP_AuthToken(secret,name); }
 bool REMOTEPLAY_SameSecret(const std::string &a,const std::string &b) { return RP_SameSecret(a,b); }
 std::string REMOTEPLAY_CleanName(const std::string &name) { return RP_CleanName(name); }
+/* For RollbackNet (inputnet.cpp RB_GuardDrops): the DOS shell or a DOSBox-X command is in front (machine state only). */
+bool REMOTEPLAY_ShellInFront(void) { return Guard_Blocked(); }
 
 void REMOTEPLAY_Configure(Section_prop *section) {
     RP_SetBlockedKeys(section->Get_string("block keys"));
@@ -6530,6 +6532,7 @@ void REMOTEPLAY_Init(void) { }
 void REMOTEPLAY_ProcessEnded(void) { }
 bool REMOTEPLAY_HostRequested(void) { return false; }
 bool REMOTEPLAY_HideScreenRequested(void) { return false; }
+bool REMOTEPLAY_ShellInFront(void) { return false; }
 bool REMOTEPLAY_StartServer(uint16_t) { return false; }
 void REMOTEPLAY_StopServer(const char *) { }
 bool REMOTEPLAY_ServerRunning(void) { return false; }

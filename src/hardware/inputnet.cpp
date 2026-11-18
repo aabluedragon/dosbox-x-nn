@@ -706,6 +706,7 @@ static void INPUTNET_QueueLocal(const InputNetEvent &ev) {
 }
 
 bool INPUTNET_InterceptKey(KBD_KEYS keytype,bool pressed) {
+    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
     if (!inputnet_capture_active || !inputnet_share_keyboard) return false;
     if ((unsigned)keytype >= (unsigned)KBD_LAST) return false;
 
@@ -718,6 +719,7 @@ bool INPUTNET_InterceptKey(KBD_KEYS keytype,bool pressed) {
 }
 
 bool INPUTNET_InterceptMouseMotion(float xrel,float yrel,float x,float y,bool emulate) {
+    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
     if (!inputnet_capture_active || !inputnet_share_mouse) return false;
 
     InputNetEvent ev;
@@ -729,6 +731,7 @@ bool INPUTNET_InterceptMouseMotion(float xrel,float yrel,float x,float y,bool em
 }
 
 bool INPUTNET_InterceptMouseButton(uint8_t button,bool pressed) {
+    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
     if (!inputnet_capture_active || !inputnet_share_mouse) return false;
 
     InputNetEvent ev;
@@ -740,6 +743,7 @@ bool INPUTNET_InterceptMouseButton(uint8_t button,bool pressed) {
 }
 
 bool INPUTNET_InterceptMouseWheel(int32_t scroll) {
+    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
     if (!inputnet_capture_active || !inputnet_share_mouse) return false;
     if (scroll < -32768 || scroll > 32767) return false;
 
@@ -1843,12 +1847,12 @@ static void INPUTNET_EndSession(const char *reason,bool notify_peers) {
 
     if (inputnet_session) {
         inputnet_session = false;
-        inputnet_capture_active = false;
+        inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
         INPUTNET_ReleaseHeldInput();
     }
     RB_SessionEnded();
 
-    inputnet_capture_active = false;
+    inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
 
     for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
         InputNetPeer &p = inputnet_peers[i];
@@ -1937,7 +1941,7 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
      * participant, so stop the lockstep first. */
     if (inputnet_session) {
         inputnet_session = false;
-        inputnet_capture_active = false;
+        inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
         INPUTNET_ReleaseHeldInput();
     }
 
@@ -2220,7 +2224,7 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
 
             if (inputnet_session) {
                 inputnet_session = false;
-                inputnet_capture_active = false;
+                inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
                 INPUTNET_ReleaseHeldInput();
             }
 
@@ -4863,8 +4867,13 @@ static void RBC_SendGo(unsigned c, uint32_t frame, const std::vector<InputNetEve
 }
 
 /* (At the DOS prompt only the server's autorun types: RB_ApplyInputs.) */
+/* Key presses that do not reach the machines: while the DOS shell or one of DOSBox-X's own commands (CONFIG, MOUNT, ...)
+ * is in front (REMOTEPLAY_ShellInFront, the remote play guard's test, which reads only the machine), not just while the
+ * prompt waits: a player's keys during the start-up batch went into the keyboard buffer and the prompt read them in
+ * front of the game's start command. The server's own typing of that command (bit 1) always goes through. */
+bool REMOTEPLAY_ShellInFront(void);
 static inline bool RB_GuardDrops(const InputNetEvent &e) {
-    return dos_shell_reading_input && e.type == INEV_KEY && (e.pressed & 1u) && !(e.pressed & 2u);
+    return e.type == INEV_KEY && (e.pressed & 1u) && !(e.pressed & 2u) && (dos_shell_reading_input || REMOTEPLAY_ShellInFront());
 }
 
 /* Leader: everyone's input for "frame", each participant's to the copy it plays (rb_seat; the server's autorun typing to every copy), then
@@ -5236,7 +5245,7 @@ static void RBC_FollowerCommands(void) {
                 RB_SessionStarted();
                 break;
             case RBC_CMD_END:
-                if (inputnet_session) { inputnet_session = false; inputnet_capture_active = false; RB_SessionEnded(); }
+                if (inputnet_session) { inputnet_session = false; inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */ RB_SessionEnded(); }
                 break;
             case RBC_CMD_SETCOPY:           /* this process runs copy c.a from now on (its machine comes with a LOADRESYNC) */
                 if (c.a < rbc_copies && c.a != rbc_copy) {
@@ -5360,7 +5369,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
         if (GetTicks() - rbc_last_heard > 15000u) {   /* (a command may have taken a while since "now") */
             LOG_MSG("INPUTNET: cluster: the leader is gone");
             inputnet_session = false;
-            inputnet_capture_active = false;
+            inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
             RB_SessionEnded();
             rbcf_cur = UINT32_MAX;
             return;
@@ -7094,6 +7103,11 @@ public:
         inputnet_frame_ms = (unsigned int)((v >= 1 && v <= 100) ? v : 10);
 
         inputnet_rollback = std::string(section->Get_string("mode")) == "rollback";
+        /* RollbackNet: this computer's keyboard and mouse reach its machine only as the session's input. Before the
+         * session runs (the start-up commands, "Switch to secure mode" and the rest) a key would go into this machine
+         * alone and wait in its keyboard buffer, and the DOS prompt would then read it in front of the game's start
+         * command: taken and dropped from the start (INPUTNET_InterceptKey). */
+        if (inputnet_rollback) inputnet_capture_active = true;
 
         v = section->Get_int("delay");
         if (inputnet_rollback) inputnet_delay = (unsigned int)((v >= 0 && v <= 8) ? v : 0);

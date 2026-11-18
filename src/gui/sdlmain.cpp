@@ -6313,6 +6313,24 @@ bool gfx_in_mapper = false;
 
 void GFX_Events() {
     REMOTEPLAY_Poll();
+#if defined(C_SDL2)
+    /* A RollbackNet cluster's follower has no screen: something can still show its window (on Windows it appeared as a
+     * second, white and frozen DOSBox-X-NN window next to the game), so it is hidden again whenever it shows. */
+    if (cluster_window_hidden && sdl.window != NULL) {
+        static Bitu last_check = 0;
+        const Bitu now = (Bitu)SDL_GetTicks();
+        if (now - last_check >= 200u) {
+            last_check = now;
+            if (!(SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN)) SDL_HideWindow(sdl.window);
+# if defined(WIN32) && !defined(HX_DOS)
+            {
+                HWND self = GetHWND();
+                if (self != NULL && IsWindowVisible(self)) ShowWindow(self, SW_HIDE);
+            }
+# endif
+        }
+    }
+#endif
 #if C_EMSCRIPTEN
     /* CALLBACK_Idle calls this for every guest idle poll - over a million
      * times a second at cycles=max - and everything below (SDL_GetTicks,
