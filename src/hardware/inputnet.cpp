@@ -2974,6 +2974,7 @@ static uint32_t rb_stat_ctxchanges = 0; /* host context changes seen at frame st
 static uint64_t rb_stat_replay_us = 0, rb_stat_replay_max_us = 0, rb_stat_replays = 0;
 /* where replays' time goes (5 s): loading the frame (and the copies'), saving frames, waiting for the copies */
 static uint64_t rb_stat_rp_restore_us = 0, rb_stat_rp_save_us = 0, rb_stat_rp_wait_us = 0;
+static uint64_t rb_replay_us_total = 0;     /* every replay's time since the start (RB_Propose's replay reserve) */
 static uint32_t rb_stat_last_log = 0;
 
 extern bool dos_shell_reading_input;
@@ -4009,7 +4010,27 @@ static void RB_Propose(void) {
     rb_ml_cost_s = (rb_ml_cost_s < 0) ? cost : rb_ml_cost_s * 0.6 + cost * 0.4;
     rb_ml_fixed_s = (rb_ml_fixed_s < 0) ? fixed : rb_ml_fixed_s * 0.6 + fixed * 0.4;
     const double target = (double)rb_maxload / 100.0;
-    const double avail = std::max(target - rb_ml_fixed_s, target / 3.0);
+    /* Far apart, part of the time is kept for replays while there are few (35% from 150 ms round trip, 20% from 100
+     * ms, less what replays took lately): in a game's menus, or while nobody moves, nothing has to be corrected and the
+     * speed went up to 75,000 and more, so the first corrections of the game took half as long again as they could
+     * afford (a gap of about half a second when a game began, at 220 ms). While playing, the replays measured are the
+     * load and this keeps nothing. */
+    static uint64_t rp_last_total = 0, rp_last_t = 0;
+    static double rp_share_s = 0;
+    {
+        const uint64_t now = RB_MicroTicks();
+        if (rp_last_t != 0 && now > rp_last_t) {
+            const double share = std::min(1.0, (double)(rb_replay_us_total - rp_last_total) / (double)(now - rp_last_t));
+            rp_share_s = rp_share_s * 0.6 + share * 0.4;
+        }
+        rp_last_total = rb_replay_us_total; rp_last_t = now;
+    }
+    uint32_t far = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
+        if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) far = std::max(far, rb_rtt[i]);
+    const double reserve = far >= 150u ? 0.35 : (far >= 100u ? 0.20 : 0.0);
+    const double keep = std::max(0.0, reserve - rp_share_s);
+    const double avail = std::max(target - rb_ml_fixed_s - keep, target / 3.0);
     const double limit = (CPU_CycleLimit > 0) ? (double)CPU_CycleLimit : 1000000.0;
     /* (replays are part of the load measured; how long one takes is not a limit of its own: a game at a low speed
      * draws few frames a second, which shows far more than a replay of a few tens of milliseconds now and then.
@@ -6444,6 +6465,7 @@ static void RB_FrameBoundary(uint32_t frame) {
         if (rb_replay_started) {
             const uint64_t us = RB_MicroTicks() - rb_replay_started;
             rb_stat_replay_us += us; rb_stat_replays++;
+            rb_replay_us_total += us;
             if (us > rb_stat_replay_max_us) rb_stat_replay_max_us = us;
             rb_replay_started = 0;
         }

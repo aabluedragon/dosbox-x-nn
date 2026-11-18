@@ -520,7 +520,14 @@ instead of 90%) for 20 ms of our own input. And a frame held back over 200 ms by
 20% less speed at once (`rb_replay_hitch`, not below 35,000) instead of the picture guard's few percent a second: a
 game comes from its menus, or from playing alone, at a speed (75,000 and more) its replays cannot afford, and the
 first 10 to 20 seconds of a game had most of the long gaps. With both: speed 76,000 to 49,000 in the next 5 seconds,
-then 38,000 to 51,000; the longest gap in each 5 seconds mostly 130 to 220 ms, one or two over 300 ms in two minutes. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
+then 38,000 to 51,000; the longest gap in each 5 seconds mostly 130 to 220 ms, one or two over 300 ms in two minutes.
+That first drop still came after a gap (about half a second when a game began): far apart, part of the time is now
+kept for replays while there are few (35% from 150 ms round trip, 20% from 100 ms, less the share replays took
+lately), so a game's menus no longer run at 75,000: before playing 39,000, and no long gap when the game began. The
+price: far apart, a game where little needs correcting runs slower than this computer could (an 800x600 game shows
+fewer frames); while playing, the replays measured are the load and nothing is kept. In a real NukemNet game between
+this Linux computer and a Windows laptop at 220 ms (`NN_RB_SENDDELAY=153` on one side), both moving for two minutes:
+the longest gap in each 5 seconds mostly 70 to 110 ms on one and 37 to 131 ms on the other, 0 desyncs. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
 its code cache, which a load empties). Tried and dropped: gathering
 corrections into fewer replays (4 frames after the previous one: as many replays, and less real time), a lower load
 target (70%: real time kept better, the picture changed 30 to 40 times a second instead of 40 to 48). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
