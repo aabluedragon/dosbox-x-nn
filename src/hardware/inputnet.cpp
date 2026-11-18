@@ -73,6 +73,7 @@ bool inputnet_rollback_resim = false;
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <deque>
 #if defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
 #include <unistd.h>
@@ -550,7 +551,36 @@ static void INPUTNET_Stall(uint32_t &last_events) {
     SDL_Delay(1);
 }
 
+static bool INPUTNET_SendRawNow(const IPaddress &addr,const uint8_t *data,size_t len);
+
+/* Debugging: NN_RB_SENDDELAY=<ms> holds every packet this computer sends to the others that long (a longer distance
+ * over a real network; the copies of a cluster talk on their own socket, undelayed). */
+struct INDelayed { uint32_t due; IPaddress addr; std::vector<uint8_t> data; };
+static std::deque<INDelayed> inputnet_delayed;
+static uint32_t INPUTNET_SendDelay(void) {
+    static int ms = -1;
+    if (ms < 0) { const char *e = getenv("NN_RB_SENDDELAY"); ms = (e != NULL) ? std::max(0, std::min(1000, atoi(e))) : 0; }
+    return (uint32_t)ms;
+}
+static void INPUTNET_FlushDelayed(void) {
+    const uint32_t now = GetTicks();
+    while (!inputnet_delayed.empty() && (int32_t)(now - inputnet_delayed.front().due) >= 0) {
+        const INDelayed &d = inputnet_delayed.front();
+        INPUTNET_SendRawNow(d.addr, &d.data[0], d.data.size());
+        inputnet_delayed.pop_front();
+    }
+}
+
 static bool INPUTNET_SendRaw(const IPaddress &addr,const uint8_t *data,size_t len) {
+    if (INPUTNET_SendDelay() == 0) return INPUTNET_SendRawNow(addr, data, len);
+    if (inputnet_socket == NULL || inputnet_sendpkt == NULL || len > (size_t)inputnet_sendpkt->maxlen) return false;
+    INDelayed d; d.due = GetTicks() + INPUTNET_SendDelay(); d.addr = addr; d.data.assign(data, data + len);
+    inputnet_delayed.push_back(d);
+    INPUTNET_FlushDelayed();
+    return true;
+}
+
+static bool INPUTNET_SendRawNow(const IPaddress &addr,const uint8_t *data,size_t len) {
     if (inputnet_socket == NULL || inputnet_sendpkt == NULL) return false;
     if (len > (size_t)inputnet_sendpkt->maxlen) return false;
 
@@ -2350,6 +2380,7 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
 }
 
 static void INPUTNET_PollSocket(void) {
+    if (!inputnet_delayed.empty()) INPUTNET_FlushDelayed();
     RBC_PollLeader();
     if (inputnet_socket == NULL || inputnet_recvpkt == NULL) return;
 
@@ -2941,6 +2972,8 @@ static uint64_t rb_stat_scan_us = 0, rb_stat_lean_us = 0;
 static uint32_t rb_stat_lockstep = 0;   /* frames run in lockstep since the last log (see RB_UpdateLockstep) */
 static uint32_t rb_stat_ctxchanges = 0; /* host context changes seen at frame starts since the last log */
 static uint64_t rb_stat_replay_us = 0, rb_stat_replay_max_us = 0, rb_stat_replays = 0;
+/* where replays' time goes (5 s): loading the frame (and the copies'), saving frames, waiting for the copies */
+static uint64_t rb_stat_rp_restore_us = 0, rb_stat_rp_save_us = 0, rb_stat_rp_wait_us = 0;
 static uint32_t rb_stat_last_log = 0;
 
 extern bool dos_shell_reading_input;
@@ -3393,6 +3426,7 @@ static void RB_Capture(uint32_t frame) {
     }
 
     rb_stat_capture_us += RB_MicroTicks() - t0;
+    if (inputnet_rollback_resim) rb_stat_rp_save_us += RB_MicroTicks() - t0;
     rb_stat_captures++;
     rb_stat_pages += s.undo_page.size();
 }
@@ -3591,6 +3625,7 @@ static bool RB_Rollback(uint32_t target, uint32_t frame) {
     const uint32_t usable = RB_RestorableAtOrBefore(target, lowest);
     if (usable != UINT32_MAX) target = usable;
     else if (rbc_copies && rbc_leader) return false;    /* (a frame some copy cannot load) */
+    const uint64_t restore_t0 = RB_MicroTicks();
     if (frame - target > inputnet_rbwindow + 2u || !RB_Restore(target, frame)) {
         LOG_MSG("INPUTNET: cannot roll back from frame %u to %u",(unsigned)frame,(unsigned)target);
         return false;
@@ -3608,6 +3643,7 @@ static bool RB_Rollback(uint32_t target, uint32_t frame) {
     DOSBOX_AddTicksRemain(depth * inputnet_frame_ms);
     inputnet_frame = target;
     if (rbc_copies && rbc_leader) RBC_LeaderRewind(target);
+    rb_stat_rp_restore_us += RB_MicroTicks() - restore_t0;
     RB_ApplyInputs(target);
     return true;
 }
@@ -4107,6 +4143,10 @@ static void RB_LogStats(void) {
     rb_stat_hitches = 0; rb_stat_maxgap_us = 0; rb_stat_trims = 0;
     rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
     rb_stat_capture_us = 0; rb_stat_captures = 0; rb_stat_pages = 0;
+    if (rb_stat_replays) LOG_MSG("INPUTNET: replays' time (5 s): %.0f ms in all, loading the frame %.0f ms, saving frames %.0f ms, "
+        "waiting for the copies %.0f ms", (double)(rb_stat_replay_us + rb_stat_rp_restore_us) / 1000.0, (double)rb_stat_rp_restore_us / 1000.0,
+        (double)rb_stat_rp_save_us / 1000.0, (double)rb_stat_rp_wait_us / 1000.0);
+    rb_stat_rp_restore_us = rb_stat_rp_save_us = rb_stat_rp_wait_us = 0;
     rb_stat_replay_us = 0; rb_stat_replays = 0; rb_stat_replay_max_us = 0;
 }
 
@@ -4871,7 +4911,14 @@ static bool RBC_AllStable(uint32_t frame, uint8_t *prompt = NULL) {
 /* Leader, at a frame start: every follower there (RBC_REWIND: put back to "frame" first; RBC_HOLD: at the epoch it
  * moved to by a command), their packets of the frame before routed (RBC_ROUTE only), and the cluster's checksum.
  * False when a copy stopped answering (the session is over then). */
+static bool RBC_LeaderBarrierRun(uint32_t frame, int mode);
 static bool RBC_LeaderBarrier(uint32_t frame, int mode) {
+    const uint64_t t0 = RB_MicroTicks();
+    const bool r = RBC_LeaderBarrierRun(frame, mode);
+    if (inputnet_rollback_resim && mode != RBC_REWIND) rb_stat_rp_wait_us += RB_MicroTicks() - t0;
+    return r;
+}
+static bool RBC_LeaderBarrierRun(uint32_t frame, int mode) {
     RBWaitTimer waited;             /* (the copies report how busy they are themselves) */
     std::vector<std::vector<uint8_t> > own;
     std::vector<uint8_t> own_ser;

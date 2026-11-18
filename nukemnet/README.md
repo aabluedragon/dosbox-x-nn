@@ -508,7 +508,11 @@ replayed deeper: at 220 ms with both players aiming with the mouse, replays went
 with a stall (0.3 to 0.7 s gaps, about one every 3.5 s once the speed had settled, 40 in two minutes); with it, 1 or 2
 such gaps in two minutes, the longest 355 to 561 ms, and 2 stalls instead of 31 (keys only: longest gap 300 to 340 ms
 instead of 570 to 670). New input of ours goes to the next frame not sent yet, which the catch-up reaches within tens
-of milliseconds. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
+of milliseconds. Every 5 s the log also splits the replays' time ("replays' time"): at 220 ms with both players
+aiming, about 1.8 s in 5 went to replays, of which loading the frame about 50 ms, saving frames about 130 ms and
+waiting for the cluster's copies about 140 ms: the rest, nearly 85%, is emulating the frames again (about 110,000
+cycles per millisecond of this computer's time with the normal core). Fewer frames to replay is what is left: the
+room's input delay (each frame of it makes every correction a frame shallower) or coarser mouse frames. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
 its code cache, which a load empties). Tried and dropped: gathering
 corrections into fewer replays (4 frames after the previous one: as many replays, and less real time), a lower load
 target (70%: real time kept better, the picture changed 30 to 40 times a second instead of 40 to 48). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
@@ -596,7 +600,9 @@ Debugging (environment variables): `NN_RB_TRACE=1` logs every frame start (`RBTR
 context, PIC ticks, registers, memory hash and machine hash, `RBSB` with the Sound Blaster's state; compare two
 participants' logs line by line, the last line of each frame counts; `RBDOS` with every INT 21h call, its result and
 the name or the file found); `NN_RB_GAPLOG=1` logs every real-time frame that came more than 300 ms after the one before
-(`RBGAP`: stalls, replays and their frames, time waited for input, the speed); `NN_RB_SELFTEST=<n>` goes back 4 frames every
+(`RBGAP`: stalls, replays and their frames, time waited for input, the speed); `NN_RB_SENDDELAY=<ms>` holds every packet
+this computer sends to the other participants that long (a longer distance over a real network: 153 on one side made a
+67 ms link a 220 ms one; the copies of a cluster talk undelayed); `NN_RB_SELFTEST=<n>` goes back 4 frames every
 n frames and checks that every replayed frame start equals the original (it reports the differing component and
 bytes); `NN_RB_DUMP=<frame>` writes that frame start's RAM, video memory and devices to the working folder
 (`+n`: n frames after the newest load), `NN_RB_FULLDUMP=+n[,+m]` that frame start's whole state as a save state
