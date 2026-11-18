@@ -3680,7 +3680,7 @@ bool GFX_StartUpdate(uint8_t* &pixels,Bitu &pitch)
     /* RollbackNet replays frames at full speed: nothing of them is shown (presenting could also wait for vsync), and
      * the renderer skips the frame as it does when frames are skipped. */
     extern bool streamnet_rollback_resim;
-    if (streamnet_rollback_resim)
+    if (streamnet_rollback_resim || cluster_window_hidden)  /* (a cluster's follower has no screen) */
         return false;
 
     switch (sdl.desktop.type)

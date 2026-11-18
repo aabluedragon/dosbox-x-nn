@@ -3939,6 +3939,12 @@ void VGA_FreeBiosLogo(void) {
 /* NukemNet remote play host (see NN_EarlyFrameOK): the start address the last frame was drawn from */
 static uint32_t nn_shown_start = 0xFFFFFFFFu;
 
+/* RollbackNet shows nothing of a replayed frame (GFX_StartUpdate refuses), and a cluster's follower has no screen:
+ * decoding the scanlines from video memory would only cost time (Duke Nukem 3D at 800x600: about 8% of a replay).
+ * The decoders change no state of the emulated machine. */
+extern bool streamnet_rollback_resim, cluster_window_hidden;
+static inline bool VGA_SkipDecode(void) { return GCC_UNLIKELY(streamnet_rollback_resim || cluster_window_hidden); }
+
 static void VGA_DrawSingleLine(Bitu /*blah*/) {
     unsigned int lines = 0;
     bool skiprender;
@@ -3956,7 +3962,7 @@ again:
     if ((++vga.draw.render_step) >= vga.draw.render_max)
         vga.draw.render_step = 0;
 
-    if (!skiprender) {
+    if (!skiprender && !VGA_SkipDecode()) {
         if (video_debug_overlay && machine == MCH_PC98) {
             for (unsigned int i=0;i < 2;i++) {
                 if (pc98_gdc[i].dbg_ev_partition) {
@@ -4183,7 +4189,7 @@ static void VGA_DrawEGASingleLine(Bitu /*blah*/) {
     if ((++vga.draw.render_step) >= vga.draw.render_max)
         vga.draw.render_step = 0;
 
-    if (!skiprender) {
+    if (!skiprender && !VGA_SkipDecode()) {
         if (GCC_UNLIKELY(vga.attr.disabled && !vga.dosboxig.svga)) {
             memset(TempLine, 0, TempLineSize);
             RENDER_DrawLine(TempLine);
