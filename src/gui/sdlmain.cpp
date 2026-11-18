@@ -2368,6 +2368,99 @@ void OutputSettingMenuUpdate(void);
 
 /* Draws the placeholder (plain background, two lines of text) on the window
  * surface, below the SDL drawn menu bar. */
+/* RollbackNet: a small window over the game while the machines are being handed over (a player joining, a resync):
+ * a heading, a progress bar with the percentage, and what is left with the time it should take. Its own window, so it
+ * shows over every output (OpenGL, Direct3D, surface) while the game stands still; it takes no focus. The game window's
+ * title says the same in short. Nothing for a cluster's hidden copies. */
+#if defined(C_SDL2)
+static SDL_Window *sync_overlay = NULL;
+static Uint32 sync_overlay_id = 0;
+#endif
+static std::string sync_title_saved;
+static bool sync_title_on = false;
+
+static void SyncOverlay_Text(SDL_Surface *surf, int x0, int y0, const char *text, uint32_t color, int maxw) {
+    const int bpp = surf->format->BytesPerPixel;
+    uint8_t *pixels = (uint8_t*)surf->pixels;
+    for (int c = 0; text[c] && (c + 1) * 8 <= maxw; c++) {
+        const uint8_t *glyph = &int10_font_16[(uint8_t)text[c] * 16];
+        for (int gy = 0; gy < 16; gy++) {
+            const int y = y0 + gy;
+            if (y < 0 || y >= surf->h) continue;
+            uint8_t *row = pixels + (size_t)y * (size_t)surf->pitch;
+            for (int gx = 0; gx < 8; gx++) {
+                const int x = x0 + c * 8 + gx;
+                if (x < 0 || x >= surf->w || !(glyph[gy] & (0x80 >> gx))) continue;
+                if (bpp == 4) ((uint32_t*)row)[x] = color; else if (bpp == 2) ((uint16_t*)row)[x] = (uint16_t)color;
+            }
+        }
+    }
+}
+
+static void SyncOverlay_Fill(SDL_Surface *surf, int x0, int y0, int w, int h, uint32_t color) {
+    SDL_Rect r = { x0, y0, w, h };
+    SDL_FillRect(surf, &r, color);
+}
+
+void GFX_SyncProgress(const char *heading, double fraction, const char *detail) {
+    extern bool cluster_window_hidden;
+    if (cluster_window_hidden) return;
+    if (fraction < 0) fraction = 0; else if (fraction > 1) fraction = 1;
+    const int pct = (int)(fraction * 100.0 + 0.0001);
+#if defined(C_SDL2)
+    if (sdl.window != NULL) {
+        char title[200];
+        snprintf(title, sizeof(title), "%s %d%%", heading, pct);
+        if (!sync_title_on) { const char *t = SDL_GetWindowTitle(sdl.window); sync_title_saved = t ? t : ""; sync_title_on = true; }
+        SDL_SetWindowTitle(sdl.window, title);
+    }
+    const int W = 480, H = 104;
+    if (sync_overlay == NULL && sdl.window != NULL) {
+        int mx = 0, my = 0, mw = 640, mh = 480;
+        SDL_GetWindowPosition(sdl.window, &mx, &my);
+        SDL_GetWindowSize(sdl.window, &mw, &mh);
+# ifdef SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN
+        SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+# endif
+        sync_overlay = SDL_CreateWindow("NukemNet", mx + (mw - W) / 2, my + (mh - H) / 2, W, H,
+            SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_SKIP_TASKBAR);
+# ifdef SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN
+        SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "0");
+# endif
+        sync_overlay_id = sync_overlay ? SDL_GetWindowID(sync_overlay) : 0;
+    }
+    if (sync_overlay == NULL) return;
+    SDL_Surface *surf = SDL_GetWindowSurface(sync_overlay);
+    if (surf == NULL || (surf->format->BytesPerPixel != 4 && surf->format->BytesPerPixel != 2)) return;
+    if (SDL_MUSTLOCK(surf) && SDL_LockSurface(surf) != 0) return;
+    const uint32_t bg = SDL_MapRGB(surf->format, 0x24, 0x2b, 0x38), border = SDL_MapRGB(surf->format, 0x5a, 0x66, 0x7a);
+    const uint32_t text = SDL_MapRGB(surf->format, 0xe8, 0xec, 0xf2), dim = SDL_MapRGB(surf->format, 0x9a, 0xa4, 0xb4);
+    const uint32_t track = SDL_MapRGB(surf->format, 0x3a, 0x43, 0x52), bar = SDL_MapRGB(surf->format, 0x4c, 0xaf, 0x50);
+    SyncOverlay_Fill(surf, 0, 0, surf->w, surf->h, border);
+    SyncOverlay_Fill(surf, 1, 1, surf->w - 2, surf->h - 2, bg);
+    SyncOverlay_Text(surf, 16, 12, heading, text, surf->w - 32);
+    const int bx = 16, by = 40, bw = surf->w - 32 - 48, bh = 18;
+    SyncOverlay_Fill(surf, bx, by, bw, bh, track);
+    SyncOverlay_Fill(surf, bx, by, (int)(bw * fraction), bh, bar);
+    char p[8];
+    snprintf(p, sizeof(p), "%3d%%", pct);
+    SyncOverlay_Text(surf, bx + bw + 8, by + 1, p, text, 40);
+    SyncOverlay_Text(surf, 16, 72, detail ? detail : "", dim, surf->w - 32);
+    if (SDL_MUSTLOCK(surf)) SDL_UnlockSurface(surf);
+    SDL_UpdateWindowSurface(sync_overlay);
+#else
+    (void)heading; (void)detail; (void)pct;
+#endif
+}
+
+void GFX_SyncProgressDone(void) {
+#if defined(C_SDL2)
+    if (sync_overlay != NULL) { SDL_DestroyWindow(sync_overlay); sync_overlay = NULL; sync_overlay_id = 0; }
+    if (sync_title_on && sdl.window != NULL) GFX_SetTitle(-1, -1, -1, false);   /* (the usual title, as it is now) */
+#endif
+    sync_title_on = false;
+}
+
 void GFX_RemotePlayDrawHidden(void) {
     if (!remoteplay_screen_hidden || sdl.desktop.type != SCREEN_SURFACE || sdl.surface == NULL || sdl.updating)
         return;
@@ -6403,6 +6496,8 @@ void GFX_Events() {
 
     while (SDL_PollEvent(&event)) {
 #if defined(C_SDL2)
+        /* (the progress window over the game while machines are handed over: none of the game window's business) */
+        if (sync_overlay_id != 0 && event.type == SDL_WINDOWEVENT && event.window.windowID == sync_overlay_id) continue;
         /* SDL2 hack: There seems to be a problem where calling the SetWindowSize function,
            even for the same size, still causes a resize event, and sometimes for no apparent
            reason, will cause an endless feed of Windows Restored events. */

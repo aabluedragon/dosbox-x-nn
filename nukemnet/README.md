@@ -596,6 +596,12 @@ sends its own input while it waits), up to six timeouts: the server drops the on
 (with three players, the one who stayed used to time out first and leave too). A joining player in a running game plays the
 copy as the game knows it (its name in the game is the one it was started with).
 
+While machines are handed over (a player joining, a player leaving, a resync), every computer shows a small window over
+the game: the joining player "Joining the game: receiving it from the host", the others "<name> is joining: syncing the
+game", the server "<name> is joining: sending the game", each with a progress bar, the percentage, the megabytes and the
+time left (from the rate so far). It is a window of its own (borderless, on top, without focus), so it shows over every
+output; the game window's title shows the percentage too. A cluster's hidden copies show nothing.
+
 What a save state does not hold and a joining computer has to take from the server (it would keep its own, from its
 DOS prompt): the VGA frame clock (set before the load as well, since the load compares the mode's rate with it), how
 frames are drawn (render on demand, for the frame being drawn and for the mode), the BIOS's current video mode (INT 10h

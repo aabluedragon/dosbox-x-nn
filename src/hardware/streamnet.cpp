@@ -5947,6 +5947,37 @@ static uint32_t rb_resync_acked_by[STREAMNET_MAX_PEERS];   /* server: chunks eac
 
 /* Server: the resync's blob to every participant, each at its own pace. "joined" and "left" tell the clients who plays
  * from this frame on (a cluster's joins and leaves). */
+/* The progress window over the game while machines are handed over (sdlmain.cpp): the heading, how far, and what is
+ * left ("4.1 of 11.2 MB, about 9 s left"; the time once a second of it has gone). */
+void GFX_SyncProgress(const char *heading, double fraction, const char *detail);
+void GFX_SyncProgressDone(void);
+static void RB_ShowSyncProgress(const std::string &heading, uint64_t done, uint64_t total, uint32_t started) {
+    static uint32_t last = 0;
+    const uint32_t now = GetTicks();
+    if (done < total && now - last < 100u) return;
+    last = now;
+    const double frac = total ? (double)done / (double)total : 1.0;
+    const double mb = (double)total / 1048576.0, dmb = (double)done / 1048576.0, secs = (now - started) / 1000.0;
+    char detail[120];
+    if (secs >= 1.0 && done > 0 && done < total) {
+        const double left = secs * (double)(total - done) / (double)done;
+        snprintf(detail, sizeof(detail), "%.1f of %.1f MB, about %.0f s left", dmb, mb, left < 1 ? 1.0 : left);
+    }
+    else snprintf(detail, sizeof(detail), "%.1f of %.1f MB%s", dmb, mb, done < total ? ", working out the time left" : "");
+    GFX_SyncProgress(heading.c_str(), frac, detail);
+}
+
+/* Who is joining, for the progress window: the names of those participants, joined with ", ". */
+static std::string RB_JoinerNames(const std::vector<uint8_t> &ids) {
+    std::string n;
+    for (size_t j = 0; j < ids.size(); j++) {
+        if (ids[j] >= STREAMNET_MAX_PEERS) continue;
+        const std::string name = streamnet_peers[ids[j]].name.empty() ? "a player" : streamnet_peers[ids[j]].name;
+        n += (n.empty() ? "" : ", ") + name.substr(0, 24);
+    }
+    return n;
+}
+
 static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint32_t rawsize, const std::vector<uint8_t> &joined, const std::vector<uint8_t> &left,
                           const uint8_t *seats) {
     const uint32_t id = (uint32_t)(GetTicks() ^ (frame * 2654435761u)) | 1u;
@@ -5975,11 +6006,18 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
     for (size_t j = 0; j < left.size(); j++) hw.u8(left[j]);
     hw.u8(seats != NULL ? (uint8_t)rbc_copies : 0);     /* who plays which copy from this frame on (rb_seat) */
     if (seats != NULL) for (unsigned c = 0; c < rbc_copies; c++) hw.u8(seats[c]);
+    /* who joins (for everyone's progress window) */
+    const std::string joiners = RB_JoinerNames(joined).substr(0, 48);
+    hw.u8((uint8_t)joiners.size());
+    if (!joiners.empty()) hw.bytes((const uint8_t*)joiners.data(), joiners.size());
+    const std::string heading = !joiners.empty() ? joiners + " is joining: sending the game"
+        : !left.empty() ? "A player left: syncing the game" : "Syncing the game";
     streamnet_accepting = true;      /* (no join meanwhile) */
     uint32_t last_events = t0, lastkeep = t0;
     for (;;) {
-        if (!streamnet_session) { streamnet_accepting = false; return false; }
+        if (!streamnet_session) { streamnet_accepting = false; GFX_SyncProgressDone(); return false; }
         bool done = true;
+        uint64_t sum_acked = 0, sum_all = 0;
         const uint32_t now = GetTicks();
         /* the others hear the server meanwhile (a transfer through a slow relay takes many seconds, and a participant
          * that has everything, or is in the session already, waits for the server's input: RB_ClientWaitsOn) */
@@ -5989,6 +6027,7 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
             StreamNetPeer &p = streamnet_peers[i];
             if (!p.active) { to[i] = false; continue; }
             const uint32_t acked = std::min(rb_resync_acked_by[i], nchunks);
+            sum_acked += acked; sum_all += nchunks;
             if (acked >= nchunks) continue;
             done = false;
             if (acked > seen[i]) { seen[i] = acked; progress[i] = now; }
@@ -6016,11 +6055,13 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
             }
         }
         if (done) break;
+        if (sum_all) RB_ShowSyncProgress(heading, (uint64_t)((double)blob.size() * (double)sum_acked / (double)sum_all), blob.size(), t0);
         STREAMNET_PollSocket();
         if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
         SDL_Delay(1);
     }
     streamnet_accepting = false;
+    GFX_SyncProgressDone();
     rb_stat_resyncs++;
     LOG_MSG("STREAMNET: resync: frame %u sent in %u ms", (unsigned)frame, (unsigned)(GetTicks() - t0));
     return true;
@@ -6186,7 +6227,13 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
         uint8_t seats[STREAMNET_MAX_PEERS];
         unsigned ns = 0;
         if (r.remain() >= 1) { ns = r.u8(); for (unsigned j = 0; j < ns; j++) { const uint8_t v = r.u8(); if (j < STREAMNET_MAX_PEERS) seats[j] = v; } }
+        std::string joiners;
+        if (r.remain() >= 1) { const unsigned nl = r.u8(); const uint8_t *b = nl ? r.bytes(nl) : NULL; if (b) joiners.assign((const char*)b, nl); }
         if (r.bad()) return;
+        for (size_t c = 0; c < joiners.size(); c++) if ((unsigned char)joiners[c] < 0x20 || (unsigned char)joiners[c] > 0x7e) joiners[c] = '?';
+        const std::string heading = rb_joining ? "Joining the game: receiving it from the host"
+            : !joiners.empty() ? joiners + " is joining: syncing the game"
+            : !left.empty() ? "A player left: syncing the game" : "Syncing the game with the host";
         if (ns == rbc_copies && ns >= 2 && ns <= STREAMNET_MAX_PEERS) { memcpy(rbc_resync_seat, seats, ns); rbc_resync_has_seats = true; }
         for (size_t j = 0; j < joined.size(); j++) {
             const unsigned i = joined[j];
@@ -6218,14 +6265,16 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
         uint32_t progress_at = start;
         while (contiguous < nchunks) {
             /* (30 seconds without a piece: a slow link may take longer than that for the whole of it) */
-            if (!streamnet_link_up || (GetTicks() - progress_at) > 30000u) { LOG_MSG("STREAMNET: resync: transfer failed"); rb_resync_id = 0; return; }
+            if (!streamnet_link_up || (GetTicks() - progress_at) > 30000u) { LOG_MSG("STREAMNET: resync: transfer failed"); rb_resync_id = 0; GFX_SyncProgressDone(); return; }
             STREAMNET_PollSocket();              /* chunks land in rb_resync_buf (sub == 2 below) */
             const uint32_t was = contiguous;
             while (contiguous < nchunks && rb_resync_have[contiguous]) contiguous++;
             if (contiguous != was) progress_at = GetTicks();
             if ((GetTicks() - lastack) >= 20u) { RB_SendResyncAck(id, contiguous); lastack = GetTicks(); }
+            RB_ShowSyncProgress(heading, (uint64_t)std::min((uint64_t)contiguous * RB_RESYNC_CHUNK, (uint64_t)total), total, start);
             STREAMNET_Stall(last_events);
         }
+        GFX_SyncProgressDone();
         RB_SendResyncAck(id, contiguous);
         RB_SendResyncAck(id, contiguous);
         rb_resync_done_id = id; rb_resync_done_count = contiguous;     /* (acknowledged again should the server repeat it) */
