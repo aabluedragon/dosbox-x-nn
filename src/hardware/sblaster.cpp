@@ -877,6 +877,14 @@ void SB_INFO::sb_update_recording_source_settings() {
 		else
 			recording_source = REC_SILENCE;
 	}
+
+#if defined(_MSC_VER) || defined(__MINGW64__)
+	/* NukemNet: the microphone opens only when it is the recording source. Opening it at every start (as
+	 * SBLASTER_Init did) held the start-up 13 s on a laptop with a Realtek microphone, the window not
+	 * answering ("Not responding", and a white ghost window from Windows). */
+	if (recording_source == REC_MICROPHONE && MIC_Initialize())
+		LOG(LOG_MISC,LOG_DEBUG)("Microphone input initialized successfully");
+#endif
 }
 
 void SB_INFO::SB_OnEndOfDMA(void) {
@@ -4788,13 +4796,6 @@ void SBLASTER_DOS_Boot(Section *sec) {
 
 void SBLASTER_Init() {
 	LOG(LOG_MISC,LOG_DEBUG)("Initializing Sound Blaster emulation");
-
-#if defined(_MSC_VER) || defined(__MINGW64__)
-	// Initialize microphone input for recording support
-	if (MIC_Initialize()) {
-		LOG(LOG_MISC,LOG_DEBUG)("Microphone input initialized successfully");
-	}
-#endif
 
 	AddExitFunction(AddExitFunctionFuncPair(SBLASTER_ShutDown),true);
 	AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(SBLASTER_OnReset));
