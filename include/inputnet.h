@@ -99,6 +99,7 @@ void INPUTNET_ReplayPublish(void);
 void DOSBOX_AddTicksRemain(uint32_t n);
 bool DOSBOX_DropTickRemain(void);
 Bitu DOSBOX_TrimTickRemain(Bitu keep);
+Bitu DOSBOX_TicksRemain(void);
 
 /* Session state, for the INPUTNET command and the status line. */
 bool INPUTNET_IsServer(void);

@@ -3625,7 +3625,16 @@ static unsigned int RB_EffectiveDelay(void) {
 
 /* Our input up to frame+delay is final now: send it, from the oldest frame anybody lacks. */
 static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe);
-static void RB_SendInput(uint32_t frame) { RB_SendInputEx(frame, true, rb_realframe); }
+/* Catching up after a replay (the emulation behind real time by DOSBOX_TicksRemain), our input goes out up to where
+ * real time is, not only up to the frame emulated: the others learn it as early as if we had been on time (their
+ * corrections as deep as the distance, not the distance plus our delay), and new input of ours goes to the next frame
+ * not sent yet, which the catch-up reaches in a few tens of milliseconds. At most 16 frames. */
+static uint32_t RB_CatchUpLead(void) {
+    if (inputnet_rollback_resim) return 0;
+    const Bitu lag = DOSBOX_TicksRemain() / std::max<Bitu>(inputnet_frame_ms, 1u);
+    return (uint32_t)std::min<Bitu>(lag, 16u);
+}
+static void RB_SendInput(uint32_t frame) { const uint32_t lead = RB_CatchUpLead(); RB_SendInputEx(frame + lead, true, rb_realframe + lead); }
 
 /* During a replay our input keeps going out at real time (every 10 ms, from the main loop): the player's new input is
  * read and every frame whose time has come is published, as if this computer were there already (it gets there when
@@ -3708,7 +3717,7 @@ static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe) 
      * loaded, since a checksum from before one compares machines that were made equal since */
     w.u16(rb_epoch);
     /* (frames after a wrong guess that waits for its correction are not final either) */
-    const uint32_t final_frame = std::min(std::min(RB_MinHave(), frame), rb_pending_wrong);
+    const uint32_t final_frame = std::min(std::min(RB_MinHave(), std::min(frame, rb_realframe)), rb_pending_wrong);
     const RBSnap &cs = rb_snap[final_frame % RB_RING];
     if (with_check && final_frame != UINT32_MAX && cs.valid && cs.frame == final_frame) {
         w.u32(final_frame);

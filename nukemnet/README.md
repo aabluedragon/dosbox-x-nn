@@ -500,7 +500,16 @@ final). Before, a replay of 100-200 ms stopped our input for that long, so the o
 replayed that much deeper and stopped theirs in turn: at 220 ms replays averaged 17 to 24 frames, about the whole
 round trip; now 12 to 13 (half of it), with 20 to 30% fewer frames replayed, fewer stalls (91 and 24 instead of 183
 and 96 with keys) and more real time with mouse aiming (82 to 85% instead of 70 to 80%). The side ahead now slows by
-1 ms a frame (2 when over 4 frames ahead), not 1 ms every second frame. Tried and dropped: gathering
+1 ms a frame (2 when over 4 frames ahead), not 1 ms every second frame. After a replay the emulation is behind real
+time (`DOSBOX_TicksRemain`) and catches up; meanwhile our input goes out up to where real time is (at most 16 frames
+ahead of the frame emulated, `RB_CatchUpLead`), and the frame we report for the time sync is that one too. Before, the
+input of the catch-up frames went out only as they were emulated, so the others learned it the catch-up late and
+replayed deeper: at 220 ms with both players aiming with the mouse, replays went to 30 frames, two or three in a row,
+with a stall (0.3 to 0.7 s gaps, about one every 3.5 s once the speed had settled, 40 in two minutes); with it, 1 or 2
+such gaps in two minutes, the longest 355 to 561 ms, and 2 stalls instead of 31 (keys only: longest gap 300 to 340 ms
+instead of 570 to 670). New input of ours goes to the next frame not sent yet, which the catch-up reaches within tens
+of milliseconds. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
+its code cache, which a load empties). Tried and dropped: gathering
 corrections into fewer replays (4 frames after the previous one: as many replays, and less real time), a lower load
 target (70%: real time kept better, the picture changed 30 to 40 times a second instead of 40 to 48). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,
 read only in a RollbackNet session), so rollbacks and joins carry the speed along. The log says where it stands every

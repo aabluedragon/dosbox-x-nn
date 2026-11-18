@@ -654,6 +654,9 @@ bool DOSBOX_DropTickRemain(void) {
     return true;
 }
 
+/* RollbackNet: the emulated milliseconds still to run to be on time (behind after a replay, until caught up). */
+Bitu DOSBOX_TicksRemain(void) { return ticksRemain; }
+
 /* RollbackNet: drop the time still to catch up beyond "keep" milliseconds (this computer got ahead of the others: it would
  * only race into waiting for them). Returns how many were dropped. */
 Bitu DOSBOX_TrimTickRemain(Bitu keep) {
