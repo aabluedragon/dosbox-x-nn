@@ -4025,10 +4025,10 @@ static void RB_Propose(void) {
         }
         rp_last_total = rb_replay_us_total; rp_last_t = now;
     }
-    uint32_t far = 0;
+    uint32_t dist = 0;     /* (not "far": a macro on Windows) */
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
-        if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) far = std::max(far, rb_rtt[i]);
-    const double reserve = far >= 150u ? 0.35 : (far >= 100u ? 0.20 : 0.0);
+        if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) dist = std::max(dist, rb_rtt[i]);
+    const double reserve = dist >= 150u ? 0.35 : (dist >= 100u ? 0.20 : 0.0);
     const double keep = std::max(0.0, reserve - rp_share_s);
     const double avail = std::max(target - rb_ml_fixed_s - keep, target / 3.0);
     const double limit = (CPU_CycleLimit > 0) ? (double)CPU_CycleLimit : 1000000.0;
