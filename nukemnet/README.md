@@ -511,8 +511,16 @@ instead of 570 to 670). New input of ours goes to the next frame not sent yet, w
 of milliseconds. Every 5 s the log also splits the replays' time ("replays' time"): at 220 ms with both players
 aiming, about 1.8 s in 5 went to replays, of which loading the frame about 50 ms, saving frames about 130 ms and
 waiting for the cluster's copies about 140 ms: the rest, nearly 85%, is emulating the frames again (about 110,000
-cycles per millisecond of this computer's time with the normal core). Fewer frames to replay is what is left: the
-room's input delay (each frame of it makes every correction a frame shallower) or coarser mouse frames. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
+cycles per millisecond of this computer's time with the normal core). Fewer frames to replay is what is left: far
+apart, our input now waits a little by itself (`[inputnet] rollback auto delay`, on by default; "delay" stays the
+least): 1 frame from 150 ms round trip, 2 from 200 ms (stepping down 15 ms below), logged ("our input waits N
+frame(s) now"). Each frame of it makes every correction of the others a frame shorter: at 220 ms with mouse aiming, an
+explicit delay 2 left no gap over 300 ms in two minutes (the longest 238 ms instead of 355 to 561, real time 94%
+instead of 90%) for 20 ms of our own input. And a frame held back over 200 ms by replays makes this computer propose
+20% less speed at once (`rb_replay_hitch`, not below 35,000) instead of the picture guard's few percent a second: a
+game comes from its menus, or from playing alone, at a speed (75,000 and more) its replays cannot afford, and the
+first 10 to 20 seconds of a game had most of the long gaps. With both: speed 76,000 to 49,000 in the next 5 seconds,
+then 38,000 to 51,000; the longest gap in each 5 seconds mostly 130 to 220 ms, one or two over 300 ms in two minutes. Tried and dropped: `core=dynamic` (replays were not identical: the dynamic core's timing depends on
 its code cache, which a load empties). Tried and dropped: gathering
 corrections into fewer replays (4 frames after the previous one: as many replays, and less real time), a lower load
 target (70%: real time kept better, the picture changed 30 to 40 times a second instead of 40 to 48). `CPU_CycleMax` and the time stamp counter's base are saved with the CPU (after the rest,

@@ -5574,6 +5574,11 @@ void DOSBOX_SetupConfigSections(void) {
                    "the others mispredict it that much less often (each wrong frame costs them a replay). 0 chooses from the\n"
                    "distance: 1 under 80 ms round trip, 2 under 160 ms, 3 beyond. Valid range is 0 to 4.");
 
+    Pbool = secprop->Add_bool("rollback auto delay",Property::Changeable::WhenIdle, true);
+    Pbool->Set_help("mode=rollback: far apart, this computer's input waits a little (\"delay\" stays the least): 1 frame from\n"
+                    "150 ms round trip, 2 from 200 ms. Every frame of it makes every correction of the others a frame shorter\n"
+                    "(at 220 ms with mouse aiming: no gap over 300 ms, the longest 238 ms instead of 355 to 561).");
+
     Pint = secprop->Add_int("cluster",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("mode=rollback: IPX/NullModem-over-RollbackNet. Every computer runs a copy of the game for every\n"
                    "player (this many), linked by IPX or a null modem, and RollbackNet keeps all of them the same on every\n"

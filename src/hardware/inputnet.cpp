@@ -3651,8 +3651,32 @@ static bool RB_Rollback(uint32_t target, uint32_t frame) {
 /* The local input delay. At the DOS prompt the frames run with everybody's real input only (RB_WaitForInputs), so
  * our input goes out far enough ahead to arrive before the others need it: typing a command does not need the lowest
  * latency, and nobody waits a round trip for every frame. */
+static bool rb_auto_delay = true;
+static unsigned int rb_auto_d = 0;
+/* "rollback auto delay": far apart, our input waits a frame (from 150 ms round trip) or two (from 200 ms), so every
+ * correction of the others is that much shorter (a replay re-emulates every frame since the wrong guess, nearly 85% of
+ * its time: Nov 2026, 220 ms with both players aiming with the mouse, delay 2 left no gap over 300 ms, the longest 238
+ * ms instead of 355 to 561, real time 94% instead of 90%). It steps down 15 ms below the step (no going back and forth
+ * on a distance that wavers). Our input is never put into a frame already sent (INPUTNET_ScheduleFrame), so it can
+ * change during a game. */
+static unsigned int RB_AutoDelay(void) {
+    if (!rb_auto_delay) return 0;
+    uint32_t rtt = 0;
+    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
+    unsigned int d = rb_auto_d;
+    if (rtt >= 200u) d = 2;
+    else if (rtt >= 150u) d = std::max(1u, d == 2u && rtt >= 185u ? 2u : 1u);
+    else if (rtt < 135u) d = 0;
+    else d = std::min(d, 1u);
+    if (d != rb_auto_d) {
+        LOG_MSG("INPUTNET: our input waits %u frame(s) now (round trip %u ms; [inputnet] rollback auto delay)", d, (unsigned)rtt);
+        rb_auto_d = d;
+    }
+    return d;
+}
+
 static unsigned int RB_EffectiveDelay(void) {
-    if (!rb_lockstep) return inputnet_delay;
+    if (!rb_lockstep) return std::max(inputnet_delay, RB_AutoDelay());
     uint32_t rtt = 0;
     for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
     const unsigned int need = (unsigned int)((rtt / 2u + 15u) / inputnet_frame_ms) + 1u;
@@ -3977,6 +4001,7 @@ static double RB_ReplayCap(void) {
     return std::max(room, 0.0) / per_frame_core;
 }
 
+static bool rb_replay_hitch = false;    /* a frame came over 200 ms late because of replays, since the last proposal */
 static void RB_Propose(void) {
     /* (what ran while another program had the CPU took no CPU of its own: count only the share that ran) */
     const double fixed = std::max(0.0, rb_ml_load - rb_ml_core) * rb_ml_run;
@@ -4002,6 +4027,11 @@ static void RB_Propose(void) {
     }
     /* (a fully busy second at a low speed is a game loading or the DOS prompt's own work, not too high a speed) */
     if (rb_ml_load > 0.97) cap = std::min(cap, std::max((double)CPU_CycleMax * 0.8, 10000.0));
+    /* replays that held a frame back over 200 ms: 20% less at once (not below 35,000), not a few percent a second. A game
+     * comes from its menus (and from playing alone) at a speed its replays cannot afford: at 75,000 every replay takes
+     * half as long again as at 50,000, and the first 10 to 20 seconds of a game at 220 ms had most of the long gaps */
+    if (rb_replay_hitch && CPU_CycleMax > 35000) cap = std::min(cap, std::max((double)CPU_CycleMax * 0.8, 35000.0));
+    rb_replay_hitch = false;
     rb_cap_local = (uint32_t)std::max(2000.0, std::min(cap, limit));
 }
 
@@ -6530,6 +6560,7 @@ static void RB_FrameBoundary(uint32_t frame) {
         if (rb_hitch_last != 0 && t > rb_hitch_last) {
             const uint64_t gap = t - rb_hitch_last;
             if (gap > 30000u) rb_stat_hitches++;
+            if (gap > 200000u && rb_stat_rollbacks != replays_before) rb_replay_hitch = true;
             rb_stat_maxgap_us = std::max(rb_stat_maxgap_us, gap);
             /* (debugging long hitches: what happened since the frame before) */
             static const bool gaplog = getenv("NN_RB_GAPLOG") != NULL && *getenv("NN_RB_GAPLOG");
@@ -7051,6 +7082,8 @@ public:
         rb_maxload = (unsigned int)((v >= 20 && v <= 95) ? v : 85);
         v = section->Get_int("rollback mouse frames");
         rb_mouse_frames = (unsigned int)((v >= 1 && v <= 4) ? v : 0);
+        rb_auto_delay = section->Get_bool("rollback auto delay");
+        rb_auto_d = 0;
         v = section->Get_int("players");
         inputnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)INPUTNET_MAX_PEERS) ? v : 0);
         inputnet_rbautorun = section->Get_string("autorun");
