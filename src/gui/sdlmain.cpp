@@ -8004,19 +8004,18 @@ bool DOSBOX_parse_argv() {
         else if (optname == "machine") {
             if (!control->cmdline->NextOptArgv(control->opt_machine)) return false;
         }
-        /* (-inputnet-*: the names before StreamNet was called so; NukemNet versions of that time pass them) */
-        else if (optname == "streamnet-server" || optname == "inputnet-server") {
+        else if (optname == "streamnet-server") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
             control->opt_streamnet_server = atoi(tmp.c_str());
             if (control->opt_streamnet_server < 0 || control->opt_streamnet_server > 65535) control->opt_streamnet_server = 0;
         }
-        else if (optname == "streamnet-connect" || optname == "inputnet-connect") {
+        else if (optname == "streamnet-connect") {
             if (!control->cmdline->NextOptArgv(control->opt_streamnet_connect)) return false;
         }
-        else if (optname == "streamnet-hidescreen" || optname == "inputnet-hidescreen") {
+        else if (optname == "streamnet-hidescreen") {
             control->opt_streamnet_hidescreen = true;
         }
-        else if (optname == "streamnet-lockdown" || optname == "inputnet-lockdown") {
+        else if (optname == "streamnet-lockdown") {
             control->opt_streamnet_lockdown = true;
         }
         else if (optname == "time-limit") {

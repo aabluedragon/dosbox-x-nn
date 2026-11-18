@@ -10358,7 +10358,6 @@ void Add_VFiles(bool usecp) {
 # endif
 #if defined(C_SDL_NET) || defined(C_SDL2_NET)
 	if (addstreamnet) PROGRAMS_MakeFile("STREAMNET.COM",STREAMNET_ProgramStart,"/SYSTEM/");
-	if (addstreamnet) PROGRAMS_MakeFile("INPUTNET.COM",STREAMNET_ProgramStart,"/SYSTEM/");   /* (its name before StreamNet) */
 #endif
 	if (addovl) VFILE_RegisterBuiltinFileBlob(bfb_GLIDE2X_OVL, "/SYSTEM/");
 #endif
