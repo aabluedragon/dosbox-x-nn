@@ -433,6 +433,11 @@ bool RENDER_StartUpdate(void) {
         return false;
     if (GCC_UNLIKELY(render.disablerender))
         return false;
+    /* A RollbackNet replay shows nothing (GFX_StartUpdate refuses), and its scanlines are not even decoded
+     * (vga_draw.cpp VGA_SkipDecode): a frame started during it would take the lines after it, when it ends in the
+     * middle of the frame, for its first ones and draw them that much too high (the picture sheared while another
+     * player moved). The first frame after the replay is drawn whole (RENDER_RedrawAll). */
+    { extern bool streamnet_rollback_resim; if (GCC_UNLIKELY(streamnet_rollback_resim)) return false; }
     if (GCC_UNLIKELY(!scalerSourceCacheBuffer && !useTraditionalRenderCache))
 	return false;
     if (GCC_UNLIKELY(render.frameskip.count<render.frameskip.max)) {
