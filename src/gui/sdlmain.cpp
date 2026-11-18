@@ -159,7 +159,8 @@ char* revert_escape_newlines(const char* aMessage);
 #include "inout.h"
 #include "jfont.h"
 #include "remoteplay.h"
-extern bool cluster_window_hidden;   /* RollbackNet cluster follower without a window (defined below) */
+extern bool cluster_seat_copy;   /* RollbackNet cluster follower: another player's copy (defined below) */
+static int cluster_seat_copy_n = 0;     /* its copy number (copy c is player c+1) */
 #include "render.h"
 #include "../dos/cdrom.h"
 #include "../dos/drives.h"
@@ -2001,7 +2002,7 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
                                       width, height,
                                       (GFX_IsFullscreen() ? (sdl.desktop.full.display_res ? SDL_WINDOW_FULLSCREEN_DESKTOP : SDL_WINDOW_FULLSCREEN) : 0)
                                       | ((screenType == SCREEN_OPENGL) ? SDL_WINDOW_OPENGL : 0) | (maximize && !TTF_using()? SDL_WINDOW_MAXIMIZED : 0)
-                                      | ((remoteplay_screen_hidden || cluster_window_hidden) ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) /* shown later without focus (remote play) or never (a RollbackNet cluster's follower) */
+                                      | (remoteplay_screen_hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) /* shown later without focus (remote play, a RollbackNet cluster's follower) */
                                       | (SDL2_resize_enable ? SDL_WINDOW_RESIZABLE : 0)
                                       | (dpi_aware_enable ? SDL_WINDOW_ALLOW_HIGHDPI : 0));
         if (sdl.window) {
@@ -2403,8 +2404,7 @@ static void SyncOverlay_Fill(SDL_Surface *surf, int x0, int y0, int w, int h, ui
 }
 
 void GFX_SyncProgress(const char *heading, double fraction, const char *detail) {
-    extern bool cluster_window_hidden;
-    if (cluster_window_hidden) return;
+    if (cluster_seat_copy) return;   /* (the copy this computer's player plays shows it) */
     if (fraction < 0) fraction = 0; else if (fraction > 1) fraction = 1;
     const int pct = (int)(fraction * 100.0 + 0.0001);
 #if defined(C_SDL2)
@@ -2478,8 +2478,11 @@ void GFX_RemotePlayDrawHidden(void) {
 
     const uint32_t bg = SDL_MapRGB(surf->format, 0x24, 0x2b, 0x38);
     const uint32_t colors[2] = { SDL_MapRGB(surf->format, 0xe8, 0xec, 0xf2), SDL_MapRGB(surf->format, 0x9a, 0xa4, 0xb4) };
-    const char *lines[2] = { "Streaming to the remote player. Screen hidden.",
-                             "Video menu: \"Show screen (remote play)\" shows it." };
+    char seat_line[96];
+    snprintf(seat_line, sizeof(seat_line), "Player %d's copy: played from another computer.", cluster_seat_copy_n + 1);
+    const char *lines[2] = { cluster_seat_copy ? seat_line : "Streaming to the remote player. Screen hidden.",
+                             cluster_seat_copy ? "Screen hidden. Video menu: \"Show screen\" shows it."
+                                               : "Video menu: \"Show screen (remote play)\" shows it." };
 
     uint8_t *pixels = (uint8_t*)surf->pixels;
     for (int y = top; y < surf->h; y++) {
@@ -2526,7 +2529,10 @@ void GFX_RemotePlayDrawHidden(void) {
  * the active one (labwc, for one, puts it on top), but a minimized window
  * never covers the host's own game. It waits in the taskbar; restoring it
  * gives the Video menu with "Show screen (remote play)". */
-bool cluster_window_hidden = false;   /* RollbackNet: a cluster's follower opens no window ([streamnet] cluster hide window) */
+/* RollbackNet: a cluster's follower runs a copy another player plays ([streamnet] cluster hide window): its window
+ * opens minimized like a remote play host's hidden screen, with a placeholder saying whose copy it is, and the Video
+ * menu shows its picture. While the screen is hidden nothing is drawn (vga_draw.cpp VGA_SkipDecode). */
+bool cluster_seat_copy = false;
 
 static void GFX_RemotePlayShowWindowQuietly(void) {
 #if defined(C_SDL2)
@@ -2562,8 +2568,7 @@ static void GFX_RemotePlayShowWindowQuietly(void) {
 
 void GFX_RemotePlaySetScreenHidden(bool hidden) {
     if (hidden == remoteplay_screen_hidden) return;
-    if (!hidden && cluster_window_hidden) return;   /* (a RollbackNet cluster's follower has no screen to show) */
-    if (hidden && !REMOTEPLAY_ServerRunning() && !REMOTEPLAY_HostRequested()) return;
+    if (hidden && !cluster_seat_copy && !REMOTEPLAY_ServerRunning() && !REMOTEPLAY_HostRequested()) return;
     if (hidden && sdl.desktop.fullscreen) GFX_SwitchFullScreen();
 
     remoteplay_screen_hidden = hidden;
@@ -3680,7 +3685,7 @@ bool GFX_StartUpdate(uint8_t* &pixels,Bitu &pitch)
     /* RollbackNet replays frames at full speed: nothing of them is shown (presenting could also wait for vsync), and
      * the renderer skips the frame as it does when frames are skipped. */
     extern bool streamnet_rollback_resim;
-    if (streamnet_rollback_resim || cluster_window_hidden)  /* (a cluster's follower has no screen) */
+    if (streamnet_rollback_resim)
         return false;
 
     switch (sdl.desktop.type)
@@ -4207,20 +4212,23 @@ static void GUI_StartUp() {
         maximize = false;
         LOG_MSG("STREAMNET: remote play: the local screen is hidden (Video menu: \"Show screen (remote play)\")");
     }
-    /* RollbackNet: a cluster's follower runs a copy another player plays (no window here, never fullscreen); and no
-     * RollbackNet copy pauses when it is not in front: every other copy and computer would wait for it. */
+    /* RollbackNet: a cluster's follower runs a copy another player plays (its screen hidden like a remote play
+     * host's, never fullscreen); and no RollbackNet copy pauses when it is not in front: every other copy and
+     * computer would wait for it. */
     bool rollback_copy = false;
     {
         Section_prop *in = static_cast<Section_prop *>(control->GetSection("streamnet"));
         if (in != NULL && in->Get_bool("streamnet") && std::string(in->Get_string("mode")) == "rollback") {
             rollback_copy = true;
-            cluster_window_hidden = in->Get_int("cluster") >= 2 && std::string(in->Get_string("cluster role")) != "leader" &&
+            cluster_seat_copy = in->Get_int("cluster") >= 2 && std::string(in->Get_string("cluster role")) != "leader" &&
                 in->Get_bool("cluster hide window");
+            cluster_seat_copy_n = in->Get_int("cluster copy");
         }
     }
-    if (cluster_window_hidden) {
+    if (cluster_seat_copy) {
         maximize = false;
-        LOG_MSG("STREAMNET: cluster: this copy runs without a window");
+        remoteplay_screen_hidden = true;
+        LOG_MSG("STREAMNET: cluster: player %d's copy, its screen hidden (Video menu: \"Show screen\")", cluster_seat_copy_n + 1);
     }
 
     sdl.desktop.fullscreen=false;
@@ -6407,22 +6415,6 @@ bool gfx_in_mapper = false;
 void GFX_Events() {
     REMOTEPLAY_Poll();
 #if defined(C_SDL2)
-    /* A RollbackNet cluster's follower has no screen: something can still show its window (on Windows it appeared as a
-     * second, white and frozen DOSBox-X-NN window next to the game), so it is hidden again whenever it shows. */
-    if (cluster_window_hidden && sdl.window != NULL) {
-        static Bitu last_check = 0;
-        const Bitu now = (Bitu)SDL_GetTicks();
-        if (now - last_check >= 200u) {
-            last_check = now;
-            if (!(SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN)) SDL_HideWindow(sdl.window);
-# if defined(WIN32) && !defined(HX_DOS)
-            {
-                HWND self = GetHWND();
-                if (self != NULL && IsWindowVisible(self)) ShowWindow(self, SW_HIDE);
-            }
-# endif
-        }
-    }
 #endif
 #if C_EMSCRIPTEN
     /* CALLBACK_Idle calls this for every guest idle poll - over a million
@@ -10423,8 +10415,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             Section_prop* sdl_sec = static_cast<Section_prop*>(control->GetSection("sdl"));
 
             if ((control->opt_fullscreen || sdl_sec->Get_bool("fullscreen")) && sdl.desktop.want_type != SCREEN_GAMELINK &&
-                !remoteplay_screen_hidden /* a hidden remote play screen must not cover the host's own game */ &&
-                !cluster_window_hidden) {
+                !remoteplay_screen_hidden /* a hidden remote play screen must not cover the host's own game */) {
                 LOG(LOG_MISC, LOG_DEBUG)("Going fullscreen immediately, during startup");
 
 #if defined(WIN32)

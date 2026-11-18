@@ -5595,8 +5595,9 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->Set_help("mode=rollback with a cluster: the local UDP port the leader listens on for its followers.");
 
     Pbool = secprop->Add_bool("cluster hide window",Property::Changeable::WhenIdle,false);
-    Pbool->Set_help("mode=rollback with a cluster: a follower opens no window (another player plays its copy; NukemNet starts\n"
-                    "one copy per player on every computer and shows only the local player's).");
+    Pbool->Set_help("mode=rollback with a cluster: a follower's screen is hidden (another player plays its copy; NukemNet starts\n"
+                    "one copy per player on every computer): its window opens minimized with a note whose copy it is, and the\n"
+                    "Video menu's \"Show screen\" shows its picture.");
 
     Pint = secprop->Add_int("players",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("mode=rollback, server: how many participants (this one included) the session waits for at the DOS\n"

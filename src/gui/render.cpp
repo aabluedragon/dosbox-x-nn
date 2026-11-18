@@ -455,7 +455,8 @@ bool RENDER_StartUpdate(void) {
             render.scale.clearCache = false;
             GFX_RemotePlayDrawHidden();
         }
-        if (!scalerSourceCacheBuffer) return false;
+        extern bool cluster_seat_copy;  /* (another player's RollbackNet copy: nobody watches it, nothing is kept) */
+        if (cluster_seat_copy || !scalerSourceCacheBuffer) return false;
         RENDER_DrawLine = RENDER_RemotePlayCacheLineHandler;
         render.updating = true;
         return true;

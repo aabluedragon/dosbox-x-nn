@@ -6548,8 +6548,11 @@ int REMOTEPLAY_RunViewer(const std::string &) { return 1; }
 /* The "Show screen (remote play)" menu item only appears on remote play hosts. */
 void REMOTEPLAY_UpdateMenu(void) {
     if (!mainMenu.item_exists("mapper_rpscreen")) return;
-    const bool host = remoteplay_screen_hidden || REMOTEPLAY_ServerRunning() || REMOTEPLAY_HostRequested();
-    mainMenu.get_item("mapper_rpscreen").hide(!host).check(!remoteplay_screen_hidden).refresh_item(mainMenu);
+    extern bool cluster_seat_copy;     /* (another player's RollbackNet copy: "Show screen") */
+    const bool host = cluster_seat_copy || remoteplay_screen_hidden || REMOTEPLAY_ServerRunning() || REMOTEPLAY_HostRequested();
+    DOSBoxMenu::item &item = mainMenu.get_item("mapper_rpscreen");
+    if (cluster_seat_copy) item.set_text("Show screen");
+    item.hide(!host).check(!remoteplay_screen_hidden).refresh_item(mainMenu);
 }
 
 /* See remoteplay.h. */

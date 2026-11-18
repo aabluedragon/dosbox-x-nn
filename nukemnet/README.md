@@ -557,8 +557,9 @@ Capability `rollbackNetMaxCycles`.
 A game that plays over IPX or a null modem runs one copy per player on every computer, all identical: copy c plays
 for participant c (the server's player has copy 0). `[streamnet] cluster = <copies>` (2 to 8), `cluster copy`,
 `cluster role = leader|follower` and `cluster port`: the leader is the copy of the computer's own player (its window,
-its sound, its network session); the followers have no window (`cluster hide window = true`) and talk to the leader
-over 127.0.0.1 on the cluster port. At every frame start each follower sends its frame, its machine checksum and what
+its sound, its network session); the followers' screens are hidden (`cluster hide window = true`: the window opens
+minimized, without the focus, with "Player N's copy: played from another computer", the Video menu's "Show screen"
+shows the picture, and nothing is drawn while it is hidden) and they talk to the leader over 127.0.0.1 on the cluster port. At every frame start each follower sends its frame, its machine checksum and what
 its game sent (IPX packets, null modem bytes and the RTS/DTR lines), and waits for the leader's go with what it
 receives; the leader routes in copy order (IPX broadcasts to every copy but the sender, unicasts by node address
 10.0.0.(c+1); null modem copy 0 to 1 and back, the lines becoming CTS/DSR/CD), so all computers deliver the same

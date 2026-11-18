@@ -3939,11 +3939,11 @@ void VGA_FreeBiosLogo(void) {
 /* NukemNet remote play host (see NN_EarlyFrameOK): the start address the last frame was drawn from */
 static uint32_t nn_shown_start = 0xFFFFFFFFu;
 
-/* RollbackNet shows nothing of a replayed frame (GFX_StartUpdate refuses), and a cluster's follower has no screen:
- * decoding the scanlines from video memory would only cost time (Duke Nukem 3D at 800x600: about 8% of a replay).
- * The decoders change no state of the emulated machine. */
-extern bool streamnet_rollback_resim, cluster_window_hidden;
-static inline bool VGA_SkipDecode(void) { return GCC_UNLIKELY(streamnet_rollback_resim || cluster_window_hidden); }
+/* RollbackNet shows nothing of a replayed frame (GFX_StartUpdate refuses), nor of another player's copy while its
+ * screen is hidden: decoding the scanlines from video memory would only cost time (Duke Nukem 3D at 800x600: about
+ * 8% of a replay). The decoders change no state of the emulated machine. */
+extern bool streamnet_rollback_resim, cluster_seat_copy, remoteplay_screen_hidden;
+static inline bool VGA_SkipDecode(void) { return GCC_UNLIKELY(streamnet_rollback_resim || (cluster_seat_copy && remoteplay_screen_hidden)); }
 
 static void VGA_DrawSingleLine(Bitu /*blah*/) {
     unsigned int lines = 0;
