@@ -58,11 +58,13 @@ jobs:
           MINGW_ARCH=MINGW64 makepkg-mingw -sCLf --noconfirm
           pacman --noconfirm -U mingw-w64-*-any.pkg.tar.zst
       - name: Build MinGW64 SDL1
+        if: false   # NukemNet uses only the SDL2 build
         run: |
           top=`pwd`
           ./build-mingw
           strip -s $top/src/dosbox-x.exe
       - name: Package MinGW64 SDL1
+        if: false   # NukemNet uses only the SDL2 build
         run: |
           top=`pwd`
           mkdir -p $top/package/mingw-build/mingw/drivez
@@ -174,11 +176,13 @@ jobs:
             echo "VERSION=$VERSION" >> $GITHUB_ENV
           fi
       - name: Build UCRT64 SDL1
+        if: false   # NukemNet uses only the SDL2 build
         run: |
           top=`pwd`
           ./build-mingw
           strip -s $top/src/dosbox-x.exe
       - name: Package UCRT64 SDL1
+        if: false   # NukemNet uses only the SDL2 build
         run: |
           top=`pwd`
           mkdir -p $top/package/mingw-build/mingw/drivez
@@ -285,11 +289,13 @@ jobs:
             echo "VERSION=$VERSION" >> $GITHUB_ENV
           fi
       - name: Build UCRT64 SDL1 osfree
+        if: false   # NukemNet uses only the SDL2 build
         run: |
           top=`pwd`
           ./build-mingw
           strip -s $top/src/dosbox-x.exe
       - name: Package UCRT64 SDL1
+        if: false   # NukemNet uses only the SDL2 build
         run: |
           top=`pwd`
           mkdir -p $top/package/mingw-build/mingw/drivez
