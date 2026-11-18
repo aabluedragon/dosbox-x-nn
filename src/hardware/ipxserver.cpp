@@ -172,7 +172,7 @@ static void IPX_ServerLoop() {
 
 
 	result = SDLNet_UDP_Recv(ipxServerSocket, &inPacket);
-	/* NukemNet: a server started with env NN_RP_LOCAL_ONLY (the link between the copies of an IPX-over-InputNet game,
+	/* NukemNet: a server started with env NN_RP_LOCAL_ONLY (the link between the copies of an IPX-over-StreamNet game,
 	 * which all run on the host's computer) takes nothing from outside it. */
 	if (result != 0 && ipxServerLocalOnly) {
 		const uint8_t *h = (const uint8_t*)&inPacket.address.host;   /* network byte order */

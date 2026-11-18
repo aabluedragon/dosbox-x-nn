@@ -1212,7 +1212,7 @@ const void *pic_state_event_table[] = {
 };
 
 
-extern void *INPUTNET_TickHandler_PIC_Timer;
+extern void *STREAMNET_TickHandler_PIC_Timer;
 
 const void *pic_state_timer_table[] = {
 	NULL,
@@ -1224,7 +1224,7 @@ const void *pic_state_timer_table[] = {
 	KEYBOARD_TickHandler_PIC_Timer,
 	//MIXER_Mix_NoSound_PIC_Timer,
 	MIXER_Mix_PIC_Timer,
-	INPUTNET_TickHandler_PIC_Timer,
+	STREAMNET_TickHandler_PIC_Timer,
 
 	//NE2000_Poller_PIC_Event,
 };

@@ -32,7 +32,7 @@
 #include "regs.h"
 #include "cpu.h"
 #include "mouse.h"
-#include "inputnet.h"
+#include "streamnet.h"
 #include "pic.h"
 #include "inout.h"
 #include "int10.h"
@@ -858,28 +858,28 @@ bool IsDebuggerActive(void);
  * is handed to the other DOSBox-X instances instead and every instance
  * (including this one) applies it at the same emulated time. */
 void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
-    if (inputnet_capture_active && INPUTNET_InterceptMouseMotion(xrel,yrel,x,y,emulate))
+    if (streamnet_capture_active && STREAMNET_InterceptMouseMotion(xrel,yrel,x,y,emulate))
         return;
 
     Mouse_CursorMovedRaw(xrel,yrel,x,y,emulate);
 }
 
 void Mouse_ButtonPressed(uint8_t button) {
-    if (inputnet_capture_active && INPUTNET_InterceptMouseButton(button,true))
+    if (streamnet_capture_active && STREAMNET_InterceptMouseButton(button,true))
         return;
 
     Mouse_ButtonPressedRaw(button);
 }
 
 void Mouse_ButtonReleased(uint8_t button) {
-    if (inputnet_capture_active && INPUTNET_InterceptMouseButton(button,false))
+    if (streamnet_capture_active && STREAMNET_InterceptMouseButton(button,false))
         return;
 
     Mouse_ButtonReleasedRaw(button);
 }
 
 void Mouse_WheelMoved(int32_t scroll) {
-    if (inputnet_capture_active && INPUTNET_InterceptMouseWheel(scroll))
+    if (streamnet_capture_active && STREAMNET_InterceptMouseWheel(scroll))
         return;
 
     Mouse_WheelMovedRaw(scroll);
@@ -1695,8 +1695,8 @@ void Mouse_Used(void) {
  * Duke Nukem 3D turned with the mouse on one and not on the other, and the machines differed within a second). */
 static bool Mouse_GuestLocked() {
     extern bool remoteplay_streaming;
-    extern bool inputnet_rollback_active;
-    return inputnet_rollback_active || MOUSE_IsLocked() || remoteplay_streaming;
+    extern bool streamnet_rollback_active;
+    return streamnet_rollback_active || MOUSE_IsLocked() || remoteplay_streaming;
 }
 
 void Mouse_Read_Motion_Data() {

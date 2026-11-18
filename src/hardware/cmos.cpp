@@ -35,7 +35,7 @@
 #else
 #include "sys/time.h"
 #endif
-#include "inputnet.h"
+#include "streamnet.h"
 
 static struct {
     uint8_t regs[0x40];
@@ -90,8 +90,8 @@ uint8_t cmos_sync_sec = 0,cmos_sync_min = 0,cmos_sync_hour = 0;
 static void cmos_tick(void) {
     ++cmos.clock_time_t;
 
-    /* Shared input (INPUTNET) machines keep the server's clock in step by emulated time only. */
-    if (sync_time && !INPUTNET_IsConnected()) {
+    /* Shared input (STREAMNET) machines keep the server's clock in step by emulated time only. */
+    if (sync_time && !STREAMNET_IsConnected()) {
         time_t now = time(NULL);
         long dt = (long)now - (long)cmos.clock_time_t;
         if (labs(dt) >= 5l) {
@@ -610,7 +610,7 @@ void CMOS_Init() {
     AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(CMOS_Reset));
 }
 
-/* Shared input (INPUTNET): the server hands its real-time clock to joining machines as broken-down
+/* Shared input (STREAMNET): the server hands its real-time clock to joining machines as broken-down
  * fields, so that a different host time zone or clock does not change what the guest reads. */
 void CMOS_GetSharedClock(uint8_t out[16]) {
     const uint64_t t = (uint64_t)cmos.clock_time_t;

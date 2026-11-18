@@ -23,8 +23,8 @@
  * keys on the same keyboard. This module makes those games playable over a
  * network by running two (or more) DOSBox-X instances as one virtual machine:
  *
- *  - one instance acts as the server (INPUTNET STARTSERVER), the others connect
- *    to it (INPUTNET CONNECT <address>),
+ *  - one instance acts as the server (STREAMNET STARTSERVER), the others connect
+ *    to it (STREAMNET CONNECT <address>),
  *  - when a client joins, the server hands its complete emulator save state
  *    over to it, so that every instance starts from bit-identical state,
  *  - from then on the instances run in lockstep: emulated time is divided into
@@ -39,7 +39,7 @@
  * load is tiny (a couple of KB/s) compared to a remote desktop / VNC approach.
  *
  * The design intentionally mirrors the IPX over UDP tunneling support: a UDP
- * socket, a server that the other instances dial into, and an INPUTNET.COM
+ * socket, a server that the other instances dial into, and an STREAMNET.COM
  * command on drive Z: with the same sub-command layout as IPXNET.COM.
  *
  * Requirements for a session to stay in sync:
@@ -51,19 +51,19 @@
  */
 
 #include "dosbox.h"
-#include "inputnet.h"
+#include "streamnet.h"
 #include "remoteplay.h"
 
 /* Fast path flag. Defined unconditionally so that the keyboard/mouse code does
  * not need to know whether networking support was compiled in at all. */
-bool inputnet_capture_active = false;
+bool streamnet_capture_active = false;
 
 /* RollbackNet ("mode = rollback"): a session is running, and frames are being replayed after a correction. Checked by
  * the main loop (dosbox.cpp) and the mixer. */
-bool inputnet_rollback_active = false;
-bool inputnet_rollback_resim = false;
+bool streamnet_rollback_active = false;
+bool streamnet_rollback_resim = false;
 
-#if C_INPUTNET
+#if C_STREAMNET
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,49 +140,49 @@ void CMOS_GetSharedClock(uint8_t out[16]);
 void CMOS_SetSharedClock(const uint8_t in[16]);
 /* The real-time clock and the DOS date are not part of a save state: a joining machine takes
  * the server's, sent with the WELCOME, and applies them with the server's emulator state. */
-static uint8_t inputnet_pending_clock[16];
-static uint16_t inputnet_pending_year;
-static uint8_t inputnet_pending_month, inputnet_pending_day;
-static bool inputnet_have_pending_clock = false;
+static uint8_t streamnet_pending_clock[16];
+static uint16_t streamnet_pending_year;
+static uint8_t streamnet_pending_month, streamnet_pending_day;
+static bool streamnet_have_pending_clock = false;
 /* Neither is the time stamp counter's base: the server rebases it at the snapshot and sends the
  * count, and the client rebases to that count at the same emulated moment. */
 extern uint64_t rdtsc_count_base;
 extern pic_tickindex_t rdtsc_pic_base;
 void RDTSC_rebase();
-static uint64_t inputnet_pending_tsc = 0;
-static bool inputnet_have_pending_tsc = false;
+static uint64_t streamnet_pending_tsc = 0;
+static bool streamnet_have_pending_tsc = false;
 /* Nor is the VGA's frame pacing reference (an absolute emulated time): without it the joining
  * machine schedules its vertical retrace up to 0.1 ms away from the server's. */
 extern double vga_fps, vga_mode_time_base;
 extern int vga_mode_frames_since_time_base;
 uint8_t VGA_GetOnDemandFlags(void);         /* vga_draw.cpp: how frames are drawn, not in save states */
 void VGA_SetOnDemandFlags(uint8_t f);
-static double inputnet_pending_vga_fps = 0, inputnet_pending_vga_base = 0;
-static uint32_t inputnet_pending_vga_frames = 0;
-static bool inputnet_have_pending_vga = false;
-static uint64_t INPUTNET_DoubleBits(double d) { uint64_t u; memcpy(&u,&d,8); return u; }
-static double INPUTNET_BitsDouble(uint64_t u) { double d; memcpy(&d,&u,8); return d; }
+static double streamnet_pending_vga_fps = 0, streamnet_pending_vga_base = 0;
+static uint32_t streamnet_pending_vga_frames = 0;
+static bool streamnet_have_pending_vga = false;
+static uint64_t STREAMNET_DoubleBits(double d) { uint64_t u; memcpy(&u,&d,8); return u; }
+static double STREAMNET_BitsDouble(uint64_t u) { double d; memcpy(&d,&u,8); return d; }
 #include "dos_inc.h"
 
 /* Host volume labels (read from the host disk on Windows) differ between computers. Shared input
  * machines must answer the guest identically, so local folder drives show no label in a session. */
-static void INPUTNET_ClearHostVolumeLabels(void) {
+static void STREAMNET_ClearHostVolumeLabels(void) {
     for (unsigned i=0;i < DOS_DRIVES;i++)
         if (Drives[i] && !strncmp(Drives[i]->GetInfo(),"local directory ",16)) Drives[i]->SetLabel("",false,true);
 }
 
-#define INPUTNET_DEFAULT_PORT   2130u   /* not an assigned port, but adjacent to IPX's 213 */
-#define INPUTNET_MAX_PEERS      8u
-#define INPUTNET_RING           1024u   /* input frames kept per peer, power of two (RollbackNet replays after a resync) */
-#define INPUTNET_MAX_PACKET     1400u   /* stay below the usual 1500 byte MTU */
-#define INPUTNET_MAX_EVENT_SIZE 18u     /* the largest an encoded event can get */
-#define INPUTNET_MAX_FRAME_EVENTS 64u   /* so that one frame always fits a datagram */
-#define INPUTNET_MAGIC          0x4E495844u /* "DXIN" */
-#define INPUTNET_PROTOVER       1u
+#define STREAMNET_DEFAULT_PORT   2130u   /* not an assigned port, but adjacent to IPX's 213 */
+#define STREAMNET_MAX_PEERS      8u
+#define STREAMNET_RING           1024u   /* input frames kept per peer, power of two (RollbackNet replays after a resync) */
+#define STREAMNET_MAX_PACKET     1400u   /* stay below the usual 1500 byte MTU */
+#define STREAMNET_MAX_EVENT_SIZE 18u     /* the largest an encoded event can get */
+#define STREAMNET_MAX_FRAME_EVENTS 64u   /* so that one frame always fits a datagram */
+#define STREAMNET_MAGIC          0x4E495844u /* "DXIN" */
+#define STREAMNET_PROTOVER       1u
 
 /* Save state hand-off */
-#define INPUTNET_STATE_CHUNK    1024u
-#define INPUTNET_STATE_WINDOW   32u
+#define STREAMNET_STATE_CHUNK    1024u
+#define STREAMNET_STATE_WINDOW   32u
 
 /* Packet types */
 enum {
@@ -236,9 +236,9 @@ enum {
 /* Packet (de)serialization                                                   */
 /* ------------------------------------------------------------------------- */
 
-class InputNetWriter {
+class StreamNetWriter {
 public:
-    InputNetWriter(uint8_t *buf,size_t buflen) : b(buf), cap(buflen) { }
+    StreamNetWriter(uint8_t *buf,size_t buflen) : b(buf), cap(buflen) { }
 
     void u8(uint8_t v) {
         if (o+1 > cap) { err = true; return; }
@@ -273,9 +273,9 @@ private:
     bool err = false;
 };
 
-class InputNetReader {
+class StreamNetReader {
 public:
-    InputNetReader(const uint8_t *buf,size_t buflen) : b(buf), len(buflen) { }
+    StreamNetReader(const uint8_t *buf,size_t buflen) : b(buf), len(buflen) { }
 
     uint8_t u8(void) {
         if (o+1 > len) { err = true; return 0; }
@@ -313,7 +313,7 @@ private:
 /* Session state                                                              */
 /* ------------------------------------------------------------------------- */
 
-struct InputNetEvent {
+struct StreamNetEvent {
     uint8_t type = 0;
     uint8_t pressed = 0;
     uint8_t button = 0;
@@ -325,21 +325,21 @@ struct InputNetEvent {
 };
 
 /* One machine checksum, kept in a small ring per participant. */
-struct InputNetCheck {
+struct StreamNetCheck {
     uint32_t frame = 0;
     uint32_t hash = 0;
     bool valid = false;
 };
 
-#define INPUTNET_CHECK_RING 16u
+#define STREAMNET_CHECK_RING 16u
 
-struct InputNetFrame {
+struct StreamNetFrame {
     uint32_t frame = 0;
     bool valid = false;
-    std::vector<InputNetEvent> events;
+    std::vector<StreamNetEvent> events;
 };
 
-struct InputNetPeer {
+struct StreamNetPeer {
     bool active = false;        /* slot in use */
     bool ready = false;         /* taking part in the lockstep */
     bool local = false;         /* this is us */
@@ -349,32 +349,32 @@ struct InputNetPeer {
     uint32_t lastheard = 0;     /* host time (ms) of the last packet from this peer */
     uint32_t rtt = 0;           /* last measured round trip time, ms */
     std::string name;
-    InputNetFrame ring[INPUTNET_RING];
-    InputNetCheck checks[INPUTNET_CHECK_RING];
+    StreamNetFrame ring[STREAMNET_RING];
+    StreamNetCheck checks[STREAMNET_CHECK_RING];
 
     void resetFrames(void) {
         confirmed = 0;
         delivered = 0;
-        for (unsigned i=0;i < INPUTNET_RING;i++) {
+        for (unsigned i=0;i < STREAMNET_RING;i++) {
             ring[i].valid = false;
             ring[i].frame = 0;
             ring[i].events.clear();
         }
-        for (unsigned i=0;i < INPUTNET_CHECK_RING;i++)
+        for (unsigned i=0;i < STREAMNET_CHECK_RING;i++)
             checks[i].valid = false;
     }
 };
 
 /* Configuration */
-static bool inputnet_enabled = false;
-static bool inputnet_remote = false;        /* "mode = remote": stream from the host instead of lockstep */
-static bool inputnet_rollback = false;      /* "mode = rollback": predict the others' input, correct by rolling back */
-static unsigned int inputnet_rbwindow = 16; /* mode=rollback: frames that may run ahead of the others' input */
+static bool streamnet_enabled = false;
+static bool streamnet_remote = false;        /* "mode = remote": stream from the host instead of lockstep */
+static bool streamnet_rollback = false;      /* "mode = rollback": predict the others' input, correct by rolling back */
+static unsigned int streamnet_rbwindow = 16; /* mode=rollback: frames that may run ahead of the others' input */
 /* mode=rollback, cycles=max (RB_MaxCycles): the load the busiest computer runs at, in percent; this computer's speed
  * proposal (cycles per ms, 0: none yet), what the server heard from the others, and the measurement under way */
 static unsigned int rb_maxload = 85;
 static uint32_t rb_cap_local = 0;
-static uint32_t rb_cap_peer[INPUTNET_MAX_PEERS], rb_cap_peer_at[INPUTNET_MAX_PEERS];
+static uint32_t rb_cap_peer[STREAMNET_MAX_PEERS], rb_cap_peer_at[STREAMNET_MAX_PEERS];
 static uint64_t rb_ml_t0 = 0, rb_ml_wait = 0, rb_ml_sleep0 = 0, rb_ml_core0 = 0;
 static uint32_t rb_ml_changed_at = 0, rb_ml_told_at = 0;
 /* the last second's load, the CPU core's share of it and the average speed meanwhile; averages over a few seconds of
@@ -410,83 +410,83 @@ static uint32_t rb_mis_key = 0, rb_mis_mouse = 0, rb_mis_speed = 0, rb_mis_other
 extern uint64_t dosbox_core_ns;             /* dosbox.cpp: what the CPU core ran, while dosbox_core_timing */
 extern bool dosbox_core_timing;
 extern uint64_t dosbox_sleep_us;            /* dosbox.cpp: what increaseticks() slept */
-static unsigned int inputnet_rbplayers = 0; /* mode=rollback server: participants to wait for before typing autorun */
-static std::string inputnet_rbautorun;      /* mode=rollback server: the command typed then */
-static bool inputnet_rbautorun_done = false;
-static bool inputnet_share_keyboard = true;
-static bool inputnet_share_mouse = true;
-static bool inputnet_sync_state = true;
-static uint16_t inputnet_default_port = (uint16_t)INPUTNET_DEFAULT_PORT;
-static unsigned int inputnet_frame_ms = 10;
-static unsigned int inputnet_delay = 3;
-static unsigned int inputnet_redundancy = 4;
-static unsigned int inputnet_timeout = 10000;
-static unsigned int inputnet_cyclesync = INCYCLES_AUTO;
-static unsigned int inputnet_checkevery = 100;
+static unsigned int streamnet_rbplayers = 0; /* mode=rollback server: participants to wait for before typing autorun */
+static std::string streamnet_rbautorun;      /* mode=rollback server: the command typed then */
+static bool streamnet_rbautorun_done = false;
+static bool streamnet_share_keyboard = true;
+static bool streamnet_share_mouse = true;
+static bool streamnet_sync_state = true;
+static uint16_t streamnet_default_port = (uint16_t)STREAMNET_DEFAULT_PORT;
+static unsigned int streamnet_frame_ms = 10;
+static unsigned int streamnet_delay = 3;
+static unsigned int streamnet_redundancy = 4;
+static unsigned int streamnet_timeout = 10000;
+static unsigned int streamnet_cyclesync = INCYCLES_AUTO;
+static unsigned int streamnet_checkevery = 100;
 
 /* Auto start, from the config file or the command line */
-static std::string inputnet_auto_connect;
-static int inputnet_auto_server = -1;
-static bool inputnet_autostart_done = false;
+static std::string streamnet_auto_connect;
+static int streamnet_auto_server = -1;
+static bool streamnet_autostart_done = false;
 
 /* Link */
-static UDPsocket inputnet_socket = NULL;
-static bool inputnet_is_server = false;
-static bool inputnet_link_up = false;       /* socket open and talking to someone */
-static bool inputnet_session = false;       /* lockstep running */
-static IPaddress inputnet_server_addr = { 0, 0 };
-static uint16_t inputnet_active_port = 0;
-static uint8_t inputnet_selfid = 0;
-static InputNetPeer inputnet_peers[INPUTNET_MAX_PEERS];
+static UDPsocket streamnet_socket = NULL;
+static bool streamnet_is_server = false;
+static bool streamnet_link_up = false;       /* socket open and talking to someone */
+static bool streamnet_session = false;       /* lockstep running */
+static IPaddress streamnet_server_addr = { 0, 0 };
+static uint16_t streamnet_active_port = 0;
+static uint8_t streamnet_selfid = 0;
+static StreamNetPeer streamnet_peers[STREAMNET_MAX_PEERS];
 
 /* Lockstep bookkeeping */
-static uint32_t inputnet_epoch = 0;         /* bumped by the server on every (re)start */
-static uint32_t inputnet_frame = 0;
-static uint32_t inputnet_local_confirmed = 0;
-static unsigned int inputnet_tickaccum = 0;
-static bool inputnet_busy = false;          /* a blocking operation is in progress */
-static bool inputnet_in_tick = false;       /* running inside INPUTNET_TickHandler */
-static bool inputnet_tick_installed = false;
+static uint32_t streamnet_epoch = 0;         /* bumped by the server on every (re)start */
+static uint32_t streamnet_frame = 0;
+static uint32_t streamnet_local_confirmed = 0;
+static unsigned int streamnet_tickaccum = 0;
+static bool streamnet_busy = false;          /* a blocking operation is in progress */
+static bool streamnet_in_tick = false;       /* running inside STREAMNET_TickHandler */
+static bool streamnet_tick_installed = false;
 
 /* Pending save state to apply at the next safe point */
-static bool inputnet_pending_stateload = false;
-static std::vector<uint8_t> inputnet_pending_state;
+static bool streamnet_pending_stateload = false;
+static std::vector<uint8_t> streamnet_pending_state;
 
 /* Keys/buttons we handed to the emulated machine, so they can be released
  * cleanly when the session ends. */
-static bool inputnet_keydown[KBD_LAST];
-static uint32_t inputnet_buttondown = 0;
+static bool streamnet_keydown[KBD_LAST];
+static uint32_t streamnet_buttondown = 0;
 
-/* Statistics, shown by INPUTNET STATUS */
-static uint32_t inputnet_stat_stallms = 0;
-static uint32_t inputnet_stat_frames = 0;
-static uint32_t inputnet_stat_desyncs = 0;
-static uint32_t inputnet_stat_cycleupdates = 0;
+/* Statistics, shown by STREAMNET STATUS */
+static uint32_t streamnet_stat_stallms = 0;
+static uint32_t streamnet_stat_frames = 0;
+static uint32_t streamnet_stat_desyncs = 0;
+static uint32_t streamnet_stat_cycleupdates = 0;
 
 /* Emulated CPU speed the whole session is running at. */
-static uint32_t inputnet_cyclemax = 0;
-static InputNetCheck inputnet_localchecks[INPUTNET_CHECK_RING];
+static uint32_t streamnet_cyclemax = 0;
+static StreamNetCheck streamnet_localchecks[STREAMNET_CHECK_RING];
 
-static UDPpacket *inputnet_sendpkt = NULL;
-static UDPpacket *inputnet_recvpkt = NULL;
+static UDPpacket *streamnet_sendpkt = NULL;
+static UDPpacket *streamnet_recvpkt = NULL;
 
 /* Re-entrancy guard: accepting a participant polls the socket, which can turn
  * up another join request. */
-static bool inputnet_accepting = false;
+static bool streamnet_accepting = false;
 
-/* Set while INPUTNET.COM is running. Replacing the emulator state (or freezing
+/* Set while STREAMNET.COM is running. Replacing the emulator state (or freezing
  * the machine to hand it over) is only safe once the DOS program has returned:
  * until then the host still has emulated-CPU frames on its stack that expect to
  * resume the machine we are about to throw away. */
-static bool inputnet_in_program = false;
+static bool streamnet_in_program = false;
 
 extern bool SDLNetInited;
 
-static void INPUTNET_EndSession(const char *reason,bool notify_peers);
-static void INPUTNET_CloseLink(const char *reason,bool notify_peers);
-static void INPUTNET_PollSocket(void);
-static void RB_HandleInput(InputNetPeer &p,unsigned peerid,InputNetReader &r);
-static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned peerid);
+static void STREAMNET_EndSession(const char *reason,bool notify_peers);
+static void STREAMNET_CloseLink(const char *reason,bool notify_peers);
+static void STREAMNET_PollSocket(void);
+static void RB_HandleInput(StreamNetPeer &p,unsigned peerid,StreamNetReader &r);
+static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned peerid);
 static std::string RB_Fingerprint(void);
 static std::string RB_FingerprintDiff(const std::string &theirs, const std::string &mine);
 /* clusters (IPX/NullModem-over-RollbackNet) */
@@ -518,29 +518,29 @@ static void RB_SessionEnded(void);
 /* Small helpers                                                              */
 /* ------------------------------------------------------------------------- */
 
-static bool INPUTNET_SameAddr(const IPaddress &a,const IPaddress &b) {
+static bool STREAMNET_SameAddr(const IPaddress &a,const IPaddress &b) {
     return a.host == b.host && a.port == b.port;
 }
 
-static InputNetPeer *INPUTNET_PeerByAddr(const IPaddress &addr) {
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        if (inputnet_peers[i].active && !inputnet_peers[i].local &&
-            INPUTNET_SameAddr(inputnet_peers[i].addr,addr))
-            return &inputnet_peers[i];
+static StreamNetPeer *STREAMNET_PeerByAddr(const IPaddress &addr) {
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        if (streamnet_peers[i].active && !streamnet_peers[i].local &&
+            STREAMNET_SameAddr(streamnet_peers[i].addr,addr))
+            return &streamnet_peers[i];
     }
     return NULL;
 }
 
-static unsigned INPUTNET_PeerCount(void) {
+static unsigned STREAMNET_PeerCount(void) {
     unsigned n = 0;
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++)
-        if (inputnet_peers[i].active) n++;
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++)
+        if (streamnet_peers[i].active) n++;
     return n;
 }
 
 /* Keep the host side of the emulator responsive while emulation is stalled
  * waiting for the other side. */
-static void INPUTNET_Stall(uint32_t &last_events) {
+static void STREAMNET_Stall(uint32_t &last_events) {
     const uint32_t now = GetTicks();
 
     if ((now - last_events) >= 10u) {
@@ -551,73 +551,73 @@ static void INPUTNET_Stall(uint32_t &last_events) {
     SDL_Delay(1);
 }
 
-static bool INPUTNET_SendRawNow(const IPaddress &addr,const uint8_t *data,size_t len);
+static bool STREAMNET_SendRawNow(const IPaddress &addr,const uint8_t *data,size_t len);
 
 /* Debugging: NN_RB_SENDDELAY=<ms> holds every packet this computer sends to the others that long (a longer distance
  * over a real network; the copies of a cluster talk on their own socket, undelayed). */
 struct INDelayed { uint32_t due; IPaddress addr; std::vector<uint8_t> data; };
-static std::deque<INDelayed> inputnet_delayed;
-static uint32_t INPUTNET_SendDelay(void) {
+static std::deque<INDelayed> streamnet_delayed;
+static uint32_t STREAMNET_SendDelay(void) {
     static int ms = -1;
     if (ms < 0) { const char *e = getenv("NN_RB_SENDDELAY"); ms = (e != NULL) ? std::max(0, std::min(1000, atoi(e))) : 0; }
     return (uint32_t)ms;
 }
-static void INPUTNET_FlushDelayed(void) {
+static void STREAMNET_FlushDelayed(void) {
     const uint32_t now = GetTicks();
-    while (!inputnet_delayed.empty() && (int32_t)(now - inputnet_delayed.front().due) >= 0) {
-        const INDelayed &d = inputnet_delayed.front();
-        INPUTNET_SendRawNow(d.addr, &d.data[0], d.data.size());
-        inputnet_delayed.pop_front();
+    while (!streamnet_delayed.empty() && (int32_t)(now - streamnet_delayed.front().due) >= 0) {
+        const INDelayed &d = streamnet_delayed.front();
+        STREAMNET_SendRawNow(d.addr, &d.data[0], d.data.size());
+        streamnet_delayed.pop_front();
     }
 }
 
-static bool INPUTNET_SendRaw(const IPaddress &addr,const uint8_t *data,size_t len) {
+static bool STREAMNET_SendRaw(const IPaddress &addr,const uint8_t *data,size_t len) {
     /* (only once the session runs: the connection's first packets go at once, whatever loop waits for their answer) */
-    if (INPUTNET_SendDelay() == 0 || !inputnet_session) return INPUTNET_SendRawNow(addr, data, len);
-    if (inputnet_socket == NULL || inputnet_sendpkt == NULL || len > (size_t)inputnet_sendpkt->maxlen) return false;
-    INDelayed d; d.due = GetTicks() + INPUTNET_SendDelay(); d.addr = addr; d.data.assign(data, data + len);
-    inputnet_delayed.push_back(d);
-    INPUTNET_FlushDelayed();
+    if (STREAMNET_SendDelay() == 0 || !streamnet_session) return STREAMNET_SendRawNow(addr, data, len);
+    if (streamnet_socket == NULL || streamnet_sendpkt == NULL || len > (size_t)streamnet_sendpkt->maxlen) return false;
+    INDelayed d; d.due = GetTicks() + STREAMNET_SendDelay(); d.addr = addr; d.data.assign(data, data + len);
+    streamnet_delayed.push_back(d);
+    STREAMNET_FlushDelayed();
     return true;
 }
 
-static bool INPUTNET_SendRawNow(const IPaddress &addr,const uint8_t *data,size_t len) {
-    if (inputnet_socket == NULL || inputnet_sendpkt == NULL) return false;
-    if (len > (size_t)inputnet_sendpkt->maxlen) return false;
+static bool STREAMNET_SendRawNow(const IPaddress &addr,const uint8_t *data,size_t len) {
+    if (streamnet_socket == NULL || streamnet_sendpkt == NULL) return false;
+    if (len > (size_t)streamnet_sendpkt->maxlen) return false;
 
-    memcpy(inputnet_sendpkt->data,data,len);
-    inputnet_sendpkt->len = (int)len;
-    inputnet_sendpkt->address = addr;
+    memcpy(streamnet_sendpkt->data,data,len);
+    streamnet_sendpkt->len = (int)len;
+    streamnet_sendpkt->address = addr;
 
     /* channel -1 means "use the address stored in the packet" */
-    return SDLNet_UDP_Send(inputnet_socket,-1,inputnet_sendpkt) != 0;
+    return SDLNet_UDP_Send(streamnet_socket,-1,streamnet_sendpkt) != 0;
 }
 
 /* Send to every peer except ourselves, and except "skip" if given. A client
  * only ever talks to the server; the server talks to everybody. */
-static void INPUTNET_SendToPeers(const uint8_t *data,size_t len,const InputNetPeer *skip = NULL) {
-    if (!inputnet_is_server) {
-        INPUTNET_SendRaw(inputnet_server_addr,data,len);
+static void STREAMNET_SendToPeers(const uint8_t *data,size_t len,const StreamNetPeer *skip = NULL) {
+    if (!streamnet_is_server) {
+        STREAMNET_SendRaw(streamnet_server_addr,data,len);
         return;
     }
 
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || p.local || &p == skip) continue;
-        INPUTNET_SendRaw(p.addr,data,len);
+        STREAMNET_SendRaw(p.addr,data,len);
     }
 }
 
-static void INPUTNET_BeginPacket(InputNetWriter &w,uint8_t type) {
-    w.u32(INPUTNET_MAGIC);
-    w.u8((uint8_t)INPUTNET_PROTOVER);
+static void STREAMNET_BeginPacket(StreamNetWriter &w,uint8_t type) {
+    w.u32(STREAMNET_MAGIC);
+    w.u8((uint8_t)STREAMNET_PROTOVER);
     w.u8(type);
-    w.u8(inputnet_selfid);
+    w.u8(streamnet_selfid);
     w.u8(0); /* reserved */
 }
 
-static InputNetFrame &INPUTNET_FrameSlot(InputNetPeer &p,uint32_t frame) {
-    InputNetFrame &s = p.ring[frame % INPUTNET_RING];
+static StreamNetFrame &STREAMNET_FrameSlot(StreamNetPeer &p,uint32_t frame) {
+    StreamNetFrame &s = p.ring[frame % STREAMNET_RING];
     if (!s.valid || s.frame != frame) {
         s.frame = frame;
         s.valid = true;
@@ -626,8 +626,8 @@ static InputNetFrame &INPUTNET_FrameSlot(InputNetPeer &p,uint32_t frame) {
     return s;
 }
 
-static InputNetFrame *INPUTNET_FrameSlotIfValid(InputNetPeer &p,uint32_t frame) {
-    InputNetFrame &s = p.ring[frame % INPUTNET_RING];
+static StreamNetFrame *STREAMNET_FrameSlotIfValid(StreamNetPeer &p,uint32_t frame) {
+    StreamNetFrame &s = p.ring[frame % STREAMNET_RING];
     if (s.valid && s.frame == frame) return &s;
     return NULL;
 }
@@ -642,9 +642,9 @@ static InputNetFrame *INPUTNET_FrameSlotIfValid(InputNetPeer &p,uint32_t frame) 
  * can happen for events picked up while emulation is stalled. */
 static unsigned int RB_EffectiveDelay(void);
 
-static uint32_t INPUTNET_ScheduleFrame(void) {
-    uint32_t f = inputnet_frame + (inputnet_rollback ? RB_EffectiveDelay() : inputnet_delay);
-    if (f <= inputnet_local_confirmed) f = inputnet_local_confirmed + 1u;
+static uint32_t STREAMNET_ScheduleFrame(void) {
+    uint32_t f = streamnet_frame + (streamnet_rollback ? RB_EffectiveDelay() : streamnet_delay);
+    if (f <= streamnet_local_confirmed) f = streamnet_local_confirmed + 1u;
     return f;
 }
 
@@ -657,16 +657,16 @@ static uint32_t INPUTNET_ScheduleFrame(void) {
 static unsigned int rb_mouse_frames = 0;    /* 0: from the distance */
 static unsigned int RB_MouseFrames(void);   /* (1: every frame, as at the DOS prompt) */
 
-static void INPUTNET_QueueLocal(const InputNetEvent &ev) {
+static void STREAMNET_QueueLocal(const StreamNetEvent &ev) {
     /* a cluster's follower is played by somebody elsewhere (RBC_ApplyInputs); a joining computer waits for the machines */
     if (rbc_copies && (!rbc_leader || rb_joining)) return;
-    InputNetPeer &self = inputnet_peers[inputnet_selfid];
-    uint32_t at = INPUTNET_ScheduleFrame();
-    if (ev.type == INEV_MOUSEMOVE && inputnet_rollback && inputnet_rollback_active) {
+    StreamNetPeer &self = streamnet_peers[streamnet_selfid];
+    uint32_t at = STREAMNET_ScheduleFrame();
+    if (ev.type == INEV_MOUSEMOVE && streamnet_rollback && streamnet_rollback_active) {
         const uint32_t k = RB_MouseFrames();
         if (k > 1u) at = ((at + k - 1u) / k) * k;
     }
-    InputNetFrame &slot = INPUTNET_FrameSlot(self,at);
+    StreamNetFrame &slot = STREAMNET_FrameSlot(self,at);
 
     /* Only the newest speed proposal for a frame is worth keeping. */
     if (ev.type == INEV_CYCLEMAX) {
@@ -696,61 +696,61 @@ static void INPUTNET_QueueLocal(const InputNetEvent &ev) {
 
     /* Runaway protection. The limit is chosen so that one frame's worth of
      * events always fits in a single datagram: 64 * 18 bytes plus the header is
-     * comfortably below INPUTNET_MAX_PACKET. */
-    if (slot.events.size() >= INPUTNET_MAX_FRAME_EVENTS) {
-        LOG(LOG_MISC,LOG_WARN)("INPUTNET: too many input events in one frame, dropping");
+     * comfortably below STREAMNET_MAX_PACKET. */
+    if (slot.events.size() >= STREAMNET_MAX_FRAME_EVENTS) {
+        LOG(LOG_MISC,LOG_WARN)("STREAMNET: too many input events in one frame, dropping");
         return;
     }
 
     slot.events.push_back(ev);
 }
 
-bool INPUTNET_InterceptKey(KBD_KEYS keytype,bool pressed) {
-    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
-    if (!inputnet_capture_active || !inputnet_share_keyboard) return false;
+bool STREAMNET_InterceptKey(KBD_KEYS keytype,bool pressed) {
+    if (streamnet_rollback && !streamnet_session) return true;   /* (not into this machine alone: see the config) */
+    if (!streamnet_capture_active || !streamnet_share_keyboard) return false;
     if ((unsigned)keytype >= (unsigned)KBD_LAST) return false;
 
-    InputNetEvent ev;
+    StreamNetEvent ev;
     ev.type = INEV_KEY;
     ev.key = (uint16_t)keytype;
     ev.pressed = pressed ? 1 : 0;
-    INPUTNET_QueueLocal(ev);
+    STREAMNET_QueueLocal(ev);
     return true;
 }
 
-bool INPUTNET_InterceptMouseMotion(float xrel,float yrel,float x,float y,bool emulate) {
-    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
-    if (!inputnet_capture_active || !inputnet_share_mouse) return false;
+bool STREAMNET_InterceptMouseMotion(float xrel,float yrel,float x,float y,bool emulate) {
+    if (streamnet_rollback && !streamnet_session) return true;   /* (not into this machine alone: see the config) */
+    if (!streamnet_capture_active || !streamnet_share_mouse) return false;
 
-    InputNetEvent ev;
+    StreamNetEvent ev;
     ev.type = INEV_MOUSEMOVE;
     ev.xrel = xrel; ev.yrel = yrel; ev.x = x; ev.y = y;
     ev.emulate = emulate ? 1 : 0;
-    INPUTNET_QueueLocal(ev);
+    STREAMNET_QueueLocal(ev);
     return true;
 }
 
-bool INPUTNET_InterceptMouseButton(uint8_t button,bool pressed) {
-    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
-    if (!inputnet_capture_active || !inputnet_share_mouse) return false;
+bool STREAMNET_InterceptMouseButton(uint8_t button,bool pressed) {
+    if (streamnet_rollback && !streamnet_session) return true;   /* (not into this machine alone: see the config) */
+    if (!streamnet_capture_active || !streamnet_share_mouse) return false;
 
-    InputNetEvent ev;
+    StreamNetEvent ev;
     ev.type = INEV_MOUSEBUTTON;
     ev.button = button;
     ev.pressed = pressed ? 1 : 0;
-    INPUTNET_QueueLocal(ev);
+    STREAMNET_QueueLocal(ev);
     return true;
 }
 
-bool INPUTNET_InterceptMouseWheel(int32_t scroll) {
-    if (inputnet_rollback && !inputnet_session) return true;   /* (not into this machine alone: see the config) */
-    if (!inputnet_capture_active || !inputnet_share_mouse) return false;
+bool STREAMNET_InterceptMouseWheel(int32_t scroll) {
+    if (streamnet_rollback && !streamnet_session) return true;   /* (not into this machine alone: see the config) */
+    if (!streamnet_capture_active || !streamnet_share_mouse) return false;
     if (scroll < -32768 || scroll > 32767) return false;
 
-    InputNetEvent ev;
+    StreamNetEvent ev;
     ev.type = INEV_MOUSEWHEEL;
     ev.wheel = (int16_t)scroll;
-    INPUTNET_QueueLocal(ev);
+    STREAMNET_QueueLocal(ev);
     return true;
 }
 
@@ -767,44 +767,44 @@ static const uint32_t RB_SPEED_LEAD = 40;
 static std::map<uint32_t,uint32_t> rb_speed_sched;
 /* Events the leader adds for every copy at a frame (a speed change it learned of late: RB_FindMisprediction); kept by
  * frame, so a replay across it routes them again. */
-static std::map<uint32_t, std::vector<InputNetEvent> > rbc_injected;
+static std::map<uint32_t, std::vector<StreamNetEvent> > rbc_injected;
 static bool RB_SpeedTrace(void) { static const bool t = getenv("NN_RB_TRACE") != NULL && *getenv("NN_RB_TRACE"); return t; }
-void INPUTNET_ScheduleSpeed(uint32_t frame, uint32_t speed) {
+void STREAMNET_ScheduleSpeed(uint32_t frame, uint32_t speed) {
     if (speed == 0) return;
-    if (RB_SpeedTrace() && rb_speed_sched[frame] != speed) LOG_MSG("RBSPEED schedule at=%u speed=%u (now frame %u)", (unsigned)frame, (unsigned)speed, (unsigned)inputnet_frame);
+    if (RB_SpeedTrace() && rb_speed_sched[frame] != speed) LOG_MSG("RBSPEED schedule at=%u speed=%u (now frame %u)", (unsigned)frame, (unsigned)speed, (unsigned)streamnet_frame);
     rb_speed_sched[frame] = speed;
     while (rb_speed_sched.size() > 64) rb_speed_sched.erase(rb_speed_sched.begin());
 }
 /* The change still to come after the current frame (the CPU's saved state carries it): false when none. */
-bool INPUTNET_PendingSpeed(uint32_t &frame, uint32_t &speed);
+bool STREAMNET_PendingSpeed(uint32_t &frame, uint32_t &speed);
 static void RB_ApplyScheduledSpeed(uint32_t frame) {
     const auto it = rb_speed_sched.find(frame);
     if (it != rb_speed_sched.end() && it->second != (uint32_t)CPU_CycleMax) {
-        if (RB_SpeedTrace()) LOG_MSG("RBSPEED apply f=%u speed=%u%s", (unsigned)frame, (unsigned)it->second, inputnet_rollback_resim ? " replay" : "");
+        if (RB_SpeedTrace()) LOG_MSG("RBSPEED apply f=%u speed=%u%s", (unsigned)frame, (unsigned)it->second, streamnet_rollback_resim ? " replay" : "");
         DOSBOX_ApplyCycleMax((cpu_cycles_count_t)it->second, false);
     }
 }
 
-static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
+static void STREAMNET_ApplyEvent(const StreamNetEvent &ev) {
     switch (ev.type) {
         case INEV_KEY:  /* "pressed": bit 0 down, bit 1 typed by the RollbackNet server's autorun */
             if (ev.key < (uint16_t)KBD_LAST) {
-                inputnet_keydown[ev.key] = (ev.pressed & 1u) != 0;
+                streamnet_keydown[ev.key] = (ev.pressed & 1u) != 0;
                 KEYBOARD_AddKeyRaw((KBD_KEYS)ev.key,(ev.pressed & 1u) != 0);
             }
             break;
         case INEV_MOUSEBUTTON:
             if (ev.pressed) {
-                if (ev.button < 32) inputnet_buttondown |= (1u << ev.button);
+                if (ev.button < 32) streamnet_buttondown |= (1u << ev.button);
                 Mouse_ButtonPressedRaw(ev.button);
             }
             else {
-                if (ev.button < 32) inputnet_buttondown &= ~(1u << ev.button);
+                if (ev.button < 32) streamnet_buttondown &= ~(1u << ev.button);
                 Mouse_ButtonReleasedRaw(ev.button);
             }
             break;
         case INEV_MOUSEMOVE:
-            if (inputnet_rollback) {
+            if (streamnet_rollback) {
                 /* RollbackNet: as motion from a remote play viewer, relative only. Otherwise the motion would be
                  * applied by this computer's own state (whether its window has the mouse, fullscreen, where its host
                  * pointer is), which differs on every computer. */
@@ -819,16 +819,16 @@ static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
             Mouse_WheelMovedRaw(ev.wheel);
             break;
         case INEV_CYCLEMAX:
-            if (ev.pressed >= 2u && inputnet_rollback) {     /* (RollbackNet: applies later, RB_ApplyScheduledSpeed) */
-                INPUTNET_ScheduleSpeed(inputnet_frame + (uint32_t)(ev.pressed - 2u), ev.cyclemax);
+            if (ev.pressed >= 2u && streamnet_rollback) {     /* (RollbackNet: applies later, RB_ApplyScheduledSpeed) */
+                STREAMNET_ScheduleSpeed(streamnet_frame + (uint32_t)(ev.pressed - 2u), ev.cyclemax);
                 break;
             }
             /* Every participant reaches this at the same emulated time, so the
              * emulated machines keep executing the same amount of guest code
              * per emulated millisecond. */
-            if (ev.cyclemax != 0 && inputnet_cyclesync != INCYCLES_OFF) {
-                inputnet_cyclemax = ev.cyclemax;
-                inputnet_stat_cycleupdates++;
+            if (ev.cyclemax != 0 && streamnet_cyclesync != INCYCLES_OFF) {
+                streamnet_cyclemax = ev.cyclemax;
+                streamnet_stat_cycleupdates++;
                 DOSBOX_ApplyCycleMax((cpu_cycles_count_t)ev.cyclemax,ev.pressed != 0);
             }
             break;
@@ -839,15 +839,15 @@ static void INPUTNET_ApplyEvent(const InputNetEvent &ev) {
 
 /* Apply the input of every participant for one frame. The peers are walked in
  * a fixed order so that every instance applies the events in the same sequence. */
-static void INPUTNET_DeliverFrame(uint32_t frame) {
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        InputNetPeer &p = inputnet_peers[i];
+static void STREAMNET_DeliverFrame(uint32_t frame) {
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready) continue;
 
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p,frame);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(p,frame);
         if (slot != NULL) {
             for (size_t e=0;e < slot->events.size();e++)
-                INPUTNET_ApplyEvent(slot->events[e]);
+                STREAMNET_ApplyEvent(slot->events[e]);
             slot->valid = false;
             slot->events.clear();
         }
@@ -857,16 +857,16 @@ static void INPUTNET_DeliverFrame(uint32_t frame) {
 }
 
 /* Let go of everything the remote side left pressed. */
-static void INPUTNET_ReleaseHeldInput(void) {
+static void STREAMNET_ReleaseHeldInput(void) {
     for (unsigned k=0;k < (unsigned)KBD_LAST;k++) {
-        if (inputnet_keydown[k]) {
-            inputnet_keydown[k] = false;
+        if (streamnet_keydown[k]) {
+            streamnet_keydown[k] = false;
             KEYBOARD_AddKeyRaw((KBD_KEYS)k,false);
         }
     }
     for (unsigned b=0;b < 32;b++) {
-        if (inputnet_buttondown & (1u << b)) {
-            inputnet_buttondown &= ~(1u << b);
+        if (streamnet_buttondown & (1u << b)) {
+            streamnet_buttondown &= ~(1u << b);
             Mouse_ButtonReleasedRaw((uint8_t)b);
         }
     }
@@ -886,23 +886,23 @@ static void INPUTNET_ReleaseHeldInput(void) {
  * waits to be told. Because the participants run in lockstep, the server's
  * automatic guessing measures the speed of the whole group and settles on
  * something the slowest host can sustain. */
-bool INPUTNET_ProposeCycleMax(uint32_t newmax,bool reset_counters) {
-    if (!inputnet_capture_active) return false;      /* no session: business as usual */
-    if (inputnet_cyclesync == INCYCLES_OFF) return false;
+bool STREAMNET_ProposeCycleMax(uint32_t newmax,bool reset_counters) {
+    if (!streamnet_capture_active) return false;      /* no session: business as usual */
+    if (streamnet_cyclesync == INCYCLES_OFF) return false;
 
     /* Clients never decide the speed, and in "freeze" mode nobody does. */
-    if (!inputnet_is_server || inputnet_cyclesync != INCYCLES_AUTO) return true;
-    if (newmax == 0 || newmax == inputnet_cyclemax) return true;
+    if (!streamnet_is_server || streamnet_cyclesync != INCYCLES_AUTO) return true;
+    if (newmax == 0 || newmax == streamnet_cyclemax) return true;
 
-    InputNetEvent ev;
+    StreamNetEvent ev;
     ev.type = INEV_CYCLEMAX;
     ev.cyclemax = newmax;
     ev.pressed = reset_counters ? 1 : 0;
-    INPUTNET_QueueLocal(ev);
+    STREAMNET_QueueLocal(ev);
 
     /* Remember it right away so that the guessing, which runs far more often
      * than we publish, does not queue the same value over and over. */
-    inputnet_cyclemax = newmax;
+    streamnet_cyclemax = newmax;
     return true;
 }
 
@@ -914,7 +914,7 @@ bool INPUTNET_ProposeCycleMax(uint32_t newmax,bool reset_counters) {
  * the participants ever stopped executing the same code: the CPU registers and
  * conventional memory. FNV-1a, computed at a frame boundary so that every
  * participant hashes the exact same emulated moment. */
-static uint32_t INPUTNET_MachineHash(void) {
+static uint32_t STREAMNET_MachineHash(void) {
     uint32_t h = 2166136261u;
 
     const uint8_t *regs = (const uint8_t*)&cpu_regs;
@@ -935,54 +935,54 @@ static uint32_t INPUTNET_MachineHash(void) {
     return h;
 }
 
-static void INPUTNET_StoreCheck(InputNetCheck *ring,uint32_t frame,uint32_t hash) {
-    InputNetCheck &c = ring[frame % INPUTNET_CHECK_RING];
+static void STREAMNET_StoreCheck(StreamNetCheck *ring,uint32_t frame,uint32_t hash) {
+    StreamNetCheck &c = ring[frame % STREAMNET_CHECK_RING];
     c.frame = frame;
     c.hash = hash;
     c.valid = true;
 }
 
-static const InputNetCheck *INPUTNET_FindCheck(const InputNetCheck *ring,uint32_t frame) {
-    const InputNetCheck &c = ring[frame % INPUTNET_CHECK_RING];
+static const StreamNetCheck *STREAMNET_FindCheck(const StreamNetCheck *ring,uint32_t frame) {
+    const StreamNetCheck &c = ring[frame % STREAMNET_CHECK_RING];
     if (c.valid && c.frame == frame) return &c;
     return NULL;
 }
 
-static void INPUTNET_ReportDesync(const InputNetPeer &p,uint32_t frame) {
-    inputnet_stat_desyncs++;
-    LOG_MSG("INPUTNET: WARNING - the emulated machine no longer matches participant \"%s\" at frame %u.",
+static void STREAMNET_ReportDesync(const StreamNetPeer &p,uint32_t frame) {
+    streamnet_stat_desyncs++;
+    LOG_MSG("STREAMNET: WARNING - the emulated machine no longer matches participant \"%s\" at frame %u.",
         p.name.empty() ? "(peer)" : p.name.c_str(),(unsigned)frame);
-    LOG_MSG("INPUTNET: the sessions have drifted apart; reconnect to pick the state up again.");
-    if (inputnet_cyclesync == INCYCLES_OFF)
-        LOG_MSG("INPUTNET: \"cycle sync\" is off - with cycles=max or cycles=auto this is expected.");
+    LOG_MSG("STREAMNET: the sessions have drifted apart; reconnect to pick the state up again.");
+    if (streamnet_cyclesync == INCYCLES_OFF)
+        LOG_MSG("STREAMNET: \"cycle sync\" is off - with cycles=max or cycles=auto this is expected.");
 }
 
-static void INPUTNET_CompareCheck(InputNetPeer &p,uint32_t frame,uint32_t hash) {
-    INPUTNET_StoreCheck(p.checks,frame,hash);
+static void STREAMNET_CompareCheck(StreamNetPeer &p,uint32_t frame,uint32_t hash) {
+    STREAMNET_StoreCheck(p.checks,frame,hash);
 
-    const InputNetCheck *mine = INPUTNET_FindCheck(inputnet_localchecks,frame);
-    if (mine != NULL && mine->hash != hash) INPUTNET_ReportDesync(p,frame);
+    const StreamNetCheck *mine = STREAMNET_FindCheck(streamnet_localchecks,frame);
+    if (mine != NULL && mine->hash != hash) STREAMNET_ReportDesync(p,frame);
 }
 
 /* Hash our own machine for this frame, publish it, and compare against anything
  * the other participants already sent for the same frame. */
-static void INPUTNET_RunCheck(uint32_t frame) {
-    const uint32_t hash = INPUTNET_MachineHash();
-    INPUTNET_StoreCheck(inputnet_localchecks,frame,hash);
+static void STREAMNET_RunCheck(uint32_t frame) {
+    const uint32_t hash = STREAMNET_MachineHash();
+    STREAMNET_StoreCheck(streamnet_localchecks,frame,hash);
 
     uint8_t buf[32];
-    InputNetWriter w(buf,sizeof(buf));
-    INPUTNET_BeginPacket(w,INPKT_CHECK);
+    StreamNetWriter w(buf,sizeof(buf));
+    STREAMNET_BeginPacket(w,INPKT_CHECK);
     w.u32(frame);
     w.u32(hash);
-    INPUTNET_SendToPeers(buf,w.size());
+    STREAMNET_SendToPeers(buf,w.size());
 
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || p.local || !p.ready) continue;
 
-        const InputNetCheck *theirs = INPUTNET_FindCheck(p.checks,frame);
-        if (theirs != NULL && theirs->hash != hash) INPUTNET_ReportDesync(p,frame);
+        const StreamNetCheck *theirs = STREAMNET_FindCheck(p.checks,frame);
+        if (theirs != NULL && theirs->hash != hash) STREAMNET_ReportDesync(p,frame);
     }
 }
 
@@ -990,7 +990,7 @@ static void INPUTNET_RunCheck(uint32_t frame) {
 /* Input packets                                                              */
 /* ------------------------------------------------------------------------- */
 
-static void INPUTNET_WriteEvent(InputNetWriter &w,const InputNetEvent &ev) {
+static void STREAMNET_WriteEvent(StreamNetWriter &w,const StreamNetEvent &ev) {
     w.u8(ev.type);
     switch (ev.type) {
         case INEV_KEY:
@@ -1017,8 +1017,8 @@ static void INPUTNET_WriteEvent(InputNetWriter &w,const InputNetEvent &ev) {
     }
 }
 
-static bool INPUTNET_ReadEvent(InputNetReader &r,InputNetEvent &ev) {
-    ev = InputNetEvent();
+static bool STREAMNET_ReadEvent(StreamNetReader &r,StreamNetEvent &ev) {
+    ev = StreamNetEvent();
     ev.type = r.u8();
     switch (ev.type) {
         case INEV_KEY:
@@ -1052,58 +1052,58 @@ static bool INPUTNET_ReadEvent(InputNetReader &r,InputNetEvent &ev) {
  * and a lost input frame would stall the whole session until it timed out, so
  * instead of adding retransmit machinery the recent history simply rides along
  * - it is only a handful of bytes. */
-static void INPUTNET_SendLocalInput(void) {
-    InputNetPeer &self = inputnet_peers[inputnet_selfid];
-    const uint32_t confirmed = inputnet_frame + inputnet_delay;
+static void STREAMNET_SendLocalInput(void) {
+    StreamNetPeer &self = streamnet_peers[streamnet_selfid];
+    const uint32_t confirmed = streamnet_frame + streamnet_delay;
 
     /* Make sure the slot exists even when nothing was pressed: an empty frame is
      * still information the other side is waiting for. */
-    INPUTNET_FrameSlot(self,confirmed);
+    STREAMNET_FrameSlot(self,confirmed);
     self.confirmed = confirmed;
-    inputnet_local_confirmed = confirmed;
+    streamnet_local_confirmed = confirmed;
 
     /* Decide how many frames of history fit into one datagram, newest first.
      * The newest frame is never dropped - it is the one the other participants
      * are waiting for - and the event cap above guarantees that it fits. */
     uint32_t first = confirmed;
-    size_t budget = INPUTNET_MAX_PACKET - 16u; /* header, frame number, block count */
+    size_t budget = STREAMNET_MAX_PACKET - 16u; /* header, frame number, block count */
 
-    for (unsigned back=0;back < inputnet_redundancy;back++) {
+    for (unsigned back=0;back < streamnet_redundancy;back++) {
         if (confirmed < back) break;
 
         const uint32_t f = confirmed - back;
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(self,f);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(self,f);
         size_t need = 1;
-        if (slot != NULL) need += slot->events.size() * INPUTNET_MAX_EVENT_SIZE;
+        if (slot != NULL) need += slot->events.size() * STREAMNET_MAX_EVENT_SIZE;
 
         if (back != 0 && need > budget) break;
         budget = (need < budget) ? (budget - need) : 0;
         first = f;
     }
 
-    uint8_t buf[INPUTNET_MAX_PACKET];
-    InputNetWriter w(buf,sizeof(buf));
-    INPUTNET_BeginPacket(w,INPKT_INPUT);
+    uint8_t buf[STREAMNET_MAX_PACKET];
+    StreamNetWriter w(buf,sizeof(buf));
+    STREAMNET_BeginPacket(w,INPKT_INPUT);
     w.u32(confirmed);
     w.u8((uint8_t)(confirmed - first + 1u));
 
     for (uint32_t f=first;f <= confirmed;f++) {
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(self,f);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(self,f);
         const size_t n = (slot != NULL) ? slot->events.size() : 0;
         w.u8((uint8_t)n);
         for (size_t i=0;i < n;i++)
-            INPUTNET_WriteEvent(w,slot->events[i]);
+            STREAMNET_WriteEvent(w,slot->events[i]);
     }
 
     if (w.overflow()) {
-        LOG(LOG_MISC,LOG_WARN)("INPUTNET: input packet overflow, dropping history");
+        LOG(LOG_MISC,LOG_WARN)("STREAMNET: input packet overflow, dropping history");
         return;
     }
 
-    INPUTNET_SendToPeers(buf,w.size());
+    STREAMNET_SendToPeers(buf,w.size());
 }
 
-static void INPUTNET_HandleInputPacket(InputNetPeer &p,InputNetReader &r) {
+static void STREAMNET_HandleInputPacket(StreamNetPeer &p,StreamNetReader &r) {
     const uint32_t confirmed = r.u32();
     const unsigned blocks = r.u8();
     if (r.bad() || blocks == 0) return;
@@ -1116,22 +1116,22 @@ static void INPUTNET_HandleInputPacket(InputNetPeer &p,InputNetReader &r) {
 
         /* Already applied, or far enough in the future that it cannot be real. */
         const bool stale = (f <= p.delivered);
-        const bool absurd = (f > inputnet_frame + INPUTNET_RING/2u);
-        const bool have = (INPUTNET_FrameSlotIfValid(p,f) != NULL);
+        const bool absurd = (f > streamnet_frame + STREAMNET_RING/2u);
+        const bool have = (STREAMNET_FrameSlotIfValid(p,f) != NULL);
 
         if (stale || absurd || have) {
             /* Still need to walk past the events to stay in sync with the reader. */
             for (unsigned i=0;i < n;i++) {
-                InputNetEvent ev;
-                if (!INPUTNET_ReadEvent(r,ev)) return;
+                StreamNetEvent ev;
+                if (!STREAMNET_ReadEvent(r,ev)) return;
             }
             continue;
         }
 
-        InputNetFrame &slot = INPUTNET_FrameSlot(p,f);
+        StreamNetFrame &slot = STREAMNET_FrameSlot(p,f);
         for (unsigned i=0;i < n;i++) {
-            InputNetEvent ev;
-            if (!INPUTNET_ReadEvent(r,ev)) return;
+            StreamNetEvent ev;
+            if (!STREAMNET_ReadEvent(r,ev)) return;
             slot.events.push_back(ev);
         }
     }
@@ -1147,7 +1147,7 @@ extern bool use_save_file, noremark_save_state, force_load_state;
 extern std::string savefilename;
 extern std::string capturedir;
 
-static std::string INPUTNET_TempStatePath(void) {
+static std::string STREAMNET_TempStatePath(void) {
     std::string path;
     bool Get_Custom_SaveDir(std::string& savedir);
 
@@ -1163,15 +1163,15 @@ static std::string INPUTNET_TempStatePath(void) {
         path += CROSS_FILESPLIT;
     }
 
-    path += "inputnet-transfer.sav";
+    path += "streamnet-transfer.sav";
     return path;
 }
 
 /* Save state settings are global and driven by the menu; borrow them for the
  * duration of one save/load and put them back afterwards. */
-class InputNetSaveStateOverride {
+class StreamNetSaveStateOverride {
 public:
-    InputNetSaveStateOverride(const std::string &path,bool force_load) {
+    StreamNetSaveStateOverride(const std::string &path,bool force_load) {
         old_use = use_save_file;
         old_name = savefilename;
         old_noremark = noremark_save_state;
@@ -1184,7 +1184,7 @@ public:
         old_keep = savestate_keep_local_drives;
         if (force_load) savestate_keep_local_drives = true;
     }
-    ~InputNetSaveStateOverride() {
+    ~StreamNetSaveStateOverride() {
         use_save_file = old_use;
         savefilename = old_name;
         noremark_save_state = old_noremark;
@@ -1196,24 +1196,24 @@ private:
     std::string old_name;
 };
 
-static bool INPUTNET_SnapshotState(std::vector<uint8_t> &out) {
-    const std::string path = INPUTNET_TempStatePath();
+static bool STREAMNET_SnapshotState(std::vector<uint8_t> &out) {
+    const std::string path = STREAMNET_TempStatePath();
 
     out.clear();
     remove(path.c_str());
 
     try {
-        InputNetSaveStateOverride ov(path,false);
+        StreamNetSaveStateOverride ov(path,false);
         SaveState::instance().save(0);
     }
     catch (const SaveState::Error &err) {
-        LOG_MSG("INPUTNET: unable to save emulator state: %s",err.c_str());
+        LOG_MSG("STREAMNET: unable to save emulator state: %s",err.c_str());
         return false;
     }
 
     FILE *fp = fopen(path.c_str(),"rb");
     if (fp == NULL) {
-        LOG_MSG("INPUTNET: emulator state was not written to %s",path.c_str());
+        LOG_MSG("STREAMNET: emulator state was not written to %s",path.c_str());
         return false;
     }
 
@@ -1225,44 +1225,44 @@ static bool INPUTNET_SnapshotState(std::vector<uint8_t> &out) {
     remove(path.c_str());
 
     if (out.empty()) {
-        LOG_MSG("INPUTNET: emulator state is empty");
+        LOG_MSG("STREAMNET: emulator state is empty");
         return false;
     }
 
-    LOG_MSG("INPUTNET: emulator state snapshot is %lu bytes",(unsigned long)out.size());
+    LOG_MSG("STREAMNET: emulator state snapshot is %lu bytes",(unsigned long)out.size());
     return true;
 }
 
-static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
+static bool STREAMNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
     if (in.empty()) return false;
 
-    const std::string path = INPUTNET_TempStatePath();
+    const std::string path = STREAMNET_TempStatePath();
 
     FILE *fp = fopen(path.c_str(),"wb");
     if (fp == NULL) {
-        LOG_MSG("INPUTNET: cannot write %s: %s",path.c_str(),strerror(errno));
+        LOG_MSG("STREAMNET: cannot write %s: %s",path.c_str(),strerror(errno));
         return false;
     }
     const size_t written = fwrite(&in[0],1,in.size(),fp);
     fclose(fp);
     if (written != in.size()) {
-        LOG_MSG("INPUTNET: short write while storing the received emulator state");
+        LOG_MSG("STREAMNET: short write while storing the received emulator state");
         remove(path.c_str());
         return false;
     }
 
     bool ok = true;
-    if (inputnet_have_pending_vga) {    /* (before the load too: see RB_LoadResyncState) */
-        vga_fps = inputnet_pending_vga_fps;
-        vga_mode_time_base = inputnet_pending_vga_base;
-        vga_mode_frames_since_time_base = (int)inputnet_pending_vga_frames;
+    if (streamnet_have_pending_vga) {    /* (before the load too: see RB_LoadResyncState) */
+        vga_fps = streamnet_pending_vga_fps;
+        vga_mode_time_base = streamnet_pending_vga_base;
+        vga_mode_frames_since_time_base = (int)streamnet_pending_vga_frames;
     }
     try {
-        InputNetSaveStateOverride ov(path,true);
+        StreamNetSaveStateOverride ov(path,true);
         SaveState::instance().load(0);
     }
     catch (const SaveState::Error &err) {
-        LOG_MSG("INPUTNET: unable to load the received emulator state: %s",err.c_str());
+        LOG_MSG("STREAMNET: unable to load the received emulator state: %s",err.c_str());
         ok = false;
     }
 
@@ -1276,24 +1276,24 @@ static bool INPUTNET_ApplyStateSnapshot(const std::vector<uint8_t> &in) {
      * VGA state that was loaded says how it is mapped. */
     if (ok) VGA_SetupHandlers();
     if (ok) { extern void RENDER_EndUpdate(bool abort); RENDER_EndUpdate(true); }   /* (the window's frame in progress was another machine's) */
-    if (ok) INPUTNET_ClearHostVolumeLabels();
-    if (ok && inputnet_have_pending_clock) {
-        CMOS_SetSharedClock(inputnet_pending_clock);
-        dos.date.year = inputnet_pending_year;
-        dos.date.month = inputnet_pending_month;
-        dos.date.day = inputnet_pending_day;
-        inputnet_have_pending_clock = false;
+    if (ok) STREAMNET_ClearHostVolumeLabels();
+    if (ok && streamnet_have_pending_clock) {
+        CMOS_SetSharedClock(streamnet_pending_clock);
+        dos.date.year = streamnet_pending_year;
+        dos.date.month = streamnet_pending_month;
+        dos.date.day = streamnet_pending_day;
+        streamnet_have_pending_clock = false;
     }
-    if (ok && inputnet_have_pending_tsc) {
-        rdtsc_count_base = inputnet_pending_tsc;
+    if (ok && streamnet_have_pending_tsc) {
+        rdtsc_count_base = streamnet_pending_tsc;
         rdtsc_pic_base = PIC_FullIndex();
-        inputnet_have_pending_tsc = false;
+        streamnet_have_pending_tsc = false;
     }
-    if (ok && inputnet_have_pending_vga) {
-        vga_fps = inputnet_pending_vga_fps;
-        vga_mode_time_base = inputnet_pending_vga_base;
-        vga_mode_frames_since_time_base = (int)inputnet_pending_vga_frames;
-        inputnet_have_pending_vga = false;
+    if (ok && streamnet_have_pending_vga) {
+        vga_fps = streamnet_pending_vga_fps;
+        vga_mode_time_base = streamnet_pending_vga_base;
+        vga_mode_frames_since_time_base = (int)streamnet_pending_vga_frames;
+        streamnet_have_pending_vga = false;
     }
     remove(path.c_str());
     return ok;
@@ -1506,7 +1506,7 @@ static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std
         for (size_t i = 0; i < theirs.size() && !found; i++) found = (theirs[i].drive == mine[k].drive && theirs[i].path == mine[k].path);
         if (!found) extra++;
     }
-    LOG_MSG("INPUTNET: the server's files: %u, %u differ here and %u are missing (%llu KB to take over); %u files only here",
+    LOG_MSG("STREAMNET: the server's files: %u, %u differ here and %u are missing (%llu KB to take over); %u files only here",
         (unsigned)theirs.size(), differ, missing, (unsigned long long)(total >> 10), extra);
     return true;
 }
@@ -1526,19 +1526,19 @@ static void RB_SendFileRequest(void) {
     for (size_t off = 0; off < rb_cli_bits.size() || off == 0; off += per) {
         const size_t n = std::min(per, rb_cli_bits.size() - std::min(off, rb_cli_bits.size()));
         uint8_t buf[1100];
-        InputNetWriter w(buf, sizeof(buf));
-        INPUTNET_BeginPacket(w, INPKT_FILEREQ);
+        StreamNetWriter w(buf, sizeof(buf));
+        STREAMNET_BeginPacket(w, INPKT_FILEREQ);
         w.u32(rb_cli_manifest_count);
         w.u32((uint32_t)off);
         w.u16((uint16_t)n);
         if (n) w.bytes(&rb_cli_bits[off], n);
-        INPUTNET_SendRaw(inputnet_server_addr, buf, w.size());
+        STREAMNET_SendRaw(streamnet_server_addr, buf, w.size());
         if (rb_cli_bits.empty()) break;
     }
 }
 
 /* Server: a part of a joining participant's file request. */
-static void RB_HandleFileRequest(InputNetReader &r) {
+static void RB_HandleFileRequest(StreamNetReader &r) {
     const uint32_t count = r.u32(), off = r.u32();
     const unsigned n = r.u16();
     const uint8_t *b = n ? r.bytes(n) : NULL;
@@ -1657,11 +1657,11 @@ static void RB_UnmapReceivedFiles(void) {
     rb_sync_dirs.clear();
 }
 
-static uint8_t inputnet_xfer_type = 7;  /* INPKT_STATE or INPKT_FILES: the transfer acknowledgements count for */
+static uint8_t streamnet_xfer_type = 7;  /* INPKT_STATE or INPKT_FILES: the transfer acknowledgements count for */
 
-static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &state,uint8_t type = INPKT_STATE) {
+static bool STREAMNET_SendStateTo(StreamNetPeer &p,const std::vector<uint8_t> &state,uint8_t type = INPKT_STATE) {
     const uint32_t total = (uint32_t)state.size();
-    inputnet_xfer_type = type;
+    streamnet_xfer_type = type;
     p.confirmed = 0;
     uint32_t acked = 0;
     uint32_t lastprogress = GetTicks();
@@ -1671,17 +1671,17 @@ static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &sta
         if (!p.active) return false; /* the participant went away mid-transfer */
 
         uint32_t off = acked;
-        for (unsigned i=0;i < INPUTNET_STATE_WINDOW && off < total;i++) {
-            const uint32_t n = std::min((uint32_t)INPUTNET_STATE_CHUNK,total-off);
+        for (unsigned i=0;i < STREAMNET_STATE_WINDOW && off < total;i++) {
+            const uint32_t n = std::min((uint32_t)STREAMNET_STATE_CHUNK,total-off);
 
-            uint8_t buf[INPUTNET_STATE_CHUNK+32u];
-            InputNetWriter w(buf,sizeof(buf));
-            INPUTNET_BeginPacket(w,type);
+            uint8_t buf[STREAMNET_STATE_CHUNK+32u];
+            StreamNetWriter w(buf,sizeof(buf));
+            STREAMNET_BeginPacket(w,type);
             w.u32(total);
             w.u32(off);
             w.u16((uint16_t)n);
             w.bytes(&state[off],n);
-            if (!w.overflow()) INPUTNET_SendRaw(p.addr,buf,w.size());
+            if (!w.overflow()) STREAMNET_SendRaw(p.addr,buf,w.size());
 
             off += n;
         }
@@ -1690,17 +1690,17 @@ static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &sta
         const uint32_t waitstart = GetTicks();
         while ((GetTicks() - waitstart) < 250u) {
             const uint32_t before = acked;
-            INPUTNET_PollSocket();
-            /* INPUTNET_PollSocket() updates the ack through the shared variable
+            STREAMNET_PollSocket();
+            /* STREAMNET_PollSocket() updates the ack through the shared variable
              * below; re-read it. */
             acked = p.confirmed; /* reused as the state transfer ack while joining */
             if (acked != before) { lastprogress = GetTicks(); break; }
             if (acked >= total) break;
-            INPUTNET_Stall(last_events);
+            STREAMNET_Stall(last_events);
         }
 
-        if ((GetTicks() - lastprogress) > inputnet_timeout) {
-            LOG_MSG("INPUTNET: timed out transferring the emulator state (%u of %u bytes)",
+        if ((GetTicks() - lastprogress) > streamnet_timeout) {
+            LOG_MSG("STREAMNET: timed out transferring the emulator state (%u of %u bytes)",
                 (unsigned)acked,(unsigned)total);
             return false;
         }
@@ -1710,13 +1710,13 @@ static bool INPUTNET_SendStateTo(InputNetPeer &p,const std::vector<uint8_t> &sta
 }
 
 /* Client side: collect the snapshot the server is pushing at us. */
-static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,void (*nudge)(void) = NULL,uint8_t type = INPKT_STATE) {
+static bool STREAMNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,void (*nudge)(void) = NULL,uint8_t type = INPKT_STATE) {
     if (total == 0) return true;
     uint32_t lastnudge = 0;
 
     state.assign(total,0);
 
-    const uint32_t nchunks = (total + INPUTNET_STATE_CHUNK - 1u) / INPUTNET_STATE_CHUNK;
+    const uint32_t nchunks = (total + STREAMNET_STATE_CHUNK - 1u) / STREAMNET_STATE_CHUNK;
     std::vector<bool> got(nchunks,false);
     uint32_t have = 0;              /* bytes received in order */
     uint32_t lastprogress = GetTicks();
@@ -1727,12 +1727,12 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,voi
         bool advanced = false;
 
         for (;;) {
-            if (inputnet_socket == NULL) return false;
-            if (SDLNet_UDP_Recv(inputnet_socket,inputnet_recvpkt) <= 0) break;
+            if (streamnet_socket == NULL) return false;
+            if (SDLNet_UDP_Recv(streamnet_socket,streamnet_recvpkt) <= 0) break;
 
-            InputNetReader r((const uint8_t*)inputnet_recvpkt->data,(size_t)inputnet_recvpkt->len);
-            if (r.u32() != INPUTNET_MAGIC) continue;
-            if (r.u8() != (uint8_t)INPUTNET_PROTOVER) continue;
+            StreamNetReader r((const uint8_t*)streamnet_recvpkt->data,(size_t)streamnet_recvpkt->len);
+            if (r.u32() != STREAMNET_MAGIC) continue;
+            if (r.u8() != (uint8_t)STREAMNET_PROTOVER) continue;
             const uint8_t ptype = r.u8();
             r.u8(); /* peer id */
             r.u8(); /* reserved */
@@ -1743,12 +1743,12 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,voi
             const uint32_t n = r.u16();
             if (r.bad() || pkttotal != total) continue;
             if (off > total || n > total - off) continue;
-            if ((off % INPUTNET_STATE_CHUNK) != 0) continue;
+            if ((off % STREAMNET_STATE_CHUNK) != 0) continue;
 
             const uint8_t *data = r.bytes(n);
             if (data == NULL) continue;
 
-            const uint32_t idx = off / INPUTNET_STATE_CHUNK;
+            const uint32_t idx = off / STREAMNET_STATE_CHUNK;
             if (idx < nchunks && !got[idx]) {
                 memcpy(&state[off],data,n);
                 got[idx] = true;
@@ -1757,8 +1757,8 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,voi
         }
 
         if (advanced) {
-            while (have < total && got[have / INPUTNET_STATE_CHUNK])
-                have = std::min(total,have + INPUTNET_STATE_CHUNK);
+            while (have < total && got[have / STREAMNET_STATE_CHUNK])
+                have = std::min(total,have + STREAMNET_STATE_CHUNK);
             lastprogress = GetTicks();
         }
 
@@ -1766,11 +1766,11 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,voi
         const uint32_t now = GetTicks();
         if (advanced || (now - lastack) >= 50u) {
             uint8_t buf[32];
-            InputNetWriter w(buf,sizeof(buf));
-            INPUTNET_BeginPacket(w,INPKT_STATEACK);
+            StreamNetWriter w(buf,sizeof(buf));
+            STREAMNET_BeginPacket(w,INPKT_STATEACK);
             w.u32(have);
             w.u8(type);
-            INPUTNET_SendRaw(inputnet_server_addr,buf,w.size());
+            STREAMNET_SendRaw(streamnet_server_addr,buf,w.size());
             lastack = now;
         }
 
@@ -1779,23 +1779,23 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,voi
         /* until the first bytes come: repeat what made the server send them */
         if (nudge != NULL && have == 0 && (now - lastnudge) >= 300u) { nudge(); lastnudge = now; }
 
-        if ((GetTicks() - lastprogress) > inputnet_timeout) {
-            LOG_MSG("INPUTNET: timed out receiving the emulator state (%u of %u bytes)",
+        if ((GetTicks() - lastprogress) > streamnet_timeout) {
+            LOG_MSG("STREAMNET: timed out receiving the emulator state (%u of %u bytes)",
                 (unsigned)have,(unsigned)total);
             return false;
         }
 
-        INPUTNET_Stall(last_events);
+        STREAMNET_Stall(last_events);
     }
 
     /* Final acknowledge, repeated a few times because it may be lost. */
     for (unsigned i=0;i < 5;i++) {
         uint8_t buf[32];
-        InputNetWriter w(buf,sizeof(buf));
-        INPUTNET_BeginPacket(w,INPKT_STATEACK);
+        StreamNetWriter w(buf,sizeof(buf));
+        STREAMNET_BeginPacket(w,INPKT_STATEACK);
         w.u32(total);
         w.u8(type);
-        INPUTNET_SendRaw(inputnet_server_addr,buf,w.size());
+        STREAMNET_SendRaw(streamnet_server_addr,buf,w.size());
     }
 
     return true;
@@ -1805,88 +1805,88 @@ static bool INPUTNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,voi
 /* Session control                                                            */
 /* ------------------------------------------------------------------------- */
 
-static void INPUTNET_ResetSessionFrames(void) {
-    inputnet_frame = 0;
-    inputnet_local_confirmed = 0;
-    inputnet_tickaccum = 0;
-    inputnet_stat_stallms = 0;
-    inputnet_stat_frames = 0;
+static void STREAMNET_ResetSessionFrames(void) {
+    streamnet_frame = 0;
+    streamnet_local_confirmed = 0;
+    streamnet_tickaccum = 0;
+    streamnet_stat_stallms = 0;
+    streamnet_stat_frames = 0;
 
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++)
-        if (inputnet_peers[i].active) inputnet_peers[i].resetFrames();
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++)
+        if (streamnet_peers[i].active) streamnet_peers[i].resetFrames();
 }
 
-static void INPUTNET_StartSession(void) {
-    INPUTNET_ResetSessionFrames();
+static void STREAMNET_StartSession(void) {
+    STREAMNET_ResetSessionFrames();
 
-    for (unsigned i=0;i < INPUTNET_CHECK_RING;i++) inputnet_localchecks[i].valid = false;
-    inputnet_stat_desyncs = 0;
-    inputnet_stat_cycleupdates = 0;
+    for (unsigned i=0;i < STREAMNET_CHECK_RING;i++) streamnet_localchecks[i].valid = false;
+    streamnet_stat_desyncs = 0;
+    streamnet_stat_cycleupdates = 0;
 
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++)
-        if (inputnet_peers[i].active) inputnet_peers[i].ready = true;
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++)
+        if (streamnet_peers[i].active) streamnet_peers[i].ready = true;
 
-    memset(inputnet_keydown,0,sizeof(inputnet_keydown));
-    inputnet_buttondown = 0;
+    memset(streamnet_keydown,0,sizeof(streamnet_keydown));
+    streamnet_buttondown = 0;
 
-    inputnet_session = true;
-    inputnet_capture_active = true;
+    streamnet_session = true;
+    streamnet_capture_active = true;
 
-    LOG_MSG("INPUTNET: session running with %u participant(s), %u ms frames, %u frame input delay",
-        INPUTNET_PeerCount(),inputnet_frame_ms,inputnet_delay);
-    if (inputnet_rollback) RB_SessionStarted();
+    LOG_MSG("STREAMNET: session running with %u participant(s), %u ms frames, %u frame input delay",
+        STREAMNET_PeerCount(),streamnet_frame_ms,streamnet_delay);
+    if (streamnet_rollback) RB_SessionStarted();
 }
 
-static void INPUTNET_EndSession(const char *reason,bool notify_peers) {
-    if (notify_peers && inputnet_link_up) {
+static void STREAMNET_EndSession(const char *reason,bool notify_peers) {
+    if (notify_peers && streamnet_link_up) {
         uint8_t buf[16];
-        InputNetWriter w(buf,sizeof(buf));
-        INPUTNET_BeginPacket(w,INPKT_BYE);
-        INPUTNET_SendToPeers(buf,w.size());
+        StreamNetWriter w(buf,sizeof(buf));
+        STREAMNET_BeginPacket(w,INPKT_BYE);
+        STREAMNET_SendToPeers(buf,w.size());
     }
 
-    if (inputnet_session) {
-        inputnet_session = false;
-        inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
-        INPUTNET_ReleaseHeldInput();
+    if (streamnet_session) {
+        streamnet_session = false;
+        streamnet_capture_active = streamnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
+        STREAMNET_ReleaseHeldInput();
     }
     RB_SessionEnded();
 
-    inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
+    streamnet_capture_active = streamnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
 
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (p.local) { p.ready = false; continue; }
         p.active = false;
         p.ready = false;
         p.resetFrames();
     }
 
-    inputnet_pending_stateload = false;
-    inputnet_pending_state.clear();
+    streamnet_pending_stateload = false;
+    streamnet_pending_state.clear();
 
-    if (reason != NULL) LOG_MSG("INPUTNET: session ended (%s)",reason);
+    if (reason != NULL) LOG_MSG("STREAMNET: session ended (%s)",reason);
 }
 
-static void INPUTNET_CloseLink(const char *reason,bool notify_peers) {
-    INPUTNET_EndSession(reason,notify_peers);
+static void STREAMNET_CloseLink(const char *reason,bool notify_peers) {
+    STREAMNET_EndSession(reason,notify_peers);
 
-    if (inputnet_socket != NULL) {
-        SDLNet_UDP_Close(inputnet_socket);
-        inputnet_socket = NULL;
+    if (streamnet_socket != NULL) {
+        SDLNet_UDP_Close(streamnet_socket);
+        streamnet_socket = NULL;
     }
 
-    inputnet_link_up = false;
-    inputnet_is_server = false;
-    inputnet_selfid = 0;
-    inputnet_epoch = 0;
+    streamnet_link_up = false;
+    streamnet_is_server = false;
+    streamnet_selfid = 0;
+    streamnet_epoch = 0;
 
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        inputnet_peers[i].active = false;
-        inputnet_peers[i].local = false;
-        inputnet_peers[i].ready = false;
-        inputnet_peers[i].name.clear();
-        inputnet_peers[i].resetFrames();
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        streamnet_peers[i].active = false;
+        streamnet_peers[i].local = false;
+        streamnet_peers[i].ready = false;
+        streamnet_peers[i].name.clear();
+        streamnet_peers[i].resetFrames();
     }
 }
 
@@ -1898,20 +1898,20 @@ static void INPUTNET_CloseLink(const char *reason,bool notify_peers) {
  * restart the lockstep with everybody at frame 0. Emulation stands still for
  * the duration, which is exactly what we want: the state must not move while it
  * is being copied. */
-static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string &name) {
-    if (inputnet_accepting) return;
+static void STREAMNET_ServerAcceptClient(const IPaddress &addr,const std::string &name) {
+    if (streamnet_accepting) return;
 
     /* Not now: the client keeps saying hello and we pick it up a moment later. */
-    if (inputnet_in_program) return;
+    if (streamnet_in_program) return;
 
-    InputNetPeer *p = INPUTNET_PeerByAddr(addr);
+    StreamNetPeer *p = STREAMNET_PeerByAddr(addr);
 
     if (p == NULL) {
-        for (unsigned i=1;i < INPUTNET_MAX_PEERS;i++) {
-            if (!inputnet_peers[i].active) { p = &inputnet_peers[i]; break; }
+        for (unsigned i=1;i < STREAMNET_MAX_PEERS;i++) {
+            if (!streamnet_peers[i].active) { p = &streamnet_peers[i]; break; }
         }
         if (p == NULL) {
-            LOG_MSG("INPUTNET: no free slot for a new participant");
+            LOG_MSG("STREAMNET: no free slot for a new participant");
             return;
         }
         p->active = true;
@@ -1923,15 +1923,15 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         return;
     }
 
-    inputnet_accepting = true;
+    streamnet_accepting = true;
 
-    const uint8_t peerid = (uint8_t)(p - inputnet_peers);
+    const uint8_t peerid = (uint8_t)(p - streamnet_peers);
     p->name = name;
     p->ready = false;
     p->lastheard = GetTicks();
     p->resetFrames();
 
-    LOG_MSG("INPUTNET: participant \"%s\" joining from %d.%d.%d.%d as peer %u",
+    LOG_MSG("STREAMNET: participant \"%s\" joining from %d.%d.%d.%d as peer %u",
         name.c_str(),
         (int)( addr.host        & 0xFF),(int)((addr.host >>  8u) & 0xFF),
         (int)((addr.host >> 16u) & 0xFF),(int)((addr.host >> 24u) & 0xFF),
@@ -1939,20 +1939,20 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
 
     /* Everybody already running has to restart at frame 0 together with the new
      * participant, so stop the lockstep first. */
-    if (inputnet_session) {
-        inputnet_session = false;
-        inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
-        INPUTNET_ReleaseHeldInput();
+    if (streamnet_session) {
+        streamnet_session = false;
+        streamnet_capture_active = streamnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
+        STREAMNET_ReleaseHeldInput();
     }
 
     /* From here on the emulated machine stands still until the new participant
      * has taken over our state: it must not move on while it is being copied. */
     std::vector<uint8_t> state;
-    if (inputnet_sync_state && !INPUTNET_SnapshotState(state)) {
-        LOG_MSG("INPUTNET: state hand-off failed, dropping the new participant");
+    if (streamnet_sync_state && !STREAMNET_SnapshotState(state)) {
+        LOG_MSG("STREAMNET: state hand-off failed, dropping the new participant");
         p->active = false;
-        inputnet_accepting = false;
-        if (INPUTNET_PeerCount() > 1) INPUTNET_StartSession();
+        streamnet_accepting = false;
+        if (STREAMNET_PeerCount() > 1) STREAMNET_StartSession();
         return;
     }
 
@@ -1961,11 +1961,11 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
      * precision than they run at, and loading cuts the current round of timer
      * tick handlers short), so a machine that kept running from its live state
      * would drift a few CPU cycles away from one that loaded the copy. */
-    if (!state.empty() && !INPUTNET_ApplyStateSnapshot(state)) {
-        LOG_MSG("INPUTNET: could not reload the emulator state, dropping the new participant");
+    if (!state.empty() && !STREAMNET_ApplyStateSnapshot(state)) {
+        LOG_MSG("STREAMNET: could not reload the emulator state, dropping the new participant");
         p->active = false;
-        inputnet_accepting = false;
-        if (INPUTNET_PeerCount() > 1) INPUTNET_StartSession();
+        streamnet_accepting = false;
+        if (STREAMNET_PeerCount() > 1) STREAMNET_StartSession();
         return;
     }
 
@@ -1973,26 +1973,26 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
     rb_filereq_ready = false;
     rb_filereq_bits.clear();
     rb_filereq_part.clear();
-    if (inputnet_rollback && !state.empty()) {
+    if (streamnet_rollback && !state.empty()) {
         RB_BuildManifest(rb_srv_manifest);
         RB_PutManifest(state, rb_srv_manifest);
-        LOG_MSG("INPUTNET: %u files on the mounted folders listed for the joining participant",(unsigned)rb_srv_manifest.size());
+        LOG_MSG("STREAMNET: %u files on the mounted folders listed for the joining participant",(unsigned)rb_srv_manifest.size());
     }
 
     uint8_t welcome[1024];   /* RollbackNet adds its settings fingerprint */
-    InputNetWriter w(welcome,sizeof(welcome));
-    INPUTNET_BeginPacket(w,INPKT_WELCOME);
+    StreamNetWriter w(welcome,sizeof(welcome));
+    STREAMNET_BeginPacket(w,INPKT_WELCOME);
     w.u8(peerid);
-    w.u16((uint16_t)inputnet_frame_ms);
-    w.u16((uint16_t)inputnet_delay);
-    w.u16((uint16_t)inputnet_redundancy);
-    w.u8(inputnet_share_keyboard ? 1 : 0);
-    w.u8(inputnet_share_mouse ? 1 : 0);
-    w.u8((uint8_t)inputnet_cyclesync);
+    w.u16((uint16_t)streamnet_frame_ms);
+    w.u16((uint16_t)streamnet_delay);
+    w.u16((uint16_t)streamnet_redundancy);
+    w.u8(streamnet_share_keyboard ? 1 : 0);
+    w.u8(streamnet_share_mouse ? 1 : 0);
+    w.u8((uint8_t)streamnet_cyclesync);
     w.u32((uint32_t)state.size());
     /* Lets the client refuse a state it would run differently (see CALLBACK_LayoutSignature). */
     w.u32(CALLBACK_LayoutSignature());
-    LOG_MSG("INPUTNET: callback layout %08x",(unsigned int)CALLBACK_LayoutSignature());
+    LOG_MSG("STREAMNET: callback layout %08x",(unsigned int)CALLBACK_LayoutSignature());
     {
         uint8_t clock[16];
         CMOS_GetSharedClock(clock);
@@ -2003,20 +2003,20 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         RDTSC_rebase();
         w.u32((uint32_t)(rdtsc_count_base >> 32u));
         w.u32((uint32_t)rdtsc_count_base);
-        const uint64_t fps = INPUTNET_DoubleBits(vga_fps), base = INPUTNET_DoubleBits(vga_mode_time_base);
+        const uint64_t fps = STREAMNET_DoubleBits(vga_fps), base = STREAMNET_DoubleBits(vga_mode_time_base);
         w.u32((uint32_t)(fps >> 32u)); w.u32((uint32_t)fps);
         w.u32((uint32_t)(base >> 32u)); w.u32((uint32_t)base);
         w.u32((uint32_t)vga_mode_frames_since_time_base);
     }
-    w.u8(inputnet_rollback ? 1 : 0);
-    w.u8((uint8_t)inputnet_rbwindow);
-    if (inputnet_rollback) {    /* what has to be the same on every computer for the machines to run identically */
+    w.u8(streamnet_rollback ? 1 : 0);
+    w.u8((uint8_t)streamnet_rbwindow);
+    if (streamnet_rollback) {    /* what has to be the same on every computer for the machines to run identically */
         const std::string fp = RB_Fingerprint();
         w.u16((uint16_t)fp.size());
         w.bytes((const uint8_t*)fp.data(), fp.size());
     }
     const size_t welcomelen = w.size();
-    INPUTNET_SendRaw(p->addr,welcome,welcomelen);
+    STREAMNET_SendRaw(p->addr,welcome,welcomelen);
 
     /* "confirmed" doubles as the save state transfer acknowledge while joining. */
     p->confirmed = 0;
@@ -2029,15 +2029,15 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
         uint32_t last_events = GetTicks();
         const uint32_t wstart = GetTicks();
         while (p->confirmed == 0 && (GetTicks() - wstart) < 1000u) {
-            INPUTNET_SendRaw(p->addr,welcome,welcomelen);
+            STREAMNET_SendRaw(p->addr,welcome,welcomelen);
             const uint32_t round = GetTicks();
             while ((GetTicks() - round) < 100u && p->confirmed == 0) {
-                INPUTNET_PollSocket();
-                INPUTNET_Stall(last_events);
+                STREAMNET_PollSocket();
+                STREAMNET_Stall(last_events);
             }
         }
 
-        ok = INPUTNET_SendStateTo(*p,state);
+        ok = STREAMNET_SendStateTo(*p,state);
     }
 
     /* Wait for the client to report that it applied the state and is ready. */
@@ -2048,24 +2048,24 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
 
         bool files_sent = false;
         while (!p->ready) {
-            INPUTNET_PollSocket();
+            STREAMNET_PollSocket();
             if (p->ready) break;
 
             if (rb_filereq_ready && !files_sent) {     /* RollbackNet: the files it asked for */
                 files_sent = true;
                 std::vector<uint8_t> files;
                 if (!RB_BuildFileBlob(files)) {
-                    LOG_MSG("INPUTNET: could not read the game files \"%s\" asked for",p->name.c_str());
+                    LOG_MSG("STREAMNET: could not read the game files \"%s\" asked for",p->name.c_str());
                     ok = false;
                     break;
                 }
-                LOG_MSG("INPUTNET: sending %u KB of game files to \"%s\"",(unsigned)(files.size() >> 10),p->name.c_str());
-                if (!INPUTNET_SendStateTo(*p,files,INPKT_FILES)) { ok = false; break; }
+                LOG_MSG("STREAMNET: sending %u KB of game files to \"%s\"",(unsigned)(files.size() >> 10),p->name.c_str());
+                if (!STREAMNET_SendStateTo(*p,files,INPKT_FILES)) { ok = false; break; }
                 continue;
             }
 
-            if ((GetTicks() - waitstart) > inputnet_timeout) {
-                LOG_MSG("INPUTNET: participant \"%s\" never became ready",p->name.c_str());
+            if ((GetTicks() - waitstart) > streamnet_timeout) {
+                LOG_MSG("STREAMNET: participant \"%s\" never became ready",p->name.c_str());
                 ok = false;
                 break;
             }
@@ -2073,19 +2073,19 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
             /* A client that never saw the welcome keeps saying hello; repeating
              * the welcome is what gets it moving again. */
             if (state.empty() && (GetTicks() - lastwelcome) >= 250u) {
-                INPUTNET_SendRaw(p->addr,welcome,welcomelen);
+                STREAMNET_SendRaw(p->addr,welcome,welcomelen);
                 lastwelcome = GetTicks();
             }
 
-            INPUTNET_Stall(last_events);
+            STREAMNET_Stall(last_events);
         }
     }
 
     if (!ok) {
         p->active = false;
         p->ready = false;
-        inputnet_accepting = false;
-        if (INPUTNET_PeerCount() > 1) INPUTNET_StartSession();
+        streamnet_accepting = false;
+        if (STREAMNET_PeerCount() > 1) STREAMNET_StartSession();
         return;
     }
 
@@ -2094,38 +2094,38 @@ static void INPUTNET_ServerAcceptClient(const IPaddress &addr,const std::string 
      * repeated a few times because a lost one would leave a participant waiting
      * forever; the epoch makes the repeats harmless. */
     {
-        inputnet_epoch++;
+        streamnet_epoch++;
 
         /* The save state does not carry the cycle count, so it is sent here:
          * everybody has to start out executing the same amount of guest code
          * per emulated millisecond. */
-        inputnet_cyclemax = (uint32_t)CPU_CycleMax;
+        streamnet_cyclemax = (uint32_t)CPU_CycleMax;
 
         uint8_t sbuf[64];
-        InputNetWriter sw(sbuf,sizeof(sbuf));
-        INPUTNET_BeginPacket(sw,INPKT_START);
-        sw.u32(inputnet_epoch);
-        sw.u32(inputnet_cyclemax);
+        StreamNetWriter sw(sbuf,sizeof(sbuf));
+        STREAMNET_BeginPacket(sw,INPKT_START);
+        sw.u32(streamnet_epoch);
+        sw.u32(streamnet_cyclemax);
         /* "cycles=auto" restores this when a DOS program exits, which the guest
          * triggers at the same emulated moment everywhere - but only produces
          * the same result if the saved value matches too. */
         sw.u32((uint32_t)CPU_OldCycleMax);
-        sw.u8((uint8_t)INPUTNET_PeerCount());
-        for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++)
-            if (inputnet_peers[i].active) sw.u8((uint8_t)i);
+        sw.u8((uint8_t)STREAMNET_PeerCount());
+        for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++)
+            if (streamnet_peers[i].active) sw.u8((uint8_t)i);
 
-        for (unsigned i=0;i < 4;i++) INPUTNET_SendToPeers(sbuf,sw.size());
+        for (unsigned i=0;i < 4;i++) STREAMNET_SendToPeers(sbuf,sw.size());
     }
 
-    inputnet_accepting = false;
-    INPUTNET_StartSession();
+    streamnet_accepting = false;
+    STREAMNET_StartSession();
 }
 
-static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
-    InputNetReader r(data,len);
+static void STREAMNET_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
+    StreamNetReader r(data,len);
 
-    if (r.u32() != INPUTNET_MAGIC) return;
-    if (r.u8() != (uint8_t)INPUTNET_PROTOVER) return;
+    if (r.u32() != STREAMNET_MAGIC) return;
+    if (r.u8() != (uint8_t)STREAMNET_PROTOVER) return;
     const uint8_t type = r.u8();
     const uint8_t peerid = r.u8();
     r.u8(); /* reserved */
@@ -2133,7 +2133,7 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
 
     switch (type) {
         case INPKT_HELLO: {
-            if (!inputnet_is_server) return;
+            if (!streamnet_is_server) return;
             const uint8_t namelen = r.u8();
             std::string name;
             const uint8_t *nb = r.bytes(namelen);
@@ -2153,7 +2153,7 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
                     if (name.empty() || !REMOTEPLAY_SameSecret(token,REMOTEPLAY_AuthToken(secret,name))) {
                         static uint32_t last_told = 0;
                         if ((GetTicks() - last_told) > 5000u) {
-                            LOG_MSG("INPUTNET: refused a join as \"%s\": not invited to this room (no valid token)",name.c_str());
+                            LOG_MSG("STREAMNET: refused a join as \"%s\": not invited to this room (no valid token)",name.c_str());
                             last_told = GetTicks();
                         }
                         return;
@@ -2165,26 +2165,26 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
              * again until it is answered. */
             if (rbc_copies) { RBC_ServerHello(from,name,copies,want); break; }
             if (copies != 0) return;        /* a cluster's computer: this session is not one */
-            if (!inputnet_in_tick) return;
-            INPUTNET_ServerAcceptClient(from,name);
+            if (!streamnet_in_tick) return;
+            STREAMNET_ServerAcceptClient(from,name);
             break;
         }
 
         case INPKT_STATEACK: {
-            if (!inputnet_is_server) return;
-            InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            if (!streamnet_is_server) return;
+            StreamNetPeer *p = STREAMNET_PeerByAddr(from);
             if (p == NULL) return;
             const uint32_t ack = r.u32();
             if (r.bad()) return;
-            if (r.remain() >= 1 && r.u8() != inputnet_xfer_type) return;    /* the other transfer's, late */
+            if (r.remain() >= 1 && r.u8() != streamnet_xfer_type) return;    /* the other transfer's, late */
             if (!p->ready && ack > p->confirmed) p->confirmed = ack;
             p->lastheard = GetTicks();
             break;
         }
 
         case INPKT_FILEREQ: {
-            if (!inputnet_is_server || !inputnet_rollback) return;
-            InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            if (!streamnet_is_server || !streamnet_rollback) return;
+            StreamNetPeer *p = STREAMNET_PeerByAddr(from);
             if (p == NULL || p->ready) return;
             RB_HandleFileRequest(r);
             p->lastheard = GetTicks();
@@ -2192,8 +2192,8 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
         }
 
         case INPKT_READY: {
-            if (!inputnet_is_server) return;
-            InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            if (!streamnet_is_server) return;
+            StreamNetPeer *p = STREAMNET_PeerByAddr(from);
             if (p == NULL) return;
             p->ready = true;
             p->lastheard = GetTicks();
@@ -2201,134 +2201,134 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
         }
 
         case INPKT_START: {
-            if (inputnet_is_server) return;
-            if (!INPUTNET_SameAddr(from,inputnet_server_addr)) return;
+            if (streamnet_is_server) return;
+            if (!STREAMNET_SameAddr(from,streamnet_server_addr)) return;
 
             const uint32_t epoch = r.u32();
             const uint32_t cyclemax = r.u32();
             const uint32_t oldcyclemax = r.u32();
             const unsigned npeers = r.u8();
-            if (r.bad() || npeers == 0 || npeers > INPUTNET_MAX_PEERS) return;
+            if (r.bad() || npeers == 0 || npeers > STREAMNET_MAX_PEERS) return;
 
-            uint8_t ids[INPUTNET_MAX_PEERS];
+            uint8_t ids[STREAMNET_MAX_PEERS];
             for (unsigned i=0;i < npeers;i++) {
                 ids[i] = r.u8();
-                if (ids[i] >= INPUTNET_MAX_PEERS) return;
+                if (ids[i] >= STREAMNET_MAX_PEERS) return;
             }
             if (r.bad()) return;
 
             /* The server repeats the start; only act on the first copy, or the
              * frame numbering would be reset out from under a running session. */
-            if (epoch == inputnet_epoch) break;
-            inputnet_epoch = epoch;
+            if (epoch == streamnet_epoch) break;
+            streamnet_epoch = epoch;
 
-            if (inputnet_session) {
-                inputnet_session = false;
-                inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
-                INPUTNET_ReleaseHeldInput();
+            if (streamnet_session) {
+                streamnet_session = false;
+                streamnet_capture_active = streamnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
+                STREAMNET_ReleaseHeldInput();
             }
 
-            for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-                inputnet_peers[i].active = false;
-                inputnet_peers[i].ready = false;
-                inputnet_peers[i].local = false;
-                inputnet_peers[i].resetFrames();
+            for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+                streamnet_peers[i].active = false;
+                streamnet_peers[i].ready = false;
+                streamnet_peers[i].local = false;
+                streamnet_peers[i].resetFrames();
             }
             for (unsigned i=0;i < npeers;i++) {
-                InputNetPeer &p = inputnet_peers[ids[i]];
+                StreamNetPeer &p = streamnet_peers[ids[i]];
                 p.active = true;
-                p.local = (ids[i] == inputnet_selfid);
+                p.local = (ids[i] == streamnet_selfid);
                 /* Everything reaches us through the server. */
-                if (!p.local) p.addr = inputnet_server_addr;
+                if (!p.local) p.addr = streamnet_server_addr;
             }
 
             /* Adopt the server's emulated CPU speed before the first frame runs. */
-            if (cyclemax != 0 && inputnet_cyclesync != INCYCLES_OFF) {
-                inputnet_cyclemax = cyclemax;
+            if (cyclemax != 0 && streamnet_cyclesync != INCYCLES_OFF) {
+                streamnet_cyclemax = cyclemax;
                 if (oldcyclemax != 0) CPU_OldCycleMax = (cpu_cycles_count_t)oldcyclemax;
                 DOSBOX_ApplyCycleMax((cpu_cycles_count_t)cyclemax,true);
             }
 
             /* We must always be in our own roster, or our input would go nowhere. */
-            if (inputnet_selfid < INPUTNET_MAX_PEERS) {
-                InputNetPeer &self = inputnet_peers[inputnet_selfid];
+            if (streamnet_selfid < STREAMNET_MAX_PEERS) {
+                StreamNetPeer &self = streamnet_peers[streamnet_selfid];
                 self.active = true;
                 self.local = true;
             }
 
-            INPUTNET_StartSession();
+            STREAMNET_StartSession();
             break;
         }
 
         case INPKT_INPUT: {
-            if (peerid >= INPUTNET_MAX_PEERS) return;
-            if (peerid == inputnet_selfid) return;
+            if (peerid >= STREAMNET_MAX_PEERS) return;
+            if (peerid == streamnet_selfid) return;
 
-            InputNetPeer &p = inputnet_peers[peerid];
+            StreamNetPeer &p = streamnet_peers[peerid];
             if (!p.active) {
                 /* A client learns about the other participants from the packets
                  * the server relays to it. */
-                if (inputnet_is_server) return;
+                if (streamnet_is_server) return;
                 p.active = true;
                 p.local = false;
                 p.ready = true;
-                p.addr = inputnet_server_addr;
+                p.addr = streamnet_server_addr;
                 p.resetFrames();
             }
             p.lastheard = GetTicks();
-            INPUTNET_HandleInputPacket(p,r);
+            STREAMNET_HandleInputPacket(p,r);
 
             /* The server is the hub: pass it on to everybody else. */
-            if (inputnet_is_server) {
-                InputNetPeer *src = INPUTNET_PeerByAddr(from);
-                INPUTNET_SendToPeers(data,len,src);
+            if (streamnet_is_server) {
+                StreamNetPeer *src = STREAMNET_PeerByAddr(from);
+                STREAMNET_SendToPeers(data,len,src);
             }
             break;
         }
 
         case INPKT_RBINPUT: {
-            if (!inputnet_rollback || !inputnet_session) return;
-            if (peerid >= INPUTNET_MAX_PEERS || peerid == inputnet_selfid) return;
-            InputNetPeer &p = inputnet_peers[peerid];
+            if (!streamnet_rollback || !streamnet_session) return;
+            if (peerid >= STREAMNET_MAX_PEERS || peerid == streamnet_selfid) return;
+            StreamNetPeer &p = streamnet_peers[peerid];
             if (!p.active) {
-                if (inputnet_is_server) return;
+                if (streamnet_is_server) return;
                 p.active = true;
                 p.local = false;
                 p.ready = true;
-                p.addr = inputnet_server_addr;
+                p.addr = streamnet_server_addr;
                 p.resetFrames();
             }
             p.lastheard = GetTicks();
             RB_HandleInput(p,peerid,r);
-            if (inputnet_is_server) {   /* the hub: pass it on to the other clients */
-                InputNetPeer *src = INPUTNET_PeerByAddr(from);
-                INPUTNET_SendToPeers(data,len,src);
+            if (streamnet_is_server) {   /* the hub: pass it on to the other clients */
+                StreamNetPeer *src = STREAMNET_PeerByAddr(from);
+                STREAMNET_SendToPeers(data,len,src);
             }
             break;
         }
 
         case INPKT_RESYNC: {
-            if (!inputnet_rollback || !inputnet_session) return;
-            if (!inputnet_is_server && !INPUTNET_SameAddr(from,inputnet_server_addr)) return;
+            if (!streamnet_rollback || !streamnet_session) return;
+            if (!streamnet_is_server && !STREAMNET_SameAddr(from,streamnet_server_addr)) return;
             RB_HandleResync(r,from,peerid);
             break;
         }
 
         case INPKT_CHECK: {
-            if (peerid >= INPUTNET_MAX_PEERS || peerid == inputnet_selfid) return;
-            InputNetPeer &p = inputnet_peers[peerid];
+            if (peerid >= STREAMNET_MAX_PEERS || peerid == streamnet_selfid) return;
+            StreamNetPeer &p = streamnet_peers[peerid];
             if (!p.active) return;
 
             const uint32_t frame = r.u32();
             const uint32_t hash = r.u32();
             if (r.bad()) return;
 
-            INPUTNET_CompareCheck(p,frame,hash);
+            STREAMNET_CompareCheck(p,frame,hash);
 
             /* The server is the hub for these too. */
-            if (inputnet_is_server) {
-                InputNetPeer *src = INPUTNET_PeerByAddr(from);
-                INPUTNET_SendToPeers(data,len,src);
+            if (streamnet_is_server) {
+                StreamNetPeer *src = STREAMNET_PeerByAddr(from);
+                STREAMNET_SendToPeers(data,len,src);
             }
             break;
         }
@@ -2337,17 +2337,17 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
             const uint32_t token = r.u32();
             if (r.bad()) return;
             uint8_t buf[32];
-            InputNetWriter w(buf,sizeof(buf));
-            INPUTNET_BeginPacket(w,INPKT_PONG);
+            StreamNetWriter w(buf,sizeof(buf));
+            STREAMNET_BeginPacket(w,INPKT_PONG);
             w.u32(token);
-            INPUTNET_SendRaw(from,buf,w.size());
+            STREAMNET_SendRaw(from,buf,w.size());
             break;
         }
 
         case INPKT_PONG: {
             const uint32_t token = r.u32();
             if (r.bad()) return;
-            InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            StreamNetPeer *p = STREAMNET_PeerByAddr(from);
             if (p != NULL) {
                 const uint32_t now = GetTicks();
                 p->rtt = (now >= token) ? (now - token) : 0;
@@ -2357,12 +2357,12 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
         }
 
         case INPKT_BYE: {
-            if (inputnet_is_server) {
-                InputNetPeer *p = INPUTNET_PeerByAddr(from);
+            if (streamnet_is_server) {
+                StreamNetPeer *p = STREAMNET_PeerByAddr(from);
                 if (p == NULL) break;
-                if (rbc_copies) { RBC_ServerDrop((unsigned)(p - inputnet_peers), "left"); break; }
+                if (rbc_copies) { RBC_ServerDrop((unsigned)(p - streamnet_peers), "left"); break; }
 
-                LOG_MSG("INPUTNET: participant \"%s\" left",p->name.c_str());
+                LOG_MSG("STREAMNET: participant \"%s\" left",p->name.c_str());
                 p->active = false;
                 p->ready = false;
                 p->resetFrames();
@@ -2371,10 +2371,10 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
                  * applied different amounts of that participant's input, so the
                  * session cannot simply carry on: everybody has to rejoin and
                  * pick the state up again. The server itself stays available. */
-                INPUTNET_EndSession("a participant left",true);
+                STREAMNET_EndSession("a participant left",true);
             }
-            else if (INPUTNET_SameAddr(from,inputnet_server_addr)) {
-                INPUTNET_CloseLink("server closed the session",false);
+            else if (STREAMNET_SameAddr(from,streamnet_server_addr)) {
+                STREAMNET_CloseLink("server closed the session",false);
             }
             break;
         }
@@ -2384,54 +2384,54 @@ static void INPUTNET_HandlePacket(const IPaddress &from,const uint8_t *data,size
     }
 }
 
-static void INPUTNET_PollSocket(void) {
-    if (!inputnet_delayed.empty()) INPUTNET_FlushDelayed();
+static void STREAMNET_PollSocket(void) {
+    if (!streamnet_delayed.empty()) STREAMNET_FlushDelayed();
     RBC_PollLeader();
-    if (inputnet_socket == NULL || inputnet_recvpkt == NULL) return;
+    if (streamnet_socket == NULL || streamnet_recvpkt == NULL) return;
 
     /* Bound the amount of work per call so a flood cannot lock us up. */
     for (unsigned i=0;i < 256;i++) {
-        const int got = SDLNet_UDP_Recv(inputnet_socket,inputnet_recvpkt);
+        const int got = SDLNet_UDP_Recv(streamnet_socket,streamnet_recvpkt);
         if (got <= 0) break;
-        INPUTNET_HandlePacket(inputnet_recvpkt->address,
-            (const uint8_t*)inputnet_recvpkt->data,(size_t)inputnet_recvpkt->len);
+        STREAMNET_HandlePacket(streamnet_recvpkt->address,
+            (const uint8_t*)streamnet_recvpkt->data,(size_t)streamnet_recvpkt->len);
     }
 }
 
 /* Block until every participant has published its input for "frame". This is
  * the actual lockstep: it is what keeps the emulated machines from drifting
  * apart when one host is faster than the other. */
-static bool INPUTNET_WaitForPeers(uint32_t frame) {
+static bool STREAMNET_WaitForPeers(uint32_t frame) {
     const uint32_t start = GetTicks();
     uint32_t last_events = start;
 
     for (;;) {
-        INPUTNET_PollSocket();
+        STREAMNET_PollSocket();
 
         bool waiting = false;
-        for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-            InputNetPeer &p = inputnet_peers[i];
+        for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+            StreamNetPeer &p = streamnet_peers[i];
             if (!p.active || !p.ready || p.local) continue;
             if (p.confirmed < frame) { waiting = true; break; }
         }
         if (!waiting) break;
 
-        if (!inputnet_session) return false; /* torn down underneath us */
+        if (!streamnet_session) return false; /* torn down underneath us */
 
-        if ((GetTicks() - start) > inputnet_timeout) {
+        if ((GetTicks() - start) > streamnet_timeout) {
             /* The server stays up so that a participant can rejoin; a client has
              * nothing left to talk to and drops the link entirely. */
-            if (inputnet_is_server)
-                INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
+            if (streamnet_is_server)
+                STREAMNET_EndSession("timed out waiting for the other participant(s)",true);
             else
-                INPUTNET_CloseLink("timed out waiting for the server",true);
+                STREAMNET_CloseLink("timed out waiting for the server",true);
             return false;
         }
 
-        INPUTNET_Stall(last_events);
+        STREAMNET_Stall(last_events);
     }
 
-    inputnet_stat_stallms += GetTicks() - start;
+    streamnet_stat_stallms += GetTicks() - start;
     return true;
 }
 
@@ -2439,80 +2439,80 @@ static bool INPUTNET_WaitForPeers(uint32_t frame) {
 /* Client side connect                                                        */
 /* ------------------------------------------------------------------------- */
 
-static bool INPUTNET_OpenSocket(uint16_t port) {
+static bool STREAMNET_OpenSocket(uint16_t port) {
     if (!SDLNetInited) {
         if (SDLNet_Init() == -1) {
-            LOG_MSG("INPUTNET: SDLNet_Init failed: %s",SDLNet_GetError());
+            LOG_MSG("STREAMNET: SDLNet_Init failed: %s",SDLNet_GetError());
             return false;
         }
         SDLNetInited = true;
     }
 
     /* Must hold the largest packet we send or receive: an input packet may be up
-     * to INPUTNET_MAX_PACKET, a save state chunk a little over the chunk size. */
-    const int pktsize = (int)std::max((size_t)INPUTNET_MAX_PACKET,(size_t)INPUTNET_STATE_CHUNK+64u);
-    if (inputnet_sendpkt == NULL) inputnet_sendpkt = SDLNet_AllocPacket(pktsize);
-    if (inputnet_recvpkt == NULL) inputnet_recvpkt = SDLNet_AllocPacket(pktsize);
-    if (inputnet_sendpkt == NULL || inputnet_recvpkt == NULL) {
-        LOG_MSG("INPUTNET: out of memory allocating packet buffers");
+     * to STREAMNET_MAX_PACKET, a save state chunk a little over the chunk size. */
+    const int pktsize = (int)std::max((size_t)STREAMNET_MAX_PACKET,(size_t)STREAMNET_STATE_CHUNK+64u);
+    if (streamnet_sendpkt == NULL) streamnet_sendpkt = SDLNet_AllocPacket(pktsize);
+    if (streamnet_recvpkt == NULL) streamnet_recvpkt = SDLNet_AllocPacket(pktsize);
+    if (streamnet_sendpkt == NULL || streamnet_recvpkt == NULL) {
+        LOG_MSG("STREAMNET: out of memory allocating packet buffers");
         return false;
     }
 
-    inputnet_socket = SDLNet_UDP_Open(port);
-    if (inputnet_socket == NULL) {
-        LOG_MSG("INPUTNET: unable to open UDP port %u: %s",(unsigned)port,SDLNet_GetError());
+    streamnet_socket = SDLNet_UDP_Open(port);
+    if (streamnet_socket == NULL) {
+        LOG_MSG("STREAMNET: unable to open UDP port %u: %s",(unsigned)port,SDLNet_GetError());
         return false;
     }
 
-    inputnet_active_port = port;
+    streamnet_active_port = port;
     return true;
 }
 
-static bool INPUTNET_StartServer(uint16_t port) {
-    if (inputnet_link_up) return false;
+static bool STREAMNET_StartServer(uint16_t port) {
+    if (streamnet_link_up) return false;
 
-    if (!INPUTNET_OpenSocket(port)) return false;
+    if (!STREAMNET_OpenSocket(port)) return false;
 
-    inputnet_is_server = true;
-    inputnet_link_up = true;
-    inputnet_selfid = 0;
+    streamnet_is_server = true;
+    streamnet_link_up = true;
+    streamnet_selfid = 0;
 
-    InputNetPeer &self = inputnet_peers[0];
+    StreamNetPeer &self = streamnet_peers[0];
     self.active = true;
     self.local = true;
     self.ready = false;
     self.name = "server";
     self.resetFrames();
 
-    INPUTNET_ClearHostVolumeLabels();
-    LOG_MSG("INPUTNET: waiting for participants on UDP port %u",(unsigned)port);
+    STREAMNET_ClearHostVolumeLabels();
+    LOG_MSG("STREAMNET: waiting for participants on UDP port %u",(unsigned)port);
     /* a cluster's copies run from now on, nobody else there or not (the others join it: RBC_ServerHello) */
-    if (rbc_copies) { rb_start_frame = 0; INPUTNET_StartSession(); }
+    if (rbc_copies) { rb_start_frame = 0; STREAMNET_StartSession(); }
     return true;
 }
 
-static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg) {
-    if (inputnet_link_up) { errmsg = "already connected"; return false; }
+static bool STREAMNET_Connect(const char *host,uint16_t port,std::string &errmsg) {
+    if (streamnet_link_up) { errmsg = "already connected"; return false; }
 
-    if (!INPUTNET_OpenSocket(0)) { errmsg = "unable to open a UDP socket"; return false; }
+    if (!STREAMNET_OpenSocket(0)) { errmsg = "unable to open a UDP socket"; return false; }
 
-    if (SDLNet_ResolveHost(&inputnet_server_addr,host,port) != 0) {
+    if (SDLNet_ResolveHost(&streamnet_server_addr,host,port) != 0) {
         errmsg = "unable to resolve the server address";
-        SDLNet_UDP_Close(inputnet_socket);
-        inputnet_socket = NULL;
+        SDLNet_UDP_Close(streamnet_socket);
+        streamnet_socket = NULL;
         return false;
     }
 
-    inputnet_is_server = false;
-    inputnet_link_up = true;
-    inputnet_selfid = 0xFF; /* until the server assigns one */
+    streamnet_is_server = false;
+    streamnet_link_up = true;
+    streamnet_selfid = 0xFF; /* until the server assigns one */
 
     /* Say hello until the server answers. The name and the room token come from NukemNet (as for the remote play
      * viewer): a server started with NN_RP_AUTH_SECRET takes only a name with its token. */
     extern std::string REMOTEPLAY_CleanName(const std::string &name);
     uint8_t buf[160];
-    InputNetWriter w(buf,sizeof(buf));
-    INPUTNET_BeginPacket(w,INPKT_HELLO);
+    StreamNetWriter w(buf,sizeof(buf));
+    STREAMNET_BeginPacket(w,INPKT_HELLO);
     std::string me = "client";
     {
         const char *u = getenv("USERNAME");
@@ -2533,13 +2533,13 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
     const uint32_t start = GetTicks();
 
     while (!welcomed) {
-        INPUTNET_SendRaw(inputnet_server_addr,buf,w.size());
+        STREAMNET_SendRaw(streamnet_server_addr,buf,w.size());
 
         const uint32_t round = GetTicks();
         while (!welcomed && (GetTicks() - round) < 250u) {
-            if (SDLNet_UDP_Recv(inputnet_socket,inputnet_recvpkt) > 0) {
-                InputNetReader r((const uint8_t*)inputnet_recvpkt->data,(size_t)inputnet_recvpkt->len);
-                if (r.u32() == INPUTNET_MAGIC && r.u8() == (uint8_t)INPUTNET_PROTOVER) {
+            if (SDLNet_UDP_Recv(streamnet_socket,streamnet_recvpkt) > 0) {
+                StreamNetReader r((const uint8_t*)streamnet_recvpkt->data,(size_t)streamnet_recvpkt->len);
+                if (r.u32() == STREAMNET_MAGIC && r.u8() == (uint8_t)STREAMNET_PROTOVER) {
                     const uint8_t type = r.u8();
                     r.u8(); r.u8();
                     if (type == INPKT_WELCOME) {
@@ -2555,50 +2555,50 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                         if (!r.bad() && r.remain() >= 4) {
                             const uint32_t theirs = r.u32(), ours = CALLBACK_LayoutSignature();
                             if (theirs != ours) {
-                                LOG_MSG("INPUTNET: callback layout %08x differs from the server's %08x",
+                                LOG_MSG("STREAMNET: callback layout %08x differs from the server's %08x",
                                     (unsigned int)ours,(unsigned int)theirs);
                                 errmsg = "this DOSBox-X build is not compatible with the server's (its callback layout differs); use the same DOSBox-X build on every computer";
-                                INPUTNET_CloseLink(NULL,false);
+                                STREAMNET_CloseLink(NULL,false);
                                 return false;
                             }
-                            LOG_MSG("INPUTNET: callback layout %08x matches the server",(unsigned int)ours);
+                            LOG_MSG("STREAMNET: callback layout %08x matches the server",(unsigned int)ours);
                         }
                         if (!r.bad() && r.remain() >= 20) {
                             const uint8_t *clock = r.bytes(16);
-                            if (clock != NULL) memcpy(inputnet_pending_clock,clock,16);
-                            inputnet_pending_year = r.u16();
-                            inputnet_pending_month = r.u8();
-                            inputnet_pending_day = r.u8();
-                            inputnet_have_pending_clock = (clock != NULL && !r.bad());
+                            if (clock != NULL) memcpy(streamnet_pending_clock,clock,16);
+                            streamnet_pending_year = r.u16();
+                            streamnet_pending_month = r.u8();
+                            streamnet_pending_day = r.u8();
+                            streamnet_have_pending_clock = (clock != NULL && !r.bad());
                         }
-                        inputnet_have_pending_tsc = false;
+                        streamnet_have_pending_tsc = false;
                         if (!r.bad() && r.remain() >= 8) {
                             const uint32_t hi = r.u32(), lo = r.u32();
-                            inputnet_pending_tsc = ((uint64_t)hi << 32u) | lo;
-                            inputnet_have_pending_tsc = !r.bad();
+                            streamnet_pending_tsc = ((uint64_t)hi << 32u) | lo;
+                            streamnet_have_pending_tsc = !r.bad();
                         }
-                        inputnet_have_pending_vga = false;
+                        streamnet_have_pending_vga = false;
                         if (!r.bad() && r.remain() >= 20) {
                             uint64_t fps = (uint64_t)r.u32() << 32u; fps |= r.u32();
                             uint64_t base = (uint64_t)r.u32() << 32u; base |= r.u32();
-                            inputnet_pending_vga_frames = r.u32();
-                            inputnet_pending_vga_fps = INPUTNET_BitsDouble(fps);
-                            inputnet_pending_vga_base = INPUTNET_BitsDouble(base);
-                            inputnet_have_pending_vga = !r.bad();
+                            streamnet_pending_vga_frames = r.u32();
+                            streamnet_pending_vga_fps = STREAMNET_BitsDouble(fps);
+                            streamnet_pending_vga_base = STREAMNET_BitsDouble(base);
+                            streamnet_have_pending_vga = !r.bad();
                         }
                         {
                             /* RollbackNet and the lockstep cannot share a session */
                             uint8_t theirs_rb = 0, win = 0;
                             if (!r.bad() && r.remain() >= 2) { theirs_rb = r.u8(); win = r.u8(); }
-                            if (theirs_rb != (inputnet_rollback ? 1 : 0)) {
+                            if (theirs_rb != (streamnet_rollback ? 1 : 0)) {
                                 errmsg = theirs_rb ? "the server runs mode=rollback, this DOSBox-X does not"
                                                    : "this DOSBox-X runs mode=rollback, the server does not";
-                                LOG_MSG("INPUTNET: %s",errmsg.c_str());
-                                INPUTNET_CloseLink(NULL,false);
+                                LOG_MSG("STREAMNET: %s",errmsg.c_str());
+                                STREAMNET_CloseLink(NULL,false);
                                 return false;
                             }
-                            if (inputnet_rollback && win >= 2 && win <= 48) inputnet_rbwindow = win;
-                            if (inputnet_rollback) {
+                            if (streamnet_rollback && win >= 2 && win <= 48) streamnet_rbwindow = win;
+                            if (streamnet_rollback) {
                                 std::string theirs;
                                 if (!r.bad() && r.remain() >= 2) {
                                     const unsigned n = r.u16();
@@ -2609,8 +2609,8 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                                 if (theirs != mine) {
                                     errmsg = "RollbackNet needs the same emulator and settings on every computer; different here: " +
                                         RB_FingerprintDiff(theirs, mine);
-                                    LOG_MSG("INPUTNET: %s",errmsg.c_str());
-                                    INPUTNET_CloseLink(NULL,false);
+                                    LOG_MSG("STREAMNET: %s",errmsg.c_str());
+                                    STREAMNET_CloseLink(NULL,false);
                                     return false;
                                 }
                                 if (rbc_copies) {   /* a cluster: the server's runs as many copies */
@@ -2618,8 +2618,8 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                                     if (!r.bad() && r.remain() >= 1) theirs_c = r.u8();
                                     if (theirs_c != rbc_copies) {
                                         errmsg = "the server runs " + std::to_string(theirs_c) + " copies of the game, this computer " + std::to_string(rbc_copies);
-                                        LOG_MSG("INPUTNET: %s",errmsg.c_str());
-                                        INPUTNET_CloseLink(NULL,false);
+                                        LOG_MSG("STREAMNET: %s",errmsg.c_str());
+                                        STREAMNET_CloseLink(NULL,false);
                                         return false;
                                     }
                                     server_frame = r.u32();
@@ -2628,80 +2628,80 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                                     const uint8_t *ab = r.bytes(al);
                                     rbj_autorun = (ab != NULL) ? std::string((const char*)ab, al) : std::string();
                                     /* (the machines bring their own clock etc. later: RBCExtras) */
-                                    inputnet_have_pending_clock = inputnet_have_pending_tsc = inputnet_have_pending_vga = false;
+                                    streamnet_have_pending_clock = streamnet_have_pending_tsc = streamnet_have_pending_vga = false;
                                     welcomed_at = GetTicks();
                                 }
                             }
                         }
-                        if (!r.bad() && myid < INPUTNET_MAX_PEERS) {
+                        if (!r.bad() && myid < STREAMNET_MAX_PEERS) {
                             /* Clamp: these drive our ring buffer and packet sizes. */
-                            inputnet_selfid = myid;
-                            inputnet_frame_ms = (fms >= 1 && fms <= 100) ? fms : 10u;
-                            inputnet_delay = (dly <= 64 && (dly >= 1 || inputnet_rollback)) ? dly : 3u;
-                            inputnet_redundancy = (red >= 1 && red <= 32) ? red : 4u;
-                            inputnet_share_keyboard = (shk != 0);
-                            inputnet_share_mouse = (shm != 0);
+                            streamnet_selfid = myid;
+                            streamnet_frame_ms = (fms >= 1 && fms <= 100) ? fms : 10u;
+                            streamnet_delay = (dly <= 64 && (dly >= 1 || streamnet_rollback)) ? dly : 3u;
+                            streamnet_redundancy = (red >= 1 && red <= 32) ? red : 4u;
+                            streamnet_share_keyboard = (shk != 0);
+                            streamnet_share_mouse = (shm != 0);
                             /* The whole session has to follow one cycle policy. */
-                            inputnet_cyclesync = (csy <= INCYCLES_OFF) ? csy : INCYCLES_AUTO;
+                            streamnet_cyclesync = (csy <= INCYCLES_OFF) ? csy : INCYCLES_AUTO;
                             welcomed = true;
                         }
                     }
                 }
             }
-            if (!welcomed) INPUTNET_Stall(last_events);
+            if (!welcomed) STREAMNET_Stall(last_events);
         }
 
         /* Generous: before answering, the server has to snapshot its complete
          * emulator state, which on a large machine takes a few seconds. */
         if (!welcomed && (GetTicks() - start) > 30000u) {
             errmsg = "no answer from the server";
-            INPUTNET_CloseLink(NULL,false);
+            STREAMNET_CloseLink(NULL,false);
             return false;
         }
     }
 
     /* Register ourselves and the server as participants. */
-    for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-        inputnet_peers[i].active = false;
-        inputnet_peers[i].local = false;
-        inputnet_peers[i].ready = false;
-        inputnet_peers[i].resetFrames();
+    for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+        streamnet_peers[i].active = false;
+        streamnet_peers[i].local = false;
+        streamnet_peers[i].ready = false;
+        streamnet_peers[i].resetFrames();
     }
 
-    InputNetPeer &self = inputnet_peers[inputnet_selfid];
+    StreamNetPeer &self = streamnet_peers[streamnet_selfid];
     self.active = true;
     self.local = true;
     self.name = "client";
 
-    InputNetPeer &srv = inputnet_peers[0];
-    if (inputnet_selfid != 0) {
+    StreamNetPeer &srv = streamnet_peers[0];
+    if (streamnet_selfid != 0) {
         srv.active = true;
         srv.local = false;
-        srv.addr = inputnet_server_addr;
+        srv.addr = streamnet_server_addr;
         srv.name = "server";
     }
 
-    LOG_MSG("INPUTNET: joined as peer %u, %u ms frames, %u frame input delay",
-        (unsigned)inputnet_selfid,inputnet_frame_ms,inputnet_delay);
+    LOG_MSG("STREAMNET: joined as peer %u, %u ms frames, %u frame input delay",
+        (unsigned)streamnet_selfid,streamnet_frame_ms,streamnet_delay);
 
     if (rbc_copies) {
         if (!RBC_ClientJoin(total, server_frame, welcomed_at, errmsg)) {
-            LOG_MSG("INPUTNET: %s", errmsg.c_str());
-            INPUTNET_CloseLink(NULL, true);
+            LOG_MSG("STREAMNET: %s", errmsg.c_str());
+            STREAMNET_CloseLink(NULL, true);
             return false;
         }
         return true;
     }
 
     if (total != 0) {
-        LOG_MSG("INPUTNET: receiving %u bytes of emulator state from the server",(unsigned)total);
+        LOG_MSG("STREAMNET: receiving %u bytes of emulator state from the server",(unsigned)total);
         std::vector<uint8_t> state;
-        if (!INPUTNET_ReceiveState(state,total)) {
+        if (!STREAMNET_ReceiveState(state,total)) {
             errmsg = "the emulator state transfer failed";
-            INPUTNET_CloseLink(NULL,true);
+            STREAMNET_CloseLink(NULL,true);
             return false;
         }
-        if (inputnet_rollback) {
+        if (streamnet_rollback) {
             /* RollbackNet: the server's game files, wherever ours differ */
             std::vector<RBFile> theirs;
             std::vector<uint8_t> bits;
@@ -2717,27 +2717,27 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
                 if (!rb_cli_need.empty()) {
                     std::vector<uint8_t> files;
                     RB_SendFileRequest();
-                    if (!INPUTNET_ReceiveState(files,(uint32_t)need,RB_SendFileRequest,INPKT_FILES))
+                    if (!STREAMNET_ReceiveState(files,(uint32_t)need,RB_SendFileRequest,INPKT_FILES))
                         err = "the server's game files did not arrive";
                     else if (RB_MapReceivedFiles(files,err))
-                        LOG_MSG("INPUTNET: using %u of the server's files in place of ours for this session",(unsigned)rb_cli_need.size());
+                        LOG_MSG("STREAMNET: using %u of the server's files in place of ours for this session",(unsigned)rb_cli_need.size());
                 }
             }
             if (!err.empty()) {
                 errmsg = err;
-                LOG_MSG("INPUTNET: %s",errmsg.c_str());
-                INPUTNET_CloseLink(NULL,true);
+                LOG_MSG("STREAMNET: %s",errmsg.c_str());
+                STREAMNET_CloseLink(NULL,true);
                 return false;
             }
         }
         /* The state cannot be applied from here: we are running as a DOS
          * program inside the machine that is about to be replaced. Hand it to
          * the tick handler, which runs between CPU blocks. */
-        inputnet_pending_state.swap(state);
-        inputnet_pending_stateload = true;
+        streamnet_pending_state.swap(state);
+        streamnet_pending_stateload = true;
     }
     else {
-        inputnet_pending_stateload = true; /* nothing to load, but still announce readiness */
+        streamnet_pending_stateload = true; /* nothing to load, but still announce readiness */
     }
 
     return true;
@@ -2745,38 +2745,38 @@ static bool INPUTNET_Connect(const char *host,uint16_t port,std::string &errmsg)
 
 /* Client side: apply the state we were given (if any), announce readiness and
  * wait for the server to start the lockstep. Runs from the tick handler. */
-static void INPUTNET_FinishJoin(void) {
-    inputnet_pending_stateload = false;
+static void STREAMNET_FinishJoin(void) {
+    streamnet_pending_stateload = false;
 
-    if (!inputnet_pending_state.empty()) {
-        LOG_MSG("INPUTNET: applying the emulator state received from the server");
-        const bool ok = INPUTNET_ApplyStateSnapshot(inputnet_pending_state);
-        inputnet_pending_state.clear();
+    if (!streamnet_pending_state.empty()) {
+        LOG_MSG("STREAMNET: applying the emulator state received from the server");
+        const bool ok = STREAMNET_ApplyStateSnapshot(streamnet_pending_state);
+        streamnet_pending_state.clear();
         if (!ok) {
-            INPUTNET_CloseLink("could not apply the received emulator state",true);
+            STREAMNET_CloseLink("could not apply the received emulator state",true);
             return;
         }
     }
 
     uint8_t buf[32];
-    InputNetWriter w(buf,sizeof(buf));
-    INPUTNET_BeginPacket(w,INPKT_READY);
+    StreamNetWriter w(buf,sizeof(buf));
+    STREAMNET_BeginPacket(w,INPKT_READY);
 
     uint32_t last_events = GetTicks();
     const uint32_t start = GetTicks();
 
-    while (!inputnet_session) {
-        INPUTNET_SendRaw(inputnet_server_addr,buf,w.size());
+    while (!streamnet_session) {
+        STREAMNET_SendRaw(streamnet_server_addr,buf,w.size());
 
         const uint32_t round = GetTicks();
-        while (!inputnet_session && (GetTicks() - round) < 200u) {
-            INPUTNET_PollSocket();
-            if (inputnet_session) break;
-            INPUTNET_Stall(last_events);
+        while (!streamnet_session && (GetTicks() - round) < 200u) {
+            STREAMNET_PollSocket();
+            if (streamnet_session) break;
+            STREAMNET_Stall(last_events);
         }
 
-        if (!inputnet_session && (GetTicks() - start) > inputnet_timeout) {
-            INPUTNET_CloseLink("the server never started the session",true);
+        if (!streamnet_session && (GetTicks() - start) > streamnet_timeout) {
+            STREAMNET_CloseLink("the server never started the session",true);
             return;
         }
     }
@@ -2786,16 +2786,16 @@ static void INPUTNET_FinishJoin(void) {
 /* Tick handler - the heartbeat of the lockstep                               */
 /* ------------------------------------------------------------------------- */
 
-static void INPUTNET_TickHandler(void) {
-    if (inputnet_busy) return;
-    inputnet_busy = true;
-    struct InTick { InTick() { inputnet_in_tick = true; } ~InTick() { inputnet_in_tick = false; } } in_tick;
+static void STREAMNET_TickHandler(void) {
+    if (streamnet_busy) return;
+    streamnet_busy = true;
+    struct InTick { InTick() { streamnet_in_tick = true; } ~InTick() { streamnet_in_tick = false; } } in_tick;
 
     if (rbc_copies) {               /* a cluster: the copies find each other at their DOS prompts first */
         extern bool dos_shell_reading_input;
         if (!rbc_attached && dos_shell_reading_input && rbc_copies >= 2) { IPX_ClusterAttach(rbc_copy); rbc_attached = true; }
-        if (!rbc_leader) { RBC_FollowerTick(); inputnet_busy = false; return; }
-        if (!rbc_ready) { RBC_LeaderGather(); if (!rbc_ready) { inputnet_busy = false; return; } }
+        if (!rbc_leader) { RBC_FollowerTick(); streamnet_busy = false; return; }
+        if (!rbc_ready) { RBC_LeaderGather(); if (!rbc_ready) { streamnet_busy = false; return; } }
     }
 
     /* Deferred start from the config file or the command line. Wait until the
@@ -2804,78 +2804,78 @@ static void INPUTNET_TickHandler(void) {
      * same quiescent input wait instead of midway through a booting program
      * (e.g. the welcome screen). */
     extern bool dos_shell_reading_input;
-    if (!inputnet_autostart_done && dos_shell_reading_input) {
-        inputnet_autostart_done = true;
+    if (!streamnet_autostart_done && dos_shell_reading_input) {
+        streamnet_autostart_done = true;
 
-        if (inputnet_auto_server >= 0) {
-            INPUTNET_StartServer((uint16_t)inputnet_auto_server);
+        if (streamnet_auto_server >= 0) {
+            STREAMNET_StartServer((uint16_t)streamnet_auto_server);
         }
-        else if (!inputnet_auto_connect.empty()) {
-            std::string host = inputnet_auto_connect;
-            uint16_t port = inputnet_default_port;
+        else if (!streamnet_auto_connect.empty()) {
+            std::string host = streamnet_auto_connect;
+            uint16_t port = streamnet_default_port;
             const size_t colon = host.find_last_of(':');
             if (colon != std::string::npos) {
                 port = (uint16_t)atoi(host.substr(colon+1).c_str());
                 host = host.substr(0,colon);
-                if (port == 0) port = inputnet_default_port;
+                if (port == 0) port = streamnet_default_port;
             }
 
             std::string err;
-            if (!INPUTNET_Connect(host.c_str(),port,err))
-                LOG_MSG("INPUTNET: auto connect to %s failed: %s",host.c_str(),err.c_str());
+            if (!STREAMNET_Connect(host.c_str(),port,err))
+                LOG_MSG("STREAMNET: auto connect to %s failed: %s",host.c_str(),err.c_str());
         }
     }
 
-    if (!inputnet_link_up) { inputnet_busy = false; return; }
+    if (!streamnet_link_up) { streamnet_busy = false; return; }
 
-    if (inputnet_pending_stateload) {
-        /* Wait until INPUTNET.COM has returned and the shell is parked at its
+    if (streamnet_pending_stateload) {
+        /* Wait until STREAMNET.COM has returned and the shell is parked at its
          * prompt before replacing the machine. */
-        if (!inputnet_in_program && dos_shell_reading_input) INPUTNET_FinishJoin();
-        inputnet_busy = false;
+        if (!streamnet_in_program && dos_shell_reading_input) STREAMNET_FinishJoin();
+        streamnet_busy = false;
         return;
     }
 
-    if (!inputnet_session) {
+    if (!streamnet_session) {
         /* Not running yet: keep servicing the socket so that joins, pings and
          * state transfers make progress. */
-        INPUTNET_PollSocket();
-        inputnet_busy = false;
+        STREAMNET_PollSocket();
+        streamnet_busy = false;
         return;
     }
 
-    /* RollbackNet saves, restores and runs its frames from the main loop (INPUTNET_RollbackTick). */
-    if (inputnet_rollback) {
-        inputnet_busy = false;
+    /* RollbackNet saves, restores and runs its frames from the main loop (STREAMNET_RollbackTick). */
+    if (streamnet_rollback) {
+        streamnet_busy = false;
         return;
     }
 
-    if (++inputnet_tickaccum < inputnet_frame_ms) {
-        INPUTNET_PollSocket();
-        inputnet_busy = false;
+    if (++streamnet_tickaccum < streamnet_frame_ms) {
+        STREAMNET_PollSocket();
+        streamnet_busy = false;
         return;
     }
-    inputnet_tickaccum = 0;
+    streamnet_tickaccum = 0;
 
-    inputnet_frame++;
-    inputnet_stat_frames++;
+    streamnet_frame++;
+    streamnet_stat_frames++;
 
-    INPUTNET_SendLocalInput();
+    STREAMNET_SendLocalInput();
 
-    if (INPUTNET_WaitForPeers(inputnet_frame)) {
-        INPUTNET_DeliverFrame(inputnet_frame);
+    if (STREAMNET_WaitForPeers(streamnet_frame)) {
+        STREAMNET_DeliverFrame(streamnet_frame);
 
         /* Every participant reaches this point for the same frame having applied
          * exactly the same input, so the machines must look identical here. */
-        if (inputnet_checkevery != 0 && (inputnet_frame % inputnet_checkevery) == 0)
-            INPUTNET_RunCheck(inputnet_frame);
+        if (streamnet_checkevery != 0 && (streamnet_frame % streamnet_checkevery) == 0)
+            STREAMNET_RunCheck(streamnet_frame);
     }
 
-    inputnet_busy = false;
+    streamnet_busy = false;
 }
 
 //save state support
-void *INPUTNET_TickHandler_PIC_Timer = (void*)((uintptr_t)INPUTNET_TickHandler);
+void *STREAMNET_TickHandler_PIC_Timer = (void*)((uintptr_t)STREAMNET_TickHandler);
 
 /* ------------------------------------------------------------------------- */
 /* RollbackNet ("mode = rollback")                                            */
@@ -2902,7 +2902,7 @@ void *INPUTNET_TickHandler_PIC_Timer = (void*)((uintptr_t)INPUTNET_TickHandler);
  * the server's state over (RESYNC), so the machines can never stay apart.
  *
  * Saving, restoring and replaying happen at the start of an emulated
- * millisecond (INPUTNET_RollbackTick, called by the main loop right after
+ * millisecond (STREAMNET_RollbackTick, called by the main loop right after
  * TIMER_AddTick): every tick handler has run, the mixer has finished the
  * millisecond before, and no device is half way through anything. */
 
@@ -2948,16 +2948,16 @@ static uint32_t rb_tick = 0;        /* emulated ms since the session started (re
 static bool rb_have_first = false;
 static uint32_t rb_target = 0;      /* the frame a replay ends at */
 static uint32_t rb_realframe = 0;   /* the frame real time is at */
-static uint32_t rb_predicted[INPUTNET_MAX_PEERS][RB_RING]; /* frame+1 that ran with predicted input from this peer */
-static uint32_t rb_have[INPUTNET_MAX_PEERS];      /* frames 0..rb_have-1 of this peer's input are here */
-static uint32_t rb_checked[INPUTNET_MAX_PEERS];   /* frames below this were checked against what we predicted */
-static uint32_t rb_acked[INPUTNET_MAX_PEERS];     /* frames 0..rb_acked-1 of OUR input this peer has */
-static uint32_t rb_peerframe[INPUTNET_MAX_PEERS]; /* the real-time frame the peer last said it was at */
-static uint32_t rb_peerframe_at[INPUTNET_MAX_PEERS]; /* host ms when that arrived */
-static uint32_t rb_peerstamp[INPUTNET_MAX_PEERS]; /* the peer's send time in its newest packet, echoed back */
-static uint32_t rb_peerstamp_at[INPUTNET_MAX_PEERS];
-static uint32_t rb_rtt[INPUTNET_MAX_PEERS];
-static RBCheck rb_peercheck[INPUTNET_MAX_PEERS][INPUTNET_CHECK_RING];
+static uint32_t rb_predicted[STREAMNET_MAX_PEERS][RB_RING]; /* frame+1 that ran with predicted input from this peer */
+static uint32_t rb_have[STREAMNET_MAX_PEERS];      /* frames 0..rb_have-1 of this peer's input are here */
+static uint32_t rb_checked[STREAMNET_MAX_PEERS];   /* frames below this were checked against what we predicted */
+static uint32_t rb_acked[STREAMNET_MAX_PEERS];     /* frames 0..rb_acked-1 of OUR input this peer has */
+static uint32_t rb_peerframe[STREAMNET_MAX_PEERS]; /* the real-time frame the peer last said it was at */
+static uint32_t rb_peerframe_at[STREAMNET_MAX_PEERS]; /* host ms when that arrived */
+static uint32_t rb_peerstamp[STREAMNET_MAX_PEERS]; /* the peer's send time in its newest packet, echoed back */
+static uint32_t rb_peerstamp_at[STREAMNET_MAX_PEERS];
+static uint32_t rb_rtt[STREAMNET_MAX_PEERS];
+static RBCheck rb_peercheck[STREAMNET_MAX_PEERS][STREAMNET_CHECK_RING];
 static double rb_advantage = 0;     /* smoothed: how many frames we run ahead of the others */
 static uint32_t rb_last_slowdown = 0;
 static bool rb_desynced = false;    /* client: asked for, or receiving, the server's state */
@@ -3000,7 +3000,7 @@ static unsigned int RB_MouseFrames(void) {
     if (rb_lockstep) return 1;
     if (rb_mouse_frames) return rb_mouse_frames;
     uint32_t rtt = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) if (inputnet_peers[i].active && !inputnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) if (streamnet_peers[i].active && !streamnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
     return rtt < 80u ? 1u : (rtt < 160u ? 2u : 3u);
 }
 static uint64_t rb_lockstep_ctx = 0;
@@ -3011,7 +3011,7 @@ static void RB_UpdateLockstep(uint32_t frame) {
     const uint64_t ctx = RB_HostContext();
     if (ctx != rb_lockstep_ctx) { rb_lockstep_ctx = ctx; rb_stat_ctxchanges++; }
     const uint32_t oldest = std::min(RB_MinHave(), frame);
-    const uint32_t lowest = (frame > inputnet_rbwindow) ? frame - inputnet_rbwindow : 0;
+    const uint32_t lowest = (frame > streamnet_rbwindow) ? frame - streamnet_rbwindow : 0;
     if (RB_RestorableAtOrBefore(oldest, lowest) == UINT32_MAX) rb_unrestorable++;
     else rb_unrestorable = 0;
     /* One such frame start alone is a nested loop of a moment (a BIOS call DOS makes for the console): the next one is
@@ -3188,7 +3188,7 @@ static void RBT_Start(uint8_t *base, size_t bytes) {
 #endif
     if (rbt_hp == 0 || (rbt_hp % RB_PAGE) != 0 || ((uintptr_t)base % rbt_hp) != 0) {
         static bool told = false;
-        if (!told) LOG_MSG("INPUTNET: guest RAM is not aligned to host pages; every page is compared at every frame start");
+        if (!told) LOG_MSG("STREAMNET: guest RAM is not aligned to host pages; every page is compared at every frame start");
         told = true;
         return;
     }
@@ -3211,7 +3211,7 @@ static void RBT_Start(uint8_t *base, size_t bytes) {
     rbt_on = true;
     if (!RBT_SetWritable(0, n, false)) {
         rbt_on = false;
-        LOG_MSG("INPUTNET: cannot write-protect guest RAM; every page is compared at every frame start");
+        LOG_MSG("STREAMNET: cannot write-protect guest RAM; every page is compared at every frame start");
     }
 }
 
@@ -3388,13 +3388,13 @@ static void RB_Capture(uint32_t frame) {
         extern void SBLASTER_DebugState(char *out, size_t n);
         char sbs[200];
         SBLASTER_DebugState(sbs, sizeof(sbs));
-        LOG_MSG("RBSB f=%u %s%s", (unsigned)frame, sbs, inputnet_rollback_resim ? " replay" : "");
+        LOG_MSG("RBSB f=%u %s%s", (unsigned)frame, sbs, streamnet_rollback_resim ? " replay" : "");
         uint64_t devh = 1469598103934665603ull;
         LOG_MSG("RBTRACE f=%u t=%u ctx=%u pic=%u cs:eip=%04x:%08x eax=%08x ebx=%08x ecx=%08x edx=%08x esp=%08x fl=%08x mem=%08x%08x h=%08x%08x%s",
             (unsigned)frame,(unsigned)rb_tick,(unsigned)(s.context & 0xFFFFFFFFu),(unsigned)PIC_Ticks,(unsigned)Segs.val[cs],(unsigned)cpu_regs.ip.dword[0],
             (unsigned)cpu_regs.regs[0].dword[0],(unsigned)cpu_regs.regs[3].dword[0],(unsigned)cpu_regs.regs[1].dword[0],(unsigned)cpu_regs.regs[2].dword[0],
             (unsigned)cpu_regs.regs[4].dword[0],(unsigned)cpu_regs.flags,(unsigned)(rb_memhash >> 32u),(unsigned)rb_memhash,
-            (unsigned)(s.hash >> 32u),(unsigned)s.hash,inputnet_rollback_resim ? " replay" : "");
+            (unsigned)(s.hash >> 32u),(unsigned)s.hash,streamnet_rollback_resim ? " replay" : "");
         (void)devh;
     }
 
@@ -3412,7 +3412,7 @@ static void RB_Capture(uint32_t frame) {
         snprintf(name, sizeof(name), "rbdump-%u-devices.bin", (unsigned)frame);
         FILE *f = fopen(name, "wb");
         if (f) { fwrite(s.devices.data(), 1, s.devices.size(), f); fclose(f); }
-        LOG_MSG("INPUTNET: dumped frame %u (hash %08x%08x)", (unsigned)frame, (unsigned)(s.hash >> 32u), (unsigned)s.hash);
+        LOG_MSG("STREAMNET: dumped frame %u (hash %08x%08x)", (unsigned)frame, (unsigned)(s.hash >> 32u), (unsigned)s.hash);
     }
 
     /* debugging: NN_RB_FULLDUMP=+<n>[,+<m>...] also writes the portable save state of the frames that many after the newest
@@ -3422,7 +3422,7 @@ static void RB_Capture(uint32_t frame) {
         for (const char *q = fulldump_env; q != NULL && *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : NULL) {
             if (*q != '+' || rb_last_load_frame + (uint32_t)strtoul(q + 1, NULL, 10) != frame) continue;
             std::vector<uint8_t> st;
-            if (INPUTNET_SnapshotState(st)) {
+            if (STREAMNET_SnapshotState(st)) {
                 char name[64];
                 snprintf(name, sizeof(name), "rbfull-%u.sav", (unsigned)frame);
                 FILE *f = fopen(name, "wb");
@@ -3432,7 +3432,7 @@ static void RB_Capture(uint32_t frame) {
     }
 
     rb_stat_capture_us += RB_MicroTicks() - t0;
-    if (inputnet_rollback_resim) rb_stat_rp_save_us += RB_MicroTicks() - t0;
+    if (streamnet_rollback_resim) rb_stat_rp_save_us += RB_MicroTicks() - t0;
     rb_stat_captures++;
     rb_stat_pages += s.undo_page.size();
 }
@@ -3446,7 +3446,7 @@ static bool RB_Restore(uint32_t target, uint32_t newest) {
     /* The frame we load has to have been saved with the host's stack as it is now (the frames in between only give
      * back memory pages; the replay makes their nested loops again). */
     if (rb_snap[target % RB_RING].context != RB_HostContext()) {
-        LOG_MSG("INPUTNET: frame %u was saved in another host context",(unsigned)target);
+        LOG_MSG("STREAMNET: frame %u was saved in another host context",(unsigned)target);
         return false;
     }
 
@@ -3467,17 +3467,17 @@ static bool RB_Restore(uint32_t target, uint32_t newest) {
     }
 
     if (!SaveState::instance().loadLean(rb_snap[target % RB_RING].devices)) {
-        LOG_MSG("INPUTNET: rollback could not load the saved devices of frame %u",(unsigned)target);
+        LOG_MSG("STREAMNET: rollback could not load the saved devices of frame %u",(unsigned)target);
         return false;
     }
-    VGA_SetupHandlers();            /* (the video memory window's handlers: see INPUTNET_ApplyStateSnapshot) */
+    VGA_SetupHandlers();            /* (the video memory window's handlers: see STREAMNET_ApplyStateSnapshot) */
     {   /* the window's frame in progress belongs to the frames gone: the next one starts over (no more lines than it has) */
         extern void RENDER_EndUpdate(bool abort);
         RENDER_EndUpdate(true);
     }
     if (rbc_copies) {
         const std::string &ln = rb_snap[target % RB_RING].ipx;
-        if (!RB_LoadLinks((const uint8_t*)ln.data(), ln.size())) LOG_MSG("INPUTNET: rollback could not load the links of frame %u",(unsigned)target);
+        if (!RB_LoadLinks((const uint8_t*)ln.data(), ln.size())) LOG_MSG("STREAMNET: rollback could not load the links of frame %u",(unsigned)target);
     }
     /* Loading devices may touch guest memory (video modes, fonts): make it exactly the saved frame again. With write
      * tracking only writable pages can differ. */
@@ -3529,8 +3529,8 @@ static bool RB_Restore(uint32_t target, uint32_t newest) {
 static void RB_ApplyInputs(uint32_t frame) {
     if (rbc_copies && rbc_leader) { RBC_ApplyInputs(frame); return; }
     RB_ApplyScheduledSpeed(frame);
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready) continue;
         if (!p.local) {
             if (frame >= rb_have[i]) {
@@ -3539,14 +3539,14 @@ static void RB_ApplyInputs(uint32_t frame) {
             }
             rb_predicted[i][frame % RB_RING] = 0;
         }
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p,frame);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(p,frame);
         if (slot == NULL) continue;
         for (size_t e = 0; e < slot->events.size(); e++) {
-            const InputNetEvent &ev = slot->events[e];
+            const StreamNetEvent &ev = slot->events[e];
             /* At the DOS prompt every machine would run what anybody types (DEL included, in everybody's game
              * folder): only the server's autorun types there. Releases always go. */
             if (dos_shell_reading_input && ev.type == INEV_KEY && (ev.pressed & 1u) && !(ev.pressed & 2u)) continue;
-            INPUTNET_ApplyEvent(ev);
+            STREAMNET_ApplyEvent(ev);
         }
     }
 }
@@ -3554,14 +3554,14 @@ static void RB_ApplyInputs(uint32_t frame) {
 /* The earliest frame before "frame" that ran with a prediction the real input now contradicts, or UINT32_MAX. */
 static uint32_t RB_FindMisprediction(uint32_t frame) {
     uint32_t earliest = UINT32_MAX;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local) continue;
         const uint32_t upto = std::min(rb_have[i], frame);   /* frames below "frame" have run */
         for (uint32_t f = rb_checked[i]; f < upto; f++) {
             if (rb_predicted[i][f % RB_RING] != f + 1u) continue;
             rb_predicted[i][f % RB_RING] = 0;
-            InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p,f);
+            StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(p,f);
             if (slot != NULL && !slot->events.empty()) {
                 /* only speed changes that apply later, at a frame still to come: learn them now, no correction */
                 bool sched_only = true;
@@ -3570,11 +3570,11 @@ static uint32_t RB_FindMisprediction(uint32_t frame) {
                         f + (uint32_t)(slot->events[e].pressed - 2u) >= frame;
                 if (sched_only) {
                     for (size_t e = 0; e < slot->events.size(); e++) {
-                        const InputNetEvent &x = slot->events[e];
+                        const StreamNetEvent &x = slot->events[e];
                         const uint32_t at = f + (uint32_t)(x.pressed - 2u);
-                        INPUTNET_ScheduleSpeed(at, x.cyclemax);
+                        STREAMNET_ScheduleSpeed(at, x.cyclemax);
                         if (rbc_copies > 1 && rbc_leader) {     /* (the copies learn it with this frame's events) */
-                            InputNetEvent y = x;
+                            StreamNetEvent y = x;
                             y.pressed = (uint8_t)(2u + (at - frame));
                             rbc_injected[frame].push_back(y);
                         }
@@ -3605,8 +3605,8 @@ static uint32_t RB_FindMisprediction(uint32_t frame) {
 
 static uint32_t RB_MinHave(void) {
     uint32_t m = UINT32_MAX;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local) continue;
         m = std::min(m, rb_have[i]);
     }
@@ -3618,7 +3618,7 @@ static uint32_t RB_RestorableAtOrBefore(uint32_t frame, uint32_t lowest) {
     const uint64_t ctx = RB_HostContext();
     for (uint32_t f = frame + 1u; f-- > lowest; ) {
         const RBSnap &s = rb_snap[f % RB_RING];
-        if (s.valid && s.frame == f && s.context == ctx && (!rbc_copies || !rbc_leader || RBC_FollowersCanLoad(f, inputnet_frame))) return f;
+        if (s.valid && s.frame == f && s.context == ctx && (!rbc_copies || !rbc_leader || RBC_FollowersCanLoad(f, streamnet_frame))) return f;
         if (f == 0) break;
     }
     return UINT32_MAX;
@@ -3627,13 +3627,13 @@ static uint32_t RB_RestorableAtOrBefore(uint32_t frame, uint32_t lowest) {
 static bool RB_Rollback(uint32_t target, uint32_t frame) {
     /* A frame saved inside a nested emulation loop that has ended since (a BIOS call DOS made for the console, say)
      * cannot be loaded: go back to the newest one before it that can, and replay a little more. */
-    const uint32_t lowest = (frame > inputnet_rbwindow + 2u) ? frame - (inputnet_rbwindow + 2u) : 0;
+    const uint32_t lowest = (frame > streamnet_rbwindow + 2u) ? frame - (streamnet_rbwindow + 2u) : 0;
     const uint32_t usable = RB_RestorableAtOrBefore(target, lowest);
     if (usable != UINT32_MAX) target = usable;
     else if (rbc_copies && rbc_leader) return false;    /* (a frame some copy cannot load) */
     const uint64_t restore_t0 = RB_MicroTicks();
-    if (frame - target > inputnet_rbwindow + 2u || !RB_Restore(target, frame)) {
-        LOG_MSG("INPUTNET: cannot roll back from frame %u to %u",(unsigned)frame,(unsigned)target);
+    if (frame - target > streamnet_rbwindow + 2u || !RB_Restore(target, frame)) {
+        LOG_MSG("STREAMNET: cannot roll back from frame %u to %u",(unsigned)frame,(unsigned)target);
         return false;
     }
     const uint32_t depth = frame - target;
@@ -3641,13 +3641,13 @@ static bool RB_Rollback(uint32_t target, uint32_t frame) {
     rb_stat_replayed += depth;
     if (depth > rb_stat_maxdepth) rb_stat_maxdepth = depth;
 
-    inputnet_rollback_resim = true;
+    streamnet_rollback_resim = true;
     rb_target = frame;
     rb_replay_started = RB_MicroTicks();
     RB_ReplayBegin(depth);
     MIXER_SetRollbackDiscard(true);
-    DOSBOX_AddTicksRemain(depth * inputnet_frame_ms);
-    inputnet_frame = target;
+    DOSBOX_AddTicksRemain(depth * streamnet_frame_ms);
+    streamnet_frame = target;
     if (rbc_copies && rbc_leader) RBC_LeaderRewind(target);
     rb_stat_rp_restore_us += RB_MicroTicks() - restore_t0;
     RB_ApplyInputs(target);
@@ -3663,30 +3663,30 @@ static unsigned int rb_auto_d = 0;
  * correction of the others is that much shorter (a replay re-emulates every frame since the wrong guess, nearly 85% of
  * its time: Nov 2026, 220 ms with both players aiming with the mouse, delay 2 left no gap over 300 ms, the longest 238
  * ms instead of 355 to 561, real time 94% instead of 90%). It steps down 15 ms below the step (no going back and forth
- * on a distance that wavers). Our input is never put into a frame already sent (INPUTNET_ScheduleFrame), so it can
+ * on a distance that wavers). Our input is never put into a frame already sent (STREAMNET_ScheduleFrame), so it can
  * change during a game. */
 static unsigned int RB_AutoDelay(void) {
     if (!rb_auto_delay) return 0;
     uint32_t rtt = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) if (streamnet_peers[i].active && streamnet_peers[i].ready && !streamnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
     unsigned int d = rb_auto_d;
     if (rtt >= 200u) d = 2;
     else if (rtt >= 150u) d = std::max(1u, d == 2u && rtt >= 185u ? 2u : 1u);
     else if (rtt < 135u) d = 0;
     else d = std::min(d, 1u);
     if (d != rb_auto_d) {
-        LOG_MSG("INPUTNET: our input waits %u frame(s) now (round trip %u ms; [inputnet] rollback auto delay)", d, (unsigned)rtt);
+        LOG_MSG("STREAMNET: our input waits %u frame(s) now (round trip %u ms; [streamnet] rollback auto delay)", d, (unsigned)rtt);
         rb_auto_d = d;
     }
     return d;
 }
 
 static unsigned int RB_EffectiveDelay(void) {
-    if (!rb_lockstep) return std::max(inputnet_delay, RB_AutoDelay());
+    if (!rb_lockstep) return std::max(streamnet_delay, RB_AutoDelay());
     uint32_t rtt = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
-    const unsigned int need = (unsigned int)((rtt / 2u + 15u) / inputnet_frame_ms) + 1u;
-    return std::min(std::max(inputnet_delay, need), 32u);
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
+    const unsigned int need = (unsigned int)((rtt / 2u + 15u) / streamnet_frame_ms) + 1u;
+    return std::min(std::max(streamnet_delay, need), 32u);
 }
 
 /* Our input up to frame+delay is final now: send it, from the oldest frame anybody lacks. */
@@ -3696,8 +3696,8 @@ static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe);
  * corrections as deep as the distance, not the distance plus our delay), and new input of ours goes to the next frame
  * not sent yet, which the catch-up reaches in a few tens of milliseconds. At most 16 frames. */
 static uint32_t RB_CatchUpLead(void) {
-    if (inputnet_rollback_resim) return 0;
-    const Bitu lag = DOSBOX_TicksRemain() / std::max<Bitu>(inputnet_frame_ms, 1u);
+    if (streamnet_rollback_resim) return 0;
+    const Bitu lag = DOSBOX_TicksRemain() / std::max<Bitu>(streamnet_frame_ms, 1u);
     return (uint32_t)std::min<Bitu>(lag, 16u);
 }
 static void RB_SendInput(uint32_t frame) { const uint32_t lead = RB_CatchUpLead(); RB_SendInputEx(frame + lead, true, rb_realframe + lead); }
@@ -3708,71 +3708,71 @@ static void RB_SendInput(uint32_t frame) { const uint32_t lead = RB_CatchUpLead(
  * learned it that much later, replayed that much deeper, and stopped theirs in turn: replays of about the whole round
  * trip instead of half of it. The packets carry no checksum (the frames still being replayed are not final). */
 extern void GFX_Events();
-void INPUTNET_ReplayPublish(void) {
-    if (!inputnet_rollback || !inputnet_rollback_active || !inputnet_session || rb_joining || rb_lockstep) return;
+void STREAMNET_ReplayPublish(void) {
+    if (!streamnet_rollback || !streamnet_rollback_active || !streamnet_session || rb_joining || rb_lockstep) return;
     if (rbc_copies && !rbc_leader) return;
     if (rb_replay_started == 0) return;     /* (a correction's replay only, RB_Rollback) */
     static uint64_t last = 0;
     const uint64_t now = RB_MicroTicks();
     if (now - last < 10000u) return;
     last = now;
-    const uint32_t elapsed = (uint32_t)((now - rb_replay_started) / 1000u / inputnet_frame_ms);
+    const uint32_t elapsed = (uint32_t)((now - rb_replay_started) / 1000u / streamnet_frame_ms);
     if (elapsed == 0) return;
     GFX_Events();
-    if (!inputnet_session) return;
+    if (!streamnet_session) return;
     RB_SendInputEx(rb_target + elapsed, false, rb_target + elapsed);
 }
 
 static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe) {
     if (rb_joining) return;         /* (nothing of ours counts before we have the server's machines) */
-    InputNetPeer &self = inputnet_peers[inputnet_selfid];
-    const uint32_t newest = std::max(frame + RB_EffectiveDelay(), inputnet_local_confirmed);
-    INPUTNET_FrameSlot(self,newest);
+    StreamNetPeer &self = streamnet_peers[streamnet_selfid];
+    const uint32_t newest = std::max(frame + RB_EffectiveDelay(), streamnet_local_confirmed);
+    STREAMNET_FrameSlot(self,newest);
     self.confirmed = newest;
-    inputnet_local_confirmed = newest;
+    streamnet_local_confirmed = newest;
 
     uint32_t lack = newest;     /* the oldest frame of ours somebody does not have */
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local) continue;
         lack = std::min(lack, rb_acked[i]);
     }
-    if (newest - lack >= INPUTNET_RING / 2u) lack = newest - (INPUTNET_RING / 2u - 1u);
+    if (newest - lack >= STREAMNET_RING / 2u) lack = newest - (STREAMNET_RING / 2u - 1u);
 
     /* newest first, as many older frames as fit */
-    size_t budget = INPUTNET_MAX_PACKET - 96u;
+    size_t budget = STREAMNET_MAX_PACKET - 96u;
     uint32_t first = newest;
     for (uint32_t f = newest + 1u; f-- > lack; ) {
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(self,f);
-        const size_t need = 1u + ((slot != NULL) ? slot->events.size() * INPUTNET_MAX_EVENT_SIZE : 0u);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(self,f);
+        const size_t need = 1u + ((slot != NULL) ? slot->events.size() * STREAMNET_MAX_EVENT_SIZE : 0u);
         if (f != newest && need > budget) break;
         budget = (need < budget) ? (budget - need) : 0u;
         first = f;
         if (f == 0) break;
     }
 
-    uint8_t buf[INPUTNET_MAX_PACKET];
-    InputNetWriter w(buf,sizeof(buf));
-    INPUTNET_BeginPacket(w,INPKT_RBINPUT);
+    uint8_t buf[STREAMNET_MAX_PACKET];
+    StreamNetWriter w(buf,sizeof(buf));
+    STREAMNET_BeginPacket(w,INPKT_RBINPUT);
     w.u32(newest);
     w.u32(realframe);
     w.u32(GetTicks());
     w.u16((uint16_t)std::min<uint32_t>(newest - first + 1u, 0xFFFFu));
     for (uint32_t f = first; f <= newest; f++) {
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(self,f);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(self,f);
         const size_t n = (slot != NULL) ? slot->events.size() : 0u;
         w.u8((uint8_t)n);
-        for (size_t e = 0; e < n; e++) INPUTNET_WriteEvent(w,slot->events[e]);
+        for (size_t e = 0; e < n; e++) STREAMNET_WriteEvent(w,slot->events[e]);
     }
 
     /* what we have of everybody else's input, and when their newest packet was sent (for their round trip time) */
     uint8_t nacks = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
-        if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) nacks++;
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++)
+        if (streamnet_peers[i].active && streamnet_peers[i].ready && !streamnet_peers[i].local) nacks++;
     w.u8(nacks);
     const uint32_t now = GetTicks();
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local) continue;
         w.u8((uint8_t)i);
         w.u32(rb_have[i]);
@@ -3797,35 +3797,35 @@ static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe) 
     w.u32(rb_cap_local);            /* this computer's speed proposal at cycles=max (RB_MaxCycles; 0: none) */
 
     if (w.overflow()) {
-        LOG(LOG_MISC,LOG_WARN)("INPUTNET: rollback input packet overflow");
+        LOG(LOG_MISC,LOG_WARN)("STREAMNET: rollback input packet overflow");
         return;
     }
-    INPUTNET_SendToPeers(buf,w.size());
+    STREAMNET_SendToPeers(buf,w.size());
 }
 
-static void RB_Desync(InputNetPeer &p, unsigned peerid, uint32_t frame, uint64_t mine, uint64_t theirs);
+static void RB_Desync(StreamNetPeer &p, unsigned peerid, uint32_t frame, uint64_t mine, uint64_t theirs);
 
-static void RB_CompareCheck(InputNetPeer &p, unsigned peerid, uint32_t frame) {
-    const RBCheck &c = rb_peercheck[peerid][frame % INPUTNET_CHECK_RING];
+static void RB_CompareCheck(StreamNetPeer &p, unsigned peerid, uint32_t frame) {
+    const RBCheck &c = rb_peercheck[peerid][frame % STREAMNET_CHECK_RING];
     if (!c.valid || c.frame != frame) return;
     if (frame >= std::min(RB_MinHave(), rb_realframe) + 1u) return;  /* not final here yet */
     /* Final only once the input of every frame before it was compared with what ran (RB_FindMisprediction, at a frame
      * start) and a rollback, if one was needed, has replayed it: input that has merely arrived may still contradict
      * the prediction this frame start was computed with. */
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &q = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &q = streamnet_peers[i];
         if (q.active && q.ready && !q.local && rb_checked[i] < frame) return;
     }
-    if (inputnet_rollback_resim) return;
+    if (streamnet_rollback_resim) return;
     if (rb_pending_wrong != UINT32_MAX && frame > rb_pending_wrong) return;   /* waits for its correction */
     const RBSnap &s = rb_snap[frame % RB_RING];
     if (!s.valid || s.frame != frame) return;
     rb_stat_checks++;
     if (s.hash != c.hash) RB_Desync(p, peerid, frame, s.hash, c.hash);
-    rb_peercheck[peerid][frame % INPUTNET_CHECK_RING].valid = false;
+    rb_peercheck[peerid][frame % STREAMNET_CHECK_RING].valid = false;
 }
 
-static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) {
+static void RB_HandleInput(StreamNetPeer &p, unsigned peerid, StreamNetReader &r) {
     const uint32_t newest = r.u32();
     const uint32_t theirframe = r.u32();
     const uint32_t stamp = r.u32();
@@ -3836,20 +3836,20 @@ static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) 
     for (uint32_t f = first; f <= newest; f++) {
         const unsigned n = r.u8();
         if (r.bad()) return;
-        const bool have = (f < rb_have[peerid]) || (INPUTNET_FrameSlotIfValid(p,f) != NULL);
-        const bool absurd = (f > rb_realframe + INPUTNET_RING / 2u);
+        const bool have = (f < rb_have[peerid]) || (STREAMNET_FrameSlotIfValid(p,f) != NULL);
+        const bool absurd = (f > rb_realframe + STREAMNET_RING / 2u);
         if (have || absurd) {
-            for (unsigned e = 0; e < n; e++) { InputNetEvent ev; if (!INPUTNET_ReadEvent(r,ev)) return; }
+            for (unsigned e = 0; e < n; e++) { StreamNetEvent ev; if (!STREAMNET_ReadEvent(r,ev)) return; }
             continue;
         }
-        InputNetFrame &slot = INPUTNET_FrameSlot(p,f);
+        StreamNetFrame &slot = STREAMNET_FrameSlot(p,f);
         for (unsigned e = 0; e < n; e++) {
-            InputNetEvent ev;
-            if (!INPUTNET_ReadEvent(r,ev)) return;
+            StreamNetEvent ev;
+            if (!STREAMNET_ReadEvent(r,ev)) return;
             slot.events.push_back(ev);
         }
     }
-    while (INPUTNET_FrameSlotIfValid(p,rb_have[peerid]) != NULL) rb_have[peerid]++;
+    while (STREAMNET_FrameSlotIfValid(p,rb_have[peerid]) != NULL) rb_have[peerid]++;
     if (newest > p.confirmed) p.confirmed = newest;
 
     const uint32_t now = GetTicks();
@@ -3864,7 +3864,7 @@ static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) 
         const uint32_t have = r.u32();
         const uint32_t echo = r.u32();
         if (r.bad()) return;
-        if (who == inputnet_selfid) {
+        if (who == streamnet_selfid) {
             if (have > rb_acked[peerid]) rb_acked[peerid] = have;
             const uint32_t rtt = now - echo;
             if (rtt < 5000u) rb_rtt[peerid] = rb_rtt[peerid] ? (rb_rtt[peerid] * 7u + rtt) / 8u : rtt;
@@ -3875,7 +3875,7 @@ static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) 
     const uint32_t cframe = r.u32();
     const uint32_t chi = r.u32(), clo = r.u32();
     if (!r.bad() && cframe != UINT32_MAX && epoch == rb_epoch) {
-        RBCheck &c = rb_peercheck[peerid][cframe % INPUTNET_CHECK_RING];
+        RBCheck &c = rb_peercheck[peerid][cframe % STREAMNET_CHECK_RING];
         c.frame = cframe;
         c.hash = ((uint64_t)chi << 32u) | clo;
         c.valid = true;
@@ -3893,10 +3893,10 @@ static void RB_HandleInput(InputNetPeer &p, unsigned peerid, InputNetReader &r) 
  * client waits for that (up to six timeouts) instead of leaving: with three players, the one who did not quit timed out
  * first and left too. */
 static bool RB_ClientWaitsOn(uint32_t start) {
-    if (inputnet_is_server) return false;
+    if (streamnet_is_server) return false;
     const uint32_t now = GetTicks();
-    const InputNetPeer &srv = inputnet_peers[0];
-    return srv.active && now - srv.lastheard < inputnet_timeout && now - start < 6u * inputnet_timeout;
+    const StreamNetPeer &srv = streamnet_peers[0];
+    return srv.active && now - srv.lastheard < streamnet_timeout && now - start < 6u * streamnet_timeout;
 }
 
 /* Time spent waiting for the other computers' input: not this computer's load (RB_MaxCycles). */
@@ -4031,8 +4031,8 @@ static void RB_Propose(void) {
         rp_last_total = rb_replay_us_total; rp_last_t = now;
     }
     uint32_t dist = 0;     /* (not "far": a macro on Windows) */
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
-        if (inputnet_peers[i].active && inputnet_peers[i].ready && !inputnet_peers[i].local) dist = std::max(dist, rb_rtt[i]);
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++)
+        if (streamnet_peers[i].active && streamnet_peers[i].ready && !streamnet_peers[i].local) dist = std::max(dist, rb_rtt[i]);
     const double reserve = dist >= 150u ? 0.35 : (dist >= 100u ? 0.20 : 0.0);
     const double keep = std::max(0.0, reserve - rp_share_s);
     const double avail = std::max(target - rb_ml_fixed_s - keep, target / 3.0);
@@ -4066,35 +4066,35 @@ static bool RB_WaitForWindow(uint32_t frame) {
     uint32_t start = 0, last_events = 0, lastresend = GetTicks();
     for (;;) {
         bool ok = true;
-        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-            InputNetPeer &p = inputnet_peers[i];
+        for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+            StreamNetPeer &p = streamnet_peers[i];
             if (!p.active || !p.ready || p.local) continue;
-            if (frame >= rb_have[i] + inputnet_rbwindow) { ok = false; break; }
+            if (frame >= rb_have[i] + streamnet_rbwindow) { ok = false; break; }
         }
         if (ok) break;
         if (start == 0) { start = GetTicks(); last_events = start; rb_stat_stalls++; }
-        if (!inputnet_session) return false;
-        if ((GetTicks() - start) > inputnet_timeout && inputnet_is_server && rbc_copies) {
-            for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-                InputNetPeer &p = inputnet_peers[i];
-                if (p.active && p.ready && !p.local && frame >= rb_have[i] + inputnet_rbwindow) RBC_ServerDrop(i, "fell too far behind");
+        if (!streamnet_session) return false;
+        if ((GetTicks() - start) > streamnet_timeout && streamnet_is_server && rbc_copies) {
+            for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+                StreamNetPeer &p = streamnet_peers[i];
+                if (p.active && p.ready && !p.local && frame >= rb_have[i] + streamnet_rbwindow) RBC_ServerDrop(i, "fell too far behind");
             }
             continue;
         }
         if ((GetTicks() - lastresend) >= 30u) { RB_SendInput(frame); lastresend = GetTicks(); }  /* (they may wait for ours) */
-        if ((GetTicks() - start) > inputnet_timeout && !RB_ClientWaitsOn(start)) {
-            if (inputnet_is_server)
-                INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
+        if ((GetTicks() - start) > streamnet_timeout && !RB_ClientWaitsOn(start)) {
+            if (streamnet_is_server)
+                STREAMNET_EndSession("timed out waiting for the other participant(s)",true);
             else
-                INPUTNET_CloseLink("timed out waiting for the server",true);
+                STREAMNET_CloseLink("timed out waiting for the server",true);
             return false;
         }
-        INPUTNET_Stall(last_events);
+        STREAMNET_Stall(last_events);
         const uint32_t before = GetTicks();
-        INPUTNET_PollSocket();
+        STREAMNET_PollSocket();
         if (GetTicks() - before > 500u) start = GetTicks();     /* (a resync's transfer came meanwhile) */
     }
-    if (start != 0) inputnet_stat_stallms += GetTicks() - start;
+    if (start != 0) streamnet_stat_stallms += GetTicks() - start;
     return true;
 }
 
@@ -4104,11 +4104,11 @@ static void RB_TimeSync(uint32_t frame) {
     double worst = 0;
     bool any = false;
     const uint32_t now = GetTicks();
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local || rb_peerframe_at[i] == 0) continue;
         const double theirs = (double)rb_peerframe[i] +
-            ((double)(now - rb_peerframe_at[i]) + (double)rb_rtt[i] / 2.0) / (double)inputnet_frame_ms;
+            ((double)(now - rb_peerframe_at[i]) + (double)rb_rtt[i] / 2.0) / (double)streamnet_frame_ms;
         const double adv = (double)frame - theirs;
         if (!any || adv > worst) worst = adv;
         any = true;
@@ -4117,7 +4117,7 @@ static void RB_TimeSync(uint32_t frame) {
     /* catching up after a long replay (increaseticks keeps up to two seconds) goes only as far as the others are:
      * racing ahead of them would only end in waiting for their input (a stall, which shows), and the one that waited
      * would then race ahead of us in turn */
-    if (worst > 3.0 && DOSBOX_TrimTickRemain(inputnet_frame_ms) > 0) rb_stat_trims++;
+    if (worst > 3.0 && DOSBOX_TrimTickRemain(streamnet_frame_ms) > 0) rb_stat_trims++;
     rb_advantage = rb_advantage * 0.9 + worst * 0.1;
     /* (the side ahead slows down: by a millisecond a frame, two while more than 4 frames ahead. At 5% at most, a gap of 10
      * frames after a long replay took seconds to close, and meanwhile every input of the side behind arrived that much
@@ -4135,25 +4135,25 @@ static bool RB_WaitForInputs(uint32_t frame) {
     uint32_t start = 0, last_events = 0, lastresend = GetTicks();
     while (RB_MinHave() <= frame) {
         if (start == 0) { start = GetTicks(); last_events = start; }
-        if (!inputnet_session) return false;
-        if ((GetTicks() - start) > inputnet_timeout && inputnet_is_server && rbc_copies) {
-            for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-                InputNetPeer &p = inputnet_peers[i];
+        if (!streamnet_session) return false;
+        if ((GetTicks() - start) > streamnet_timeout && streamnet_is_server && rbc_copies) {
+            for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+                StreamNetPeer &p = streamnet_peers[i];
                 if (p.active && p.ready && !p.local && rb_have[i] <= frame) RBC_ServerDrop(i, "fell too far behind");
             }
             continue;
         }
         if ((GetTicks() - lastresend) >= 30u) { RB_SendInput(frame); lastresend = GetTicks(); }  /* (they may wait for ours) */
-        if ((GetTicks() - start) > inputnet_timeout && !RB_ClientWaitsOn(start)) {
-            if (inputnet_is_server)
-                INPUTNET_EndSession("timed out waiting for the other participant(s)",true);
+        if ((GetTicks() - start) > streamnet_timeout && !RB_ClientWaitsOn(start)) {
+            if (streamnet_is_server)
+                STREAMNET_EndSession("timed out waiting for the other participant(s)",true);
             else
-                INPUTNET_CloseLink("timed out waiting for the server",true);
+                STREAMNET_CloseLink("timed out waiting for the server",true);
             return false;
         }
-        INPUTNET_Stall(last_events);
+        STREAMNET_Stall(last_events);
         const uint32_t before = GetTicks();
-        INPUTNET_PollSocket();
+        STREAMNET_PollSocket();
         if (GetTicks() - before > 500u) start = GetTicks();     /* (a resync's transfer came meanwhile) */
     }
     return true;
@@ -4164,8 +4164,8 @@ static void RB_LogStats(void) {
     if ((now - rb_stat_last_log) < 5000u) return;
     rb_stat_last_log = now;
     uint32_t rtt = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
-    LOG_MSG("INPUTNET: rollback frame %u: %u rollbacks (%u frames replayed, deepest %u), %u slowdowns, %u stalls, "
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) rtt = std::max(rtt, rb_rtt[i]);
+    LOG_MSG("STREAMNET: rollback frame %u: %u rollbacks (%u frames replayed, deepest %u), %u slowdowns, %u stalls, "
         "%u checks, %u desyncs, %u resyncs; rtt %u ms, ahead %.2f frames; saving a frame takes %.0f us, %.1f pages; "
         "a replay takes %.1f ms (at most %.1f); memory scan %.0f us, devices %.0f us; %u frames in lockstep, %u host context changes",
         (unsigned)rb_realframe,(unsigned)rb_stat_rollbacks,(unsigned)rb_stat_replayed,(unsigned)rb_stat_maxdepth,
@@ -4177,11 +4177,11 @@ static void RB_LogStats(void) {
         rb_stat_captures ? (double)rb_stat_scan_us / (double)rb_stat_captures : 0.0,
         rb_stat_captures ? (double)rb_stat_lean_us / (double)rb_stat_captures : 0.0,
         (unsigned)rb_stat_lockstep, (unsigned)rb_stat_ctxchanges);
-    LOG_MSG("INPUTNET: the others' input that needed a correction: %u frames with keys, %u with the mouse, %u with a speed change, %u other "
+    LOG_MSG("STREAMNET: the others' input that needed a correction: %u frames with keys, %u with the mouse, %u with a speed change, %u other "
         "(and %u speed changes learned in time, without one)", (unsigned)rb_mis_key, (unsigned)rb_mis_mouse, (unsigned)rb_mis_speed,
         (unsigned)rb_mis_other, (unsigned)rb_mis_speed_late);
     rb_mis_key = rb_mis_mouse = rb_mis_speed = rb_mis_other = rb_mis_speed_late = 0;
-    if (CPU_CycleAutoAdjust) LOG_MSG("INPUTNET: speed %u cycles per ms (cycles=max), this computer %.0f%% busy (CPU core %.0f%%, "
+    if (CPU_CycleAutoAdjust) LOG_MSG("STREAMNET: speed %u cycles per ms (cycles=max), this computer %.0f%% busy (CPU core %.0f%%, "
         "running %.0f%% of it), picture %.0f a second (%.0f Hz, %.0f%% of the frames drawn changed), proposing %u", (unsigned)CPU_CycleMax,
         rb_ml_load * 100.0, rb_ml_core * 100.0, rb_ml_run * 100.0, rb_ml_pictures, rb_ml_refresh, rb_ml_changed_share * 100.0, rb_cap_local);
     {
@@ -4190,7 +4190,7 @@ static void RB_LogStats(void) {
         static uint32_t flips_at = 0;
         const uint32_t tnow = GetTicks();
         const double secs = flips_at ? (double)(tnow - flips_at) / 1000.0 : 0.0;
-        LOG_MSG("INPUTNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms; %u catch-ups cut short; the game showed %.1f frames/s (page flips, "
+        LOG_MSG("STREAMNET: %u hitches (frames more than 30 ms late), the longest gap %.0f ms; %u catch-ups cut short; the game showed %.1f frames/s (page flips, "
             "frames copied through the bank window), the picture changed %.1f times/s",
             (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0, (unsigned)rb_stat_trims, secs > 0 ? (double)(vga_shown_flips - flips_last) / secs : 0.0,
             secs > 0 ? (double)(render_changed_frames - changed_last) / secs : 0.0);
@@ -4199,7 +4199,7 @@ static void RB_LogStats(void) {
     rb_stat_hitches = 0; rb_stat_maxgap_us = 0; rb_stat_trims = 0;
     rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
     rb_stat_capture_us = 0; rb_stat_captures = 0; rb_stat_pages = 0;
-    if (rb_stat_replays) LOG_MSG("INPUTNET: replays' time (5 s): %.0f ms in all, loading the frame %.0f ms, saving frames %.0f ms, "
+    if (rb_stat_replays) LOG_MSG("STREAMNET: replays' time (5 s): %.0f ms in all, loading the frame %.0f ms, saving frames %.0f ms, "
         "waiting for the copies %.0f ms", (double)(rb_stat_replay_us + rb_stat_rp_restore_us) / 1000.0, (double)rb_stat_rp_restore_us / 1000.0,
         (double)rb_stat_rp_save_us / 1000.0, (double)rb_stat_rp_wait_us / 1000.0);
     rb_stat_rp_restore_us = rb_stat_rp_save_us = rb_stat_rp_wait_us = 0;
@@ -4222,29 +4222,29 @@ static uint32_t rb_resync_ready_raw = 0;
 static uint32_t rb_resync_acked = 0;    /* server: chunks acknowledged */
 static bool rb_resync_applied = false;  /* client: the server's state was just loaded */
 
-static void RB_Desync(InputNetPeer &p, unsigned peerid, uint32_t frame, uint64_t mine, uint64_t theirs) {
+static void RB_Desync(StreamNetPeer &p, unsigned peerid, uint32_t frame, uint64_t mine, uint64_t theirs) {
     (void)peerid;
     rb_stat_desyncs++;
-    LOG_MSG("INPUTNET: RollbackNet machines differ at frame %u (%08x%08x here, %08x%08x at \"%s\"); %s",
+    LOG_MSG("STREAMNET: RollbackNet machines differ at frame %u (%08x%08x here, %08x%08x at \"%s\"); %s",
         (unsigned)frame,(unsigned)(mine >> 32u),(unsigned)mine,(unsigned)(theirs >> 32u),(unsigned)theirs,
         p.name.empty() ? "peer" : p.name.c_str(),
-        inputnet_is_server ? "sending our state" : "taking the server's state over");
-    if (inputnet_is_server) rb_resync_wanted = true;
+        streamnet_is_server ? "sending our state" : "taking the server's state over");
+    if (streamnet_is_server) rb_resync_wanted = true;
     else { rb_desynced = true; rb_resync_last_sent = 0; }
 }
 
 static void RB_SendResyncAck(uint32_t id, uint32_t count) {
     uint8_t buf[32];
-    InputNetWriter w(buf,sizeof(buf));
-    INPUTNET_BeginPacket(w,INPKT_RESYNC);
+    StreamNetWriter w(buf,sizeof(buf));
+    STREAMNET_BeginPacket(w,INPKT_RESYNC);
     w.u8(3);
     w.u32(id);
     w.u32(count);
-    INPUTNET_SendToPeers(buf,w.size());
+    STREAMNET_SendToPeers(buf,w.size());
 }
 
 /* What a resync carries besides the save state: the frame it is, the session's tick, and the VGA frame clock the save
- * state format does not hold (INPUTNET_ApplyStateSnapshot's join sets the same from the WELCOME). */
+ * state format does not hold (STREAMNET_ApplyStateSnapshot's join sets the same from the WELCOME). */
 struct RBResyncInfo {
     uint32_t frame = 0, tick = 0;
     double vfps = 0, vbase = 0;
@@ -4280,7 +4280,7 @@ static bool RB_LoadResyncState(const RBResyncInfo &h, const std::vector<uint8_t>
     vga_fps = h.vfps;
     vga_mode_time_base = h.vbase;
     vga_mode_frames_since_time_base = (int)h.vframes;
-    if (!INPUTNET_ApplyStateSnapshot(state)) { RB_InitRegions(); return false; }
+    if (!STREAMNET_ApplyStateSnapshot(state)) { RB_InitRegions(); return false; }
     vga_fps = h.vfps;
     vga_mode_time_base = h.vbase;
     vga_mode_frames_since_time_base = (int)h.vframes;
@@ -4294,12 +4294,12 @@ static bool RB_LoadResyncState(const RBResyncInfo &h, const std::vector<uint8_t>
     rb_rp_t0 = 0;
     rb_evlog_on = getenv("NN_RB_EVLOG") != NULL;
     RB_InitRegions();               /* every older frame start is gone */
-    inputnet_frame = h.frame;
+    streamnet_frame = h.frame;
     RB_Capture(h.frame);
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
         for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
         rb_checked[i] = h.frame;    /* frames before this one are never compared again */
-        for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+        for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
     }
     return true;
 }
@@ -4311,7 +4311,7 @@ static bool RB_LoadResyncState(const RBResyncInfo &h, const std::vector<uint8_t>
  * every player, the copies linked by IPX as on a LAN, and the copies run identically on every computer: the whole
  * LAN is the machine RollbackNet keeps in step. Copy c is played by participant c (the host's is copy 0): that
  * participant's input goes to copy c on every computer, and a copy whose player is not there (yet) runs without
- * input. So a player can join later and take a free copy over, as with IPX-over-InputNet.
+ * input. So a player can join later and take a free copy over, as with IPX-over-StreamNet.
  *
  * On each computer one copy is the leader (the one its player plays: the RollbackNet participant, with the input,
  * the predictions, the rollbacks and the checksums); the others are its followers, driven over 127.0.0.1 ("cluster
@@ -4368,16 +4368,16 @@ struct RBCFollower {
     uint32_t go_frame = UINT32_MAX, go_epoch = 0;
     uint32_t cap = 0, cap_at = 0;               /* its speed proposal (RB_Propose, 0: none yet), and when it said */
 };
-static RBCFollower rbc_f[INPUTNET_MAX_PEERS];   /* leader: by copy */
+static RBCFollower rbc_f[STREAMNET_MAX_PEERS];   /* leader: by copy */
 static uint32_t rbc_seq = 0;
 /* The command RBC_Command waits for (one at a time), and the copy it went to: its acknowledgements count for that
  * follower whatever copy they name (a SETCOPY changes it in between). */
 static uint32_t rbc_inflight_seq = 0;
 static unsigned rbc_inflight_c = 0;
-static std::vector<std::vector<uint8_t> > rbc_inbox[RB_RING][INPUTNET_MAX_PEERS];  /* leader: each copy's packets at a frame start */
+static std::vector<std::vector<uint8_t> > rbc_inbox[RB_RING][STREAMNET_MAX_PEERS];  /* leader: each copy's packets at a frame start */
 static uint32_t rbc_inbox_frame[RB_RING];
-static std::vector<uint8_t> rbc_ser_inbox[RB_RING][INPUTNET_MAX_PEERS];  /* leader: what each copy's null modem receives */
-static uint8_t rbc_ser_lines[RB_RING][INPUTNET_MAX_PEERS];               /* ...and the other side's RTS/DTR */
+static std::vector<uint8_t> rbc_ser_inbox[RB_RING][STREAMNET_MAX_PEERS];  /* leader: what each copy's null modem receives */
+static uint8_t rbc_ser_lines[RB_RING][STREAMNET_MAX_PEERS];               /* ...and the other side's RTS/DTR */
 
 /* a blob coming in (either side) */
 static uint32_t rbc_blob_id = 0, rbc_blob_total = 0, rbc_blob_have = 0;
@@ -4395,7 +4395,7 @@ static uint32_t rbcf_last_cmd = 0;
 static uint32_t rbcf_cur = UINT32_MAX;          /* the frame start it waits at */
 static bool rbcf_go = false;
 static uint32_t rbcf_go_frame = 0, rbcf_go_epoch = 0;
-static std::vector<InputNetEvent> rbcf_go_events;
+static std::vector<StreamNetEvent> rbcf_go_events;
 static std::vector<std::vector<uint8_t> > rbcf_go_packets;
 static std::vector<uint8_t> rbcf_go_ser;
 static uint8_t rbcf_go_lines = 0;
@@ -4407,33 +4407,33 @@ static bool rbcf_reloaded = false;              /* SAVE or LOADRESYNC made the f
 static bool rbj_typed = false;
 static uint32_t rbj_steady = 0;                 /* frames in a row every copy has been where it can take the state */
 static uint32_t rbj_last_request = 0;
-static std::vector<std::vector<InputNetEvent> > rbj_typing;     /* our own typing on our copies, a frame each */
+static std::vector<std::vector<StreamNetEvent> > rbj_typing;     /* our own typing on our copies, a frame each */
 static size_t rbj_typing_pos = 0;
 
 /* client: the server's machines (uncompressed) until they can be loaded */
 static std::vector<uint8_t> rbc_resync_raw;
-static uint8_t rbc_resync_prompt[INPUTNET_MAX_PEERS];
+static uint8_t rbc_resync_prompt[STREAMNET_MAX_PEERS];
 static uint32_t rbc_resync_since = 0;
 
 /* server: joining and leaving participants */
-static bool rbs_joining[INPUTNET_MAX_PEERS];    /* asked to join, not in the session yet */
-static bool rbs_wants[INPUTNET_MAX_PEERS];      /* ...and ready to take the machines over */
+static bool rbs_joining[STREAMNET_MAX_PEERS];    /* asked to join, not in the session yet */
+static bool rbs_wants[STREAMNET_MAX_PEERS];      /* ...and ready to take the machines over */
 static std::vector<uint8_t> rbs_left;           /* left since the last transfer */
-static uint8_t rbs_join_copy[INPUTNET_MAX_PEERS];   /* the copy a joining participant asked for (RBC_ServerHello) */
+static uint8_t rbs_join_copy[STREAMNET_MAX_PEERS];   /* the copy a joining participant asked for (RBC_ServerHello) */
 
 /* Seats (clusters): the participant who plays each copy, 0xFF for nobody, the same on every computer. Participant c
- * plays copy c until a seat changes (INPUTNET_RollbackSeat: the server's control channel, "rbseat"); seats change only
+ * plays copy c until a seat changes (STREAMNET_RollbackSeat: the server's control channel, "rbseat"); seats change only
  * with a resync, which carries them, so every computer switches at the same frame. A computer whose player gets
  * another copy switches its own copies too (RBC_SwitchCopy): the leader, with the window and the sound, always runs
  * the copy its player plays. */
-static uint8_t rb_seat[INPUTNET_MAX_PEERS];
-static uint8_t rbs_seat_next[INPUTNET_MAX_PEERS];   /* server: the seats the next resync gives */
+static uint8_t rb_seat[STREAMNET_MAX_PEERS];
+static uint8_t rbs_seat_next[STREAMNET_MAX_PEERS];   /* server: the seats the next resync gives */
 static bool rbs_seat_change = false;
-static uint8_t rbc_resync_seat[INPUTNET_MAX_PEERS]; /* client: the seats of the resync being received */
+static uint8_t rbc_resync_seat[STREAMNET_MAX_PEERS]; /* client: the seats of the resync being received */
 static bool rbc_resync_has_seats = false;
 
 static void RB_SeatsReset(void) {
-    for (unsigned c = 0; c < INPUTNET_MAX_PEERS; c++) rb_seat[c] = (uint8_t)c;
+    for (unsigned c = 0; c < STREAMNET_MAX_PEERS; c++) rb_seat[c] = (uint8_t)c;
     rbs_seat_change = false;
     rbc_resync_has_seats = false;
 }
@@ -4455,8 +4455,8 @@ static void RB_ReportSeats(void) {
     for (unsigned c = 0; c < rbc_copies; c++) {
         if (c) j += ',';
         const uint8_t s = rb_seat[c];
-        if (s >= INPUTNET_MAX_PEERS || !inputnet_peers[s].active) { j += "null"; continue; }
-        const std::string name = inputnet_peers[s].local ? std::string("@host") : inputnet_peers[s].name;
+        if (s >= STREAMNET_MAX_PEERS || !streamnet_peers[s].active) { j += "null"; continue; }
+        const std::string name = streamnet_peers[s].local ? std::string("@host") : streamnet_peers[s].name;
         j += '"';
         for (char ch : name) { if (ch == '"' || ch == '\\') j += '\\'; if ((unsigned char)ch >= 0x20) j += ch; }
         j += '"';
@@ -4465,13 +4465,13 @@ static void RB_ReportSeats(void) {
     IPaddress to;
     SDLNet_Write32(0x7F000001u, &to.host);
     SDLNet_Write16((uint16_t)port, &to.port);
-    INPUTNET_SendRaw(to, (const uint8_t*)j.data(), j.size());
+    STREAMNET_SendRaw(to, (const uint8_t*)j.data(), j.size());
 }
 
 /* Whether nobody in the session plays copy c in "seats". */
 static bool RB_CopyFree(const uint8_t *seats, unsigned c) {
     const uint8_t s = seats[c];
-    return s >= INPUTNET_MAX_PEERS || !inputnet_peers[s].active;
+    return s >= STREAMNET_MAX_PEERS || !streamnet_peers[s].active;
 }
 static int rbs_filereq_peer = -1;               /* whose file request rb_filereq_* hold */
 
@@ -4530,9 +4530,9 @@ static bool RBC_Send(const IPaddress &to, const uint8_t *data, size_t len) {
     return SDLNet_UDP_Send(rbc_sock, -1, rbc_out) != 0;
 }
 
-static void RBC_BeginPacket(InputNetWriter &w, uint8_t type) {
-    w.u32(INPUTNET_MAGIC);
-    w.u8((uint8_t)INPUTNET_PROTOVER);
+static void RBC_BeginPacket(StreamNetWriter &w, uint8_t type) {
+    w.u32(STREAMNET_MAGIC);
+    w.u8((uint8_t)STREAMNET_PROTOVER);
     w.u8(type);
     w.u8((uint8_t)rbc_copy);
     w.u8(0);
@@ -4553,7 +4553,7 @@ static void RBC_Beat(void) {
     if (now - rbc_last_beat < 500u) return;
     rbc_last_beat = now;
     uint8_t buf[16];
-    InputNetWriter w(buf, sizeof(buf));
+    StreamNetWriter w(buf, sizeof(buf));
     RBC_BeginPacket(w, INPKT_CL_WELCOME);
     for (unsigned c = 0; c < rbc_copies; c++) if (c != rbc_copy && rbc_f[c].present) RBC_Send(rbc_f[c].addr, buf, w.size());
 }
@@ -4566,7 +4566,7 @@ static void RBC_PollLeader(void) {
 
 static void RBC_SendBlobAck(const IPaddress &to) {
     uint8_t buf[32];
-    InputNetWriter w(buf, sizeof(buf));
+    StreamNetWriter w(buf, sizeof(buf));
     RBC_BeginPacket(w, INPKT_CL_BULKACK);
     w.u32(rbc_blob_id);
     w.u32(rbc_blob_have);
@@ -4574,8 +4574,8 @@ static void RBC_SendBlobAck(const IPaddress &to) {
 }
 
 static void RBC_Dispatch(void) {
-    InputNetReader r((const uint8_t*)rbc_in->data, (size_t)rbc_in->len);
-    if (r.u32() != INPUTNET_MAGIC || r.u8() != (uint8_t)INPUTNET_PROTOVER) return;
+    StreamNetReader r((const uint8_t*)rbc_in->data, (size_t)rbc_in->len);
+    if (r.u32() != STREAMNET_MAGIC || r.u8() != (uint8_t)STREAMNET_PROTOVER) return;
     const uint8_t type = r.u8();
     const unsigned from = r.u8();
     r.u8();
@@ -4590,11 +4590,11 @@ static void RBC_Dispatch(void) {
         case INPKT_CL_HELLO: {
             if (!rbc_leader || from >= rbc_copies || from == rbc_copy) return;
             RBCFollower &f = rbc_f[from];
-            if (!f.present) LOG_MSG("INPUTNET: cluster: the copy for player %u is here", from + 1u);
+            if (!f.present) LOG_MSG("STREAMNET: cluster: the copy for player %u is here", from + 1u);
             f.present = true;
             f.addr = addr;
             uint8_t buf[16];
-            InputNetWriter w(buf, sizeof(buf));
+            StreamNetWriter w(buf, sizeof(buf));
             RBC_BeginPacket(w, INPKT_CL_WELCOME);
             RBC_Send(addr, buf, w.size());
             break;
@@ -4608,7 +4608,7 @@ static void RBC_Dispatch(void) {
             if (r.bad() || rbc_leader) return;
             if (c.seq > rbcf_last_cmd) { rbcf_cmds.push_back(c); rbcf_last_cmd = c.seq; }
             uint8_t buf[24];
-            InputNetWriter w(buf, sizeof(buf));
+            StreamNetWriter w(buf, sizeof(buf));
             RBC_BeginPacket(w, INPKT_CL_CMDACK);
             w.u32(c.seq);
             w.u8(0);                                    /* received */
@@ -4692,9 +4692,9 @@ static void RBC_Dispatch(void) {
         case INPKT_CL_GO: {
             const uint32_t frame = r.u32(), epoch = r.u32();
             if (r.bad() || rbc_leader) return;
-            std::vector<InputNetEvent> evs;
+            std::vector<StreamNetEvent> evs;
             const unsigned ne = r.u16();
-            for (unsigned i = 0; i < ne; i++) { InputNetEvent ev; if (!INPUTNET_ReadEvent(r, ev)) return; evs.push_back(ev); }
+            for (unsigned i = 0; i < ne; i++) { StreamNetEvent ev; if (!STREAMNET_ReadEvent(r, ev)) return; evs.push_back(ev); }
             std::vector<std::vector<uint8_t> > pk;
             const unsigned np = r.u16();
             for (unsigned i = 0; i < np; i++) {
@@ -4741,7 +4741,7 @@ static bool RBC_SendBlob(const IPaddress &to, uint32_t id, const std::vector<uin
         for (uint32_t c = from; c < nchunks && c < from + 64u; c++) {
             const uint32_t off = c * RBC_CHUNK, len = (total > off) ? std::min(RBC_CHUNK, total - off) : 0u;
             static uint8_t buf[RBC_CHUNK + 64];
-            InputNetWriter w(buf, sizeof(buf));
+            StreamNetWriter w(buf, sizeof(buf));
             RBC_BeginPacket(w, INPKT_CL_BULK);
             w.u32(id); w.u32(total); w.u32(off); w.u16((uint16_t)len);
             if (len) w.bytes(&blob[off], len);
@@ -4752,7 +4752,7 @@ static bool RBC_SendBlob(const IPaddress &to, uint32_t id, const std::vector<uin
         const uint32_t before = rbc_ack_have, t0 = GetTicks();
         while (GetTicks() - t0 < 30u && rbc_ack_have == before) RBC_Poll(2);
         if (rbc_ack_have != before) lastprogress = GetTicks();
-        if (GetTicks() - lastprogress > 15000u) { LOG_MSG("INPUTNET: cluster: a transfer between the copies timed out"); return false; }
+        if (GetTicks() - lastprogress > 15000u) { LOG_MSG("STREAMNET: cluster: a transfer between the copies timed out"); return false; }
         if (GetTicks() - last_events >= 10u) { GFX_Events(); last_events = GetTicks(); }
     }
     return true;
@@ -4771,7 +4771,7 @@ static bool RBC_ReceiveBlob(uint32_t id, std::vector<uint8_t> &out, uint32_t tim
             return true;
         }
         const uint32_t now = GetTicks();
-        if (now - start > timeout_ms) { LOG_MSG("INPUTNET: cluster: a transfer between the copies timed out"); return false; }
+        if (now - start > timeout_ms) { LOG_MSG("STREAMNET: cluster: a transfer between the copies timed out"); return false; }
         if (rbc_blob_id == id && now - lastack > 50u) { RBC_SendBlobAck(rbc_blob_from); lastack = now; }
         if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
     }
@@ -4789,13 +4789,13 @@ static bool RBC_Command(unsigned c, uint8_t cmd, uint32_t a, uint32_t b, uint32_
         const uint32_t now = GetTicks();
         if (lastsend == 0 || now - lastsend > 50u) {
             uint8_t buf[40];
-            InputNetWriter w(buf, sizeof(buf));
+            StreamNetWriter w(buf, sizeof(buf));
             RBC_BeginPacket(w, INPKT_CL_CMD);
             w.u32(seq); w.u8(cmd); w.u32(a); w.u32(b); w.u32(cc);
             RBC_Send(f.addr, buf, w.size());
             lastsend = now ? now : 1u;
         }
-        if (now - start > 20000u) { LOG_MSG("INPUTNET: cluster: the copy for player %u does not answer", c + 1u); return false; }
+        if (now - start > 20000u) { LOG_MSG("STREAMNET: cluster: the copy for player %u does not answer", c + 1u); return false; }
         RBC_Poll(2);
         if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
     }
@@ -4803,7 +4803,7 @@ static bool RBC_Command(unsigned c, uint8_t cmd, uint32_t a, uint32_t b, uint32_
     if (reply != NULL && !RBC_ReceiveBlob(seq, *reply, 60000u)) return false;
     start = GetTicks();
     while (f.done < seq) {
-        if (GetTicks() - start > 60000u) { LOG_MSG("INPUTNET: cluster: the copy for player %u did not finish", c + 1u); return false; }
+        if (GetTicks() - start > 60000u) { LOG_MSG("STREAMNET: cluster: the copy for player %u did not finish", c + 1u); return false; }
         RBC_Poll(2);
         if (GetTicks() - last_events >= 10u) { GFX_Events(); last_events = GetTicks(); }
     }
@@ -4813,11 +4813,11 @@ static bool RBC_Command(unsigned c, uint8_t cmd, uint32_t a, uint32_t b, uint32_
 static bool RBC_OpenSocket(uint16_t port) {
     if (rbc_sock != NULL) return true;
     if (!SDLNetInited) {
-        if (SDLNet_Init() == -1) { LOG_MSG("INPUTNET: cluster: SDLNet_Init failed: %s", SDLNet_GetError()); return false; }
+        if (SDLNet_Init() == -1) { LOG_MSG("STREAMNET: cluster: SDLNet_Init failed: %s", SDLNet_GetError()); return false; }
         SDLNetInited = true;
     }
     rbc_sock = SDLNet_UDP_Open(port);
-    if (rbc_sock == NULL) { LOG_MSG("INPUTNET: cluster: cannot open UDP port %u: %s", (unsigned)port, SDLNet_GetError()); return false; }
+    if (rbc_sock == NULL) { LOG_MSG("STREAMNET: cluster: cannot open UDP port %u: %s", (unsigned)port, SDLNet_GetError()); return false; }
     if (rbc_in == NULL) rbc_in = SDLNet_AllocPacket(RBC_MAXPKT);
     if (rbc_out == NULL) rbc_out = SDLNet_AllocPacket(RBC_MAXPKT);
     if (rbc_set == NULL) rbc_set = SDLNet_AllocSocketSet(1);
@@ -4833,33 +4833,33 @@ static void RBC_LeaderGather(void) {
         if (failed) return;
         if (!RBC_OpenSocket((uint16_t)rbc_port)) { failed = true; return; }
         for (unsigned k = 0; k < RB_RING; k++) rbc_inbox_frame[k] = UINT32_MAX;
-        LOG_MSG("INPUTNET: cluster: player %u's copy waits for the other %u on port %u", rbc_copy + 1u, rbc_copies - 1u, rbc_port);
+        LOG_MSG("STREAMNET: cluster: player %u's copy waits for the other %u on port %u", rbc_copy + 1u, rbc_copies - 1u, rbc_port);
     }
     RBC_Poll();
     unsigned here = 1;
     for (unsigned c = 0; c < rbc_copies; c++) if (c != rbc_copy && rbc_f[c].present) here++;
     if (here < rbc_copies) return;
     rbc_ready = true;
-    LOG_MSG("INPUTNET: cluster of %u copies ready (this one is player %u's)", rbc_copies, rbc_copy + 1u);
+    LOG_MSG("STREAMNET: cluster of %u copies ready (this one is player %u's)", rbc_copies, rbc_copy + 1u);
 }
 
 /* Leader: copy c's input and packets at "frame". */
-static void RBC_SendGo(unsigned c, uint32_t frame, const std::vector<InputNetEvent> &events, const std::vector<std::vector<uint8_t> > &packets,
+static void RBC_SendGo(unsigned c, uint32_t frame, const std::vector<StreamNetEvent> &events, const std::vector<std::vector<uint8_t> > &packets,
                        const std::vector<uint8_t> &ser, uint8_t lines) {
     RBCFollower &f = rbc_f[c];
     if (!f.present) return;
     std::vector<uint8_t> buf(RBC_MAXPKT);
-    InputNetWriter w(&buf[0], buf.size());
+    StreamNetWriter w(&buf[0], buf.size());
     RBC_BeginPacket(w, INPKT_CL_GO);
     w.u32(frame); w.u32(rbc_epoch);
     w.u16((uint16_t)events.size());
-    for (size_t i = 0; i < events.size(); i++) INPUTNET_WriteEvent(w, events[i]);
+    for (size_t i = 0; i < events.size(); i++) STREAMNET_WriteEvent(w, events[i]);
     w.u16((uint16_t)packets.size());
     for (size_t i = 0; i < packets.size(); i++) { w.u16((uint16_t)packets[i].size()); w.bytes(&packets[i][0], packets[i].size()); }
     w.u16((uint16_t)ser.size());
     if (!ser.empty()) w.bytes(&ser[0], ser.size());
     w.u8(lines);
-    if (w.overflow()) { LOG_MSG("INPUTNET: cluster: too much for one frame of the copy for player %u", c + 1u); return; }
+    if (w.overflow()) { LOG_MSG("STREAMNET: cluster: too much for one frame of the copy for player %u", c + 1u); return; }
     buf.resize(w.size());
     f.go.swap(buf);
     f.go_frame = frame; f.go_epoch = rbc_epoch;
@@ -4872,14 +4872,14 @@ static void RBC_SendGo(unsigned c, uint32_t frame, const std::vector<InputNetEve
  * prompt waits: a player's keys during the start-up batch went into the keyboard buffer and the prompt read them in
  * front of the game's start command. The server's own typing of that command (bit 1) always goes through. */
 bool REMOTEPLAY_ShellInFront(void);
-static inline bool RB_GuardDrops(const InputNetEvent &e) {
+static inline bool RB_GuardDrops(const StreamNetEvent &e) {
     return e.type == INEV_KEY && (e.pressed & 1u) && !(e.pressed & 2u) && (dos_shell_reading_input || REMOTEPLAY_ShellInFront());
 }
 
 /* Leader: everyone's input for "frame", each participant's to the copy it plays (rb_seat; the server's autorun typing to every copy), then
  * this copy's packets and input, and every follower's GO. A joining computer runs its own typing only. */
 static void RBC_ApplyInputs(uint32_t frame) {
-    std::vector<InputNetEvent> ev[INPUTNET_MAX_PEERS];
+    std::vector<StreamNetEvent> ev[STREAMNET_MAX_PEERS];
     {
         const auto inj = rbc_injected.find(frame);
         if (inj != rbc_injected.end()) for (unsigned c = 0; c < rbc_copies; c++) ev[c] = inj->second;
@@ -4891,17 +4891,17 @@ static void RBC_ApplyInputs(uint32_t frame) {
             rbj_typing_pos++;
         }
     }
-    else for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    else for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready) continue;
         if (!p.local) {
             if (frame >= rb_have[i]) { rb_predicted[i][frame % RB_RING] = frame + 1u; continue; }
             rb_predicted[i][frame % RB_RING] = 0;
         }
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(p, frame);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(p, frame);
         if (slot == NULL) continue;
         for (size_t e = 0; e < slot->events.size(); e++) {
-            const InputNetEvent &x = slot->events[e];
+            const StreamNetEvent &x = slot->events[e];
             if ((x.type == INEV_KEY && (x.pressed & 2u)) || x.type == INEV_CYCLEMAX) { for (unsigned c = 0; c < rbc_copies; c++) ev[c].push_back(x); }
             else if (rbc_copies == 1) ev[0].push_back(x);   /* (the game alone: everybody plays it) */
             else { const int c = RB_CopyOf(rb_seat, i); if (c >= 0) ev[c].push_back(x); }
@@ -4919,7 +4919,7 @@ static void RBC_ApplyInputs(uint32_t frame) {
     /* (a scheduled speed change goes after the frame's packets and before its input, on the leader and on every copy alike:
      * delivering a packet schedules emulated events in cycles, so the order is part of the machine's course) */
     RB_ApplyScheduledSpeed(frame);
-    for (size_t i = 0; i < ev[rbc_copy].size(); i++) if (!RB_GuardDrops(ev[rbc_copy][i])) INPUTNET_ApplyEvent(ev[rbc_copy][i]);
+    for (size_t i = 0; i < ev[rbc_copy].size(); i++) if (!RB_GuardDrops(ev[rbc_copy][i])) STREAMNET_ApplyEvent(ev[rbc_copy][i]);
     for (unsigned c = 0; c < rbc_copies; c++)
         if (c != rbc_copy) RBC_SendGo(c, frame, ev[c], have ? rbc_inbox[k][c] : none, have ? rbc_ser_inbox[k][c] : noser, have ? rbc_ser_lines[k][c] : 0);
 }
@@ -4976,7 +4976,7 @@ static bool RBC_LeaderBarrierRun(uint32_t frame, int mode);
 static bool RBC_LeaderBarrier(uint32_t frame, int mode) {
     const uint64_t t0 = RB_MicroTicks();
     const bool r = RBC_LeaderBarrierRun(frame, mode);
-    if (inputnet_rollback_resim && mode != RBC_REWIND) rb_stat_rp_wait_us += RB_MicroTicks() - t0;
+    if (streamnet_rollback_resim && mode != RBC_REWIND) rb_stat_rp_wait_us += RB_MicroTicks() - t0;
     return r;
 }
 static bool RBC_LeaderBarrierRun(uint32_t frame, int mode) {
@@ -4999,16 +4999,16 @@ static bool RBC_LeaderBarrierRun(uint32_t frame, int mode) {
             for (unsigned c = 0; c < rbc_copies; c++) {
                 if (c == rbc_copy || !rbc_f[c].present || rbc_f[c].at_epoch == rbc_epoch) continue;
                 uint8_t buf[32];
-                InputNetWriter w(buf, sizeof(buf));
+                StreamNetWriter w(buf, sizeof(buf));
                 RBC_BeginPacket(w, INPKT_CL_REWIND);
-                w.u32(frame); w.u32(inputnet_rollback_resim ? rb_target : frame); w.u32(rbc_epoch);
+                w.u32(frame); w.u32(streamnet_rollback_resim ? rb_target : frame); w.u32(rbc_epoch);
                 RBC_Send(rbc_f[c].addr, buf, w.size());
             }
             lastrw = now ? now : 1u;
         }
         if (now - start > 20000u) {
-            LOG_MSG("INPUTNET: cluster: a copy stopped at frame %u", (unsigned)frame);
-            INPUTNET_EndSession("a copy of the game stopped answering", true);
+            LOG_MSG("STREAMNET: cluster: a copy stopped at frame %u", (unsigned)frame);
+            STREAMNET_EndSession("a copy of the game stopped answering", true);
             return false;
         }
         RBC_Poll(1);
@@ -5072,7 +5072,7 @@ static void RBC_LeaderStart(uint32_t frame, bool joining) {
         RBCFollower &f = rbc_f[c];
         f.at_frame = UINT32_MAX; f.at_epoch = 0; f.go_frame = UINT32_MAX; f.go.clear(); f.at_out.clear();
         if (f.present && !RBC_Command(c, RBC_CMD_START, frame, joining ? 1u : 0u, 0, NULL, NULL))
-            LOG_MSG("INPUTNET: cluster: the copy for player %u did not start", c + 1u);
+            LOG_MSG("STREAMNET: cluster: the copy for player %u did not start", c + 1u);
     }
 }
 
@@ -5082,7 +5082,7 @@ static void RBC_LeaderEnd(void) {
         if (c == rbc_copy || !rbc_f[c].present) continue;
         const uint32_t seq = ++rbc_seq;
         uint8_t buf[40];
-        InputNetWriter w(buf, sizeof(buf));
+        StreamNetWriter w(buf, sizeof(buf));
         RBC_BeginPacket(w, INPKT_CL_CMD);
         w.u32(seq); w.u8(RBC_CMD_END); w.u32(0); w.u32(0); w.u32(0);
         for (unsigned i = 0; i < 3; i++) RBC_Send(rbc_f[c].addr, buf, w.size());
@@ -5093,7 +5093,7 @@ static void RBC_LeaderEnd(void) {
 
 static void RBC_FollowerDone(uint32_t seq) {
     uint8_t buf[24];
-    InputNetWriter w(buf, sizeof(buf));
+    StreamNetWriter w(buf, sizeof(buf));
     RBC_BeginPacket(w, INPKT_CL_CMDACK);
     w.u32(seq); w.u8(1);
     for (unsigned i = 0; i < 3; i++) RBC_Send(rbc_leader_addr, buf, w.size());
@@ -5136,7 +5136,7 @@ static bool RBC_LoadCopy(const RBResyncInfo &h, const std::vector<uint8_t> &stat
     hh.vfps = x.vfps; hh.vbase = x.vbase; hh.vframes = x.vframes; hh.draw = x.draw;
     return RB_LoadResyncState(hh, state, [&]() {
         RBC_SetExtras(x);
-        if (!RB_LoadLinks(ipx, ipxlen)) LOG_MSG("INPUTNET: cluster: the links' state (IPX, null modem) did not load");
+        if (!RB_LoadLinks(ipx, ipxlen)) LOG_MSG("STREAMNET: cluster: the links' state (IPX, null modem) did not load");
     });
 }
 
@@ -5147,9 +5147,9 @@ static void RBC_FollowerCommands(void) {
         rbcf_cmds.erase(rbcf_cmds.begin());
         switch (c.cmd) {
             case RBC_CMD_SAVE: {            /* at frame start c.a: this copy's machine, then the same loaded back */
-                if (!inputnet_session || rbcf_cur != c.a) { LOG_MSG("INPUTNET: cluster: asked to save frame %u at %u", (unsigned)c.a, (unsigned)rbcf_cur); break; }
+                if (!streamnet_session || rbcf_cur != c.a) { LOG_MSG("STREAMNET: cluster: asked to save frame %u at %u", (unsigned)c.a, (unsigned)rbcf_cur); break; }
                 std::vector<uint8_t> state, blob;
-                if (!INPUTNET_SnapshotState(state)) state.clear();
+                if (!STREAMNET_SnapshotState(state)) state.clear();
                 std::string ipx;
                 RB_SaveLinks(ipx);
                 RBCExtras x;
@@ -5164,7 +5164,7 @@ static void RBC_FollowerCommands(void) {
                 if (sl) {
                     RBResyncInfo h;
                     h.frame = c.a; h.tick = rb_tick; h.epoch = c.c;
-                    if (!RBC_LoadCopy(h, state, (const uint8_t*)ipx.data(), ipx.size(), x)) LOG_MSG("INPUTNET: cluster: could not load this copy's own state");
+                    if (!RBC_LoadCopy(h, state, (const uint8_t*)ipx.data(), ipx.size(), x)) LOG_MSG("STREAMNET: cluster: could not load this copy's own state");
                 }
                 rbc_epoch = c.b;
                 rbcf_reloaded = true;
@@ -5202,7 +5202,7 @@ static void RBC_FollowerCommands(void) {
                     if (ld->AddMountedFile(m[i].path.c_str(), m[i].host.c_str(), true))
                         rb_sync_mapped.push_back(std::make_pair((int)m[i].drive, m[i].path));
                 }
-                LOG_MSG("INPUTNET: cluster: using %u of the server's files in this copy", (unsigned)m.size());
+                LOG_MSG("STREAMNET: cluster: using %u of the server's files in this copy", (unsigned)m.size());
                 break;
             }
             case RBC_CMD_LOADRESYNC: {      /* at a frame start: the server's machine for this copy at frame c.a */
@@ -5220,36 +5220,36 @@ static void RBC_FollowerCommands(void) {
                 if (!RBC_Get(p, end, &il, 4) || (size_t)(end - p) < il) break;
                 const uint8_t *ipx = p; p += il;
                 if (!RBC_GetExtrasFrom(p, end, x)) break;
-                if (!RBC_LoadCopy(h, state, ipx, il, x)) { LOG_MSG("INPUTNET: cluster: could not load the server's copy"); break; }
+                if (!RBC_LoadCopy(h, state, ipx, il, x)) { LOG_MSG("STREAMNET: cluster: could not load the server's copy"); break; }
                 const uint32_t real = c.b;
                 if (real > h.frame) {       /* replay to where real time is, with the leader */
-                    inputnet_rollback_resim = true;
+                    streamnet_rollback_resim = true;
                     rb_target = real;
                     MIXER_SetRollbackDiscard(true);
-                    DOSBOX_AddTicksRemain((real - h.frame) * inputnet_frame_ms);
+                    DOSBOX_AddTicksRemain((real - h.frame) * streamnet_frame_ms);
                 }
                 rbc_epoch = c.c;
                 rbcf_cur = h.frame;
                 rbcf_reloaded = true;
-                LOG_MSG("INPUTNET: cluster: took the server's copy for player %u over at frame %u", rbc_copy + 1u, (unsigned)h.frame);
+                LOG_MSG("STREAMNET: cluster: took the server's copy for player %u over at frame %u", rbc_copy + 1u, (unsigned)h.frame);
                 break;
             }
             case RBC_CMD_START:             /* the session starts at frame c.a */
-                if (inputnet_session) { inputnet_session = false; RB_SessionEnded(); }
-                for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) { inputnet_peers[i].active = false; inputnet_peers[i].ready = false; }
+                if (streamnet_session) { streamnet_session = false; RB_SessionEnded(); }
+                for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) { streamnet_peers[i].active = false; streamnet_peers[i].ready = false; }
                 rb_start_frame = c.a;
                 rbc_epoch = 0;
                 rbcf_go = false; rbcf_rewind = false;
-                inputnet_session = true;
-                inputnet_capture_active = true;  /* this window's own input goes nowhere (INPUTNET_QueueLocal) */
+                streamnet_session = true;
+                streamnet_capture_active = true;  /* this window's own input goes nowhere (STREAMNET_QueueLocal) */
                 RB_SessionStarted();
                 break;
             case RBC_CMD_END:
-                if (inputnet_session) { inputnet_session = false; inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */ RB_SessionEnded(); }
+                if (streamnet_session) { streamnet_session = false; streamnet_capture_active = streamnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */ RB_SessionEnded(); }
                 break;
             case RBC_CMD_SETCOPY:           /* this process runs copy c.a from now on (its machine comes with a LOADRESYNC) */
                 if (c.a < rbc_copies && c.a != rbc_copy) {
-                    LOG_MSG("INPUTNET: cluster: this process runs the copy for player %u from now on (it ran player %u's)", c.a + 1u, rbc_copy + 1u);
+                    LOG_MSG("STREAMNET: cluster: this process runs the copy for player %u from now on (it ran player %u's)", c.a + 1u, rbc_copy + 1u);
                     rbc_copy = c.a;
                     if (IPX_ClusterActive()) IPX_ClusterAttach(rbc_copy);
                 }
@@ -5263,18 +5263,18 @@ static void RBC_FollowerCommands(void) {
 
 /* Follower, between timer ticks outside a session: the leader, once the DOS prompt is reached, then its commands. */
 static void RBC_FollowerTick(void) {
-    if (inputnet_session) return;           /* (in a session everything happens at the frame starts) */
+    if (streamnet_session) return;           /* (in a session everything happens at the frame starts) */
     if (rbc_sock == NULL) {
         if (!dos_shell_reading_input) return;
         if (!RBC_OpenSocket(0)) { rbc_copies = 0; return; }
         SDLNet_ResolveHost(&rbc_leader_addr, "127.0.0.1", (uint16_t)rbc_port);
         rbc_last_heard = GetTicks();
-        LOG_MSG("INPUTNET: cluster: player %u's copy looks for its leader on port %u", rbc_copy + 1u, rbc_port);
+        LOG_MSG("STREAMNET: cluster: player %u's copy looks for its leader on port %u", rbc_copy + 1u, rbc_port);
     }
     static uint32_t lasthello = 0;
     if (!rbcf_welcomed && GetTicks() - lasthello > 200u) {
         uint8_t buf[16];
-        InputNetWriter w(buf, sizeof(buf));
+        StreamNetWriter w(buf, sizeof(buf));
         RBC_BeginPacket(w, INPKT_CL_HELLO);
         RBC_Send(rbc_leader_addr, buf, w.size());
         lasthello = GetTicks();
@@ -5285,9 +5285,9 @@ static void RBC_FollowerTick(void) {
 
 /* Follower, at a frame start: tell the leader, then do what it says. */
 static void RBC_FollowerBoundary(uint32_t frame) {
-    inputnet_frame = frame;
-    if (inputnet_rollback_resim && frame >= rb_target) {
-        inputnet_rollback_resim = false;
+    streamnet_frame = frame;
+    if (streamnet_rollback_resim && frame >= rb_target) {
+        streamnet_rollback_resim = false;
         MIXER_SetRollbackDiscard(false);
         extern void RENDER_RedrawAll(void);
         RENDER_RedrawAll();
@@ -5305,7 +5305,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
         RB_Propose();
         static unsigned told = 0;
         if (++told % 5u == 0)
-            LOG_MSG("INPUTNET: cluster copy %u: speed %u cycles per ms, %.0f%% busy (CPU core %.0f%%), replays allow %.0f, proposing %u",
+            LOG_MSG("STREAMNET: cluster copy %u: speed %u cycles per ms, %.0f%% busy (CPU core %.0f%%), replays allow %.0f, proposing %u",
                 rbc_copy + 1u, (unsigned)CPU_CycleMax, rb_ml_load * 100.0, rb_ml_core * 100.0, RB_ReplayCap(), rb_cap_local);
     }
     RBWaitTimer waited;             /* (waiting for the leader is not this copy's load) */
@@ -5315,7 +5315,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
         const uint32_t now = GetTicks();
         if (lastsend == 0 || now - lastsend >= 4u) {
             std::vector<uint8_t> buf(RBC_MAXPKT);
-            InputNetWriter w(&buf[0], buf.size());
+            StreamNetWriter w(&buf[0], buf.size());
             RBC_BeginPacket(w, INPKT_CL_AT);
             const RBSnap &s = rb_snap[rbcf_cur % RB_RING];
             const uint64_t lb = RBC_Loadable(rbcf_cur);
@@ -5335,7 +5335,7 @@ static void RBC_FollowerBoundary(uint32_t frame) {
         }
         RBC_Poll(1);
         RBC_FollowerCommands();
-        if (!inputnet_session) { rbcf_cur = UINT32_MAX; return; }   /* END */
+        if (!streamnet_session) { rbcf_cur = UINT32_MAX; return; }   /* END */
         if (rbcf_reloaded) { rbcf_reloaded = false; with_packets = false; lastsend = 0; continue; }
         if (rbcf_rewind && rbcf_rw_epoch > rbc_epoch) {
             rbcf_rewind = false;
@@ -5344,15 +5344,15 @@ static void RBC_FollowerBoundary(uint32_t frame) {
             if (target <= rbcf_cur && RB_Restore(target, rbcf_cur)) {
                 if (rbcf_rw_real > target) {
                     RB_ReplayBegin(rbcf_rw_real - target);
-                    inputnet_rollback_resim = true;
+                    streamnet_rollback_resim = true;
                     rb_target = rbcf_rw_real;
                     MIXER_SetRollbackDiscard(true);
-                    DOSBOX_AddTicksRemain((rbcf_rw_real - rbcf_cur) * inputnet_frame_ms + (rbcf_cur - target) * inputnet_frame_ms);
+                    DOSBOX_AddTicksRemain((rbcf_rw_real - rbcf_cur) * streamnet_frame_ms + (rbcf_cur - target) * streamnet_frame_ms);
                 }
-                inputnet_frame = target;
+                streamnet_frame = target;
                 rbcf_cur = target;
             }
-            else LOG_MSG("INPUTNET: cluster: the copy for player %u cannot go back to frame %u", rbc_copy + 1u, (unsigned)target);
+            else LOG_MSG("STREAMNET: cluster: the copy for player %u cannot go back to frame %u", rbc_copy + 1u, (unsigned)target);
             with_packets = false;           /* the leader keeps what was routed at "target" */
             lastsend = 0;
             continue;
@@ -5362,14 +5362,14 @@ static void RBC_FollowerBoundary(uint32_t frame) {
             for (size_t i = 0; i < rbcf_go_packets.size(); i++) IPX_ClusterDeliver(&rbcf_go_packets[i][0], rbcf_go_packets[i].size());
             if (!rbcf_go_ser.empty() || rbcf_go_lines) SERIAL_RBDeliver(rbcf_go_ser.empty() ? NULL : &rbcf_go_ser[0], rbcf_go_ser.size(), rbcf_go_lines);
             RB_ApplyScheduledSpeed(rbcf_cur);
-            for (size_t i = 0; i < rbcf_go_events.size(); i++) if (!RB_GuardDrops(rbcf_go_events[i])) INPUTNET_ApplyEvent(rbcf_go_events[i]);
+            for (size_t i = 0; i < rbcf_go_events.size(); i++) if (!RB_GuardDrops(rbcf_go_events[i])) STREAMNET_ApplyEvent(rbcf_go_events[i]);
             rbcf_cur = UINT32_MAX;
             return;
         }
         if (GetTicks() - rbc_last_heard > 15000u) {   /* (a command may have taken a while since "now") */
-            LOG_MSG("INPUTNET: cluster: the leader is gone");
-            inputnet_session = false;
-            inputnet_capture_active = inputnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
+            LOG_MSG("STREAMNET: cluster: the leader is gone");
+            streamnet_session = false;
+            streamnet_capture_active = streamnet_rollback;   /* (RollbackNet: local input never reaches the machine directly) */
             RB_SessionEnded();
             rbcf_cur = UINT32_MAX;
             return;
@@ -5379,15 +5379,15 @@ static void RBC_FollowerBoundary(uint32_t frame) {
 }
 
 static void RBC_FollowerRollbackTick(void) {
-    if (!inputnet_rollback_active || !inputnet_session) return;
+    if (!streamnet_rollback_active || !streamnet_session) return;
     if (!rb_have_first) {
         rb_have_first = true;
-        rb_tick = rb_start_frame * inputnet_frame_ms;
+        rb_tick = rb_start_frame * streamnet_frame_ms;
         RBC_FollowerBoundary(rb_start_frame);
         return;
     }
     rb_tick++;
-    if ((rb_tick % inputnet_frame_ms) == 0) RBC_FollowerBoundary(rb_tick / inputnet_frame_ms);
+    if ((rb_tick % streamnet_frame_ms) == 0) RBC_FollowerBoundary(rb_tick / streamnet_frame_ms);
 }
 
 /* ---- the machines of a cluster, for the transfer (RB_ServerResync) ---- */
@@ -5454,7 +5454,7 @@ static bool RBC_SwitchCopy(unsigned nc) {
     rbc_f[nc] = RBCFollower();
     rbc_copy = nc;
     if (IPX_ClusterActive()) IPX_ClusterAttach(rbc_copy);
-    LOG_MSG("INPUTNET: cluster: this computer's player plays copy %u from now on (was %u)", nc + 1u, old + 1u);
+    LOG_MSG("STREAMNET: cluster: this computer's player plays copy %u from now on (was %u)", nc + 1u, old + 1u);
     return true;
 }
 
@@ -5470,7 +5470,7 @@ static void RBC_PutLoadPayload(std::vector<uint8_t> &payload, const RBResyncInfo
 static bool RBC_BuildMachines(uint32_t frame, uint16_t epoch, std::vector<uint8_t> &raw, const uint8_t *seats) {
     RBResyncInfo info;
     std::vector<uint8_t> main_state;
-    if (!INPUTNET_SnapshotState(main_state)) return false;
+    if (!STREAMNET_SnapshotState(main_state)) return false;
     info.frame = frame; info.tick = rb_tick; info.epoch = epoch;
     info.vfps = vga_fps; info.vbase = vga_mode_time_base; info.vframes = (int32_t)vga_mode_frames_since_time_base;
     info.draw = VGA_GetOnDemandFlags();
@@ -5530,7 +5530,7 @@ static bool RBC_BuildMachines(uint32_t frame, uint16_t epoch, std::vector<uint8_
     raw.insert(raw.end(), clx.begin(), clx.end());
 
     /* this copy goes on from the very bytes it sends (the followers did the same) */
-    const int nc = (seats != NULL) ? RB_CopyOf(seats, inputnet_selfid) : -1;
+    const int nc = (seats != NULL) ? RB_CopyOf(seats, streamnet_selfid) : -1;
     if (nc >= 0 && (unsigned)nc != rbc_copy) {
         /* the server's player plays another copy now: the leader and the follower that ran it trade machines */
         std::vector<RBCMachine> m;
@@ -5553,12 +5553,12 @@ static bool RBC_BuildMachines(uint32_t frame, uint16_t epoch, std::vector<uint8_
 static bool RBC_ApplyMachines(uint32_t frame, bool joining) {
     RBResyncInfo info;
     std::vector<RBCMachine> m;
-    if (!RBC_ParseMachines(rbc_resync_raw, info, m)) { LOG_MSG("INPUTNET: resync: the server's machines did not arrive whole"); return false; }
+    if (!RBC_ParseMachines(rbc_resync_raw, info, m)) { LOG_MSG("STREAMNET: resync: the server's machines did not arrive whole"); return false; }
     if (rbc_resync_has_seats) {         /* who plays which copy from this frame on */
         memcpy(rb_seat, rbc_resync_seat, sizeof(rb_seat));
         rbc_resync_has_seats = false;
-        const int nc = RB_CopyOf(rb_seat, inputnet_selfid);
-        if (nc >= 0 && (unsigned)nc != rbc_copy && !RBC_SwitchCopy((unsigned)nc)) { LOG_MSG("INPUTNET: cluster: could not switch to copy %d", nc + 1); return false; }
+        const int nc = RB_CopyOf(rb_seat, streamnet_selfid);
+        if (nc >= 0 && (unsigned)nc != rbc_copy && !RBC_SwitchCopy((unsigned)nc)) { LOG_MSG("STREAMNET: cluster: could not switch to copy %d", nc + 1); return false; }
     }
     const RBCMachine &own = m[rbc_copy];
     if (!RBC_LoadCopy(info, std::vector<uint8_t>(own.state, own.state + own.statelen), own.ipx, own.ipxlen, own.x)) return false;
@@ -5583,14 +5583,14 @@ static bool RBC_ApplyMachines(uint32_t frame, bool joining) {
 /* Client: whether the server's machines can be loaded at "frame": every copy stable, and each at the DOS prompt
  * exactly where the server's was (else its emulator is inside other nested loops). */
 static bool RBC_CanApplyMachines(uint32_t frame) {
-    uint8_t prompt[INPUTNET_MAX_PEERS];
+    uint8_t prompt[STREAMNET_MAX_PEERS];
     if (!RBC_AllStable(frame, prompt)) return false;
     for (unsigned c = 0; c < rbc_copies; c++) {
         if (prompt[c] == rbc_resync_prompt[c]) continue;
         if (rbc_resync_since && GetTicks() - rbc_resync_since > 10000u) {
             static uint32_t told = 0;
             if (GetTicks() - told > 10000u) {
-                LOG_MSG("INPUTNET: resync: the copy for player %u is %s, the server's was %s", c + 1u,
+                LOG_MSG("STREAMNET: resync: the copy for player %u is %s, the server's was %s", c + 1u,
                     prompt[c] ? "at the DOS prompt" : "running a program", rbc_resync_prompt[c] ? "at the DOS prompt" : "running a program");
                 told = GetTicks();
             }
@@ -5613,7 +5613,7 @@ static void RBC_NoteMachines(void) {
 /* ---- joining ---- */
 
 /* The key events that type "text" and Enter, a frame per character (the autorun flag set: RB_ApplyInputs). */
-static void RB_TypingFrames(const std::string &text, std::vector<std::vector<InputNetEvent> > &frames) {
+static void RB_TypingFrames(const std::string &text, std::vector<std::vector<StreamNetEvent> > &frames) {
     static const char *plain = "`1234567890-=[]\\;',./";
     static const char *shifted = "~!@#$%^&*()_+{}|:\"<>?";
     static const KBD_KEYS punct[] = { KBD_grave,KBD_1,KBD_2,KBD_3,KBD_4,KBD_5,KBD_6,KBD_7,KBD_8,KBD_9,KBD_0,KBD_minus,KBD_equals,
@@ -5621,8 +5621,8 @@ static void RB_TypingFrames(const std::string &text, std::vector<std::vector<Inp
     static const KBD_KEYS letters[26] = { KBD_a,KBD_b,KBD_c,KBD_d,KBD_e,KBD_f,KBD_g,KBD_h,KBD_i,KBD_j,KBD_k,KBD_l,KBD_m,
         KBD_n,KBD_o,KBD_p,KBD_q,KBD_r,KBD_s,KBD_t,KBD_u,KBD_v,KBD_w,KBD_x,KBD_y,KBD_z };
     auto press = [&frames](KBD_KEYS k, bool shift) {
-        std::vector<InputNetEvent> f;
-        InputNetEvent ev;
+        std::vector<StreamNetEvent> f;
+        StreamNetEvent ev;
         ev.type = INEV_KEY;
         if (shift) { ev.key = (uint16_t)KBD_leftshift; ev.pressed = 3; f.push_back(ev); }
         ev.key = (uint16_t)k; ev.pressed = 3; f.push_back(ev);
@@ -5647,7 +5647,7 @@ static void RB_TypingFrames(const std::string &text, std::vector<std::vector<Inp
  * server's runs already, and once every copy has been where the server's machines can be loaded for a while, ask for
  * them (again every few seconds until they come). */
 static void RBC_JoinStep(uint32_t frame) {
-    uint8_t prompt[INPUTNET_MAX_PEERS];
+    uint8_t prompt[STREAMNET_MAX_PEERS];
     memset(prompt, 0, sizeof(prompt));
     const bool stable = RBC_AllStable(frame, prompt);
     /* (where each copy is, stable or not: the followers' newest frame start) */
@@ -5659,9 +5659,9 @@ static void RBC_JoinStep(uint32_t frame) {
     }
     if (!here) all_prompt = all_game = false;
     if (!rbj_server_prompt && !rbj_typed && stable && all_prompt) {
-        if (rbj_autorun.empty()) LOG_MSG("INPUTNET: joining: the server's game runs, but it did not say what starts it");
+        if (rbj_autorun.empty()) LOG_MSG("STREAMNET: joining: the server's game runs, but it did not say what starts it");
         else {
-            LOG_MSG("INPUTNET: joining: starting the game on our copies (\"%s\") to take the server's machines over", rbj_autorun.c_str());
+            LOG_MSG("STREAMNET: joining: starting the game on our copies (\"%s\") to take the server's machines over", rbj_autorun.c_str());
             RB_TypingFrames(rbj_autorun, rbj_typing);
         }
         rbj_typed = true;
@@ -5672,20 +5672,20 @@ static void RBC_JoinStep(uint32_t frame) {
     rbj_steady = ready ? rbj_steady + 1u : 0u;
     static uint32_t told = 0;
     if (GetTicks() - told > 2000u) {
-        LOG_MSG("INPUTNET: joining: frame %u, copies %s%s, steady for %u frames", (unsigned)frame,
+        LOG_MSG("STREAMNET: joining: frame %u, copies %s%s, steady for %u frames", (unsigned)frame,
             all_prompt ? "at the DOS prompt" : all_game ? "in the game" : "in between", stable ? " (stable)" : "", (unsigned)rbj_steady);
         told = GetTicks();
     }
     if (!rb_resync_ready.empty()) return;  /* (the machines are here, waiting for a frame start they can load at) */
     if (rbj_steady >= (rbj_server_prompt ? 5u : 150u) && (rbj_last_request == 0 || GetTicks() - rbj_last_request > 3000u)) {
         uint8_t buf[32];
-        InputNetWriter w(buf, sizeof(buf));
-        INPUTNET_BeginPacket(w, INPKT_RESYNC);
+        StreamNetWriter w(buf, sizeof(buf));
+        STREAMNET_BeginPacket(w, INPKT_RESYNC);
         w.u8(0);                            /* request */
         w.u8(1);                            /* ...to join (repeated: void once we are in) */
-        INPUTNET_SendToPeers(buf, w.size());
+        STREAMNET_SendToPeers(buf, w.size());
         rbj_last_request = GetTicks();
-        LOG_MSG("INPUTNET: joining: asking for the server's machines at frame %u", (unsigned)frame);
+        LOG_MSG("STREAMNET: joining: asking for the server's machines at frame %u", (unsigned)frame);
     }
 }
 
@@ -5693,7 +5693,7 @@ static void RBC_JoinStep(uint32_t frame) {
  * take the server's over where they differ. Then the session starts, joining (RBC_JoinStep). */
 static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welcomed_at, std::string &errmsg) {
     std::vector<uint8_t> blob;
-    if (total == 0 || !INPUTNET_ReceiveState(blob, total)) { errmsg = "the server's list of game files did not arrive"; return false; }
+    if (total == 0 || !STREAMNET_ReceiveState(blob, total)) { errmsg = "the server's list of game files did not arrive"; return false; }
     std::vector<RBFile> theirs;
     if (!RB_TakeManifest(blob, theirs)) { errmsg = "the server sent no list of its game files"; return false; }
     std::vector<std::vector<RBFile> > mine(rbc_copies);
@@ -5733,7 +5733,7 @@ static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welco
     if (need > 0) {
         if (need > RB_SYNC_TOTAL_MAX) { errmsg = "the files that differ from the server's are too large to take over: every computer needs the same version of the game"; return false; }
         std::vector<uint8_t> files;
-        if (!INPUTNET_ReceiveState(files, (uint32_t)need, RB_SendFileRequest, INPKT_FILES)) { errmsg = "the server's game files did not arrive"; return false; }
+        if (!STREAMNET_ReceiveState(files, (uint32_t)need, RB_SendFileRequest, INPKT_FILES)) { errmsg = "the server's game files did not arrive"; return false; }
         std::vector<std::vector<RBFile> > others(rbc_copies);
         std::string err;
         if (!RB_MapReceivedFiles(files, err, &others)) { errmsg = err; return false; }
@@ -5743,7 +5743,7 @@ static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welco
             RBC_PutManifestFull(payload, others[c]);
             if (!RBC_Command(c, RBC_CMD_FILEMAP, 0, 0, 0, &payload, NULL)) { errmsg = "a copy of the game here did not take the server's files"; return false; }
         }
-        LOG_MSG("INPUTNET: using %u of the server's files in place of ours for this session", (unsigned)rb_cli_need.size());
+        LOG_MSG("STREAMNET: using %u of the server's files in place of ours for this session", (unsigned)rb_cli_need.size());
     }
     else RB_SendFileRequest();
 
@@ -5751,10 +5751,10 @@ static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welco
     rbj_typed = false; rbj_steady = 0; rbj_last_request = 0;
     rbj_typing.clear(); rbj_typing_pos = 0;
     std::vector<uint8_t>().swap(rbc_resync_raw);
-    rb_start_frame = server_frame + (GetTicks() - welcomed_at) / inputnet_frame_ms;
-    LOG_MSG("INPUTNET: joining the session at frame %u (the server's game %s)", (unsigned)rb_start_frame,
+    rb_start_frame = server_frame + (GetTicks() - welcomed_at) / streamnet_frame_ms;
+    LOG_MSG("STREAMNET: joining the session at frame %u (the server's game %s)", (unsigned)rb_start_frame,
         rbj_server_prompt ? "is at the DOS prompt" : "runs");
-    INPUTNET_StartSession();
+    STREAMNET_StartSession();
     return true;
 }
 
@@ -5784,47 +5784,47 @@ static bool RBC_ServerManifest(std::vector<uint8_t> &out) {
 /* Server: someone asks to join (HELLO). Its player's copy is the one it names (the host plays copy 0); it gets the
  * game files now and the machines when it asks for them (RBC_JoinStep). */
 static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsigned copies, unsigned want) {
-    if (inputnet_accepting) return;
-    InputNetPeer *p = INPUTNET_PeerByAddr(addr);
+    if (streamnet_accepting) return;
+    StreamNetPeer *p = STREAMNET_PeerByAddr(addr);
     if (p != NULL && p->ready) return;                  /* in the session already */
-    if (p != NULL && rbs_joining[p - inputnet_peers]) return;   /* has its WELCOME (a hello sent before it came) */
+    if (p != NULL && rbs_joining[p - streamnet_peers]) return;   /* has its WELCOME (a hello sent before it came) */
     static uint32_t last_told = 0;
     const bool tell = GetTicks() - last_told > 5000u;
     if (copies != rbc_copies) {
-        if (tell) { LOG_MSG("INPUTNET: refused \"%s\": it runs %u copies of the game, the session %u", name.c_str(), copies, rbc_copies); last_told = GetTicks(); }
+        if (tell) { LOG_MSG("STREAMNET: refused \"%s\": it runs %u copies of the game, the session %u", name.c_str(), copies, rbc_copies); last_told = GetTicks(); }
         return;
     }
     if (rbc_copies == 1) {          /* the game alone: any free participant number */
         want = 0;
-        for (unsigned i = 1; i < INPUTNET_MAX_PEERS && want == 0; i++) if (!inputnet_peers[i].active) want = i;
+        for (unsigned i = 1; i < STREAMNET_MAX_PEERS && want == 0; i++) if (!streamnet_peers[i].active) want = i;
         if (want == 0) {
-            if (tell) { LOG_MSG("INPUTNET: refused \"%s\": the session is full", name.c_str()); last_told = GetTicks(); }
+            if (tell) { LOG_MSG("STREAMNET: refused \"%s\": the session is full", name.c_str()); last_told = GetTicks(); }
             return;
         }
     }
-    else if (want >= rbc_copies || want >= INPUTNET_MAX_PEERS || !RB_CopyFree(rbs_seat_change ? rbs_seat_next : rb_seat, want)) {
-        if (tell) { LOG_MSG("INPUTNET: refused \"%s\": player %u's copy is taken", name.c_str(), want + 1u); last_told = GetTicks(); }
+    else if (want >= rbc_copies || want >= STREAMNET_MAX_PEERS || !RB_CopyFree(rbs_seat_change ? rbs_seat_next : rb_seat, want)) {
+        if (tell) { LOG_MSG("STREAMNET: refused \"%s\": player %u's copy is taken", name.c_str(), want + 1u); last_told = GetTicks(); }
         return;
     }
     /* its participant number: the copy's, unless someone who moved to another copy has it */
     unsigned id = want;
-    if (rbc_copies >= 2 && inputnet_peers[id].active) {
+    if (rbc_copies >= 2 && streamnet_peers[id].active) {
         id = 0;
-        for (unsigned i = 1; i < INPUTNET_MAX_PEERS && id == 0; i++) if (!inputnet_peers[i].active && !rbs_joining[i]) id = i;
+        for (unsigned i = 1; i < STREAMNET_MAX_PEERS && id == 0; i++) if (!streamnet_peers[i].active && !rbs_joining[i]) id = i;
         if (id == 0) {
-            if (tell) { LOG_MSG("INPUTNET: refused \"%s\": the session is full", name.c_str()); last_told = GetTicks(); }
+            if (tell) { LOG_MSG("STREAMNET: refused \"%s\": the session is full", name.c_str()); last_told = GetTicks(); }
             return;
         }
     }
     const unsigned copy = want;
     want = id;
     rbs_join_copy[want] = (uint8_t)copy;
-    inputnet_accepting = true;
-    p = &inputnet_peers[want];
+    streamnet_accepting = true;
+    p = &streamnet_peers[want];
     p->active = true; p->local = false; p->ready = false; p->addr = addr; p->name = name; p->lastheard = GetTicks();
     p->resetFrames();
     rbs_joining[want] = true; rbs_wants[want] = false;
-    LOG_MSG("INPUTNET: \"%s\" joins from %d.%d.%d.%d as player %u", name.c_str(),
+    LOG_MSG("STREAMNET: \"%s\" joins from %d.%d.%d.%d as player %u", name.c_str(),
         (int)(addr.host & 0xFF), (int)((addr.host >> 8u) & 0xFF), (int)((addr.host >> 16u) & 0xFF), (int)((addr.host >> 24u) & 0xFF), copy + 1u);
 
     std::vector<uint8_t> manifest;
@@ -5832,15 +5832,15 @@ static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsi
     if (ok) {
         rbs_filereq_peer = (int)want;
         uint8_t welcome[1400];
-        InputNetWriter w(welcome, sizeof(welcome));
-        INPUTNET_BeginPacket(w, INPKT_WELCOME);
+        StreamNetWriter w(welcome, sizeof(welcome));
+        STREAMNET_BeginPacket(w, INPKT_WELCOME);
         w.u8((uint8_t)want);
-        w.u16((uint16_t)inputnet_frame_ms);
-        w.u16((uint16_t)inputnet_delay);
-        w.u16((uint16_t)inputnet_redundancy);
-        w.u8(inputnet_share_keyboard ? 1 : 0);
-        w.u8(inputnet_share_mouse ? 1 : 0);
-        w.u8((uint8_t)inputnet_cyclesync);
+        w.u16((uint16_t)streamnet_frame_ms);
+        w.u16((uint16_t)streamnet_delay);
+        w.u16((uint16_t)streamnet_redundancy);
+        w.u8(streamnet_share_keyboard ? 1 : 0);
+        w.u8(streamnet_share_mouse ? 1 : 0);
+        w.u8((uint8_t)streamnet_cyclesync);
         w.u32((uint32_t)manifest.size());
         w.u32(CALLBACK_LayoutSignature());
         {   /* (the machines come later, with what a save state leaves out of them: RBCExtras) */
@@ -5849,13 +5849,13 @@ static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsi
             w.bytes(clock, sizeof(clock));
             w.u16(dos.date.year); w.u8(dos.date.month); w.u8(dos.date.day);
             w.u32((uint32_t)(rdtsc_count_base >> 32u)); w.u32((uint32_t)rdtsc_count_base);
-            const uint64_t fps = INPUTNET_DoubleBits(vga_fps), base = INPUTNET_DoubleBits(vga_mode_time_base);
+            const uint64_t fps = STREAMNET_DoubleBits(vga_fps), base = STREAMNET_DoubleBits(vga_mode_time_base);
             w.u32((uint32_t)(fps >> 32u)); w.u32((uint32_t)fps);
             w.u32((uint32_t)(base >> 32u)); w.u32((uint32_t)base);
             w.u32((uint32_t)vga_mode_frames_since_time_base);
         }
         w.u8(1);
-        w.u8((uint8_t)inputnet_rbwindow);
+        w.u8((uint8_t)streamnet_rbwindow);
         const std::string fp = RB_Fingerprint();
         w.u16((uint16_t)fp.size());
         w.bytes((const uint8_t*)fp.data(), fp.size());
@@ -5863,7 +5863,7 @@ static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsi
         w.u8((uint8_t)rbc_copies);
         w.u32(rb_realframe);
         w.u8(dos_shell_reading_input ? 1 : 0);
-        const std::string ar = inputnet_rbautorun.substr(0, 200);
+        const std::string ar = streamnet_rbautorun.substr(0, 200);
         w.u16((uint16_t)ar.size());
         w.bytes((const uint8_t*)ar.data(), ar.size());
         const size_t wl = w.size();
@@ -5871,19 +5871,19 @@ static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsi
         uint32_t last_events = GetTicks();
         const uint32_t wstart = GetTicks(), heard = p->lastheard;
         while (p->lastheard == heard && GetTicks() - wstart < 1500u) {     /* (STATEACK: it waits for the list) */
-            INPUTNET_SendRaw(p->addr, welcome, wl);
+            STREAMNET_SendRaw(p->addr, welcome, wl);
             const uint32_t round = GetTicks();
-            while (GetTicks() - round < 100u && p->lastheard == heard) { INPUTNET_PollSocket(); INPUTNET_Stall(last_events); }
+            while (GetTicks() - round < 100u && p->lastheard == heard) { STREAMNET_PollSocket(); STREAMNET_Stall(last_events); }
         }
-        ok = INPUTNET_SendStateTo(*p, manifest, INPKT_STATE);
+        ok = STREAMNET_SendStateTo(*p, manifest, INPKT_STATE);
     }
     if (!ok) {
-        LOG_MSG("INPUTNET: \"%s\" could not join", name.c_str());
+        LOG_MSG("STREAMNET: \"%s\" could not join", name.c_str());
         p->active = false;
         rbs_joining[want] = false;
         rbs_filereq_peer = -1;
     }
-    inputnet_accepting = false;
+    streamnet_accepting = false;
 }
 
 /* Server, at a frame start: the files a joining participant asked for. */
@@ -5892,29 +5892,29 @@ static void RBC_ServerFiles(void) {
     const unsigned id = (unsigned)rbs_filereq_peer;
     rb_filereq_ready = false;
     rbs_filereq_peer = -1;
-    InputNetPeer &p = inputnet_peers[id];
+    StreamNetPeer &p = streamnet_peers[id];
     if (!p.active || !rbs_joining[id]) return;
     bool any = false;
     for (size_t i = 0; i < rb_filereq_bits.size(); i++) any = any || rb_filereq_bits[i] != 0;
     if (!any) return;
     std::vector<uint8_t> files;
-    if (!RB_BuildFileBlob(files)) { LOG_MSG("INPUTNET: could not read the game files \"%s\" asked for", p.name.c_str()); return; }
-    LOG_MSG("INPUTNET: sending %u KB of game files to \"%s\"", (unsigned)(files.size() >> 10), p.name.c_str());
-    inputnet_accepting = true;
-    if (!INPUTNET_SendStateTo(p, files, INPKT_FILES)) {
-        LOG_MSG("INPUTNET: \"%s\" did not take the game files", p.name.c_str());
+    if (!RB_BuildFileBlob(files)) { LOG_MSG("STREAMNET: could not read the game files \"%s\" asked for", p.name.c_str()); return; }
+    LOG_MSG("STREAMNET: sending %u KB of game files to \"%s\"", (unsigned)(files.size() >> 10), p.name.c_str());
+    streamnet_accepting = true;
+    if (!STREAMNET_SendStateTo(p, files, INPKT_FILES)) {
+        LOG_MSG("STREAMNET: \"%s\" did not take the game files", p.name.c_str());
         p.active = false;
         rbs_joining[id] = false;
     }
-    inputnet_accepting = false;
+    streamnet_accepting = false;
 }
 
 /* Server: a participant is gone (BYE, or too far behind): its copy runs on without input, and every computer takes
  * the server's machines over (the others may have run with different amounts of its input). */
 static void RBC_ServerDrop(unsigned id, const char *why) {
-    InputNetPeer &p = inputnet_peers[id];
+    StreamNetPeer &p = streamnet_peers[id];
     if (!p.active || p.local) return;
-    LOG_MSG("INPUTNET: \"%s\" (player %u) %s", p.name.c_str(), id + 1u, why);
+    LOG_MSG("STREAMNET: \"%s\" (player %u) %s", p.name.c_str(), id + 1u, why);
     const bool was_in = p.ready;
     p.active = false; p.ready = false; p.resetFrames();
     rbs_joining[id] = false; rbs_wants[id] = false;
@@ -5924,7 +5924,7 @@ static void RBC_ServerDrop(unsigned id, const char *why) {
 /* Server: the machine at the start of "frame" (= now) in the portable save state format, compressed; "state" gets the
  * save state alone. The live machine must be at that frame start. */
 static bool RB_BuildResyncBlob(uint32_t frame, std::vector<uint8_t> &out, uint32_t &rawsize, std::vector<uint8_t> &state, RBResyncInfo &h) {
-    if (!INPUTNET_SnapshotState(state)) return false;
+    if (!STREAMNET_SnapshotState(state)) return false;
     h.frame = frame;
     h.tick = rb_tick;
     h.epoch = (uint16_t)(rb_epoch + 1u);
@@ -5943,7 +5943,7 @@ static bool RB_BuildResyncBlob(uint32_t frame, std::vector<uint8_t> &out, uint32
     return true;
 }
 
-static uint32_t rb_resync_acked_by[INPUTNET_MAX_PEERS];   /* server: chunks each participant acknowledged */
+static uint32_t rb_resync_acked_by[STREAMNET_MAX_PEERS];   /* server: chunks each participant acknowledged */
 
 /* Server: the resync's blob to every participant, each at its own pace. "joined" and "left" tell the clients who plays
  * from this frame on (a cluster's joins and leaves). */
@@ -5951,23 +5951,23 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
                           const uint8_t *seats) {
     const uint32_t id = (uint32_t)(GetTicks() ^ (frame * 2654435761u)) | 1u;
     const uint32_t nchunks = (uint32_t)((blob.size() + RB_RESYNC_CHUNK - 1u) / RB_RESYNC_CHUNK);
-    bool to[INPUTNET_MAX_PEERS];
-    uint32_t next[INPUTNET_MAX_PEERS], lastsend[INPUTNET_MAX_PEERS], seen[INPUTNET_MAX_PEERS], progress[INPUTNET_MAX_PEERS];
+    bool to[STREAMNET_MAX_PEERS];
+    uint32_t next[STREAMNET_MAX_PEERS], lastsend[STREAMNET_MAX_PEERS], seen[STREAMNET_MAX_PEERS], progress[STREAMNET_MAX_PEERS];
     unsigned n = 0;
     const uint32_t t0 = GetTicks();
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         to[i] = p.active && p.ready && !p.local;
         next[i] = 0; lastsend[i] = 0; seen[i] = 0; progress[i] = t0;
         rb_resync_acked_by[i] = 0;
         if (to[i]) n++;
     }
     rb_resync_acked = 0;
-    LOG_MSG("INPUTNET: resync: sending frame %u to %u participant(s), %u KB (%u KB before compression)",
+    LOG_MSG("STREAMNET: resync: sending frame %u to %u participant(s), %u KB (%u KB before compression)",
         (unsigned)frame, n, (unsigned)(blob.size() / 1024u), (unsigned)(rawsize / 1024u));
     uint8_t hb[96];
-    InputNetWriter hw(hb, sizeof(hb));
-    INPUTNET_BeginPacket(hw, INPKT_RESYNC);
+    StreamNetWriter hw(hb, sizeof(hb));
+    STREAMNET_BeginPacket(hw, INPKT_RESYNC);
     hw.u8(1); hw.u32(id); hw.u32(frame); hw.u32((uint32_t)blob.size()); hw.u32(rawsize);
     hw.u8((uint8_t)joined.size());
     for (size_t j = 0; j < joined.size(); j++) hw.u8(joined[j]);
@@ -5975,25 +5975,25 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
     for (size_t j = 0; j < left.size(); j++) hw.u8(left[j]);
     hw.u8(seats != NULL ? (uint8_t)rbc_copies : 0);     /* who plays which copy from this frame on (rb_seat) */
     if (seats != NULL) for (unsigned c = 0; c < rbc_copies; c++) hw.u8(seats[c]);
-    inputnet_accepting = true;      /* (no join meanwhile) */
+    streamnet_accepting = true;      /* (no join meanwhile) */
     uint32_t last_events = t0, lastkeep = t0;
     for (;;) {
-        if (!inputnet_session) { inputnet_accepting = false; return false; }
+        if (!streamnet_session) { streamnet_accepting = false; return false; }
         bool done = true;
         const uint32_t now = GetTicks();
         /* the others hear the server meanwhile (a transfer through a slow relay takes many seconds, and a participant
          * that has everything, or is in the session already, waits for the server's input: RB_ClientWaitsOn) */
         if (now - lastkeep >= 100u) { RB_SendInput(frame); lastkeep = now; }
-        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+        for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
             if (!to[i]) continue;
-            InputNetPeer &p = inputnet_peers[i];
+            StreamNetPeer &p = streamnet_peers[i];
             if (!p.active) { to[i] = false; continue; }
             const uint32_t acked = std::min(rb_resync_acked_by[i], nchunks);
             if (acked >= nchunks) continue;
             done = false;
             if (acked > seen[i]) { seen[i] = acked; progress[i] = now; }
             if (now - progress[i] > 30000u) {
-                LOG_MSG("INPUTNET: resync: \"%s\" took nothing for 30 seconds", p.name.c_str());
+                LOG_MSG("STREAMNET: resync: \"%s\" took nothing for 30 seconds", p.name.c_str());
                 to[i] = false;
                 if (rbc_copies) RBC_ServerDrop(i, "did not take the machines");
                 continue;
@@ -6001,28 +6001,28 @@ static bool RB_SendResync(uint32_t frame, const std::vector<uint8_t> &blob, uint
             if (lastsend[i] == 0 || now - lastsend[i] > 300u) {     /* (again) from what it has */
                 next[i] = acked;
                 lastsend[i] = now ? now : 1u;
-                if (acked == 0) INPUTNET_SendRaw(p.addr, hb, hw.size());
+                if (acked == 0) STREAMNET_SendRaw(p.addr, hb, hw.size());
             }
             if (next[i] < acked) next[i] = acked;
             while (next[i] < nchunks && next[i] < acked + 256u) {
                 const size_t off = (size_t)next[i] * RB_RESYNC_CHUNK;
                 const size_t len = std::min((size_t)RB_RESYNC_CHUNK, blob.size() - off);
                 uint8_t cb[RB_RESYNC_CHUNK + 48];
-                InputNetWriter w(cb, sizeof(cb));
-                INPUTNET_BeginPacket(w, INPKT_RESYNC);
+                StreamNetWriter w(cb, sizeof(cb));
+                STREAMNET_BeginPacket(w, INPKT_RESYNC);
                 w.u8(2); w.u32(id); w.u32(next[i]); w.u16((uint16_t)len); w.bytes(&blob[off], len);
-                INPUTNET_SendRaw(p.addr, cb, w.size());
+                STREAMNET_SendRaw(p.addr, cb, w.size());
                 next[i]++;
             }
         }
         if (done) break;
-        INPUTNET_PollSocket();
+        STREAMNET_PollSocket();
         if (now - last_events >= 10u) { GFX_Events(); last_events = now; }
         SDL_Delay(1);
     }
-    inputnet_accepting = false;
+    streamnet_accepting = false;
     rb_stat_resyncs++;
-    LOG_MSG("INPUTNET: resync: frame %u sent in %u ms", (unsigned)frame, (unsigned)(GetTicks() - t0));
+    LOG_MSG("STREAMNET: resync: frame %u sent in %u ms", (unsigned)frame, (unsigned)(GetTicks() - t0));
     return true;
 }
 
@@ -6031,10 +6031,10 @@ static bool RB_ServerResync(uint32_t frame) {
     /* this frame start is final once every input before it is here */
     uint32_t start = GetTicks(), last_events = start;
     while (RB_MinHave() < frame) {
-        if (!inputnet_session) return false;
-        if ((GetTicks() - start) > inputnet_timeout) { LOG_MSG("INPUTNET: resync: no input from the client(s)"); return false; }
-        INPUTNET_Stall(last_events);
-        INPUTNET_PollSocket();
+        if (!streamnet_session) return false;
+        if ((GetTicks() - start) > streamnet_timeout) { LOG_MSG("STREAMNET: resync: no input from the client(s)"); return false; }
+        STREAMNET_Stall(last_events);
+        STREAMNET_PollSocket();
         const uint32_t g = RB_FindMisprediction(frame);
         if (g != UINT32_MAX) {                  /* correct it first; try again when the replay is done */
             if (RB_Rollback(g, frame)) { rb_late.clear(); rb_pending_wrong = UINT32_MAX; }
@@ -6045,17 +6045,17 @@ static bool RB_ServerResync(uint32_t frame) {
     std::vector<uint8_t> blob, state;
     uint32_t rawsize = 0;
     std::vector<uint8_t> joined, left;
-    uint8_t seats[INPUTNET_MAX_PEERS];
+    uint8_t seats[STREAMNET_MAX_PEERS];
     memcpy(seats, rbs_seat_change ? rbs_seat_next : rb_seat, sizeof(seats));
     if (rbc_copies) {
-        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
-            if (rbs_joining[i] && rbs_wants[i] && inputnet_peers[i].active) joined.push_back((uint8_t)i);
+        for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++)
+            if (rbs_joining[i] && rbs_wants[i] && streamnet_peers[i].active) joined.push_back((uint8_t)i);
         /* who plays which copy from this frame on: the joining ones the copies they asked for, nobody those who left */
         for (size_t j = 0; j < joined.size(); j++) if (rbs_join_copy[joined[j]] < rbc_copies) seats[rbs_join_copy[joined[j]]] = joined[j];
         for (size_t j = 0; j < rbs_left.size(); j++) { const int c = RB_CopyOf(seats, rbs_left[j]); if (c >= 0) seats[c] = 0xFF; }
         std::vector<uint8_t> raw;
         if (!RBC_BuildMachines(frame, (uint16_t)(rb_epoch + 1u), raw, seats)) {
-            LOG_MSG("INPUTNET: resync: cannot save the cluster's machines at frame %u",(unsigned)frame);
+            LOG_MSG("STREAMNET: resync: cannot save the cluster's machines at frame %u",(unsigned)frame);
             return false;
         }
         left.swap(rbs_left);
@@ -6069,21 +6069,21 @@ static bool RB_ServerResync(uint32_t frame) {
         blob.resize(clen);
         for (size_t j = 0; j < joined.size(); j++) {   /* in the session from this frame on */
             const unsigned i = joined[j];
-            InputNetPeer &p = inputnet_peers[i];
+            StreamNetPeer &p = streamnet_peers[i];
             p.ready = true;
             p.lastheard = GetTicks();
             rbs_joining[i] = false; rbs_wants[i] = false;
             rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame;
             rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_rtt[i] = 0;
             for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
-            for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
-            LOG_MSG("INPUTNET: \"%s\" plays copy %u from frame %u", p.name.c_str(), (unsigned)(RB_CopyOf(rb_seat, i) + 1), (unsigned)frame);
+            for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+            LOG_MSG("STREAMNET: \"%s\" plays copy %u from frame %u", p.name.c_str(), (unsigned)(RB_CopyOf(rb_seat, i) + 1), (unsigned)frame);
         }
     }
     else {
         RBResyncInfo info;
-        if (!RB_BuildResyncBlob(frame, blob, rawsize, state, info)) { LOG_MSG("INPUTNET: resync: cannot save the machine at frame %u",(unsigned)frame); return false; }
-        if (!RB_LoadResyncState(info, state)) { LOG_MSG("INPUTNET: resync: cannot load our own state of frame %u",(unsigned)frame); return false; }
+        if (!RB_BuildResyncBlob(frame, blob, rawsize, state, info)) { LOG_MSG("STREAMNET: resync: cannot save the machine at frame %u",(unsigned)frame); return false; }
+        if (!RB_LoadResyncState(info, state)) { LOG_MSG("STREAMNET: resync: cannot load our own state of frame %u",(unsigned)frame); return false; }
     }
     return RB_SendResync(frame, blob, rawsize, joined, left, rbc_copies >= 2 ? rb_seat : NULL);
 }
@@ -6103,14 +6103,14 @@ static bool RB_ApplyResyncBlob(const std::vector<uint8_t> &comp, uint32_t rawsiz
     const uint32_t frame = h.frame;
     if (rb_realframe > frame) {     /* replay to real time with the input we have */
         const uint32_t depth = rb_realframe - frame;
-        inputnet_rollback_resim = true;
+        streamnet_rollback_resim = true;
         rb_target = rb_realframe;
         MIXER_SetRollbackDiscard(true);
-        DOSBOX_AddTicksRemain(depth * inputnet_frame_ms);
+        DOSBOX_AddTicksRemain(depth * streamnet_frame_ms);
     }
     else rb_realframe = frame;
     RB_ApplyInputs(frame);
-    LOG_MSG("INPUTNET: resync: took the server's state at frame %u over",(unsigned)frame);
+    LOG_MSG("STREAMNET: resync: took the server's state at frame %u over",(unsigned)frame);
     return true;
 }
 
@@ -6119,62 +6119,62 @@ static bool RB_ApplyResyncBlob(const std::vector<uint8_t> &comp, uint32_t rawsiz
 static bool RB_ApplyClusterResync(uint32_t frame) {
     const bool joining = rb_joining;
     if (!RBC_ApplyMachines(frame, joining)) return false;
-    const uint32_t r0 = inputnet_frame;     /* the frame the machines are at (RB_LoadResyncState) */
+    const uint32_t r0 = streamnet_frame;     /* the frame the machines are at (RB_LoadResyncState) */
     if (joining) rb_realframe = r0;         /* (our own count was a guess; RB_TimeSync does the rest) */
     rb_desynced = false;
     rb_stat_resyncs++;
     if (joining) {
         rb_joining = false;
-        for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-            InputNetPeer &p = inputnet_peers[i];
+        for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+            StreamNetPeer &p = streamnet_peers[i];
             if (!p.active || p.local) continue;
             if (rb_have[i] < r0) rb_have[i] = r0;
-            while (INPUTNET_FrameSlotIfValid(p, rb_have[i]) != NULL) rb_have[i]++;
+            while (STREAMNET_FrameSlotIfValid(p, rb_have[i]) != NULL) rb_have[i]++;
             rb_acked[i] = r0;
         }
-        inputnet_local_confirmed = r0;
-        if (rbc_copies >= 2) LOG_MSG("INPUTNET: joined: playing copy %u from frame %u", rbc_copy + 1u, (unsigned)r0);
-        else LOG_MSG("INPUTNET: joined: playing as player %u from frame %u", (unsigned)inputnet_selfid + 1u, (unsigned)r0);
+        streamnet_local_confirmed = r0;
+        if (rbc_copies >= 2) LOG_MSG("STREAMNET: joined: playing copy %u from frame %u", rbc_copy + 1u, (unsigned)r0);
+        else LOG_MSG("STREAMNET: joined: playing as player %u from frame %u", (unsigned)streamnet_selfid + 1u, (unsigned)r0);
     }
     if (rb_realframe > r0) {
-        inputnet_rollback_resim = true;
+        streamnet_rollback_resim = true;
         rb_target = rb_realframe;
         MIXER_SetRollbackDiscard(true);
-        DOSBOX_AddTicksRemain((rb_realframe - r0) * inputnet_frame_ms);
+        DOSBOX_AddTicksRemain((rb_realframe - r0) * streamnet_frame_ms);
     }
     else rb_realframe = r0;
     RB_ApplyInputs(r0);
-    LOG_MSG("INPUTNET: resync: took the server's machines over at frame %u", (unsigned)r0);
+    LOG_MSG("STREAMNET: resync: took the server's machines over at frame %u", (unsigned)r0);
     return true;
 }
 
 static uint32_t rb_resync_done_id = 0, rb_resync_done_count = 0;  /* client: the last transfer received whole */
 
-static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned peerid) {
+static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned peerid) {
     const uint8_t sub = r.u8();
     if (r.bad()) return;
     if (sub == 0) {                 /* request from a client (a cluster's joining computer: it is ready for the machines) */
-        if (!inputnet_is_server) return;
+        if (!streamnet_is_server) return;
         const bool join = r.remain() >= 1 && r.u8() == 1;
         if (rbc_copies) {
-            InputNetPeer *p = INPUTNET_PeerByAddr(from);
-            const bool joining = p != NULL && rbs_joining[p - inputnet_peers];
+            StreamNetPeer *p = STREAMNET_PeerByAddr(from);
+            const bool joining = p != NULL && rbs_joining[p - streamnet_peers];
             if (join && !joining) return;   /* in already: a repeat of its request to join */
-            if (joining) rbs_wants[p - inputnet_peers] = true;
+            if (joining) rbs_wants[p - streamnet_peers] = true;
         }
         rb_resync_wanted = true;
         return;
     }
     if (sub == 3) {                 /* acknowledgement */
-        if (!inputnet_is_server) return;
+        if (!streamnet_is_server) return;
         r.u32();
         const uint32_t count = r.u32();
         if (r.bad()) return;
         if (count > rb_resync_acked) rb_resync_acked = count;
-        if (peerid < INPUTNET_MAX_PEERS && count > rb_resync_acked_by[peerid]) rb_resync_acked_by[peerid] = count;
+        if (peerid < STREAMNET_MAX_PEERS && count > rb_resync_acked_by[peerid]) rb_resync_acked_by[peerid] = count;
         return;
     }
-    if (inputnet_is_server) return;
+    if (streamnet_is_server) return;
     if (sub == 1) {                 /* header: receive everything now */
         const uint32_t id = r.u32(), frame = r.u32(), total = r.u32(), rawsize = r.u32();
         if (r.bad() || total == 0 || total > (256u << 20) || rawsize > (1024u << 20)) return;
@@ -6183,27 +6183,27 @@ static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned pee
         std::vector<uint8_t> joined, left;  /* who plays from this frame on */
         if (r.remain() >= 1) { const unsigned nj = r.u8(); for (unsigned j = 0; j < nj; j++) joined.push_back(r.u8()); }
         if (r.remain() >= 1) { const unsigned nl = r.u8(); for (unsigned j = 0; j < nl; j++) left.push_back(r.u8()); }
-        uint8_t seats[INPUTNET_MAX_PEERS];
+        uint8_t seats[STREAMNET_MAX_PEERS];
         unsigned ns = 0;
-        if (r.remain() >= 1) { ns = r.u8(); for (unsigned j = 0; j < ns; j++) { const uint8_t v = r.u8(); if (j < INPUTNET_MAX_PEERS) seats[j] = v; } }
+        if (r.remain() >= 1) { ns = r.u8(); for (unsigned j = 0; j < ns; j++) { const uint8_t v = r.u8(); if (j < STREAMNET_MAX_PEERS) seats[j] = v; } }
         if (r.bad()) return;
-        if (ns == rbc_copies && ns >= 2 && ns <= INPUTNET_MAX_PEERS) { memcpy(rbc_resync_seat, seats, ns); rbc_resync_has_seats = true; }
+        if (ns == rbc_copies && ns >= 2 && ns <= STREAMNET_MAX_PEERS) { memcpy(rbc_resync_seat, seats, ns); rbc_resync_has_seats = true; }
         for (size_t j = 0; j < joined.size(); j++) {
             const unsigned i = joined[j];
-            if (i >= INPUTNET_MAX_PEERS || i == inputnet_selfid) continue;
-            InputNetPeer &p = inputnet_peers[i];
-            p.active = true; p.ready = true; p.local = false; p.addr = inputnet_server_addr; p.lastheard = GetTicks();
+            if (i >= STREAMNET_MAX_PEERS || i == streamnet_selfid) continue;
+            StreamNetPeer &p = streamnet_peers[i];
+            p.active = true; p.ready = true; p.local = false; p.addr = streamnet_server_addr; p.lastheard = GetTicks();
             p.resetFrames();
             rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame; rb_peerframe_at[i] = 0; rb_rtt[i] = 0;
             for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
-            for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
-            LOG_MSG("INPUTNET: player %u joins at frame %u", i + 1u, (unsigned)frame);
+            for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+            LOG_MSG("STREAMNET: player %u joins at frame %u", i + 1u, (unsigned)frame);
         }
         for (size_t j = 0; j < left.size(); j++) {
             const unsigned i = left[j];
-            if (i >= INPUTNET_MAX_PEERS || i == inputnet_selfid) continue;
-            inputnet_peers[i].active = false; inputnet_peers[i].ready = false; inputnet_peers[i].resetFrames();
-            LOG_MSG("INPUTNET: player %u left at frame %u", i + 1u, (unsigned)frame);
+            if (i >= STREAMNET_MAX_PEERS || i == streamnet_selfid) continue;
+            streamnet_peers[i].active = false; streamnet_peers[i].ready = false; streamnet_peers[i].resetFrames();
+            LOG_MSG("STREAMNET: player %u left at frame %u", i + 1u, (unsigned)frame);
         }
         rb_resync_id = id;
         rb_resync_frame = frame;
@@ -6218,13 +6218,13 @@ static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned pee
         uint32_t progress_at = start;
         while (contiguous < nchunks) {
             /* (30 seconds without a piece: a slow link may take longer than that for the whole of it) */
-            if (!inputnet_link_up || (GetTicks() - progress_at) > 30000u) { LOG_MSG("INPUTNET: resync: transfer failed"); rb_resync_id = 0; return; }
-            INPUTNET_PollSocket();              /* chunks land in rb_resync_buf (sub == 2 below) */
+            if (!streamnet_link_up || (GetTicks() - progress_at) > 30000u) { LOG_MSG("STREAMNET: resync: transfer failed"); rb_resync_id = 0; return; }
+            STREAMNET_PollSocket();              /* chunks land in rb_resync_buf (sub == 2 below) */
             const uint32_t was = contiguous;
             while (contiguous < nchunks && rb_resync_have[contiguous]) contiguous++;
             if (contiguous != was) progress_at = GetTicks();
             if ((GetTicks() - lastack) >= 20u) { RB_SendResyncAck(id, contiguous); lastack = GetTicks(); }
-            INPUTNET_Stall(last_events);
+            STREAMNET_Stall(last_events);
         }
         RB_SendResyncAck(id, contiguous);
         RB_SendResyncAck(id, contiguous);
@@ -6237,7 +6237,7 @@ static void RB_HandleResync(InputNetReader &r,const IPaddress &from,unsigned pee
             rbc_resync_raw.assign(rawsize, 0);
             uLongf rlen = rawsize;
             if (rawsize == 0 || uncompress(&rbc_resync_raw[0], &rlen, &rb_resync_ready[0], (uLong)rb_resync_ready.size()) != Z_OK || rlen != rawsize) {
-                LOG_MSG("INPUTNET: resync: the server's machines did not unpack");
+                LOG_MSG("STREAMNET: resync: the server's machines did not unpack");
                 std::vector<uint8_t>().swap(rbc_resync_raw);
                 std::vector<uint8_t>().swap(rb_resync_ready);
                 return;
@@ -6352,34 +6352,34 @@ static void RB_SelfTestCompare(uint32_t frame) {
  * host's context): it is applied now, late, so no key press or release is lost, and the machines are then made equal
  * again from the server's state (the server sends it; a client asks for it). */
 static void RB_Unreachable(void) {
-    LOG_MSG("INPUTNET: input for %u earlier frame(s) arrived too late to roll back; applying it now",(unsigned)rb_late.size());
+    LOG_MSG("STREAMNET: input for %u earlier frame(s) arrived too late to roll back; applying it now",(unsigned)rb_late.size());
     for (size_t k = 0; k < rb_late.size(); k++) {
-        InputNetFrame *slot = INPUTNET_FrameSlotIfValid(inputnet_peers[rb_late[k].peer], rb_late[k].frame);
+        StreamNetFrame *slot = STREAMNET_FrameSlotIfValid(streamnet_peers[rb_late[k].peer], rb_late[k].frame);
         if (slot != NULL)
-            for (size_t e = 0; e < slot->events.size(); e++) INPUTNET_ApplyEvent(slot->events[e]);
+            for (size_t e = 0; e < slot->events.size(); e++) STREAMNET_ApplyEvent(slot->events[e]);
     }
     rb_late.clear();
-    if (inputnet_is_server) rb_resync_wanted = true;
+    if (streamnet_is_server) rb_resync_wanted = true;
     else { rb_desynced = true; rb_resync_last_sent = 0; }
 }
 
 /* Server: type "text" and Enter as this machine's input, one key a frame from the next frame our input can go into, so
  * that every machine in the session gets the same key presses at the same frames. */
 static void RB_QueueTyping(const std::string &text) {
-    InputNetPeer &self = inputnet_peers[inputnet_selfid];
-    uint32_t f = INPUTNET_ScheduleFrame();
-    std::vector<std::vector<InputNetEvent> > frames;
+    StreamNetPeer &self = streamnet_peers[streamnet_selfid];
+    uint32_t f = STREAMNET_ScheduleFrame();
+    std::vector<std::vector<StreamNetEvent> > frames;
     RB_TypingFrames(text, frames);
     for (size_t i = 0; i < frames.size(); i++) {
-        InputNetFrame &slot = INPUTNET_FrameSlot(self, f++);
+        StreamNetFrame &slot = STREAMNET_FrameSlot(self, f++);
         slot.events.insert(slot.events.end(), frames[i].begin(), frames[i].end());
     }
 }
 
 static unsigned int RB_Participants(void) {
     unsigned int n = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++)
-        if (inputnet_peers[i].active && inputnet_peers[i].ready) n++;
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++)
+        if (streamnet_peers[i].active && streamnet_peers[i].ready) n++;
     return n;
 }
 
@@ -6392,7 +6392,7 @@ static bool RB_Correct(uint32_t frame) {
     const uint32_t g = std::min(found, rb_pending_wrong);
     if (g == UINT32_MAX) return false;
     if (RB_Rollback(g, frame)) { rb_pending_wrong = UINT32_MAX; rb_late.clear(); return true; }
-    const uint32_t lowest = (frame > inputnet_rbwindow) ? frame - inputnet_rbwindow : 0;
+    const uint32_t lowest = (frame > streamnet_rbwindow) ? frame - streamnet_rbwindow : 0;
     if (g > lowest + 1u && RB_RestorableAtOrBefore(g, lowest) == UINT32_MAX) {
         rb_pending_wrong = g;       /* try again at the next frame start */
         return false;
@@ -6418,14 +6418,14 @@ static void RB_MaxCycles(void) {
             rb_cap_local = std::min(rb_cap_local, rbc_f[c].cap);
     const double load = rb_ml_load;
     const double limit = (CPU_CycleLimit > 0) ? (double)CPU_CycleLimit : 1000000.0;
-    if (!inputnet_is_server) return;
+    if (!streamnet_is_server) return;
 
     /* the server: the lowest proposal; a participant that has not proposed yet keeps the speed from rising */
     const uint32_t tnow = GetTicks();
     uint32_t want = rb_cap_local;
     bool all = true;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        const InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        const StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local) continue;
         if (rb_cap_peer[i] != 0 && tnow - rb_cap_peer_at[i] < 5000u) want = std::min(want, rb_cap_peer[i]);
         else all = false;
@@ -6442,14 +6442,14 @@ static void RB_MaxCycles(void) {
     next = std::max(2000.0, std::min(next, limit));
     const uint32_t n = (uint32_t)next;
     if (n == (uint32_t)CPU_CycleMax) return;
-    InputNetEvent ev;
+    StreamNetEvent ev;
     ev.type = INEV_CYCLEMAX;
     ev.cyclemax = n;
     ev.pressed = (uint8_t)(2u + RB_SPEED_LEAD);    /* applies RB_SPEED_LEAD frames later on every machine */
-    INPUTNET_QueueLocal(ev);
+    STREAMNET_QueueLocal(ev);
     rb_ml_changed_at = tnow;
     if (tnow - rb_ml_told_at > 10000u || (double)n < cur * 0.8) {
-        LOG_MSG("INPUTNET: speed: %u cycles per ms for everybody (was %u; here %.0f%% busy, proposing %u)",
+        LOG_MSG("STREAMNET: speed: %u cycles per ms for everybody (was %u; here %.0f%% busy, proposing %u)",
             n, (unsigned)CPU_CycleMax, load * 100.0, rb_cap_local);
         rb_ml_told_at = tnow;
     }
@@ -6457,7 +6457,7 @@ static void RB_MaxCycles(void) {
 
 /* A frame starts: save it, correct earlier frames if needed, then run it. */
 static void RB_FrameBoundary(uint32_t frame) {
-    inputnet_frame = frame;
+    streamnet_frame = frame;
     RB_Capture(frame);
     if (rbc_copies && rbc_leader && !RBC_LeaderBarrier(frame, RBC_ROUTE)) return;   /* every copy at this frame start */
     if (rb_selftest_end != 0 && frame <= rb_selftest_end) {
@@ -6465,9 +6465,9 @@ static void RB_FrameBoundary(uint32_t frame) {
         if (frame == rb_selftest_end) rb_selftest_end = 0;
     }
 
-    if (inputnet_rollback_resim) {
+    if (streamnet_rollback_resim) {
         if (frame < rb_target) { RB_ApplyInputs(frame); return; }
-        inputnet_rollback_resim = false;    /* caught up with real time */
+        streamnet_rollback_resim = false;    /* caught up with real time */
         MIXER_SetRollbackDiscard(false);
         extern void RENDER_RedrawAll(void);
         RENDER_RedrawAll();                 /* nothing of the replayed frames was shown */
@@ -6482,13 +6482,13 @@ static void RB_FrameBoundary(uint32_t frame) {
     }
     rb_realframe = frame;
 
-    INPUTNET_PollSocket();
-    if (!inputnet_session || !inputnet_rollback_active) return;
+    STREAMNET_PollSocket();
+    if (!streamnet_session || !streamnet_rollback_active) return;
     if (rbc_copies) {
         if (!rb_resync_ready.empty() && !rbc_resync_raw.empty() && RBC_CanApplyMachines(frame)) {
             /* client: the server's machines, loaded where every copy's host stack is steady */
             if (RB_ApplyClusterResync(frame)) rb_resync_applied = true;
-            else LOG_MSG("INPUTNET: resync: could not load the server's machines");
+            else LOG_MSG("STREAMNET: resync: could not load the server's machines");
             std::vector<uint8_t>().swap(rb_resync_ready);
             std::vector<uint8_t>().swap(rbc_resync_raw);
         }
@@ -6504,19 +6504,19 @@ static void RB_FrameBoundary(uint32_t frame) {
         rb_snap[(frame - 1u) % RB_RING].frame == frame - 1u && rb_snap[(frame - 1u) % RB_RING].context == RB_HostContext()) {
         /* client: the server's state, loaded where the host's stack is steady */
         if (RB_ApplyResyncBlob(rb_resync_ready, rb_resync_ready_raw)) rb_resync_applied = true;
-        else LOG_MSG("INPUTNET: resync: could not load the server's state");
+        else LOG_MSG("STREAMNET: resync: could not load the server's state");
         std::vector<uint8_t>().swap(rb_resync_ready);
     }
     if (rb_resync_applied) { rb_resync_applied = false; return; }   /* now replaying from the server's state */
 
     if (rb_desynced) {
         /* client: until the server's state arrives, keep asking for it */
-        if (!inputnet_is_server && (GetTicks() - rb_resync_last_sent) > 500u) {
+        if (!streamnet_is_server && (GetTicks() - rb_resync_last_sent) > 500u) {
             uint8_t buf[32];
-            InputNetWriter w(buf,sizeof(buf));
-            INPUTNET_BeginPacket(w,INPKT_RESYNC);
+            StreamNetWriter w(buf,sizeof(buf));
+            STREAMNET_BeginPacket(w,INPKT_RESYNC);
             w.u32(0);   /* request */
-            INPUTNET_SendToPeers(buf,w.size());
+            STREAMNET_SendToPeers(buf,w.size());
             rb_resync_last_sent = GetTicks();
         }
     }
@@ -6530,16 +6530,16 @@ static void RB_FrameBoundary(uint32_t frame) {
 
     {
         static const char *fr = getenv("NN_RB_FORCE_RESYNC");   /* debugging: the server sends its state at this frame */
-        if (fr != NULL && *fr && inputnet_is_server && frame == (uint32_t)strtoul(fr, NULL, 10)) rb_resync_wanted = true;
+        if (fr != NULL && *fr && streamnet_is_server && frame == (uint32_t)strtoul(fr, NULL, 10)) rb_resync_wanted = true;
     }
     /* (only where the host's stack is as it was at the last frame start: a state saved inside a nested loop of a
      * moment, a BIOS call DOS makes for the console, cannot be loaded by a machine that is not inside the same call) */
-    if (rbc_copies && inputnet_is_server) RBC_ServerFiles();    /* a joining computer's file request */
+    if (rbc_copies && streamnet_is_server) RBC_ServerFiles();    /* a joining computer's file request */
     const bool rb_stable = frame > 0 && rb_snap[(frame - 1u) % RB_RING].valid && rb_snap[(frame - 1u) % RB_RING].frame == frame - 1u &&
         rb_snap[(frame - 1u) % RB_RING].context == RB_HostContext() && rb_pending_wrong == UINT32_MAX &&
         (!rbc_copies || RBC_AllStable(frame));
-    if (inputnet_is_server && rb_resync_wanted && rb_stable && RB_ServerResync(frame)) rb_resync_wanted = false;
-    if (inputnet_rollback_resim) return;    /* a correction came first: send our state after the replay */
+    if (streamnet_is_server && rb_resync_wanted && rb_stable && RB_ServerResync(frame)) rb_resync_wanted = false;
+    if (streamnet_rollback_resim) return;    /* a correction came first: send our state after the replay */
 
     {
         static const char *st = getenv("NN_RB_SELFTEST");
@@ -6565,11 +6565,11 @@ static void RB_FrameBoundary(uint32_t frame) {
             LOG_MSG("RBSELFTEST %u replays, %u frames differed", (unsigned)rb_selftest_runs, (unsigned)rb_selftest_fails);
     }
 
-    if (inputnet_is_server && !inputnet_rbautorun_done && inputnet_rbplayers > 0 && !inputnet_rbautorun.empty() &&
-        dos_shell_reading_input && RB_Participants() >= inputnet_rbplayers) {
-        inputnet_rbautorun_done = true;
-        LOG_MSG("INPUTNET: %u participants: typing \"%s\"", RB_Participants(), inputnet_rbautorun.c_str());
-        RB_QueueTyping(inputnet_rbautorun);
+    if (streamnet_is_server && !streamnet_rbautorun_done && streamnet_rbplayers > 0 && !streamnet_rbautorun.empty() &&
+        dos_shell_reading_input && RB_Participants() >= streamnet_rbplayers) {
+        streamnet_rbautorun_done = true;
+        LOG_MSG("STREAMNET: %u participants: typing \"%s\"", RB_Participants(), streamnet_rbautorun.c_str());
+        RB_QueueTyping(streamnet_rbautorun);
     }
     RB_SendInput(frame);
     if (rb_lockstep) {
@@ -6579,10 +6579,10 @@ static void RB_FrameBoundary(uint32_t frame) {
     }
     RB_ApplyInputs(frame);
     RB_TimeSync(frame);
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
-        InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        StreamNetPeer &p = streamnet_peers[i];
         if (!p.active || !p.ready || p.local) continue;
-        for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++)
+        for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++)
             if (rb_peercheck[i][k].valid) RB_CompareCheck(p, i, rb_peercheck[i][k].frame);
     }
     {
@@ -6609,19 +6609,19 @@ static void RB_FrameBoundary(uint32_t frame) {
     RB_LogStats();
 }
 
-void INPUTNET_RollbackTick(void) {
+void STREAMNET_RollbackTick(void) {
     if (rbc_copies && !rbc_leader) { RBC_FollowerRollbackTick(); return; }
-    if (!inputnet_rollback_active || !inputnet_session) return;
+    if (!streamnet_rollback_active || !streamnet_session) return;
     if (!rb_have_first) {
         rb_have_first = true;
-        rb_tick = rb_start_frame * inputnet_frame_ms;
+        rb_tick = rb_start_frame * streamnet_frame_ms;
         RB_FrameBoundary(rb_start_frame);
         return;
     }
     rb_tick++;
-    if ((rb_tick % inputnet_frame_ms) == 0) RB_FrameBoundary(rb_tick / inputnet_frame_ms);
-    else if (!inputnet_rollback_resim) {
-        INPUTNET_PollSocket();
+    if ((rb_tick % streamnet_frame_ms) == 0) RB_FrameBoundary(rb_tick / streamnet_frame_ms);
+    else if (!streamnet_rollback_resim) {
+        STREAMNET_PollSocket();
         if (rb_resync_applied) rb_resync_applied = false;   /* replaying from the server's state already */
     }
 }
@@ -6698,12 +6698,12 @@ static std::string RB_FingerprintDiff(const std::string &theirs, const std::stri
 static void RB_SessionStarted(void) {
     RB_SeatsReset();
     rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_speed_sched.clear(); rbc_injected.clear(); rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_ml_share_s = 0; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS; i++) {
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
         rb_have[i] = 0; rb_checked[i] = 0; rb_acked[i] = 0;
         rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_peerstamp[i] = 0; rb_peerstamp_at[i] = 0; rb_rtt[i] = 0;
         for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
-        for (unsigned k = 0; k < INPUTNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
+        for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
     }
     RB_InitRegions();
     rb_have_first = false;
@@ -6726,24 +6726,24 @@ static void RB_SessionStarted(void) {
     rb_stat_stalls = rb_stat_checks = rb_stat_desyncs = rb_stat_resyncs = 0;
     rb_stat_capture_us = rb_stat_captures = rb_stat_pages = 0;
     rb_stat_last_log = GetTicks();
-    inputnet_rollback_resim = false;
+    streamnet_rollback_resim = false;
     MIXER_SetRollbackDiscard(false);
-    inputnet_rollback_active = true;
-    LOG_MSG("INPUTNET: RollbackNet running: %u ms frames, %u frame local delay, %u frame window, RAM %lu KB, video memory %lu KB",
-        inputnet_frame_ms,inputnet_delay,inputnet_rbwindow,
+    streamnet_rollback_active = true;
+    LOG_MSG("STREAMNET: RollbackNet running: %u ms frames, %u frame local delay, %u frame window, RAM %lu KB, video memory %lu KB",
+        streamnet_frame_ms,streamnet_delay,streamnet_rbwindow,
         (unsigned long)(rb_region[0].pages * 4u),(unsigned long)(rb_region[1].pages * 4u));
     if (rbc_copies && rbc_leader) RBC_LeaderStart(rb_start_frame, rb_joining);
 }
 
 static void RB_SessionEnded(void) {
-    if (rbc_copies && rbc_leader && inputnet_rollback_active) RBC_LeaderEnd();
+    if (rbc_copies && rbc_leader && streamnet_rollback_active) RBC_LeaderEnd();
     rb_joining = false;
-    if (inputnet_rollback_active) {
-        LOG_MSG("INPUTNET: RollbackNet ended at frame %u: %u rollbacks, %u frames replayed, %u desyncs, %u resyncs",
+    if (streamnet_rollback_active) {
+        LOG_MSG("STREAMNET: RollbackNet ended at frame %u: %u rollbacks, %u frames replayed, %u desyncs, %u resyncs",
             (unsigned)rb_realframe,(unsigned)rb_stat_rollbacks,(unsigned)rb_stat_replayed,(unsigned)rb_stat_desyncs,(unsigned)rb_stat_resyncs);
     }
-    inputnet_rollback_active = false;
-    inputnet_rollback_resim = false;
+    streamnet_rollback_active = false;
+    streamnet_rollback_resim = false;
     MIXER_SetRollbackDiscard(false);
     for (unsigned i = 0; i < RB_RING; i++) {
         rb_snap[i].valid = false;
@@ -6764,82 +6764,82 @@ static void RB_SessionEnded(void) {
 /* Public status                                                              */
 /* ------------------------------------------------------------------------- */
 
-bool INPUTNET_IsServer(void) { return inputnet_is_server && inputnet_link_up; }
+bool STREAMNET_IsServer(void) { return streamnet_is_server && streamnet_link_up; }
 /* (a cluster's copy is one of the session's machines from the start, the followers without a link of their own: they
  * report the same fixed file times, disk and clock as the others: drive_local.cpp, cmos.cpp) */
-bool INPUTNET_IsConnected(void) { return inputnet_link_up || rbc_copies != 0; }
+bool STREAMNET_IsConnected(void) { return streamnet_link_up || rbc_copies != 0; }
 /* NN_RB_TRACE: the frame for other components' trace lines (dos.cpp logs every INT 21h call with it) */
-uint32_t INPUTNET_TraceFrame(void) { return inputnet_frame; }
-bool INPUTNET_PendingSpeed(uint32_t &frame, uint32_t &speed) {
-    const auto it = rb_speed_sched.lower_bound(inputnet_frame);   /* (saved before this frame's own change applies) */
-    if (!inputnet_rollback_active || it == rb_speed_sched.end()) return false;
+uint32_t STREAMNET_TraceFrame(void) { return streamnet_frame; }
+bool STREAMNET_PendingSpeed(uint32_t &frame, uint32_t &speed) {
+    const auto it = rb_speed_sched.lower_bound(streamnet_frame);   /* (saved before this frame's own change applies) */
+    if (!streamnet_rollback_active || it == rb_speed_sched.end()) return false;
     frame = it->first; speed = it->second;
     return true;
 }
 
 /* ------------------------------------------------------------------------- */
-/* INPUTNET.COM                                                               */
+/* STREAMNET.COM                                                               */
 /* ------------------------------------------------------------------------- */
 
-class INPUTNET : public Program {
+class STREAMNET : public Program {
 public:
     void HelpCommand(const char *helpStr) {
         if (strcasecmp("connect",helpStr) == 0) {
-            WriteOut("INPUTNET CONNECT joins the shared input session hosted by another DOSBox-X\n");
+            WriteOut("STREAMNET CONNECT joins the shared input session hosted by another DOSBox-X\n");
             WriteOut("session.  The \"address\" parameter is the IP address or the host name of the\n");
-            WriteOut("server computer, and a UDP port may be given as well (default %u).\n\n",(unsigned)inputnet_default_port);
+            WriteOut("server computer, and a UDP port may be given as well (default %u).\n\n",(unsigned)streamnet_default_port);
             WriteOut("The server sends its complete emulator state on connect, so this DOSBox-X\n");
             WriteOut("session will continue from wherever the server currently is.\n\n");
-            WriteOut("The syntax for INPUTNET CONNECT is:\n\n");
-            WriteOut("INPUTNET CONNECT address <port>\n\n");
+            WriteOut("The syntax for STREAMNET CONNECT is:\n\n");
+            WriteOut("STREAMNET CONNECT address <port>\n\n");
             return;
         }
         if (strcasecmp("disconnect",helpStr) == 0) {
-            WriteOut("INPUTNET DISCONNECT leaves the shared input session.  Local input is applied\n");
+            WriteOut("STREAMNET DISCONNECT leaves the shared input session.  Local input is applied\n");
             WriteOut("directly again afterwards.\n\n");
-            WriteOut("The syntax for INPUTNET DISCONNECT is:\n\n");
-            WriteOut("INPUTNET DISCONNECT\n\n");
+            WriteOut("The syntax for STREAMNET DISCONNECT is:\n\n");
+            WriteOut("STREAMNET DISCONNECT\n\n");
             return;
         }
         if (strcasecmp("startserver",helpStr) == 0) {
-            WriteOut("INPUTNET STARTSERVER hosts a shared input session in this DOSBox-X session.\n");
-            WriteOut("Other DOSBox-X sessions can then join with INPUTNET CONNECT.  When one does,\n");
+            WriteOut("STREAMNET STARTSERVER hosts a shared input session in this DOSBox-X session.\n");
+            WriteOut("Other DOSBox-X sessions can then join with STREAMNET CONNECT.  When one does,\n");
             WriteOut("this session's emulator state is copied over to it and both machines continue\n");
             WriteOut("in lockstep with the keyboard and mouse input of every participant.\n\n");
-            WriteOut("The syntax for INPUTNET STARTSERVER is:\n\n");
-            WriteOut("INPUTNET STARTSERVER <port>\n\n");
+            WriteOut("The syntax for STREAMNET STARTSERVER is:\n\n");
+            WriteOut("STREAMNET STARTSERVER <port>\n\n");
             return;
         }
         if (strcasecmp("stopserver",helpStr) == 0) {
-            WriteOut("INPUTNET STOPSERVER stops the shared input session hosted by this DOSBox-X\n");
+            WriteOut("STREAMNET STOPSERVER stops the shared input session hosted by this DOSBox-X\n");
             WriteOut("session and disconnects every participant.\n\n");
-            WriteOut("The syntax for INPUTNET STOPSERVER is:\n\n");
-            WriteOut("INPUTNET STOPSERVER\n\n");
+            WriteOut("The syntax for STREAMNET STOPSERVER is:\n\n");
+            WriteOut("STREAMNET STOPSERVER\n\n");
             return;
         }
         if (strcasecmp("ping",helpStr) == 0) {
-            WriteOut("INPUTNET PING measures the round trip time to the other participants.\n\n");
-            WriteOut("The syntax for INPUTNET PING is:\n\n");
-            WriteOut("INPUTNET PING\n\n");
+            WriteOut("STREAMNET PING measures the round trip time to the other participants.\n\n");
+            WriteOut("The syntax for STREAMNET PING is:\n\n");
+            WriteOut("STREAMNET PING\n\n");
             return;
         }
         if (strcasecmp("status",helpStr) == 0) {
-            WriteOut("INPUTNET STATUS reports the state of the shared input session, the list of\n");
+            WriteOut("STREAMNET STATUS reports the state of the shared input session, the list of\n");
             WriteOut("participants and how much emulated time was spent waiting for them.\n\n");
-            WriteOut("The syntax for INPUTNET STATUS is:\n\n");
-            WriteOut("INPUTNET STATUS\n\n");
+            WriteOut("The syntax for STREAMNET STATUS is:\n\n");
+            WriteOut("STREAMNET STATUS\n\n");
             return;
         }
         WriteOut("The syntax of this command is:\n\n");
-        WriteOut("INPUTNET [ CONNECT | DISCONNECT | STARTSERVER | STOPSERVER | PING | HELP |\n           STATUS ]\n\n");
+        WriteOut("STREAMNET [ CONNECT | DISCONNECT | STARTSERVER | STOPSERVER | PING | HELP |\n           STATUS ]\n\n");
     }
 
     /* Marks the shared input layer as "a DOS program is on the stack" for as
      * long as this command runs. */
     class InProgram {
     public:
-        InProgram() { inputnet_in_program = true; }
-        ~InProgram() { inputnet_in_program = false; }
+        InProgram() { streamnet_in_program = true; }
+        ~InProgram() { streamnet_in_program = false; }
     };
 
     /* "mode = remote" */
@@ -6849,13 +6849,13 @@ public:
                 WriteOut("A remote play server is already running in this DOSBox-X session.\n");
                 return;
             }
-            uint16_t port = inputnet_default_port;
+            uint16_t port = streamnet_default_port;
             if (cmd->FindCommand(1,temp_line,/*remove*/true))
                 port = (uint16_t)strtol(temp_line.c_str(),NULL,10);
             if (REMOTEPLAY_StartServer(port)) {
                 WriteOut("Remote play server started on UDP port %u.\n",(unsigned)port);
                 WriteOut("Other players join by starting DOSBox-X with\n");
-                WriteOut("-inputnet-connect <this machine's address>:%u\n",(unsigned)port);
+                WriteOut("-streamnet-connect <this machine's address>:%u\n",(unsigned)port);
             }
             else {
                 WriteOut("Remote play server failed to start.\n");
@@ -6875,9 +6875,9 @@ public:
             REMOTEPLAY_Status(this);
             return;
         }
-        WriteOut("This DOSBox-X session uses remote play (\"mode = remote\" in [inputnet]).\n");
-        WriteOut("To join a game, start DOSBox-X with -inputnet-connect <address>:<port>.\n");
-        WriteOut("Here only INPUTNET STARTSERVER, STOPSERVER and STATUS are available.\n");
+        WriteOut("This DOSBox-X session uses remote play (\"mode = remote\" in [streamnet]).\n");
+        WriteOut("To join a game, start DOSBox-X with -streamnet-connect <address>:<port>.\n");
+        WriteOut("Here only STREAMNET STARTSERVER, STOPSERVER and STATUS are available.\n");
     }
 
     void Run(void) override {
@@ -6885,22 +6885,22 @@ public:
 
         if (cmd->GetCount() == 0) {
             WriteOut("Shared keyboard/mouse input over UDP between DOSBox-X sessions.\n\n");
-            WriteOut("The following are valid INPUTNET commands:\n\n");
-            WriteOut("INPUTNET CONNECT      INPUTNET DISCONNECT     INPUTNET STARTSERVER\n");
-            WriteOut("INPUTNET STOPSERVER   INPUTNET PING           INPUTNET STATUS\n\n");
+            WriteOut("The following are valid STREAMNET commands:\n\n");
+            WriteOut("STREAMNET CONNECT      STREAMNET DISCONNECT     STREAMNET STARTSERVER\n");
+            WriteOut("STREAMNET STOPSERVER   STREAMNET PING           STREAMNET STATUS\n\n");
             WriteOut("A summary of each command is given by:\n\n");
-            WriteOut("INPUTNET HELP command\n\n");
+            WriteOut("STREAMNET HELP command\n\n");
             return;
         }
 
         if (cmd->FindCommand(1,temp_line,/*remove*/true)) {
             if (strcasecmp("help",temp_line.c_str()) == 0) {
                 if (!cmd->FindCommand(1,temp_line,/*remove*/true)) {
-                    WriteOut("The following are valid INPUTNET commands:\n\n");
-                    WriteOut("INPUTNET CONNECT      INPUTNET DISCONNECT     INPUTNET STARTSERVER\n");
-                    WriteOut("INPUTNET STOPSERVER   INPUTNET PING           INPUTNET STATUS\n\n");
+                    WriteOut("The following are valid STREAMNET commands:\n\n");
+                    WriteOut("STREAMNET CONNECT      STREAMNET DISCONNECT     STREAMNET STARTSERVER\n");
+                    WriteOut("STREAMNET STOPSERVER   STREAMNET PING           STREAMNET STATUS\n\n");
                     WriteOut("A summary of each command is given by:\n\n");
-                    WriteOut("INPUTNET HELP command\n\n");
+                    WriteOut("STREAMNET HELP command\n\n");
                 }
                 else {
                     HelpCommand(temp_line.c_str());
@@ -6908,44 +6908,44 @@ public:
                 return;
             }
 
-            if (inputnet_remote) {
+            if (streamnet_remote) {
                 RunRemote();
                 return;
             }
 
             if (strcasecmp("startserver",temp_line.c_str()) == 0) {
-                if (INPUTNET_IsConnected()) {
+                if (STREAMNET_IsConnected()) {
                     WriteOut("A shared input session is already running in this DOSBox-X session.\n");
                     return;
                 }
 
-                uint16_t port = inputnet_default_port;
+                uint16_t port = streamnet_default_port;
                 if (cmd->FindCommand(1,temp_line,/*remove*/true))
                     port = (uint16_t)strtol(temp_line.c_str(),NULL,10);
 
-                if (INPUTNET_StartServer(port)) {
+                if (STREAMNET_StartServer(port)) {
                     WriteOut("Shared input server started on UDP port %u.\n",(unsigned)port);
-                    WriteOut("Run \"INPUTNET CONNECT <this machine's address> %u\" on the other machine.\n",(unsigned)port);
+                    WriteOut("Run \"STREAMNET CONNECT <this machine's address> %u\" on the other machine.\n",(unsigned)port);
                 }
                 else {
                     WriteOut("Shared input server failed to start.\n");
-                    if (port < 1024) WriteOut("Try a port number above 1024. See INPUTNET HELP STARTSERVER.\n");
+                    if (port < 1024) WriteOut("Try a port number above 1024. See STREAMNET HELP STARTSERVER.\n");
                 }
                 return;
             }
 
             if (strcasecmp("stopserver",temp_line.c_str()) == 0) {
-                if (!INPUTNET_IsServer()) {
+                if (!STREAMNET_IsServer()) {
                     WriteOut("No shared input server is running in this DOSBox-X session.\n");
                     return;
                 }
-                INPUTNET_CloseLink("stopped by the user",true);
+                STREAMNET_CloseLink("stopped by the user",true);
                 WriteOut("Shared input server stopped.\n");
                 return;
             }
 
             if (strcasecmp("connect",temp_line.c_str()) == 0) {
-                if (INPUTNET_IsConnected()) {
+                if (STREAMNET_IsConnected()) {
                     WriteOut("This DOSBox-X session is already part of a shared input session.\n");
                     return;
                 }
@@ -6955,14 +6955,14 @@ public:
                 }
 
                 const std::string host = temp_line;
-                uint16_t port = inputnet_default_port;
+                uint16_t port = streamnet_default_port;
                 if (cmd->FindCommand(1,temp_line,/*remove*/true))
                     port = (uint16_t)strtol(temp_line.c_str(),NULL,10);
 
                 WriteOut("Connecting to %s port %u...\n",host.c_str(),(unsigned)port);
 
                 std::string err;
-                if (INPUTNET_Connect(host.c_str(),port,err))
+                if (STREAMNET_Connect(host.c_str(),port,err))
                     WriteOut("Connected. The emulator state of the server is being taken over.\n");
                 else
                     WriteOut("Failed to connect to %s: %s.\n",host.c_str(),err.c_str());
@@ -6970,48 +6970,48 @@ public:
             }
 
             if (strcasecmp("disconnect",temp_line.c_str()) == 0) {
-                if (!INPUTNET_IsConnected()) {
+                if (!STREAMNET_IsConnected()) {
                     WriteOut("This DOSBox-X session is not part of a shared input session.\n");
                     return;
                 }
-                INPUTNET_CloseLink("disconnected by the user",true);
+                STREAMNET_CloseLink("disconnected by the user",true);
                 WriteOut("Left the shared input session.\n");
                 return;
             }
 
             if (strcasecmp("status",temp_line.c_str()) == 0) {
                 WriteOut("Shared input status:\n\n");
-                WriteOut("Server status: %s\n",INPUTNET_IsServer() ? "ACTIVE" : "INACTIVE");
-                WriteOut("Link status:   %s\n",INPUTNET_IsConnected() ? "CONNECTED" : "DISCONNECTED");
-                WriteOut("Session:       %s\n",inputnet_session ? "RUNNING" : "NOT RUNNING");
-                if (!INPUTNET_IsConnected()) return;
+                WriteOut("Server status: %s\n",STREAMNET_IsServer() ? "ACTIVE" : "INACTIVE");
+                WriteOut("Link status:   %s\n",STREAMNET_IsConnected() ? "CONNECTED" : "DISCONNECTED");
+                WriteOut("Session:       %s\n",streamnet_session ? "RUNNING" : "NOT RUNNING");
+                if (!STREAMNET_IsConnected()) return;
 
-                WriteOut("UDP port:      %u\n",(unsigned)inputnet_active_port);
+                WriteOut("UDP port:      %u\n",(unsigned)streamnet_active_port);
                 WriteOut("Frame:         %u ms, input delay %u frames (%u ms)\n",
-                    inputnet_frame_ms,inputnet_delay,inputnet_frame_ms*inputnet_delay);
+                    streamnet_frame_ms,streamnet_delay,streamnet_frame_ms*streamnet_delay);
                 WriteOut("Sharing:       %s%s%s\n",
-                    inputnet_share_keyboard ? "keyboard" : "",
-                    (inputnet_share_keyboard && inputnet_share_mouse) ? " and " : "",
-                    inputnet_share_mouse ? "mouse" : "");
+                    streamnet_share_keyboard ? "keyboard" : "",
+                    (streamnet_share_keyboard && streamnet_share_mouse) ? " and " : "",
+                    streamnet_share_mouse ? "mouse" : "");
                 WriteOut("Cycle sync:    %s",
-                    inputnet_cyclesync == INCYCLES_AUTO ? "server sets the speed" :
-                    inputnet_cyclesync == INCYCLES_FREEZE ? "frozen for the session" : "not managed");
-                if (inputnet_cyclemax)
-                    WriteOut(" (%u cycles, %u update%s)\n",inputnet_cyclemax,
-                        inputnet_stat_cycleupdates,inputnet_stat_cycleupdates == 1 ? "" : "s");
+                    streamnet_cyclesync == INCYCLES_AUTO ? "server sets the speed" :
+                    streamnet_cyclesync == INCYCLES_FREEZE ? "frozen for the session" : "not managed");
+                if (streamnet_cyclemax)
+                    WriteOut(" (%u cycles, %u update%s)\n",streamnet_cyclemax,
+                        streamnet_stat_cycleupdates,streamnet_stat_cycleupdates == 1 ? "" : "s");
                 else
                     WriteOut("\n");
-                if (inputnet_checkevery)
+                if (streamnet_checkevery)
                     WriteOut("Desync check:  every %u frames, %u mismatch%s so far\n",
-                        inputnet_checkevery,inputnet_stat_desyncs,inputnet_stat_desyncs == 1 ? "" : "es");
+                        streamnet_checkevery,streamnet_stat_desyncs,streamnet_stat_desyncs == 1 ? "" : "es");
                 else
                     WriteOut("Desync check:  disabled\n");
-                if (inputnet_stat_frames)
-                    WriteOut("Waiting:       %u ms over %u frames\n",inputnet_stat_stallms,inputnet_stat_frames);
+                if (streamnet_stat_frames)
+                    WriteOut("Waiting:       %u ms over %u frames\n",streamnet_stat_stallms,streamnet_stat_frames);
 
                 WriteOut("\nParticipants:\n\n");
-                for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-                    InputNetPeer &p = inputnet_peers[i];
+                for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+                    StreamNetPeer &p = streamnet_peers[i];
                     if (!p.active) continue;
                     if (p.local) {
                         WriteOut("     %u: this DOSBox-X session\n",i);
@@ -7029,29 +7029,29 @@ public:
             }
 
             if (strcasecmp("ping",temp_line.c_str()) == 0) {
-                if (!INPUTNET_IsConnected()) {
+                if (!STREAMNET_IsConnected()) {
                     WriteOut("This DOSBox-X session is not part of a shared input session.\n");
                     return;
                 }
 
                 const uint32_t token = GetTicks();
                 uint8_t buf[32];
-                InputNetWriter w(buf,sizeof(buf));
-                INPUTNET_BeginPacket(w,INPKT_PING);
+                StreamNetWriter w(buf,sizeof(buf));
+                STREAMNET_BeginPacket(w,INPKT_PING);
                 w.u32(token);
-                INPUTNET_SendToPeers(buf,w.size());
+                STREAMNET_SendToPeers(buf,w.size());
 
                 WriteOut("Pinging the other participants:\n\n");
 
                 const uint32_t start = GetTicks();
                 while ((GetTicks() - start) < 1500u) {
                     CALLBACK_Idle();
-                    INPUTNET_PollSocket();
+                    STREAMNET_PollSocket();
                 }
 
                 bool any = false;
-                for (unsigned i=0;i < INPUTNET_MAX_PEERS;i++) {
-                    InputNetPeer &p = inputnet_peers[i];
+                for (unsigned i=0;i < STREAMNET_MAX_PEERS;i++) {
+                    StreamNetPeer &p = streamnet_peers[i];
                     if (!p.active || p.local) continue;
                     any = true;
                     WriteOut("Response from %d.%d.%d.%d, port %u time=%ums\n",
@@ -7069,52 +7069,52 @@ public:
     }
 };
 
-void INPUTNET_ProgramStart(Program * * make) {
-    *make = new INPUTNET;
+void STREAMNET_ProgramStart(Program * * make) {
+    *make = new STREAMNET;
 }
 
 /* ------------------------------------------------------------------------- */
 /* Module life cycle                                                          */
 /* ------------------------------------------------------------------------- */
 
-bool addinputnet = false;
+bool addstreamnet = false;
 void VFILE_Remove(const char *name,const char *dir = "");
 
-class INPUTNETModule : public Module_base {
+class STREAMNETModule : public Module_base {
 public:
-    INPUTNETModule(Section *configuration) : Module_base(configuration) {
+    STREAMNETModule(Section *configuration) : Module_base(configuration) {
         Section_prop *section = static_cast<Section_prop *>(configuration);
 
-        addinputnet = false;
-        inputnet_enabled = section->Get_bool("inputnet");
+        addstreamnet = false;
+        streamnet_enabled = section->Get_bool("streamnet");
 
         /* Asking for a session on the command line implies the feature. */
-        if (!control->opt_inputnet_connect.empty() || control->opt_inputnet_server >= 0)
-            inputnet_enabled = true;
+        if (!control->opt_streamnet_connect.empty() || control->opt_streamnet_server >= 0)
+            streamnet_enabled = true;
 
-        if (!inputnet_enabled) return;
+        if (!streamnet_enabled) return;
 
         int v;
 
         v = section->Get_int("port");
-        inputnet_default_port = (uint16_t)((v > 0 && v < 65536) ? v : (int)INPUTNET_DEFAULT_PORT);
+        streamnet_default_port = (uint16_t)((v > 0 && v < 65536) ? v : (int)STREAMNET_DEFAULT_PORT);
 
         v = section->Get_int("frame");
-        inputnet_frame_ms = (unsigned int)((v >= 1 && v <= 100) ? v : 10);
+        streamnet_frame_ms = (unsigned int)((v >= 1 && v <= 100) ? v : 10);
 
-        inputnet_rollback = std::string(section->Get_string("mode")) == "rollback";
+        streamnet_rollback = std::string(section->Get_string("mode")) == "rollback";
         /* RollbackNet: this computer's keyboard and mouse reach its machine only as the session's input. Before the
          * session runs (the start-up commands, "Switch to secure mode" and the rest) a key would go into this machine
          * alone and wait in its keyboard buffer, and the DOS prompt would then read it in front of the game's start
-         * command: taken and dropped from the start (INPUTNET_InterceptKey). */
-        if (inputnet_rollback) inputnet_capture_active = true;
+         * command: taken and dropped from the start (STREAMNET_InterceptKey). */
+        if (streamnet_rollback) streamnet_capture_active = true;
 
         v = section->Get_int("delay");
-        if (inputnet_rollback) inputnet_delay = (unsigned int)((v >= 0 && v <= 8) ? v : 0);
-        else inputnet_delay = (unsigned int)((v >= 1 && v <= 64) ? v : 3);
+        if (streamnet_rollback) streamnet_delay = (unsigned int)((v >= 0 && v <= 8) ? v : 0);
+        else streamnet_delay = (unsigned int)((v >= 1 && v <= 64) ? v : 3);
 
         v = section->Get_int("rollback window");
-        inputnet_rbwindow = (unsigned int)((v >= 2 && v <= 48) ? v : 16);
+        streamnet_rbwindow = (unsigned int)((v >= 2 && v <= 48) ? v : 16);
         v = section->Get_int("rollback max load");
         rb_maxload = (unsigned int)((v >= 20 && v <= 95) ? v : 85);
         v = section->Get_int("rollback mouse frames");
@@ -7122,202 +7122,202 @@ public:
         rb_auto_delay = section->Get_bool("rollback auto delay");
         rb_auto_d = 0;
         v = section->Get_int("players");
-        inputnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)INPUTNET_MAX_PEERS) ? v : 0);
-        inputnet_rbautorun = section->Get_string("autorun");
-        inputnet_rbautorun_done = false;
+        streamnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)STREAMNET_MAX_PEERS) ? v : 0);
+        streamnet_rbautorun = section->Get_string("autorun");
+        streamnet_rbautorun_done = false;
         /* RollbackNet runs a "cluster" of copies on every computer: one (the game itself, every player's input to it), or
          * one per player for IPX/NullModem-over-RollbackNet. Either way the host's session runs from the start and
          * others join it, before or during the game (RBC_ServerHello). */
         v = section->Get_int("cluster");
         rbc_copies = 0; rbc_copy = 0; rbc_leader = false; rbc_port = 0;
-        if (inputnet_rollback) {
-            rbc_copies = (v >= 2 && v <= (int)INPUTNET_MAX_PEERS) ? (unsigned int)v : 1u;
+        if (streamnet_rollback) {
+            rbc_copies = (v >= 2 && v <= (int)STREAMNET_MAX_PEERS) ? (unsigned int)v : 1u;
             if (rbc_copies >= 2) {
                 v = section->Get_int("cluster copy");
                 rbc_copy = (v >= 0 && v < (int)rbc_copies) ? (unsigned int)v : 0u;
                 rbc_leader = std::string(section->Get_string("cluster role")) == "leader";
                 v = section->Get_int("cluster port");
                 rbc_port = (v > 0 && v < 65536) ? (unsigned int)v : 0u;
-                if (rbc_port == 0) { LOG_MSG("INPUTNET: cluster: no \"cluster port\" set, so one copy"); rbc_copies = 1; rbc_copy = 0; }
-                else LOG_MSG("INPUTNET: cluster of %u copies: this is player %u's, the %s (port %u)", rbc_copies, rbc_copy + 1u,
+                if (rbc_port == 0) { LOG_MSG("STREAMNET: cluster: no \"cluster port\" set, so one copy"); rbc_copies = 1; rbc_copy = 0; }
+                else LOG_MSG("STREAMNET: cluster of %u copies: this is player %u's, the %s (port %u)", rbc_copies, rbc_copy + 1u,
                     rbc_leader ? "leader" : "follower", rbc_port);
             }
             if (rbc_copies == 1) rbc_leader = true;
         }
 
         v = section->Get_int("redundancy");
-        inputnet_redundancy = (unsigned int)((v >= 1 && v <= 32) ? v : 4);
+        streamnet_redundancy = (unsigned int)((v >= 1 && v <= 32) ? v : 4);
 
         v = section->Get_int("timeout");
-        inputnet_timeout = (unsigned int)((v >= 250 && v <= 600000) ? v : 10000);
+        streamnet_timeout = (unsigned int)((v >= 250 && v <= 600000) ? v : 10000);
 
         v = section->Get_int("desync check");
-        inputnet_checkevery = (unsigned int)((v >= 0 && v <= 100000) ? v : 100);
+        streamnet_checkevery = (unsigned int)((v >= 0 && v <= 100000) ? v : 100);
 
         {
             const std::string cs = section->Get_string("cycle sync");
-            if (cs == "freeze")   inputnet_cyclesync = INCYCLES_FREEZE;
-            else if (cs == "off") inputnet_cyclesync = INCYCLES_OFF;
-            else                  inputnet_cyclesync = INCYCLES_AUTO;
+            if (cs == "freeze")   streamnet_cyclesync = INCYCLES_FREEZE;
+            else if (cs == "off") streamnet_cyclesync = INCYCLES_OFF;
+            else                  streamnet_cyclesync = INCYCLES_AUTO;
         }
 
-        inputnet_share_keyboard = section->Get_bool("share keyboard");
-        inputnet_share_mouse = section->Get_bool("share mouse");
-        inputnet_sync_state = section->Get_bool("sync state");
+        streamnet_share_keyboard = section->Get_bool("share keyboard");
+        streamnet_share_mouse = section->Get_bool("share mouse");
+        streamnet_sync_state = section->Get_bool("sync state");
 
         /* Command line beats the config file. */
-        inputnet_auto_connect = control->opt_inputnet_connect;
-        inputnet_auto_server = control->opt_inputnet_server;
+        streamnet_auto_connect = control->opt_streamnet_connect;
+        streamnet_auto_server = control->opt_streamnet_server;
 
-        if (inputnet_auto_connect.empty() && inputnet_auto_server < 0) {
+        if (streamnet_auto_connect.empty() && streamnet_auto_server < 0) {
             const std::string cfg_connect = section->Get_string("connect");
             const std::string cfg_server = section->Get_string("startserver");
             if (!cfg_connect.empty()) {
-                inputnet_auto_connect = cfg_connect;
+                streamnet_auto_connect = cfg_connect;
             }
             else if (!cfg_server.empty()) {
-                inputnet_auto_server = atoi(cfg_server.c_str());
+                streamnet_auto_server = atoi(cfg_server.c_str());
             }
         }
 
         /* -1 means "no server requested"; anything else that is not a usable
          * port number falls back to the configured default. */
-        if (inputnet_auto_server != -1 && (inputnet_auto_server <= 0 || inputnet_auto_server > 65535))
-            inputnet_auto_server = (int)inputnet_default_port;
+        if (streamnet_auto_server != -1 && (streamnet_auto_server <= 0 || streamnet_auto_server > 65535))
+            streamnet_auto_server = (int)streamnet_default_port;
 
-        memset(inputnet_keydown,0,sizeof(inputnet_keydown));
-        inputnet_buttondown = 0;
-        inputnet_autostart_done = false;
+        memset(streamnet_keydown,0,sizeof(streamnet_keydown));
+        streamnet_buttondown = 0;
+        streamnet_autostart_done = false;
 
         /* Remote play: only this machine runs the game; joining players watch
          * its picture and send their input (see remoteplay.cpp). */
-        inputnet_remote = std::string(section->Get_string("mode")) == "remote";
-        if (inputnet_remote) {
+        streamnet_remote = std::string(section->Get_string("mode")) == "remote";
+        if (streamnet_remote) {
             REMOTEPLAY_Configure(section);
-            addinputnet = true;
-            if (inputnet_auto_server != -1 && !REMOTEPLAY_StartServer((uint16_t)inputnet_auto_server) &&
+            addstreamnet = true;
+            if (streamnet_auto_server != -1 && !REMOTEPLAY_StartServer((uint16_t)streamnet_auto_server) &&
                 remoteplay_screen_hidden)
                 GFX_RemotePlaySetScreenHidden(false); /* nobody can watch: show what happened */
             return;
         }
 
-        if (!inputnet_tick_installed) {
-            TIMER_AddTickHandler(&INPUTNET_TickHandler);
-            inputnet_tick_installed = true;
+        if (!streamnet_tick_installed) {
+            TIMER_AddTickHandler(&STREAMNET_TickHandler);
+            streamnet_tick_installed = true;
         }
 
-        addinputnet = true;
+        addstreamnet = true;
 
-        LOG(LOG_MISC,LOG_DEBUG)("INPUTNET: shared input emulation available (default UDP port %u)",
-            (unsigned)inputnet_default_port);
+        LOG(LOG_MISC,LOG_DEBUG)("STREAMNET: shared input emulation available (default UDP port %u)",
+            (unsigned)streamnet_default_port);
     }
 
-    ~INPUTNETModule() {
+    ~STREAMNETModule() {
         REMOTEPLAY_StopServer(NULL);
-        if (inputnet_tick_installed) {
-            TIMER_DelTickHandler(&INPUTNET_TickHandler);
-            inputnet_tick_installed = false;
+        if (streamnet_tick_installed) {
+            TIMER_DelTickHandler(&STREAMNET_TickHandler);
+            streamnet_tick_installed = false;
         }
 
-        INPUTNET_CloseLink(NULL,true);
+        STREAMNET_CloseLink(NULL,true);
 
-        if (inputnet_sendpkt != NULL) { SDLNet_FreePacket(inputnet_sendpkt); inputnet_sendpkt = NULL; }
-        if (inputnet_recvpkt != NULL) { SDLNet_FreePacket(inputnet_recvpkt); inputnet_recvpkt = NULL; }
+        if (streamnet_sendpkt != NULL) { SDLNet_FreePacket(streamnet_sendpkt); streamnet_sendpkt = NULL; }
+        if (streamnet_recvpkt != NULL) { SDLNet_FreePacket(streamnet_recvpkt); streamnet_recvpkt = NULL; }
 
-        if (addinputnet) {
-            VFILE_Remove("INPUTNET.COM","SYSTEM");
-            addinputnet = false;
+        if (addstreamnet) {
+            VFILE_Remove("STREAMNET.COM","SYSTEM");
+            addstreamnet = false;
         }
     }
 };
 
-static INPUTNETModule *inputnet_module = NULL;
+static STREAMNETModule *streamnet_module = NULL;
 
-void INPUTNET_ShutDown(Section *) {
-    if (inputnet_module != NULL) {
-        delete inputnet_module;
-        inputnet_module = NULL;
+void STREAMNET_ShutDown(Section *) {
+    if (streamnet_module != NULL) {
+        delete streamnet_module;
+        streamnet_module = NULL;
     }
 }
 
-static void INPUTNET_OnReset(Section *) {
+static void STREAMNET_OnReset(Section *) {
     /* A reset of the emulated machine invalidates any synchronization. */
-    if (inputnet_link_up) INPUTNET_CloseLink("the emulated machine was reset",true);
+    if (streamnet_link_up) STREAMNET_CloseLink("the emulated machine was reset",true);
 }
 
-void INPUTNET_Setup(Section *) {
-    if (inputnet_module == NULL) {
+void STREAMNET_Setup(Section *) {
+    if (streamnet_module == NULL) {
         LOG(LOG_MISC,LOG_DEBUG)("Allocating shared input emulation");
-        inputnet_module = new INPUTNETModule(control->GetSection("inputnet"));
+        streamnet_module = new STREAMNETModule(control->GetSection("streamnet"));
     }
 }
 
-void INPUTNET_Init(void) {
+void STREAMNET_Init(void) {
     LOG(LOG_MISC,LOG_DEBUG)("Initializing shared input emulation");
 
-    AddExitFunction(AddExitFunctionFuncPair(INPUTNET_ShutDown),true);
-    AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(INPUTNET_OnReset));
+    AddExitFunction(AddExitFunctionFuncPair(STREAMNET_ShutDown),true);
+    AddVMEventFunction(VM_EVENT_RESET,AddVMEventFunctionFuncPair(STREAMNET_OnReset));
     REMOTEPLAY_Init();
 }
 
 /* The server's control channel ("rbseat <copy> <player>", see remoteplay.cpp): that player plays that copy (0 based)
  * from the next frame start where the machines can be handed over. Whoever played it gets a free copy, or the one the
  * player leaves. "@host" names the server's own player. False when it cannot be done. */
-bool INPUTNET_RollbackSeat(const std::string &name, unsigned copy) {
-    if (!inputnet_session || !inputnet_rollback || !inputnet_is_server || rbc_copies < 2 || copy >= rbc_copies) return false;
+bool STREAMNET_RollbackSeat(const std::string &name, unsigned copy) {
+    if (!streamnet_session || !streamnet_rollback || !streamnet_is_server || rbc_copies < 2 || copy >= rbc_copies) return false;
     int pid = -1;
-    for (unsigned i = 0; i < INPUTNET_MAX_PEERS && pid < 0; i++) {
-        const InputNetPeer &p = inputnet_peers[i];
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS && pid < 0; i++) {
+        const StreamNetPeer &p = streamnet_peers[i];
         if (!p.active) continue;
         if (p.local ? name == "@host" : (p.ready && strcasecmp(p.name.c_str(), name.c_str()) == 0)) pid = (int)i;
     }
-    if (pid < 0) { LOG_MSG("INPUTNET: seat: nobody called \"%s\" plays", name.c_str()); return false; }
-    uint8_t next[INPUTNET_MAX_PEERS];
+    if (pid < 0) { LOG_MSG("STREAMNET: seat: nobody called \"%s\" plays", name.c_str()); return false; }
+    uint8_t next[STREAMNET_MAX_PEERS];
     memcpy(next, rbs_seat_change ? rbs_seat_next : rb_seat, sizeof(next));
     const int from = RB_CopyOf(next, (unsigned)pid);
     if (from == (int)copy) return true;
     const uint8_t other = next[copy];
     next[copy] = (uint8_t)pid;
     if (from >= 0) next[from] = 0xFF;
-    if (other < INPUTNET_MAX_PEERS && other != (uint8_t)pid && inputnet_peers[other].active) {
+    if (other < STREAMNET_MAX_PEERS && other != (uint8_t)pid && streamnet_peers[other].active) {
         int to = -1;
         for (unsigned c = 0; c < rbc_copies && to < 0; c++) if (c != copy && RB_CopyFree(next, c)) to = (int)c;
         if (to >= 0) {
             next[to] = other;
-            LOG_MSG("INPUTNET: seat: \"%s\" goes to copy %u", inputnet_peers[other].local ? "the host" : inputnet_peers[other].name.c_str(), (unsigned)to + 1u);
+            LOG_MSG("STREAMNET: seat: \"%s\" goes to copy %u", streamnet_peers[other].local ? "the host" : streamnet_peers[other].name.c_str(), (unsigned)to + 1u);
         }
     }
     memcpy(rbs_seat_next, next, sizeof(next));
     rbs_seat_change = true;
     rb_resync_wanted = true;
-    LOG_MSG("INPUTNET: seat: \"%s\" plays copy %u from the next frame the machines can be handed over at", name.c_str(), copy + 1u);
+    LOG_MSG("STREAMNET: seat: \"%s\" plays copy %u from the next frame the machines can be handed over at", name.c_str(), copy + 1u);
     return true;
 }
 
-#else /* !C_INPUTNET */
+#else /* !C_STREAMNET */
 
 #include <string>
-bool INPUTNET_RollbackSeat(const std::string &, unsigned) { return false; }
-bool INPUTNET_PendingSpeed(uint32_t &, uint32_t &) { return false; }
-void INPUTNET_ScheduleSpeed(uint32_t, uint32_t) { }
-uint32_t INPUTNET_TraceFrame(void) { return 0; }
-void INPUTNET_ReplayPublish(void) { }
+bool STREAMNET_RollbackSeat(const std::string &, unsigned) { return false; }
+bool STREAMNET_PendingSpeed(uint32_t &, uint32_t &) { return false; }
+void STREAMNET_ScheduleSpeed(uint32_t, uint32_t) { }
+uint32_t STREAMNET_TraceFrame(void) { return 0; }
+void STREAMNET_ReplayPublish(void) { }
 
 /* Networking support was not compiled in: the hooks stay inert. */
 
-bool INPUTNET_InterceptKey(KBD_KEYS,bool) { return false; }
-bool INPUTNET_InterceptMouseMotion(float,float,float,float,bool) { return false; }
-bool INPUTNET_InterceptMouseButton(uint8_t,bool) { return false; }
-bool INPUTNET_InterceptMouseWheel(int32_t) { return false; }
+bool STREAMNET_InterceptKey(KBD_KEYS,bool) { return false; }
+bool STREAMNET_InterceptMouseMotion(float,float,float,float,bool) { return false; }
+bool STREAMNET_InterceptMouseButton(uint8_t,bool) { return false; }
+bool STREAMNET_InterceptMouseWheel(int32_t) { return false; }
 
-bool INPUTNET_IsServer(void) { return false; }
-bool INPUTNET_IsConnected(void) { return false; }
-void INPUTNET_RollbackTick(void) { }
+bool STREAMNET_IsServer(void) { return false; }
+bool STREAMNET_IsConnected(void) { return false; }
+void STREAMNET_RollbackTick(void) { }
 
-void INPUTNET_ShutDown(Section *) { }
-void INPUTNET_Setup(Section *) { }
-void INPUTNET_Init(void) { }
+void STREAMNET_ShutDown(Section *) { }
+void STREAMNET_Setup(Section *) { }
+void STREAMNET_Init(void) { }
 
-void INPUTNET_ProgramStart(Program * *) { }
+void STREAMNET_ProgramStart(Program * *) { }
 
-#endif /* C_INPUTNET */
+#endif /* C_STREAMNET */

@@ -4325,7 +4325,7 @@ static void OnDemandCompleteFrame(void) {
  * A VGA takes a new start address at the start of vertical retrace and then spends a whole refresh showing that page.
  * The emulation did the same and handed the frame over when its last line was drawn, so a page a game flipped to
  * reached the remote players 14 to 28 ms later at 70 Hz (measured: 12 to 21 ms in Shadow Warrior at 800x600, which
- * had drawn one or two newer frames by then). While a remote play server runs ([inputnet] present):
+ * had drawn one or two newer frames by then). While a remote play server runs ([streamnet] present):
  *  - 256-colour VGA modes are rendered on demand, as SVGA modes already are (ChooseRenderOnDemand): the frame is
  *    drawn at the start of vertical retrace from what video memory holds then, so a game that copies its frame to
  *    the screen is seen one refresh earlier and whole. Palette and register changes still draw up to the beam first.
@@ -4594,11 +4594,11 @@ static void NN_Verdict(bool more_drawn) {
             nn_trust = NN_TRUST_OFF;
             nn_verdict_count = 0;
             nn_trust_need = (nn_trust_need < 140) ? 140 : ((nn_trust_need < 3200) ? nn_trust_need * 2 : 6400);
-            LOG_MSG("INPUTNET: frames at vertical retrace again: this game goes on drawing after showing a frame (next try after %u clean frames)",nn_trust_need);
+            LOG_MSG("STREAMNET: frames at vertical retrace again: this game goes on drawing after showing a frame (next try after %u clean frames)",nn_trust_need);
         }
     }
     else if (nn_verdict_count >= nn_trust_need && (nn_verdicts & 0xFFFFu) == 0) {
-        LOG_MSG("INPUTNET: frames as soon as the game shows them (%u checked)",nn_verdict_count);
+        LOG_MSG("STREAMNET: frames as soon as the game shows them (%u checked)",nn_verdict_count);
         nn_trust = NN_TRUST_ON;
         nn_verdict_count = 0;
     }
@@ -4741,8 +4741,8 @@ unsigned int vga_shown_flips = 0;   /* display start changes outside replays: a 
 static void VGA_DisplayStartLatch(Bitu /*val*/) {
     const Bitu old_start = vga.config.real_start;
     {
-        extern bool inputnet_rollback_resim;
-        if (!inputnet_rollback_resim && (vga.config.display_start & vga.mem.memmask) != old_start) vga_shown_flips++;
+        extern bool streamnet_rollback_resim;
+        if (!streamnet_rollback_resim && (vga.config.display_start & vga.mem.memmask) != old_start) vga_shown_flips++;
     }
 #if defined(__EMSCRIPTEN__)
     emw_latch_count++;
@@ -6910,8 +6910,8 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
      * after a mode change, a frame skip): whether it was drawn moves the frame clock (vga_mode_frames_since_time_base,
      * at the next vertical timer), which the guest sees in its retrace timing, and the computers must not differ. The
      * renderer then draws nothing (its line handler stays empty). */
-    extern bool inputnet_rollback_active;
-    if (vga.draw.vga_override || (!RENDER_StartUpdate() && !inputnet_rollback_active)) {
+    extern bool streamnet_rollback_active;
+    if (vga.draw.vga_override || (!RENDER_StartUpdate() && !streamnet_rollback_active)) {
 #if defined(__EMSCRIPTEN__)
         emw_sufail_count++;
 #endif

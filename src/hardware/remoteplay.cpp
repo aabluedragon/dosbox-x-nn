@@ -1,10 +1,10 @@
 /*
- *  Inputnet remote play.
+ *  StreamNet remote play.
  *
  *  Only the host runs the emulated machine. It sends every rendered frame
  *  (compressed against the previous one) and its sound to the viewers, and
  *  applies the keyboard and mouse input the viewers send back as if it was
- *  typed on the host. A viewer is DOSBox-X started with -inputnet-connect while
+ *  typed on the host. A viewer is DOSBox-X started with -streamnet-connect while
  *  "mode = remote": it does not boot a machine, mount drives or need the game,
  *  so its configuration (sound card, game version, ...) cannot make the two
  *  sides differ.
@@ -31,7 +31,7 @@
 bool remoteplay_streaming = false;
 bool remoteplay_screen_hidden = false;
 
-#if C_INPUTNET
+#if C_STREAMNET
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -96,8 +96,8 @@ bool TTF_using(void);
 void ttf_switch_off(bool ss);
 #endif
 
-bool INPUTNET_RollbackSeat(const std::string &name, unsigned copy);   /* inputnet.cpp: a RollbackNet cluster's seats */
-extern bool inputnet_rollback_active;
+bool STREAMNET_RollbackSeat(const std::string &name, unsigned copy);   /* streamnet.cpp: a RollbackNet cluster's seats */
+extern bool streamnet_rollback_active;
 
 namespace {
 
@@ -253,7 +253,7 @@ std::string RP_AddrString(const IPaddress &a) {
 /* A host started with env NN_RP_AUTH_SECRET (NukemNet gives it one per launch) lets in only viewers whose HELLO carries
  * the token for the name they give: the first 16 bytes of HMAC-SHA256(secret, name in lower case), in hex. NukemNet
  * hands each player of the room their own token (env NN_RP_AUTH_TOKEN of their viewer), so nobody outside the room
- * can join, and nobody in it can take another player's name (an IPX-over-InputNet host routes viewers by name).
+ * can join, and nobody in it can take another player's name (an IPX-over-StreamNet host routes viewers by name).
  * Such a host also streams nothing to an address before it has proved it gets the host's packets (it echoes the
  * cookie of its WELCOME in its next HELLO): a HELLO with a forged source address no longer makes the host send video
  * to someone else. Every packet it sends after WELCOME carries its stream id right after the header, so packets
@@ -393,7 +393,7 @@ void RP_WidenSocket(UDPsocket sock) {
 bool RP_OpenNet(void) {
     if (!SDLNetInited) {
         if (SDLNet_Init() == -1) {
-            LOG_MSG("INPUTNET: SDLNet_Init failed: %s",SDLNet_GetError());
+            LOG_MSG("STREAMNET: SDLNet_Init failed: %s",SDLNet_GetError());
             return false;
         }
         SDLNetInited = true;
@@ -403,7 +403,7 @@ bool RP_OpenNet(void) {
 
 const uint32_t RP_LOOPBACK = 0x7F000001u;   /* 127.0.0.1: where NukemNet listens and talks from */
 
-/* The keys by their keymapper names: [inputnet] block keys, the input reports and NukemNet's control channel name
+/* The keys by their keymapper names: [streamnet] block keys, the input reports and NukemNet's control channel name
  * keys this way. */
 const struct { const char *name; KBD_KEYS key; } rp_key_names[] = {
     {"1",KBD_1},{"2",KBD_2},{"3",KBD_3},{"4",KBD_4},{"5",KBD_5},{"6",KBD_6},{"7",KBD_7},{"8",KBD_8},{"9",KBD_9},{"0",KBD_0},
@@ -485,7 +485,7 @@ struct Viewer {
     uint64_t applied_us = 0;            /* when it was applied (RP_Micros) */
     bool keydown[KBD_LAST];
     uint32_t buttons = 0;
-    float report_dx = 0, report_dy = 0; /* [inputnet] report input: mouse motion not reported yet */
+    float report_dx = 0, report_dy = 0; /* [streamnet] report input: mouse motion not reported yet */
     uint32_t report_ms = 0;
     uint32_t features = 0;              /* RP_FEAT_* from its HELLO */
     bool proven = true;                 /* (an auth host) it echoed its cookie: video and sound go to it */
@@ -586,7 +586,7 @@ Viewer viewers[RP_MAX_VIEWERS];
  * it was not there), and it gets an encoding of its own against a frame it has (Enc_Private: one difference and one
  * compression, at most one a frame, and when the encoder is behind only ten times a second). A frame's content is
  * the same whoever it was encoded for, so any frame a viewer decoded can be anyone's base. A viewer that took every
- * frame for a second is back with the others. With one viewer (every copy of an IPX-over-InputNet game has one)
+ * frame for a second is back with the others. With one viewer (every copy of an IPX-over-StreamNet game has one)
  * nothing is encoded twice. */
 
 /* The viewer takes another frame now: nothing waits for its rate, or no more than 60 ms of it. */
@@ -635,10 +635,10 @@ void Viewer_ResetVideo(Viewer &v,uint32_t now) {
 }
 
 unsigned cfg_timeout = 10000;
-bool cfg_blocked[KBD_LAST];     /* [inputnet] block keys: dropped from every remote player (see RP_SetBlockedKeys) */
-IPaddress cfg_report_to = { 0, 0 }; /* [inputnet] report input: 127.0.0.1:<port> hears every player's input (port 0: off) */
+bool cfg_blocked[KBD_LAST];     /* [streamnet] block keys: dropped from every remote player (see RP_SetBlockedKeys) */
+IPaddress cfg_report_to = { 0, 0 }; /* [streamnet] report input: 127.0.0.1:<port> hears every player's input (port 0: off) */
 unsigned cfg_maxfps = 0;
-int cfg_present = 2;            /* [inputnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
+int cfg_present = 2;            /* [streamnet] present: 0 scanout, 1 retrace, 2 flip (vga_draw.cpp, NN_EarlyFrameOK) */
 
 /* Video encoder state */
 struct EncFrame {
@@ -1110,7 +1110,7 @@ void RP_ZStart(void) {
         zdone[i] = SDL_CreateSemaphore(0);
         if (zgo[i] == NULL || zdone[i] == NULL) break;
 #if SDL_VERSION_ATLEAST(2,0,0)
-        zthreads[i] = SDL_CreateThread(RP_ZThread,"INPUTNET encoder",(void*)(uintptr_t)i);
+        zthreads[i] = SDL_CreateThread(RP_ZThread,"STREAMNET encoder",(void*)(uintptr_t)i);
 #else
         zthreads[i] = SDL_CreateThread(RP_ZThread,(void*)(uintptr_t)i);
 #endif
@@ -1304,13 +1304,13 @@ void Guard_Update(void) {
         guard_typed = false;
         for (unsigned i=0;i < RP_MAX_VIEWERS;i++)
             if (viewers[i].active) Host_ReleaseInput(viewers[i]);
-        LOG_MSG("INPUTNET: remote input blocked: the DOS prompt or a DOSBox-X command is in the foreground");
+        LOG_MSG("STREAMNET: remote input blocked: the DOS prompt or a DOSBox-X command is in the foreground");
     }
     else if (dos_kernel_disabled) {
-        LOG_MSG("INPUTNET: remote input allowed: a guest system is running");
+        LOG_MSG("STREAMNET: remote input allowed: a guest system is running");
     }
     else {
-        LOG_MSG("INPUTNET: remote input allowed: %s is running",Guard_ProcessName(dos.psp()).c_str());
+        LOG_MSG("STREAMNET: remote input allowed: %s is running",Guard_ProcessName(dos.psp()).c_str());
     }
 }
 
@@ -1490,7 +1490,7 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
         static uint32_t last_private = 0;
         const uint32_t privates = stat_private - last_private;
         last_private = stat_private;
-        LOG_MSG("INPUTNET: video at most (KB/s) %s; sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder, %.1f encoded again for a viewer at its own pace), %.1f%% of \"%s\"'s fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; scroll prediction in %u%% of the frames; frames acknowledged after %.0f ms (%u at best)%s; CPU %ld cycles",
+        LOG_MSG("STREAMNET: video at most (KB/s) %s; sent %u KB/s in %.1f frames/s (of %.1f, %.1f skipped for the link, %.1f for the encoder, %.1f encoded again for a viewer at its own pace), %.1f%% of \"%s\"'s fragments lost; encoding %.1f ms a frame (%.1f of it palette, %u threads), %.2f ms of the game's own thread%s; scroll prediction in %u%% of the frames; frames acknowledged after %.0f ms (%u at best)%s; CPU %ld cycles",
             rates.c_str(),(unsigned)((stat_bytes - last_bytes) / 1024.0 / secs),frames / secs,
             (stat_offered - last_offered) / secs,(stat_skipped - last_skipped) / secs,
             (stat_replaced - last_replaced) / secs,privates / secs,loss * 100.0,v.name.c_str(),
@@ -1503,7 +1503,7 @@ void Host_RateFeedback(Viewer &v,uint32_t exp,uint32_t got) {
         {
             static uint64_t last_part[5] = { 0, 0, 0, 0, 0 };
             if (frames)
-                LOG_MSG("INPUTNET: encoding a frame: %.2f ms until the encoder starts on it, %.2f looking for a scroll, %.2f for the difference, %.2f compressing it, %.2f compressing the frame alone too",
+                LOG_MSG("STREAMNET: encoding a frame: %.2f ms until the encoder starts on it, %.2f looking for a scroll, %.2f for the difference, %.2f compressing it, %.2f compressing the frame alone too",
                     (stat_part_us[0] - last_part[0]) / 1000.0 / frames,(stat_part_us[1] - last_part[1]) / 1000.0 / frames,
                     (stat_part_us[2] - last_part[2]) / 1000.0 / frames,(stat_part_us[3] - last_part[3]) / 1000.0 / frames,
                     (stat_part_us[4] - last_part[4]) / 1000.0 / frames);
@@ -1554,28 +1554,28 @@ void Host_DropViewer(Viewer &v,const char *reason,bool notify) {
         Host_SendTo(v.addr,w.buf,w.len);
     }
     Host_ReleaseInput(v);
-    LOG_MSG("INPUTNET: remote player \"%s\" left (%s)",v.name.c_str(),reason ? reason : "");
+    LOG_MSG("STREAMNET: remote player \"%s\" left (%s)",v.name.c_str(),reason ? reason : "");
     v.active = false;
     v.queue.clear();    /* (its share of the frames that waited for its rate) */
     v.queued = 0;
     Host_UpdateStreaming();
 }
 
-/* [inputnet] block keys: key names separated by spaces or commas. Unknown names are logged and skipped. */
+/* [streamnet] block keys: key names separated by spaces or commas. Unknown names are logged and skipped. */
 void RP_SetBlockedKeys(const std::string &list) {
     std::fill(cfg_blocked,cfg_blocked + KBD_LAST,false);
     std::string shown;
     for (const std::string &name : RP_Words(list," ,\t")) {
         KBD_KEYS key;
-        if (!RP_KeyByName(name,key)) { LOG_MSG("INPUTNET: block keys: unknown key name \"%s\"",name.c_str()); continue; }
+        if (!RP_KeyByName(name,key)) { LOG_MSG("STREAMNET: block keys: unknown key name \"%s\"",name.c_str()); continue; }
         cfg_blocked[key] = true;
         shown += (shown.empty() ? "" : " ") + name;
     }
-    if (!shown.empty()) LOG_MSG("INPUTNET: keys blocked for remote players: %s",shown.c_str());
+    if (!shown.empty()) LOG_MSG("STREAMNET: keys blocked for remote players: %s",shown.c_str());
 }
 
-/* [inputnet] report input: one datagram per input event of a remote player to 127.0.0.1:<port>, the fields given
- * here after the player's name: {"p":"<player>",<fields>} (NukemNet's server automation hears them as inputnetInput
+/* [streamnet] report input: one datagram per input event of a remote player to 127.0.0.1:<port>, the fields given
+ * here after the player's name: {"p":"<player>",<fields>} (NukemNet's server automation hears them as streamnetInput
  * events). Nothing is formatted while the setting is off. */
 void RP_ReportInput(Viewer &v,const char *fmt,...) GCC_ATTRIBUTE(__format__(__printf__,2,3));
 void RP_ReportInput(Viewer &v,const char *fmt,...) {
@@ -1617,7 +1617,7 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
                 }
                 if (ctrl && alt) return;
             }
-            /* Keys the host blocked for remote players ([inputnet] block keys): a release still goes through for a key
+            /* Keys the host blocked for remote players ([streamnet] block keys): a release still goes through for a key
              * that was down before (none can be: the list is read before anyone joins), the rest is dropped. */
             const bool blocked = cfg_blocked[key] && !(v.keydown[key] && !pressed);
             RP_ReportInput(v,"\"t\":\"key\",\"k\":\"%s\",\"d\":%d,\"b\":%d",RP_KeyName(key),pressed ? 1 : 0,blocked ? 1 : 0);
@@ -1770,7 +1770,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
             v->proven = !host_auth;
             v->cookie = host_auth ? Host_Unguessable("cookie",from) : 0;
             memset(v->keydown,0,sizeof(v->keydown));
-            LOG_MSG("INPUTNET: remote player \"%s\" joined from %s",name.c_str(),RP_AddrString(from).c_str());
+            LOG_MSG("STREAMNET: remote player \"%s\" joined from %s",name.c_str(),RP_AddrString(from).c_str());
             Host_UpdateStreaming();
             /* A viewer that decodes against named frames gets its first key frame for itself (Enc_Private); the others'
              * video goes on as it was. Only the older way starts everyone over. */
@@ -1779,7 +1779,7 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
         else if (host_auth && !v->proven && cookie == v->cookie) {
             /* It gets what we send to that address: from now on it is streamed to. */
             v->proven = true;
-            LOG_MSG("INPUTNET: remote player \"%s\" confirmed its address",v->name.c_str());
+            LOG_MSG("STREAMNET: remote player \"%s\" confirmed its address",v->name.c_str());
             Host_UpdateStreaming();
             if (!rate_adaptive) enc_needkey = true;
         }
@@ -1975,7 +1975,7 @@ int Host_KeepaliveThread(void *) {
  *                           out (the id: up to 32 characters, sent back as they came)
  *   rbseat <copy> <player>  a RollbackNet cluster's server: that player (its name in the session, "@host" for the
  *                           server's own) plays copy <copy> (1 = the first) from the next frame start the machines can
- *                           be handed over at; whoever played it gets a free copy (INPUTNET_RollbackSeat)
+ *                           be handed over at; whoever played it gets a free copy (STREAMNET_RollbackSeat)
  * In RollbackNet key steps are dropped: typed into one machine they would put it out of step with the others.
  * Key steps go out one every 40 ms, so a game that polls the keyboard sees each of them. Anything else is ignored. */
 struct ControlStep {
@@ -2042,14 +2042,14 @@ void Control_Command(const std::string &line,const IPaddress &from) {
     } else if (cmd == "wait") {
         Control_Add(ControlStep::WAIT).ms = (uint32_t)std::min(std::max(strtol(arg.c_str(),NULL,10),0L),10000L);
     } else if (cmd == "block") {
-        /* [inputnet] block keys from now on, for the remote players of the running game ("none": no key) */
-        if (arg == "none") LOG_MSG("INPUTNET: no keys blocked for remote players any more");
+        /* [streamnet] block keys from now on, for the remote players of the running game ("none": no key) */
+        if (arg == "none") LOG_MSG("STREAMNET: no keys blocked for remote players any more");
         RP_SetBlockedKeys(arg == "none" ? std::string() : arg);
     } else if (cmd == "rbseat") {
         const size_t sp = arg.find(' ');
         const long copy = strtol(arg.c_str(), NULL, 10);
         if (sp != std::string::npos && copy >= 1 && copy <= 8) {
-            if (!INPUTNET_RollbackSeat(arg.substr(sp + 1), (unsigned)(copy - 1))) LOG_MSG("NUKEMNET: control channel: no seat change (%s)", arg.c_str());
+            if (!STREAMNET_RollbackSeat(arg.substr(sp + 1), (unsigned)(copy - 1))) LOG_MSG("NUKEMNET: control channel: no seat change (%s)", arg.c_str());
         }
     } else if (cmd == "sync" && !arg.empty() && arg.size() < sizeof(ControlStep::id)) {
         ControlStep &step = Control_Add(ControlStep::SYNC);
@@ -2101,7 +2101,7 @@ void Control_Poll(uint32_t now) {
                  * always go. */
                 if (step.down && !Guard_Allows()) break;
                 {
-                    if (inputnet_rollback_active) {
+                    if (streamnet_rollback_active) {
                         static bool told = false;
                         if (!told) { LOG_MSG("NUKEMNET: control channel: keys are not typed in RollbackNet (the machines would differ)"); told = true; }
                         break;
@@ -2124,12 +2124,12 @@ void Control_Poll(uint32_t now) {
 
 } /* namespace */
 
-/* The room tokens of remote play (see Auth) for InputNet's other modes: a RollbackNet server started with env
+/* The room tokens of remote play (see Auth) for StreamNet's other modes: a RollbackNet server started with env
  * NN_RP_AUTH_SECRET lets in only participants whose HELLO carries the token for the name they give. */
 std::string REMOTEPLAY_AuthToken(const std::string &secret,const std::string &name) { return RP_AuthToken(secret,name); }
 bool REMOTEPLAY_SameSecret(const std::string &a,const std::string &b) { return RP_SameSecret(a,b); }
 std::string REMOTEPLAY_CleanName(const std::string &name) { return RP_CleanName(name); }
-/* For RollbackNet (inputnet.cpp RB_GuardDrops): the DOS shell or a DOSBox-X command is in front (machine state only). */
+/* For RollbackNet (streamnet.cpp RB_GuardDrops): the DOS shell or a DOSBox-X command is in front (machine state only). */
 bool REMOTEPLAY_ShellInFront(void) { return Guard_Blocked(); }
 
 void REMOTEPLAY_Configure(Section_prop *section) {
@@ -2166,7 +2166,7 @@ static void Host_NoThrottle(void) {
         st.ControlMask = 0x1;
         ok = set(GetCurrentProcess(),4,&st,sizeof(st)) != 0;
     }
-    LOG_MSG("INPUTNET: remote play host %s of Windows' slowing down of windows that are not in front",ok ? "is left out" : "could not be left out");
+    LOG_MSG("STREAMNET: remote play host %s of Windows' slowing down of windows that are not in front",ok ? "is left out" : "could not be left out");
 }
 #endif
 
@@ -2179,7 +2179,7 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
 
     host_sock = SDLNet_UDP_Open(port);
     if (host_sock == NULL) {
-        LOG_MSG("INPUTNET: unable to open UDP port %u: %s",(unsigned)port,SDLNet_GetError());
+        LOG_MSG("STREAMNET: unable to open UDP port %u: %s",(unsigned)port,SDLNet_GetError());
         return false;
     }
     RP_WidenSocket(host_sock);
@@ -2189,12 +2189,12 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
         const char *secret = getenv("NN_RP_AUTH_SECRET");
         host_secret = (secret != NULL) ? secret : "";
         host_auth = host_secret.size() >= 16;
-        if (!host_secret.empty() && !host_auth) LOG_MSG("INPUTNET: NN_RP_AUTH_SECRET is too short (16 characters at least): ignored");
+        if (!host_secret.empty() && !host_auth) LOG_MSG("STREAMNET: NN_RP_AUTH_SECRET is too short (16 characters at least): ignored");
         host_cookie_seq = 0;
         host_stream = host_auth ? Host_Unguessable("stream",IPaddress()) : 0;
         const char *local = getenv("NN_RP_LOCAL_ONLY");
         host_local_only = local != NULL && local[0] != 0 && local[0] != '0';
-        LOG_MSG("INPUTNET: remote play host: %s%s",host_auth ? "players need a token from the room" : "anyone who reaches the port can join",
+        LOG_MSG("STREAMNET: remote play host: %s%s",host_auth ? "players need a token from the room" : "anyone who reaches the port can join",
             host_local_only ? ", 127.0.0.1 only" : "");
     }
     host_running = true;
@@ -2207,7 +2207,7 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     host_keepalive_stop = 0;
     if (host_lock != NULL && host_keepalive == NULL)
 #if SDL_VERSION_ATLEAST(2,0,0)
-        host_keepalive = SDL_CreateThread(Host_KeepaliveThread,"INPUTNET keepalive",NULL);
+        host_keepalive = SDL_CreateThread(Host_KeepaliveThread,"STREAMNET keepalive",NULL);
 #else
         host_keepalive = SDL_CreateThread(Host_KeepaliveThread,NULL);
 #endif
@@ -2217,7 +2217,7 @@ bool REMOTEPLAY_StartServer(uint16_t port) {
     enc_haveprev = false;
     guard_state = -1;
     guard_typed = false;
-    LOG_MSG("INPUTNET: remote play: waiting for players on UDP port %u",(unsigned)port);
+    LOG_MSG("STREAMNET: remote play: waiting for players on UDP port %u",(unsigned)port);
 #if defined(WIN32)
     Host_NoThrottle();
 #endif
@@ -2240,7 +2240,7 @@ void REMOTEPLAY_StopServer(const char *reason) {
     remoteplay_streaming = false;
     for (unsigned i=0;i < RP_MAX_VIEWERS;i++) { viewers[i].queue.clear(); viewers[i].queued = 0; }
     RP_ZStop();
-    LOG_MSG("INPUTNET: remote play server stopped");
+    LOG_MSG("STREAMNET: remote play server stopped");
     REMOTEPLAY_UpdateMenu();
 }
 
@@ -2258,7 +2258,7 @@ static void REMOTEPLAY_GuestBoot(Section *) {
      * cannot be left again, so even a guest that resets the machine never reaches MOUNT, IMGMOUNT or BOOT. */
     if (NN_Lockdown() && !control->SecureMode()) {
         control->SwitchToSecureMode();
-        LOG_MSG("INPUTNET: locked down copy: secure mode from here on");
+        LOG_MSG("STREAMNET: locked down copy: secure mode from here on");
     }
 }
 
@@ -2273,17 +2273,17 @@ void REMOTEPLAY_Init(void) {
 }
 
 bool REMOTEPLAY_HostRequested(void) {
-    Section_prop *sec = static_cast<Section_prop *>(control->GetSection("inputnet"));
+    Section_prop *sec = static_cast<Section_prop *>(control->GetSection("streamnet"));
     if (sec == NULL || std::string(sec->Get_string("mode")) != "remote") return false;   /* lockstep, rollback */
-    if (control->opt_inputnet_server >= 0) return true;
-    if (!control->opt_inputnet_connect.empty() || !sec->Get_bool("inputnet")) return false;
+    if (control->opt_streamnet_server >= 0) return true;
+    if (!control->opt_streamnet_connect.empty() || !sec->Get_bool("streamnet")) return false;
     return std::string(sec->Get_string("connect")).empty() && !std::string(sec->Get_string("startserver")).empty();
 }
 
 bool REMOTEPLAY_HideScreenRequested(void) {
-    Section_prop *sec = static_cast<Section_prop *>(control->GetSection("inputnet"));
+    Section_prop *sec = static_cast<Section_prop *>(control->GetSection("streamnet"));
     if (sec == NULL) return false;
-    return (control->opt_inputnet_hidescreen || !sec->Get_bool("hostscreen")) && REMOTEPLAY_HostRequested();
+    return (control->opt_streamnet_hidescreen || !sec->Get_bool("hostscreen")) && REMOTEPLAY_HostRequested();
 }
 
 void REMOTEPLAY_Status(Program *prog) {
@@ -2709,7 +2709,7 @@ void Enc_Frame(const Capture &c) {
             if (check) {
                 enc_shiftcheck.resize(rawsize);
                 RP_ShiftXor(enc_shiftcheck.data(),d,b,geom,enc_shift_vec,enc_shift_n,enc_shiftbits.data());
-                if (memcmp(enc_shiftcheck.data(),a,rawsize) != 0) LOG_MSG("INPUTNET: scroll prediction does not give the frame back");
+                if (memcmp(enc_shiftcheck.data(),a,rawsize) != 0) LOG_MSG("STREAMNET: scroll prediction does not give the frame back");
             }
         }
         else {
@@ -2763,7 +2763,7 @@ void Enc_Frame(const Capture &c) {
             size_t ilen = 0;
             std::vector<uint8_t> t1; std::vector<uint32_t> t2;
             RP_Compress(enc_work.size() == rawsize && alone ? enc_raw.data() : enc_raw.data(),rawsize,t1,0,ilen,t2);
-            LOG_MSG("INPUTNET: encstats same %.3f difference %u alone %u",(double)enc_same,(unsigned)dlen,(unsigned)ilen);
+            LOG_MSG("STREAMNET: encstats same %.3f difference %u alone %u",(double)enc_same,(unsigned)dlen,(unsigned)ilen);
         }
         (void)dlen;
     }
@@ -2960,7 +2960,7 @@ void Enc_Start(void) {
     enc_go = SDL_CreateSemaphore(0);
     if (enc_go == NULL) return;
 #if SDL_VERSION_ATLEAST(2,0,0)
-    enc_thread = SDL_CreateThread(Enc_Thread,"INPUTNET video",NULL);
+    enc_thread = SDL_CreateThread(Enc_Thread,"STREAMNET video",NULL);
 #else
     enc_thread = SDL_CreateThread(Enc_Thread,NULL);
 #endif
@@ -3190,7 +3190,7 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
 /* View prediction (viewer)                                                   */
 /* ------------------------------------------------------------------------- */
 
-/* Moving the picture is OFF unless the player asks for it ([inputnet] predict view = true, or Ctrl+F12 in the viewer):
+/* Moving the picture is OFF unless the player asks for it ([streamnet] predict view = true, or Ctrl+F12 in the viewer):
  * a moved first-person view shows. What stays on the screen (a weapon, a crosshair, a message) either moves with the
  * view and returns with the next frame, or is held in place, and then the world it covered has to be made up; both
  * were built, and a player saw each (see the end of this note). By default the viewer shows every frame exactly as
@@ -3223,7 +3223,7 @@ KBD_KEYS RP_MapScancode(SDL_Scancode sc) {
  * A prediction is shown only while the frames that arrive agree with what had been predicted for them (the gate):
  * in a menu, a pause or a cutscene the picture does not follow the mouse, and prediction stops after two stretches
  * of frames that say so. Escape, Tab and the function keys close the gates at once, since they open menus.
- * Ctrl+F12 turns moving the picture on and off; [inputnet] predict = false turns all prediction off.
+ * Ctrl+F12 turns moving the picture on and off; [streamnet] predict = false turns all prediction off.
  * Nothing is drawn that the frame does not have: the view is shown slightly larger and moved as one piece, by whole
  * pixels, within that margin (see ViewPredict::warp), with everything in it, the weapon, the crosshair and messages
  * included; they return to their places with the next frame, which a player sees while turning (the reason this is
@@ -3780,8 +3780,8 @@ const uint32_t VP_KEYEDGE[VP_KEYBINS + 1] = {   /* milliseconds */
 
 class ViewPredict {
 public:
-    bool enabled = true;        /* the player's switch for all of it ([inputnet] predict) */
-    bool moveView = false;      /* ...and for moving the picture ([inputnet] predict view, Ctrl+F12). Off unless asked
+    bool enabled = true;        /* the player's switch for all of it ([streamnet] predict) */
+    bool moveView = false;      /* ...and for moving the picture ([streamnet] predict view, Ctrl+F12). Off unless asked
                                  * for: a first-person view cannot be moved ahead of the host without showing it.
                                  * Whatever stays on the screen (a weapon, a crosshair, a message) either moves with
                                  * the view and jumps back with the next frame, or is held in place, and then what it
@@ -3913,7 +3913,7 @@ public:
                 markStill(raw,prevraw,mo);
             }
             if (debug >= 2 && mo.bands)
-                LOG_MSG("INPUTNET: vp bands %u: votes %d %d %d %d %d %d rates %.2f %.2f %.2f %.2f %.2f %.2f scores %.0f %.0f %.0f %.0f %.0f %.0f",id,
+                LOG_MSG("STREAMNET: vp bands %u: votes %d %d %d %d %d %d rates %.2f %.2f %.2f %.2f %.2f %.2f scores %.0f %.0f %.0f %.0f %.0f %.0f",id,
                     mo.bandvote[0],mo.bandvote[1],mo.bandvote[2],mo.bandvote[3],mo.bandvote[4],mo.bandvote[5],
                     mo.bandrate[0],mo.bandrate[1],mo.bandrate[2],mo.bandrate[3],mo.bandrate[4],mo.bandrate[5],
                     band_score[0],band_score[1],band_score[2],band_score[3],band_score[4],band_score[5]);
@@ -3925,7 +3925,7 @@ public:
             dbg_regx += mo.measured; dbg_regy += mo.stayed;
             dbg_pairs++;
             if (debug >= 2 && !mo.same)
-                LOG_MSG("INPUTNET: vp frame %u: sx %s%.2f sy %s%.2f c %s%.1f ms after the last; middle %.2f %.2f (lower %s%.2f upper %s%.2f%s) fit %.2f changed %.0f%%; strips %u measured %u stayed %u agreed why %d: %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+                LOG_MSG("STREAMNET: vp frame %u: sx %s%.2f sy %s%.2f c %s%.1f ms after the last; middle %.2f %.2f (lower %s%.2f upper %s%.2f%s) fit %.2f changed %.0f%%; strips %u measured %u stayed %u agreed why %d: %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
                     id,mo.okx ? "" : "?",mo.sx,mo.oky ? "" : "?",mo.sy,
                     (prev.hasc && hasc) ? "" : "?",(prev.hasc && hasc) ? (double)(int64_t)(c - prev.c) / 1000.0 : 0.0,
                     mo.whole,mo.wholey,"",0.0,"",0.0,mo.layered ? ", layers" : "",
@@ -4140,7 +4140,7 @@ public:
         if (debug) {
             double best = 0; unsigned bj = 0;
             for (unsigned j=0;j < VP_LAGS;j++) if (ax.b[j] > 1e-9) { const double e = ax.a[j] * ax.a[j] / ax.b[j]; if (e > best) { best = e; bj = j; } }
-            LOG_MSG("INPUTNET: vp debug: %u frames, %u pairs (%u same, %u with x, %u with y, %u moved; strips measured %.1f stayed %.1f a pair); lens frames %u fit a %.3f b %.3f c %.3f rms %.3f spread %.3f means %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f; "
+            LOG_MSG("STREAMNET: vp debug: %u frames, %u pairs (%u same, %u with x, %u with y, %u moved; strips measured %.1f stayed %.1f a pair); lens frames %u fit a %.3f b %.3f c %.3f rms %.3f spread %.3f means %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f; "
                 "x: n %u c %.1f best lag %u explains %.2f gain %.4f q %.2f rejected %u; y: n %u c %.1f; mouse total %.0f %.0f",
                 st_frames,dbg_pairs,dbg_same,dbg_okx,dbg_oky,dbg_moved,dbg_pairs ? (double)dbg_regx / dbg_pairs : 0.0,dbg_pairs ? (double)dbg_regy / dbg_pairs : 0.0,
                 lens_frames,lens_fit_a,lens_fit_b,lens_fit_c,lens_fit_rms,lens_fit_spread,
@@ -4155,7 +4155,7 @@ public:
             if (st_dot_us >= 500000) snprintf(shownText,sizeof(shownText)," (shown %u%% of the time)",(unsigned)(st_dot_on_us * 100u / st_dot_us));
             if (st_ptr_errn) snprintf(errText,sizeof(errText),"; the pointer came to be %.2f pixels (of 320x200) from the dot on average, at most %.2f (%u reports)",
                 st_ptr_err / st_ptr_errn,st_ptr_errmax,st_ptr_errn);
-            LOG_MSG("INPUTNET: pointer dot %s%s: the game's pointer was where the mouse driver has it in %u of %u moves%s",
+            LOG_MSG("STREAMNET: pointer dot %s%s: the game's pointer was where the mouse driver has it in %u of %u moves%s",
                 ptr_q >= 0.7f ? "on" : "off",shownText,st_ptr_hit,st_ptr_hit + st_ptr_miss,errText);
         }
         st_ptr_hit = st_ptr_miss = 0;
@@ -4189,7 +4189,7 @@ public:
         if (kst_n) snprintf(keys,sizeof(keys),"%u keys that move the view (%u stretches, %u%% shown): off by %.1f px where the picture moved %.1f",
             nkeys,kst_n,kst_open * 100u / kst_n,kst_err / kst_n,kst_base / kst_n);
         else snprintf(keys,sizeof(keys),"%u keys that move the view",nkeys);
-        LOG_MSG("INPUTNET: view prediction%s%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place; "
+        LOG_MSG("STREAMNET: view prediction%s%s: mouse turning %s; looking up and down %s; %s; lens %s%s; view %dx%d at %d,%d, %u%% of the picture stays in place; "
             "%.2f ms a frame to learn, %.2f ms to move the picture (%u times)",
             moveView ? "" : " (off, the picture is not moved)",was ? "" : (said_ready ? " ready" : " learning"),turn,look,keys,lensText,layers,vx1 - vx0,vy1 - vy0,vx0,vy0,
             still.empty() ? 0u : (unsigned)((uint64_t)stillpx * 100u / still.size()),
@@ -4516,7 +4516,7 @@ private:
                     at += (size_t)snprintf(list + at,sizeof(list) - at,"%u:%.0fms*%.3f ",b,kact[i].ms[b],kmodel[(size_t)kact[i].k * VP_KEYCTX + ctx].vx[b] + (b < 11 ? kmodel[(size_t)kact[i].k * VP_KEYCTX + ctx].mx : 0.0f));
                 if (at + 3 < sizeof(list)) at += (size_t)snprintf(list + at,sizeof(list) - at,"];");
             }
-            LOG_MSG("INPUTNET: vp keys: %.1f ms, the picture moved %.2f (keys: %.2f), predicted %.2f, ctx %u:%s",(b1 - b0) / 1000.0,s.sx,resx,predx,ctx,list);
+            LOG_MSG("STREAMNET: vp keys: %.1f ms, the picture moved %.2f (keys: %.2f), predicted %.2f, ctx %u:%s",(b1 - b0) / 1000.0,s.sx,resx,predx,ctx,list);
         }
 
         /* How well the keys were predicted lately (before this frame is learned from): four frames together. */
@@ -4689,7 +4689,7 @@ private:
             /* enough movement seen, and the mouse explains most of it */
             if (a.n < 12 || a.c < 100.0 * unit * unit || best < 0.7 * a.c) return;
             a.known = true;
-            LOG_MSG("INPUTNET: view prediction: the mouse %s the view by %.3f pixels a count (%u stretches of frames, the mouse explains %.0f%% of the movement)",
+            LOG_MSG("STREAMNET: view prediction: the mouse %s the view by %.3f pixels a count (%u stretches of frames, the mouse explains %.0f%% of the movement)",
                 &a == &ax ? "turns" : "tilts",a.a[bj] / a.b[bj],a.n,100.0 * best / a.c);
         }
         a.lag = bj;
@@ -4800,7 +4800,7 @@ private:
                 lens.cx = (float)(vx0 + vx1 - 1) * 0.5f;
                 memset(lens_n,0,sizeof(lens_n));
                 lens_frames = lens_clean = 0;
-                LOG_MSG("INPUTNET: view prediction: the view moves in layers (a sky, a backdrop); its lens is taken to be 90 degrees wide");
+                LOG_MSG("STREAMNET: view prediction: the view moves in layers (a sky, a backdrop); its lens is taken to be 90 degrees wide");
             }
             return;
         }
@@ -4876,9 +4876,9 @@ private:
         if (!other) return;
         lens = nl;
         if (lens.persp)
-            LOG_MSG("INPUTNET: view prediction: the view is in perspective, %.0f degrees wide, its middle at column %.0f of %u",
+            LOG_MSG("STREAMNET: view prediction: the view is in perspective, %.0f degrees wide, its middle at column %.0f of %u",
                 2.0 * atan((double)(vx1 - vx0) * 0.5 / lens.f) * 180.0 / 3.14159265358979,lens.cx,w);
-        else LOG_MSG("INPUTNET: view prediction: the view moves as one piece (no perspective)");
+        else LOG_MSG("STREAMNET: view prediction: the view moves as one piece (no perspective)");
     }
 
     template <typename T> static inline bool same(const uint8_t *a,const uint8_t *b) {
@@ -5188,7 +5188,7 @@ public:
     uint32_t frame_seq = 0xFFFFFFFFu;       /* ...and the newest input the host had applied when it took it (if it said) */
     VPPointer frame_ptr;            /* ...and where the DOS mouse driver had its pointer */
     SDL_Texture *zoom_tex = NULL;   /* the view enlarged by whole pixels (see present) */
-    /* How the picture is enlarged to the window ([inputnet] viewer scaling, Ctrl+F7). Only here, when it is drawn: the
+    /* How the picture is enlarged to the window ([streamnet] viewer scaling, Ctrl+F7). Only here, when it is drawn: the
      * host sends the same picture whatever is chosen. */
     enum Scaling { SCALE_NEAREST, SCALE_BILINEAR, SCALE_SHARP } scaling = SCALE_NEAREST;
     SDL_Texture *sharp_tex = NULL;  /* the whole picture enlarged by whole pixels (sharp) */
@@ -5264,7 +5264,7 @@ public:
          * also writes it in the room). */
         title_note = why.empty() ? std::string("the host moved you to another instance of the game") : why;
         title_note_until = SDL_GetTicks() + 6000;
-        LOG_MSG("INPUTNET: %s",title_note.c_str());
+        LOG_MSG("STREAMNET: %s",title_note.c_str());
         newSession();
         welcomed = false;
         for (Assembly &a : asm_slots) a.used = false;
@@ -5462,7 +5462,7 @@ public:
         abs_pointer = on;
         if (on) setCapture(false);
         else pointerLook(false);
-        LOG_MSG("INPUTNET: the pointer %s",on ? "follows this window's pointer (no capture needed)" : "needs the mouse captured again");
+        LOG_MSG("STREAMNET: the pointer %s",on ? "follows this window's pointer (no capture needed)" : "needs the mouse captured again");
         updateTitle();
     }
 
@@ -5520,13 +5520,13 @@ public:
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F11 && (mod & KMOD_CTRL)) {
                     show_latency = !show_latency;
-                    LOG_MSG("INPUTNET: latency in the window title %s",show_latency ? "on" : "off");
+                    LOG_MSG("STREAMNET: latency in the window title %s",show_latency ? "on" : "off");
                     updateTitle();
                     break;
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F7 && (mod & KMOD_CTRL)) {
                     scaling = softwareRenderer() ? SCALE_NEAREST : (Scaling)((scaling + 1) % 3);
-                    LOG_MSG("INPUTNET: picture scaling: %s",scalingName(scaling));
+                    LOG_MSG("STREAMNET: picture scaling: %s",scalingName(scaling));
                     title_note = std::string("picture: ") + scalingName(scaling) + " (Ctrl+F7)";
                     title_note_until = SDL_GetTicks() + 2500;
                     updateTitle();
@@ -5535,7 +5535,7 @@ public:
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F12 && (mod & KMOD_CTRL)) {
                     vp.moveView = !vp.moveView;
-                    LOG_MSG("INPUTNET: view prediction %s",vp.moveView ? "on: the picture is moved by the input the host's frames do not show yet"
+                    LOG_MSG("STREAMNET: view prediction %s",vp.moveView ? "on: the picture is moved by the input the host's frames do not show yet"
                         : "off: the picture is shown as the host sends it");
                     redraw = true;
                     break;
@@ -5672,7 +5672,7 @@ public:
         const bool together = pieces != 0 && RP_InflatePieces(stream,slen,lens,pieces,scratch.data(),rawsize);
         if (together && pieces != pieces_logged) {
             pieces_logged = pieces;
-            LOG_MSG("INPUTNET: frames come compressed in %u pieces, inflated on %u threads",pieces,std::min(pieces,zworkers + 1));
+            LOG_MSG("STREAMNET: frames come compressed in %u pieces, inflated on %u threads",pieces,std::min(pieces,zworkers + 1));
         }
         if (!together) {
             uLongf outlen = (uLongf)rawsize;
@@ -5807,7 +5807,7 @@ public:
         if (now - lat_log < 5000) return;
         if (frames_decoded != 0) {
             const double secs = pic_log ? (now - pic_log) / 1000.0 : 5.0;
-            LOG_MSG("INPUTNET: picture %.1f frames/s, %u KB/s (%u KB a frame), %u%% of the frames with scroll prediction",
+            LOG_MSG("STREAMNET: picture %.1f frames/s, %u KB/s (%u KB a frame), %u%% of the frames with scroll prediction",
                 frames_decoded / secs,(unsigned)(bytes_decoded / 1024.0 / secs),(unsigned)(bytes_decoded / 1024u / frames_decoded),
                 (unsigned)(frames_shifted * 100u / frames_decoded));
         }
@@ -5818,7 +5818,7 @@ public:
         const double rtt = lat.rtt_n ? lat.rtt / lat.rtt_n : -1.0;
         if (lat.n) {
             const double n = lat.n;
-            LOG_MSG("INPUTNET: input to screen %.1f ms on average (at most %.1f) over %u inputs: viewer %.1f, network %.1f (ping %.1f), "
+            LOG_MSG("STREAMNET: input to screen %.1f ms on average (at most %.1f) over %u inputs: viewer %.1f, network %.1f (ping %.1f), "
                 "host waiting for the next frame %.1f, encoding %.1f, rest of the frame arriving %.1f, decoding and drawing %.1f; "
                 "the game's own reaction comes on top",
                 lat.total / n,lat.most,lat.n,lat.local / n,lat.net / n,rtt,lat.wait / n,lat.enc / n,lat.xfer / n,lat.draw / n);
@@ -5833,12 +5833,12 @@ public:
         }
         lat = LatencySums();
         if (aud_wait_n) {
-            LOG_MSG("INPUTNET: sound waits %u ms on average to be played%s",(unsigned)(aud_wait_sum / aud_wait_n),
+            LOG_MSG("STREAMNET: sound waits %u ms on average to be played%s",(unsigned)(aud_wait_sum / aud_wait_n),
                 aud_fast_n ? (std::string(", played faster for ") + std::to_string(aud_fast_n * 100u / aud_wait_n) + "% of the time to catch up").c_str() : "");
             aud_wait_sum = 0; aud_wait_n = aud_fast_n = 0;
         }
         vp.report();
-        if (m2s_n) LOG_MSG("INPUTNET: with view prediction the picture followed the mouse after %.1f ms on average (%u movements)",m2s_sum / m2s_n,m2s_n);
+        if (m2s_n) LOG_MSG("STREAMNET: with view prediction the picture followed the mouse after %.1f ms on average (%u movements)",m2s_sum / m2s_n,m2s_n);
         m2s_sum = 0; m2s_n = 0;
         if (show_latency) updateTitle();
     }
@@ -5956,7 +5956,7 @@ public:
                     }
                     fclose(fp);
                 }
-                LOG_MSG("INPUTNET: view prediction test picture %u: moved by %.1f, %.1f",shots,px,py);
+                LOG_MSG("STREAMNET: view prediction test picture %u: moved by %.1f, %.1f",shots,px,py);
                 shots++;
             }
             if (locked) SDL_UnlockTexture(texture);
@@ -6328,7 +6328,7 @@ public:
     bool open(void) {
         std::string host = target;
         unsigned port = 2130;
-        Section_prop *sec = static_cast<Section_prop*>(control->GetSection("inputnet"));
+        Section_prop *sec = static_cast<Section_prop*>(control->GetSection("streamnet"));
         if (sec != NULL) {
             const int p = sec->Get_int("port");
             if (p > 0 && p < 65536) port = (unsigned)p;
@@ -6383,10 +6383,10 @@ public:
         if (renderer == NULL) renderer = SDL_CreateRenderer(window,-1,SDL_RENDERER_SOFTWARE);
         if (renderer == NULL) { error = std::string("Unable to draw: ") + SDL_GetError(); return false; }
         if (scaling != SCALE_NEAREST && softwareRenderer()) {
-            LOG_MSG("INPUTNET: picture scaling %s needs a graphics card: nearest it is",scalingName(scaling));
+            LOG_MSG("STREAMNET: picture scaling %s needs a graphics card: nearest it is",scalingName(scaling));
             scaling = SCALE_NEAREST;
         }
-        if (scaling != SCALE_NEAREST) LOG_MSG("INPUTNET: picture scaling: %s (Ctrl+F7 switches)",scalingName(scaling));
+        if (scaling != SCALE_NEAREST) LOG_MSG("STREAMNET: picture scaling: %s (Ctrl+F7 switches)",scalingName(scaling));
         updateTitle();
         present();
         return true;
@@ -6497,7 +6497,7 @@ int REMOTEPLAY_RunViewer(const std::string &address) {
     s.close();
     RP_ZStop();
     if (!s.error.empty()) {
-        LOG_MSG("INPUTNET: %s",s.error.c_str());
+        LOG_MSG("STREAMNET: %s",s.error.c_str());
         fprintf(stderr,"%s\n",s.error.c_str());
         if (s.window == NULL)
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"DOSBox-X-NN remote play",s.error.c_str(),NULL);
@@ -6507,24 +6507,24 @@ int REMOTEPLAY_RunViewer(const std::string &address) {
 }
 #else
 int REMOTEPLAY_RunViewer(const std::string &) {
-    LOG_MSG("INPUTNET: joining a remote play session needs the SDL2 build of DOSBox-X");
+    LOG_MSG("STREAMNET: joining a remote play session needs the SDL2 build of DOSBox-X");
     fprintf(stderr,"Joining a remote play session needs the SDL2 build of DOSBox-X.\n");
     return 1;
 }
 #endif /* C_SDL2 */
 
 bool REMOTEPLAY_ViewerRequested(std::string &address) {
-    Section_prop *sec = static_cast<Section_prop*>(control->GetSection("inputnet"));
+    Section_prop *sec = static_cast<Section_prop*>(control->GetSection("streamnet"));
     if (sec == NULL) return false;
     if (std::string(sec->Get_string("mode")) != "remote") return false;   /* lockstep, rollback: everybody runs the game */
-    address = control->opt_inputnet_connect;
-    if (address.empty() && control->opt_inputnet_server < 0 && sec->Get_bool("inputnet"))
+    address = control->opt_streamnet_connect;
+    if (address.empty() && control->opt_streamnet_server < 0 && sec->Get_bool("streamnet"))
         address = sec->Get_string("connect");
     return !address.empty();
 }
 
 
-#else /* !C_INPUTNET */
+#else /* !C_STREAMNET */
 
 void REMOTEPLAY_Configure(Section_prop *) { }
 int REMOTEPLAY_PresentMode(void) { return 0; }
@@ -6554,5 +6554,5 @@ void REMOTEPLAY_UpdateMenu(void) {
 
 /* See remoteplay.h. */
 bool NN_Lockdown(void) {
-    return control != NULL && control->opt_inputnet_lockdown;
+    return control != NULL && control->opt_streamnet_lockdown;
 }

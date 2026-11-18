@@ -28,8 +28,8 @@
  * Nothing about the video output is transmitted - only emulator state (an
  * optional save state hand-off when a client joins) and input events. */
 
-#ifndef DOSBOX_INPUTNET_H
-#define DOSBOX_INPUTNET_H
+#ifndef DOSBOX_STREAMNET_H
+#define DOSBOX_STREAMNET_H
 
 #include "dosbox.h"
 #include "keyboard.h"
@@ -40,22 +40,22 @@ class Section;
 class Program;
 
 #if defined(C_SDL_NET) || defined(C_SDL2_NET)
-# define C_INPUTNET 1
+# define C_STREAMNET 1
 #endif
 
 /* Fast path flag. While an input sharing session is running local input events
  * must be routed through the network layer (so that every instance applies them
  * at the same emulated time) instead of being applied right away. Checked
  * inline by the input entry points so that the normal case costs nothing. */
-extern bool inputnet_capture_active;
+extern bool streamnet_capture_active;
 
 /* Interception hooks used by the keyboard/mouse entry points. Each returns true
  * when the event was consumed (queued for synchronized delivery) and therefore
  * must not be handed to the emulated hardware by the caller. */
-bool INPUTNET_InterceptKey(KBD_KEYS keytype,bool pressed);
-bool INPUTNET_InterceptMouseMotion(float xrel,float yrel,float x,float y,bool emulate);
-bool INPUTNET_InterceptMouseButton(uint8_t button,bool pressed);
-bool INPUTNET_InterceptMouseWheel(int32_t scroll);
+bool STREAMNET_InterceptKey(KBD_KEYS keytype,bool pressed);
+bool STREAMNET_InterceptMouseMotion(float xrel,float yrel,float x,float y,bool emulate);
+bool STREAMNET_InterceptMouseButton(uint8_t button,bool pressed);
+bool STREAMNET_InterceptMouseWheel(int32_t scroll);
 
 /* "Raw" input entry points that bypass the interception hooks. These are what
  * the input sharing layer calls once an event is due, and what the emulator
@@ -78,9 +78,9 @@ void Mouse_WheelMovedRaw(int32_t scroll);
  * server owns the cycle count: it publishes every change as part of its input
  * stream and all participants apply it at the same emulated time.
  *
- * INPUTNET_ProposeCycleMax() returns true when the shared input layer has taken
+ * STREAMNET_ProposeCycleMax() returns true when the shared input layer has taken
  * ownership of the change, meaning the caller must not apply it itself. */
-bool INPUTNET_ProposeCycleMax(uint32_t newmax,bool reset_counters);
+bool STREAMNET_ProposeCycleMax(uint32_t newmax,bool reset_counters);
 
 /* Implemented in dosbox.cpp. ApplyCycleMax() changes the speed immediately;
  * SetCycleMax() routes it through the shared input layer first and returns
@@ -88,28 +88,28 @@ bool INPUTNET_ProposeCycleMax(uint32_t newmax,bool reset_counters);
 void DOSBOX_ApplyCycleMax(cpu_cycles_count_t newmax,bool reset_counters);
 bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters);
 
-/* RollbackNet ("mode = rollback", see inputnet.cpp). While a session runs, the main loop calls
- * INPUTNET_RollbackTick() at the start of every emulated millisecond (right after TIMER_AddTick), and does not
+/* RollbackNet ("mode = rollback", see streamnet.cpp). While a session runs, the main loop calls
+ * STREAMNET_RollbackTick() at the start of every emulated millisecond (right after TIMER_AddTick), and does not
  * process host events while frames are being replayed after a correction. */
-extern bool inputnet_rollback_active;
-extern bool inputnet_rollback_resim;
-void INPUTNET_RollbackTick(void);
-void INPUTNET_ReplayPublish(void);
+extern bool streamnet_rollback_active;
+extern bool streamnet_rollback_resim;
+void STREAMNET_RollbackTick(void);
+void STREAMNET_ReplayPublish(void);
 /* dosbox.cpp: the main loop's budget of emulated milliseconds to run before it waits for real time */
 void DOSBOX_AddTicksRemain(uint32_t n);
 bool DOSBOX_DropTickRemain(void);
 Bitu DOSBOX_TrimTickRemain(Bitu keep);
 Bitu DOSBOX_TicksRemain(void);
 
-/* Session state, for the INPUTNET command and the status line. */
-bool INPUTNET_IsServer(void);
-bool INPUTNET_IsConnected(void);
+/* Session state, for the STREAMNET command and the status line. */
+bool STREAMNET_IsServer(void);
+bool STREAMNET_IsConnected(void);
 
 /* Module life cycle, mirrors the IPX emulation. */
-void INPUTNET_Init(void);
-void INPUTNET_Setup(Section*);
-void INPUTNET_ShutDown(Section*);
+void STREAMNET_Init(void);
+void STREAMNET_Setup(Section*);
+void STREAMNET_ShutDown(Section*);
 
-void INPUTNET_ProgramStart(Program * * make);
+void STREAMNET_ProgramStart(Program * * make);
 
 #endif

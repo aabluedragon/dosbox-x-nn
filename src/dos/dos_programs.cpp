@@ -132,7 +132,7 @@ inline bool CodePageHostToGuestUTF16(char *d/*CROSS_LEN*/,const char16_t *s/*CRO
     return CodePageHostToGuestUTF16(d, reinterpret_cast<const uint16_t *>(s));
 }
 extern bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
-extern bool addinputnet;
+extern bool addstreamnet;
 extern bool addovl, addipx, addne2k, prepared, inshell, usecon, uao, loadlang, morelen, mountfro[26], mountiro[26], resetcolor, staycolors, printfont, notrycp, internal_program;
 extern bool clear_screen(), OpenGL_using(void), DOS_SetAnsiAttr(uint8_t attr), isDBCSCP();
 extern int lastcp, lastmsgcp, tryconvertcp, FileDirExistCP(const char *name), FileDirExistUTF8(std::string &localname, const char *name);
@@ -8177,7 +8177,7 @@ void SERIAL_ProgramStart(Program * * make);
 void CONFIG_ProgramStart(Program * * make);
 #endif
 void IPXNET_ProgramStart(Program * * make);
-void INPUTNET_ProgramStart(Program * * make);
+void STREAMNET_ProgramStart(Program * * make);
 #if (defined(C_SDL_NET) || defined(C_SDL2_NET))
 void ETHNET_ProgramStart(Program * * make);
 #endif
@@ -10357,7 +10357,8 @@ void Add_VFiles(bool usecp) {
 	if (addipx) PROGRAMS_MakeFile("IPXNET.COM",IPXNET_ProgramStart,"/SYSTEM/");
 # endif
 #if defined(C_SDL_NET) || defined(C_SDL2_NET)
-	if (addinputnet) PROGRAMS_MakeFile("INPUTNET.COM",INPUTNET_ProgramStart,"/SYSTEM/");
+	if (addstreamnet) PROGRAMS_MakeFile("STREAMNET.COM",STREAMNET_ProgramStart,"/SYSTEM/");
+	if (addstreamnet) PROGRAMS_MakeFile("INPUTNET.COM",STREAMNET_ProgramStart,"/SYSTEM/");   /* (its name before StreamNet) */
 #endif
 	if (addovl) VFILE_RegisterBuiltinFileBlob(bfb_GLIDE2X_OVL, "/SYSTEM/");
 #endif

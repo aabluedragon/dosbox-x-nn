@@ -441,7 +441,7 @@
     <ClCompile Include="..\src\hardware\iohandler.cpp">
       <Filter>Sources\hardware</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\hardware\inputnet.cpp">
+    <ClCompile Include="..\src\hardware\streamnet.cpp">
       <Filter>Sources\hardware</Filter>
     </ClCompile>
     <ClCompile Include="..\src\hardware\remoteplay.cpp">
@@ -2282,7 +2282,7 @@
     <ClInclude Include="..\include\iowin32.h">
       <Filter>Includes</Filter>
     </ClInclude>
-    <ClInclude Include="..\include\inputnet.h">
+    <ClInclude Include="..\include\streamnet.h">
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\remoteplay.h">

@@ -2377,7 +2377,7 @@ void Init_RAM() {
 #elif C_HAVE_MMAP
         MemBase = (uint8_t*)mmap(NULL,memory.pages*4096u,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,0,0);
         if (MemBase == (uint8_t*)MAP_FAILED) E_Exit("Failed to mmap allocate memory");
-#elif defined(WIN32) // page aligned, for RollbackNet's write tracking (inputnet.cpp)
+#elif defined(WIN32) // page aligned, for RollbackNet's write tracking (streamnet.cpp)
         MemBase = (uint8_t*)VirtualAlloc(NULL,memory.pages*4096u,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
 #else // C_GAMELINK
         MemBase = new(std::nothrow) uint8_t[memory.pages*4096];

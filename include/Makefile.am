@@ -16,7 +16,7 @@ fpu.h \
 hardware.h \
 inout.h \
 joystick.h \
-inputnet.h \
+streamnet.h \
 ipx.h \
 ipxserver.h \
 keyboard.h \

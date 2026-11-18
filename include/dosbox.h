@@ -395,7 +395,7 @@ public:
 
     void registerComponent(const std::string& uniqueName, Component& comp); //comp must have global lifetime!
 
-    /* RollbackNet (inputnet "mode = rollback") snapshots, in memory: every component except the ones that only
+    /* RollbackNet (streamnet "mode = rollback") snapshots, in memory: every component except the ones that only
      * hold host state (window, renderer, MIDI device), and without guest RAM and video memory, which the caller
      * keeps page by page. For the same build and process only. */
     void saveLean(std::string& out);

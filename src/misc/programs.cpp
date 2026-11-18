@@ -151,7 +151,7 @@ void PROGRAMS_MakeFile(char const * const name,PROGRAMS_Main * main,const char *
 }
 
 /* PSP segments of the internal programs (the shell started as COMMAND.COM,
- * MOUNT, CONFIG, ...) that are running right now, innermost last. Inputnet
+ * MOUNT, CONFIG, ...) that are running right now, innermost last. StreamNet
  * remote play (remoteplay.cpp) never lets viewers type into these. */
 static std::vector<uint16_t> running_internal_psps;
 

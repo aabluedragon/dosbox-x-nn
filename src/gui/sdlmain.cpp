@@ -2349,7 +2349,7 @@ void RENDER_Reset(void);
 void UpdateUserCursorScreenDimensions(void);
 
 /* ------------------------------------------------------------------------- */
-/* Inputnet remote play: hiding the local screen of a streaming host          */
+/* StreamNet remote play: hiding the local screen of a streaming host          */
 /* ------------------------------------------------------------------------- */
 
 /* Size of the placeholder below the menu bar while the screen is hidden. */
@@ -2433,7 +2433,7 @@ void GFX_RemotePlayDrawHidden(void) {
  * the active one (labwc, for one, puts it on top), but a minimized window
  * never covers the host's own game. It waits in the taskbar; restoring it
  * gives the Video menu with "Show screen (remote play)". */
-bool cluster_window_hidden = false;   /* RollbackNet: a cluster's follower opens no window ([inputnet] cluster hide window) */
+bool cluster_window_hidden = false;   /* RollbackNet: a cluster's follower opens no window ([streamnet] cluster hide window) */
 
 static void GFX_RemotePlayShowWindowQuietly(void) {
 #if defined(C_SDL2)
@@ -2442,7 +2442,7 @@ static void GFX_RemotePlayShowWindowQuietly(void) {
     static bool shown = false;
     if (shown || sdl.window == NULL || !(SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN)) return;
     shown = true;
-    LOG_MSG("INPUTNET: remote play: the window opens minimized");
+    LOG_MSG("STREAMNET: remote play: the window opens minimized");
 # if defined(LINUX) && C_X11
     /* SDL would map it raised (and focus it without a window manager) */
     if (GFX_RemotePlayX11MapQuietly()) return;
@@ -2474,7 +2474,7 @@ void GFX_RemotePlaySetScreenHidden(bool hidden) {
     if (hidden && sdl.desktop.fullscreen) GFX_SwitchFullScreen();
 
     remoteplay_screen_hidden = hidden;
-    LOG_MSG("INPUTNET: remote play: local screen %s", hidden ? "hidden" : "shown");
+    LOG_MSG("STREAMNET: remote play: local screen %s", hidden ? "hidden" : "shown");
 #if defined(C_SDL2)
     if (!hidden && sdl.window != NULL && (SDL_GetWindowFlags(sdl.window) & SDL_WINDOW_HIDDEN))
         SDL_ShowWindow(sdl.window);
@@ -3586,8 +3586,8 @@ bool GFX_StartUpdate(uint8_t* &pixels,Bitu &pitch)
 
     /* RollbackNet replays frames at full speed: nothing of them is shown (presenting could also wait for vsync), and
      * the renderer skips the frame as it does when frames are skipped. */
-    extern bool inputnet_rollback_resim;
-    if (inputnet_rollback_resim)
+    extern bool streamnet_rollback_resim;
+    if (streamnet_rollback_resim)
         return false;
 
     switch (sdl.desktop.type)
@@ -4106,20 +4106,20 @@ static void GUI_StartUp() {
 
     maximize = section->Get_bool("maximize");
 
-    /* A remote play host that does not show its picture here (-inputnet-hidescreen,
-     * [inputnet] hostscreen=false) opens a small window, without fullscreen, that
+    /* A remote play host that does not show its picture here (-streamnet-hidescreen,
+     * [streamnet] hostscreen=false) opens a small window, without fullscreen, that
      * does not take the focus from the host's own game window. */
     remoteplay_screen_hidden = REMOTEPLAY_HideScreenRequested();
     if (remoteplay_screen_hidden) {
         maximize = false;
-        LOG_MSG("INPUTNET: remote play: the local screen is hidden (Video menu: \"Show screen (remote play)\")");
+        LOG_MSG("STREAMNET: remote play: the local screen is hidden (Video menu: \"Show screen (remote play)\")");
     }
     /* RollbackNet: a cluster's follower runs a copy another player plays (no window here, never fullscreen); and no
      * RollbackNet copy pauses when it is not in front: every other copy and computer would wait for it. */
     bool rollback_copy = false;
     {
-        Section_prop *in = static_cast<Section_prop *>(control->GetSection("inputnet"));
-        if (in != NULL && in->Get_bool("inputnet") && std::string(in->Get_string("mode")) == "rollback") {
+        Section_prop *in = static_cast<Section_prop *>(control->GetSection("streamnet"));
+        if (in != NULL && in->Get_bool("streamnet") && std::string(in->Get_string("mode")) == "rollback") {
             rollback_copy = true;
             cluster_window_hidden = in->Get_int("cluster") >= 2 && std::string(in->Get_string("cluster role")) != "leader" &&
                 in->Get_bool("cluster hide window");
@@ -4127,7 +4127,7 @@ static void GUI_StartUp() {
     }
     if (cluster_window_hidden) {
         maximize = false;
-        LOG_MSG("INPUTNET: cluster: this copy runs without a window");
+        LOG_MSG("STREAMNET: cluster: this copy runs without a window");
     }
 
     sdl.desktop.fullscreen=false;
@@ -7898,10 +7898,10 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -showcycles                             Show cycles count (FPS) in the title\n");
             fprintf(stderr,"  -showrt                                 Show emulation speed relative to realtime in the title\n");
             fprintf(stderr,"  -socket <socketnum>                     Specify the socket number for null-modem emulation\n");
-            fprintf(stderr,"  -inputnet-server <port>                 Host a shared keyboard/mouse session on this UDP port\n");
-            fprintf(stderr,"  -inputnet-connect <address[:port]>      Join the shared keyboard/mouse session hosted there\n");
-            fprintf(stderr,"  -inputnet-hidescreen                    Remote play host: do not show the picture on this machine\n");
-            fprintf(stderr,"  -inputnet-lockdown                      This copy plays for a remote player: nothing it does may change files here\n");
+            fprintf(stderr,"  -streamnet-server <port>                 Host a shared keyboard/mouse session on this UDP port\n");
+            fprintf(stderr,"  -streamnet-connect <address[:port]>      Join the shared keyboard/mouse session hosted there\n");
+            fprintf(stderr,"  -streamnet-hidescreen                    Remote play host: do not show the picture on this machine\n");
+            fprintf(stderr,"  -streamnet-lockdown                      This copy plays for a remote player: nothing it does may change files here\n");
             fprintf(stderr,"  -savedir <path>                         Set path for the save slots\n");
             fprintf(stderr,"  -defaultdir <path>                      Set the default working path for DOSBox-X\n");
             fprintf(stderr,"  -defaultconf                            Use the default config settings for DOSBox-X\n");
@@ -8004,19 +8004,20 @@ bool DOSBOX_parse_argv() {
         else if (optname == "machine") {
             if (!control->cmdline->NextOptArgv(control->opt_machine)) return false;
         }
-        else if (optname == "inputnet-server") {
+        /* (-inputnet-*: the names before StreamNet was called so; NukemNet versions of that time pass them) */
+        else if (optname == "streamnet-server" || optname == "inputnet-server") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
-            control->opt_inputnet_server = atoi(tmp.c_str());
-            if (control->opt_inputnet_server < 0 || control->opt_inputnet_server > 65535) control->opt_inputnet_server = 0;
+            control->opt_streamnet_server = atoi(tmp.c_str());
+            if (control->opt_streamnet_server < 0 || control->opt_streamnet_server > 65535) control->opt_streamnet_server = 0;
         }
-        else if (optname == "inputnet-connect") {
-            if (!control->cmdline->NextOptArgv(control->opt_inputnet_connect)) return false;
+        else if (optname == "streamnet-connect" || optname == "inputnet-connect") {
+            if (!control->cmdline->NextOptArgv(control->opt_streamnet_connect)) return false;
         }
-        else if (optname == "inputnet-hidescreen") {
-            control->opt_inputnet_hidescreen = true;
+        else if (optname == "streamnet-hidescreen" || optname == "inputnet-hidescreen") {
+            control->opt_streamnet_hidescreen = true;
         }
-        else if (optname == "inputnet-lockdown") {
-            control->opt_inputnet_lockdown = true;
+        else if (optname == "streamnet-lockdown" || optname == "inputnet-lockdown") {
+            control->opt_streamnet_lockdown = true;
         }
         else if (optname == "time-limit") {
             if (!control->cmdline->NextOptArgv(tmp)) return false;
@@ -8391,7 +8392,7 @@ void DRIVES_Init();
 #if !defined(OSFREE)
 void IPX_Init();
 #endif
-void INPUTNET_Init();
+void STREAMNET_Init();
 void IDE_Init();
 void NE2K_Init();
 void FDC_Primary_Init();
@@ -10488,7 +10489,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         IPX_Init();
 # endif
 #endif
-        INPUTNET_Init();
+        STREAMNET_Init();
         MSCDEX_Init();
         CDROM_Image_Init();
 

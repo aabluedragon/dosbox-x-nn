@@ -11,25 +11,25 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   copying it there. A real file of that name is hidden while the mapping exists (and left untouched);
   the folder must exist. NukemNet uses it to add maps, mods and patched files to a game's folder for a
   launch, while everything the game writes still goes to the real folder (capability `filemount`).
-- Inputnet, for games whose only multiplayer is two players on one PC. In the default remote play
-  mode (`[inputnet] mode = remote`) the host runs the game with `-inputnet-server <port>` and streams
-  its picture and sound. A joining player starts DOSBox-X with `-inputnet-connect <address:port>`,
+- StreamNet, for games whose only multiplayer is two players on one PC. In the default remote play
+  mode (`[streamnet] mode = remote`) the host runs the game with `-streamnet-server <port>` and streams
+  its picture and sound. A joining player starts DOSBox-X with `-streamnet-connect <address:port>`,
   which opens a viewer window instead of an emulated machine and sends keyboard and mouse input back,
-  so the joining player needs neither the game nor matching settings. `[inputnet] stream fps` caps
+  so the joining player needs neither the game nor matching settings. `[streamnet] stream fps` caps
   the frame rate to save upload bandwidth. `mode = lockstep` keeps the older mode in which every
   player runs an identical machine.
-- RollbackNet (`[inputnet] mode = rollback`, capability `rollbackNet`): every player runs the game, and the
+- RollbackNet (`[streamnet] mode = rollback`, capability `rollbackNet`): every player runs the game, and the
   machines exchange only input and stay identical, with each player's own input used at once. Clusters (capability
   `rollbackNetCluster`) run one copy per player on every computer for games that play over IPX or a null modem, and
   players can join a running game and take a free copy over. See [RollbackNet](#rollbacknet) below.
-- Remote play guard (capability `inputnetShellGuard`): a viewer's keyboard and mouse go straight to
+- Remote play guard (capability `streamnetShellGuard`): a viewer's keyboard and mouse go straight to
   the emulated keyboard and mouse (never to DOSBox-X's hotkeys or menus), and only while a DOS program
   other than a command shell runs, or a guest system was booted. At the DOS prompt (DOSBox-X's shell,
   a nested `COMMAND`, or a COMMAND.COM/4DOS/NDOS loaded from disk) and while DOSBox-X's own programs
   (MOUNT, CONFIG, ...) run, viewer input is dropped, keys viewers hold are released, and when a game
   ends the keystrokes still waiting in the keyboard buffers are discarded. The log says
-  `INPUTNET: remote input blocked/allowed` at each change.
-- Remote play mouse (capability `inputnetMouse`): a viewer's mouse, captured on the viewer's side, moves
+  `STREAMNET: remote input blocked/allowed` at each change.
+- Remote play mouse (capability `streamnetMouse`): a viewer's mouse, captured on the viewer's side, moves
   the host's emulated mouse by relative motion even though the host window has not captured the mouse:
   the INT 33h position no longer snaps back to the host's own cursor, and the motion counters (function
   0Bh) advance, so mouse-driven DOS games (Bonus, for one) work for the remote player.
@@ -40,13 +40,13 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   (`.../resources/app.asar/res/gameres/IPXSETUP.EXE`, where NukemNet keeps its DOS helpers) is read from the
   archive: packed files are extracted to a private temporary file (deleted when DOSBox-X exits) and mapped,
   unpacked ones are mapped from `app.asar.unpacked`, links are followed.
-- Remote play motion and hidden screen fixes (capability `inputnetMotion`): INT 33h function 0Bh and the
+- Remote play motion and hidden screen fixes (capability `streamnetMotion`): INT 33h function 0Bh and the
   PS/2 mouse report the viewer's motion while a viewer is connected (they reported nothing unless the host
   window had captured the mouse, so games that turn by the motion counters, such as Rise of the Triad,
   could not be turned); on Windows the hidden screen no longer resizes itself on every frame (the native
   menu bar wrapped in the narrow window, the placeholder blinked and no video reached the viewers); a
   viewer's error message no longer opens behind its window.
-- Remote play over slower links and SVGA (capability `inputnetAdaptive`): viewers report the newest frame
+- Remote play over slower links and SVGA (capability `streamnetAdaptive`): viewers report the newest frame
   they decoded and the video fragments that arrived; the host encodes each frame against a frame every
   viewer has (a lost frame no longer stops the picture until the next key frame), paces video to the rate
   the link takes (less on loss, more while there is none, from 1.5 MB/s) and skips frames instead of
@@ -73,7 +73,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   and the viewer's UDP sockets ask for 4 MB kernel buffers (`NetWrapper_WidenUdpBuffers`): with the defaults (64 KB
   on Windows) part of a big frame's burst was dropped whenever the receiver was busy, and the loss made the host
   pace its video, which delayed every frame.
-- Remote play frame timing (`[inputnet] present = flip | retrace | scanout`, default `flip`; only while a remote
+- Remote play frame timing (`[streamnet] present = flip | retrace | scanout`, default `flip`; only while a remote
   play server runs): a VGA takes a new start address at the start of vertical retrace and then spends a refresh
   showing that page, and the emulation handed the frame over when its last line was drawn, so a page a game
   flipped to reached the players 14 to 28 ms later at 70 Hz. A host now renders 256-colour VGA modes on demand
@@ -105,8 +105,8 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   that draw late on purpose (a box 2.5 ms after copying a frame, a block 2.5 ms after flipping a page) the
   players got an incomplete frame on every key press before this and on about one in eight after it, the same as
   with `present=retrace`. `retrace` and `scanout` remain as manual settings.
-- Hidden remote play screen (capability `inputnetHideScreen`): `-inputnet-hidescreen` or
-  `[inputnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
+- Hidden remote play screen (capability `streamnetHideScreen`): `-streamnet-hidescreen` or
+  `[streamnet] hostscreen = false` on a remote play host keeps its window small (menu bar and a short
   notice, on the surface output), opens it minimized and without the focus, so it never covers the
   window in front (some window managers, labwc for one, put new windows on top whatever they ask), and
   keeps its sound off this machine's speakers, while the viewers still get the full picture and sound.
@@ -114,7 +114,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   NukemNet uses it for the copies that play for remote players. Restore it from the taskbar for
   *Video > Show screen (remote play)* (mapper event `rpscreen`, no default key), which shows or hides
   the picture at any time.
-- Remote play pointer for Windows guests (capability `inputnetPointer`): Windows 3.x/9x with DOSBox-X's pointer
+- Remote play pointer for Windows guests (capability `streamnetPointer`): Windows 3.x/9x with DOSBox-X's pointer
   integration driver (DBOXMPI) asks the integration device where the pointer is, which was the host's own pointer over
   the host's window only: a viewer's mouse never moved the Windows pointer (it sat in the top-left corner). The host
   now answers with the place of the viewer's pointer in its picture (`nn_remote_cursor*` in `bios.cpp`; the host's own
@@ -131,8 +131,8 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   never grows beyond the size of the image; an existing layer of the same image is taken up again; without its
   layer the image is not mounted at all. (The differencing VHDs DOSBox-X already has were no option: `VHDMAKE -link`
   crashes on Linux with a double free and stores parent paths as ASCII.)
-- Locked down copies (capability `inputnetLockdown`): `-inputnet-lockdown` is for an emulator that runs a copy of a
-  game for a remote player (NukemNet's IPX/NullModem-over-InputNet with a Windows guest), who controls that guest
+- Locked down copies (capability `streamnetLockdown`): `-streamnet-lockdown` is for an emulator that runs a copy of a
+  game for a remote player (NukemNet's IPX/NullModem-over-StreamNet with a Windows guest), who controls that guest
   completely and could run anything inside it. Such a copy may not change the host's files: `MOUNT` is always
   read-only; a disk image is written only through a disk layer and is read-only otherwise (raw, VHD and QCOW2);
   nothing is captured, printed or saved (screenshots, video, sound, MIDI, parallel and serial port files, printer
@@ -170,10 +170,10 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   With both, a Windows 95 game hosted for four players (three 640x480 streams from one computer through NukemNet's
   IPv6 tunnel, 73 ms away) plays at the game's full 30 to 34 frames a second for each viewer with the ping at the
   route's own; before, the tunnel's queue grew until pings passed a second and viewers got a few frames a second.
-- Remote play host input reports (capability `inputnetReportInput`): `[inputnet] report input = <port>` sends every
+- Remote play host input reports (capability `streamnetReportInput`): `[streamnet] report input = <port>` sends every
   remote player's input to 127.0.0.1:<port> as one JSON datagram per event, `{"p":"<player>","t":"key","k":"esc","d":1,"b":0}`
   (b: blocked by `block keys`), `{"t":"button","n":0,"d":1}`, `{"t":"move","dx":..,"dy":..}` (motion gathered ten
-  times a second per player). NukemNet's server automation gets them as inputnetInput events.
+  times a second per player). NukemNet's server automation gets them as streamnetInput events.
 - NukemNet control channel (capability `nnControl`, any DOSBox-X-NN, remote play or not): env `NN_DOSBOX_CONTROL_PORT`
   and `NN_DOSBOX_CONTROL_TOKEN` (16+ characters) open a UDP port. A datagram from 127.0.0.1 is `<token> <commands>`:
   one command, or several separated by newlines, queued in the order given: `type <text>` (Shift where a character
@@ -181,14 +181,14 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   follows) and `sync <id>`, which answers the datagram `done <id>` to the sender, from the same port, once everything
   before it has gone out (the id: up to 32 characters, sent back as they came). Key steps go out one every 40 ms;
   anything else is ignored. NukemNet's `nn.typeInGame()` types chat messages into the host's own game with it.
-  `block <name> [name...]` (capability `inputnetBlockKeysLive`) replaces `[inputnet] block keys` at once, while the
+  `block <name> [name...]` (capability `streamnetBlockKeysLive`) replaces `[streamnet] block keys` at once, while the
   game runs (`block none`: no key); NukemNet sends it to the copies that serve viewers when the room's "Blocked keys"
   change during a game.
-- Remote play viewers choose how the picture is enlarged (capability `inputnetViewerScaling`): `[inputnet] viewer
+- Remote play viewers choose how the picture is enlarged (capability `streamnetViewerScaling`): `[streamnet] viewer
   scaling = nearest | bilinear | sharp`, Ctrl+F7 in the viewer switches. Only the viewer does it, with the graphics card,
   after the frame arrived: the host sends the same picture whatever is chosen (no bandwidth, no latency); a software
   renderer keeps nearest. sharp enlarges by whole pixels into a render target, then linearly to the window.
-- Who may connect to a remote play host (capability `inputnetAuth`, feature bit 32 in a viewer's HELLO). A host started
+- Who may connect to a remote play host (capability `streamnetAuth`, feature bit 32 in a viewer's HELLO). A host started
   with env `NN_RP_AUTH_SECRET` (16+ characters; NukemNet gives one per room, from the environment because other users
   can read a command line) lets in only viewers whose HELLO carries, after the features, a token (u8 length + text) for
   the name it gives: the first 16 bytes of HMAC-SHA256(secret, name in lower case) in hex (`RP_AuthToken`); a viewer
@@ -214,7 +214,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   decoded by now, and still keeps). A key frame goes to every viewer that takes a frame. A viewer that asks for a key
   frame, and one that joins, gets it for itself: the others get no key frame for it. After a second of taking every
   frame a viewer is with the others again. The host keeps a viewer's base (the newest frame it said it decoded, its
-  last key frame) beyond the newest 16 frames. With one viewer (every copy of an IPX/NullModem-over-InputNet game)
+  last key frame) beyond the newest 16 frames. With one viewer (every copy of an IPX/NullModem-over-StreamNet game)
   nothing is encoded twice. The host's log line names every viewer's rate and what it was sent ("*": at its own pace).
   Measured on one PC with Duke Nukem 3D (70 pictures/s), a viewer "fast" straight to the host and one behind a
   600 KB/s bottleneck: fast alone 65-70 frames/s, 11-18 ms from input to screen; with the slow one 68-70 frames/s,
@@ -223,9 +223,9 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   frames/s at 8-12 ms (before: 4-15 frames/s, 200-800 ms). Two slow viewers at different rates and a fast one: the
   fast one as with two viewers without bottlenecks (two interleaved rounds). Sound is not paced: a link below its
   1.4 Mbit/s (16-bit stereo, uncompressed) loses packets whatever the video does.
-- Local only (capability `inputnetLocalLinks`): env `NN_RP_LOCAL_ONLY=1` makes the remote play server and the IPX server
+- Local only (capability `streamnetLocalLinks`): env `NN_RP_LOCAL_ONLY=1` makes the remote play server and the IPX server
   (`IPXNET STARTSERVER`) take datagrams from 127.0.0.1 only: NukemNet sets it on every copy of an IPX/NullModem-over-
-  InputNet game (its proxy and the other copies are on the host's computer). The null modem's ENet server now reports
+  StreamNet game (its proxy and the other copies are on the host's computer). The null modem's ENet server now reports
   a client's real address (it reported its own, `::`, so `nonlocal:0` refused even 127.0.0.1), so such a link no longer
   needs `nonlocal:1`.
 - Remote play hardening (Nov 2026 audit): the viewer refuses frames larger than 2560x2048 and fragment counts beyond the
@@ -236,16 +236,16 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   request per viewer in 300 ms, and control channel key presses while the guard blocks (automation never types at the
   DOS prompt); it keeps viewer names to 40 printable characters. RP_MOVED may carry a reason (u8 length + text) the
   viewer shows in its title for a few seconds.
-- Remote play viewers can be moved (capability `inputnetMove`, feature bit 16 in a viewer's HELLO): the datagram
+- Remote play viewers can be moved (capability `streamnetMove`, feature bit 16 in a viewer's HELLO): the datagram
   `NNRP`, version, type 12 (RP_MOVED) from the address the viewer talks to makes it start over as a new session,
-  keeping its window. NukemNet's proxy (IPX/NullModem-over-InputNet: one copy of the game per player) sends it when
+  keeping its window. NukemNet's proxy (IPX/NullModem-over-StreamNet: one copy of the game per player) sends it when
   the host gives a player another copy; the proxy tells the old copy the player left (RP_BYE) and routes the new
   session to the new one. A viewer without the bit gets RP_BYE instead and closes.
-- Remote play host key blocking (capability `inputnetBlockKeys`): `[inputnet] block keys` lists keys, by keymapper
+- Remote play host key blocking (capability `streamnetBlockKeys`): `[streamnet] block keys` lists keys, by keymapper
   name (`esc f10 lalt kp_5`, space or comma separated), that the host drops from every remote player's input; the
   host's own keyboard is not affected and unknown names are logged and skipped. NukemNet's Host Game field "Blocked
   keys" sets it on the host's copies that serve viewers.
-- Remote play view prediction is **off by default** (capability `inputnetPredictView`: `[inputnet] predict view`,
+- Remote play view prediction is **off by default** (capability `streamnetPredictView`: `[streamnet] predict view`,
   default false; Ctrl+F12 in the viewer switches it; NukemNet's Host Game option "Experimental prediction" turns it on
   for a room's viewers). Without it the viewer shows every frame exactly as the host sent it. Why: a first-person
   view cannot be moved ahead of the host without it showing. Whatever stays on the screen in the game (the weapon, the
@@ -256,7 +256,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   off, the weapon, crosshair and text were out of place in 0 of 195 frames; on, in all 195 (the view is also shown
   2.5% larger). The pointer dot (below) is not affected and stays on. What follows describes the view prediction
   when it is turned on; the viewer learns in the background either way, so the switch works at once.
-- Remote play view prediction (capability `inputnetPredict`, viewer side, with `predict view` on, see above): what
+- Remote play view prediction (capability `streamnetPredict`, viewer side, with `predict view` on, see above): what
   a player feels as lag in a streamed first-person game is the view, which turns one round
   trip and the game's own reaction after the hand. The viewer shows the newest frame already moved by the input that
   frame does not show yet, and draws it again between frames whenever that changes, so the view follows the mouse
@@ -278,7 +278,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
     has been measured in the current video mode: until then it is the whole picture, and a viewer that predicted from
     it enlarged the status bar and moved its numbers. Reproduced with Duke's brightness key (F11) pressed while
     turning, which changes every colour as its pickup and damage flashes do: the old viewer took 320x380 of 320x400 as
-    the view, status bar included; this one keeps 320x316 (rows 16-331) in a NukemNet IPX-over-InputNet room;
+    the view, status bar included; this one keeps 320x316 (rows 16-331) in a NukemNet IPX-over-StreamNet room;
   - the pixels in it that never move with it (a weapon, a crosshair, text on the screen), which are left out of
     measuring (see below);
   - layers: bands of the view that an engine scrolls evenly at a rate of its own (`VP_Bands`). Build's sky does:
@@ -317,7 +317,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   as 90 degrees in a 288-pixel view (f 144 to 146; Doom's is 144), learned within about two seconds of turning. Duke
   Nukem 3D outdoors: 0.50 pixels a count after the game's own 43 to 49 ms, 9 behind without, 1.0 to 1.7 off with;
   two of six bands found to scroll evenly at 1.24. Between two computers 70 ms apart (a Windows host with Doom in an
-  IPX-over-InputNet room, 88 to 96 ms from input to screen plus the net game's own 47 ms): the view followed the mouse
+  IPX-over-StreamNet room, 88 to 96 ms from input to screen plus the net game's own 47 ms): the view followed the mouse
   after 7 ms, 0.4 off where it had moved 4 to 7, key turns 2.2 off where it had moved 34; while frames arrived 200 to
   340 ms late for a moment the view still followed the mouse to within 3 pixels. A menu opened with Escape: off at
   once, on again two stretches of frames after the game answers the mouse. Cost in the viewer: about 1 ms a frame to
@@ -341,7 +341,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   (with 3% of the host's datagrams dropped on one PC the dot was off at 3 of 8 checks that way, and on all of the
   time this way).
   Tested with a DOS test program that draws its own pointer and with Bonus (a mouse-only game), on one PC with
-  50 ms added each way and between two computers 70 ms apart (a Windows host in a NukemNet Inputnet room, 77 to
+  50 ms added each way and between two computers 70 ms apart (a Windows host in a NukemNet StreamNet room, 77 to
   88 ms from input to screen): the game's pointer was where the driver has it in every move of nearly every
   five-second stretch (19 of 19, 31 of 31, 34 of 34; 21 of 33 in one of them on one PC), the dot led the game's
   arrow, and it was on all of the time once it had come on. In Doom, which turns with the mouse, 1 of 73 moves on
@@ -382,7 +382,7 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   Tests: `python3 tests/filemount_keep_tests.py`.
 
 Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, each with an
-`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"inputnetRemote":true,"filemount":true,"inputnetHideScreen":true,"inputnetShellGuard":true,"inputnetMouse":true,"inputnetMotion":true,"filemountAsar":true,"inputnetAdaptive":true,"inputnetPointer":true,"diskLayer":true,"inputnetLockdown":true,"inputnetPredict":true,"inputnetPredictView":true}`.
+`nn-capabilities.json` containing `{"win95Ipx":true,"win95FastBoot":true,"streamnetRemote":true,"filemount":true,"streamnetHideScreen":true,"streamnetShellGuard":true,"streamnetMouse":true,"streamnetMotion":true,"filemountAsar":true,"streamnetAdaptive":true,"streamnetPointer":true,"diskLayer":true,"streamnetLockdown":true,"streamnetPredict":true,"streamnetPredictView":true}`.
 
 - Linux x64, ARM64 and ARMv7: `nukemnet/linux` (portable Debian Bullseye build with bundled
   libraries), run by the *NukemNet Linux packages* workflow.
@@ -391,7 +391,7 @@ Packages are published under `https://storage.nukemnet.com/misc/dosbox-x-nn/`, e
 
 ## RollbackNet
 
-`[inputnet] mode = rollback` (capability `rollbackNet`; NukemNet's "RollbackNet" Net choice, next to Inputnet). For
+`[streamnet] mode = rollback` (capability `rollbackNet`; NukemNet's "RollbackNet" Net choice, next to StreamNet). For
 the games remote play is for (two or more players on one PC), but every player runs the game, and only input crosses
 the network, so nobody waits for a picture: each player's own keys and mouse reach their machine in the next frame,
 whatever the distance to the others.
@@ -399,7 +399,7 @@ whatever the distance to the others.
 How it works:
 
 - Every machine counts the same frames of `frame` emulated milliseconds (10). A frame starts right after a timer
-  tick (`INPUTNET_RollbackTick`, called from `Normal_Loop`). The server's session starts at once; players join it at
+  tick (`STREAMNET_RollbackTick`, called from `Normal_Loop`). The server's session starts at once; players join it at
   any time (see [Joining](#joining-at-the-dos-prompt-or-a-running-game) below).
 - At every frame start the machine is saved: a lean save state of the devices (no RAM, video memory, TLB, renderer,
   MIDI; the PIC queue, the VGA line drawer and the VGA frame clock exactly, without the rounding the save state
@@ -474,7 +474,7 @@ from its own timing would run its machines differently). Instead every process m
 for other computers' input or for its cluster's copies), how much of that the CPU core took (`dosbox_core_ns`, timed
 around `cpudecoder` while this runs: drawing, sound and saving frames take the same time at any speed), and the speed
 meanwhile. From averages over a few seconds it proposes a speed (`RB_Propose`): the one at which the core gets what
-`[inputnet] rollback max load` (85% by default) leaves after the rest. Replays are part of the load measured; how long
+`[streamnet] rollback max load` (85% by default) leaves after the rest. Replays are part of the load measured; how long
 one replay takes is not a limit of its own (it was until Nov 2026, at 20 ms, and held Duke Nukem 3D at 15,000 to 30,000
 cycles at 220 ms: a few frames a second, which shows far more than replays do). A computer whose picture already changes
 in nearly every frame it draws (`render_changed_frames` of `render_frames_started`, replays draw nothing; a few seconds'
@@ -491,10 +491,10 @@ applies, so a change no longer needs a correction (before, each was input nobody
 replay as deep as the distance); a computer that learns of one late but in time records it (`RB_FindMisprediction`)
 and hands it to its copies with the current frame's events. The change still to come travels in the CPU's state, so a
 joining machine knows it. The log names what the corrections came from (keys, mouse, speed changes). Mouse motion
-goes to every Kth frame, gathered (`[inputnet] rollback mouse frames`, 0 = from the distance: 1 under 80 ms round trip,
+goes to every Kth frame, gathered (`[streamnet] rollback mouse frames`, 0 = from the distance: 1 under 80 ms round trip,
 2 under 160 ms, 3 beyond): a mouse reports in almost every frame, and every frame of it the others did not predict costs
 them a replay; this computer applies it at that frame too, so it is at most K-1 frames later. During a replay this computer's
-input keeps going out at real time (`INPUTNET_ReplayPublish`, every 10 ms from the main loop: the player's new input is
+input keeps going out at real time (`STREAMNET_ReplayPublish`, every 10 ms from the main loop: the player's new input is
 read and every frame whose time has come is published, without a checksum since the frames being replayed are not
 final). Before, a replay of 100-200 ms stopped our input for that long, so the others learned it that much later,
 replayed that much deeper and stopped theirs in turn: at 220 ms replays averaged 17 to 24 frames, about the whole
@@ -512,7 +512,7 @@ of milliseconds. Every 5 s the log also splits the replays' time ("replays' time
 aiming, about 1.8 s in 5 went to replays, of which loading the frame about 50 ms, saving frames about 130 ms and
 waiting for the cluster's copies about 140 ms: the rest, nearly 85%, is emulating the frames again (about 110,000
 cycles per millisecond of this computer's time with the normal core). Fewer frames to replay is what is left: far
-apart, our input now waits a little by itself (`[inputnet] rollback auto delay`, on by default; "delay" stays the
+apart, our input now waits a little by itself (`[streamnet] rollback auto delay`, on by default; "delay" stays the
 least): 1 frame from 150 ms round trip, 2 from 200 ms (stepping down 15 ms below), logged ("our input waits N
 frame(s) now"). Each frame of it makes every correction of the others a frame shorter: at 220 ms with mouse aiming, an
 explicit delay 2 left no gap over 300 ms in two minutes (the longest 238 ms instead of 355 to 561, real time 94%
@@ -555,7 +555,7 @@ Capability `rollbackNetMaxCycles`.
 ### Clusters: IPX and null modem games (IPX/NullModem-over-RollbackNet)
 
 A game that plays over IPX or a null modem runs one copy per player on every computer, all identical: copy c plays
-for participant c (the server's player has copy 0). `[inputnet] cluster = <copies>` (2 to 8), `cluster copy`,
+for participant c (the server's player has copy 0). `[streamnet] cluster = <copies>` (2 to 8), `cluster copy`,
 `cluster role = leader|follower` and `cluster port`: the leader is the copy of the computer's own player (its window,
 its sound, its network session); the followers have no window (`cluster hide window = true`) and talk to the leader
 over 127.0.0.1 on the cluster port. At every frame start each follower sends its frame, its machine checksum and what
@@ -604,7 +604,7 @@ counter's base. After every load the VGA's memory handlers are set up again and 
 was found by a game at 800x600 (a VESA mode, drawn on demand) that went out of step a few frames after a join, while
 320x200 never did: test joins in an SVGA mode too.
 
-For NukemNet: `[inputnet] players` and `autorun` make the server type a command at the DOS prompt once that many
+For NukemNet: `[streamnet] players` and `autorun` make the server type a command at the DOS prompt once that many
 participants are in, as its own input, so every machine starts the game at the same moment (NukemNet's
 `C:\NNRBGO.BAT`); at the DOS prompt nobody's key presses reach the machines (they would run a command on every
 computer, `DEL` included). A server started with env `NN_RP_AUTH_SECRET` takes only participants whose HELLO

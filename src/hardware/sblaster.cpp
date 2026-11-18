@@ -4816,7 +4816,7 @@ void *SB_DSP_ADC_CallBack_Func = (void*)((uintptr_t)DSP_ADC_CallBack);
 void *SB_DSP_E2_DMA_CallBack_Func = (void*)((uintptr_t)DSP_E2_DMA_CallBack);
 
 
-/* RollbackNet desync hunting (inputnet NN_RB_TRACE): the first card's playback state in one line */
+/* RollbackNet desync hunting (streamnet NN_RB_TRACE): the first card's playback state in one line */
 void SBLASTER_DebugState(char *out, size_t n) {
 	const SB_INFO &c = sb[0];
 	if (!c.chan) { snprintf(out, n, "sb=none"); return; }

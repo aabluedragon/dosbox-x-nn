@@ -708,7 +708,7 @@ void ethernetSendToIPX(const unsigned char *outptr, unsigned int outlen, unsigne
 	}
 }
 
-/* --- RollbackNet clusters (inputnet.cpp) ---------------------------------------------------------------------------
+/* --- RollbackNet clusters (streamnet.cpp) ---------------------------------------------------------------------------
  * In an IPX-over-RollbackNet game every computer runs a copy of the game for every player, linked by IPX, and the
  * copies have to see each other's packets at the same emulated moment on every computer. So a copy in a cluster sends to
  * no server: what it sends during a frame goes to its cluster's leader, which hands every packet to its addressees at

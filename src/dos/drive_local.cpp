@@ -45,18 +45,18 @@
 
 #include "dosbox.h"
 #include "dos_inc.h"
-#include "inputnet.h"
+#include "streamnet.h"
 
-/* Shared input (INPUTNET) machines must answer the guest identically, but file times differ
+/* Shared input (STREAMNET) machines must answer the guest identically, but file times differ
  * between computers (copied or downloaded at different times, other time zones). While a
  * session runs, local folder drives report one fixed date and time for every file. */
-static inline void INPUTNET_FixFileTime(uint16_t &date,uint16_t &time) {
-    if (INPUTNET_IsConnected()) { date = DOS_PackDate(1996,1,1); time = DOS_PackTime(12,0,0); }
+static inline void STREAMNET_FixFileTime(uint16_t &date,uint16_t &time) {
+    if (STREAMNET_IsConnected()) { date = DOS_PackDate(1996,1,1); time = DOS_PackTime(12,0,0); }
 }
 /* ...and the same attributes on every system (Windows reports the file system's own: archive, read-only, hidden;
  * other systems make them up): a directory, or an archive file. */
-static inline void INPUTNET_FixFileAttr(uint16_t &attr) {
-    if (INPUTNET_IsConnected()) attr = (attr & 0x10u) ? 0x10u : 0x20u;
+static inline void STREAMNET_FixFileAttr(uint16_t &attr) {
+    if (STREAMNET_IsConnected()) attr = (attr & 0x10u) ? 0x10u : 0x20u;
 }
 #include "drives.h"
 #include "logging.h"
@@ -1462,7 +1462,7 @@ bool localDrive::MountedFileFindNext(DOS_DTA &dta,uint16_t id) {
 			find_time=6;
 			find_date=4;
 		}
-		INPUTNET_FixFileTime(find_date,find_time);
+		STREAMNET_FixFileTime(find_date,find_time);
 
 		char find_name[DOS_NAMELENGTH_ASCII];
 		strcpy(find_name,entry_name.c_str());
@@ -2029,7 +2029,7 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		strcat(tempDir,end);
 	}
 
-	if (INPUTNET_IsConnected() && lfn_filefind_handle>=LFN_FILEFIND_MAX) {
+	if (STREAMNET_IsConnected() && lfn_filefind_handle>=LFN_FILEFIND_MAX) {
 		/* a shared input session: the DTA holds the search's place (SessionFindNext) */
 		const std::string dosdir = MountedFileKey(_dir);
 		std::vector<SessionEntry> listing;
@@ -2107,7 +2107,7 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 
 char * DBCS_upcase(char * str);
 
-/* Shared input sessions (RollbackNet, lockstep InputNet): every machine must find the same files in the same order and
+/* Shared input sessions (RollbackNet, lockstep StreamNet): every machine must find the same files in the same order and
  * store the same bytes in the guest's DTA, and a rollback must be able to go back to the middle of a search. So a
  * search keeps its place in the DTA, as DOS does, instead of in a host-side slot (whose number depends on each
  * computer's history: replays, host-side scans, and which a rollback does not restore): dirCluster holds a key for the
@@ -2198,7 +2198,7 @@ bool localDrive::SessionFindNext(DOS_DTA &dta) {
 		strncpy(lfind_name,e.lname.c_str(),LFN_NAMELENGTH);
 		lfind_name[LFN_NAMELENGTH]=0;
 		uint16_t find_date = 0, find_time = 0;
-		INPUTNET_FixFileTime(find_date,find_time);
+		STREAMNET_FixFileTime(find_date,find_time);
 		dta.SetResult(find_name,lfind_name,(uint32_t)(size % 0x100000000ull),(uint32_t)(size / 0x100000000ull),find_date,find_time,(uint8_t)attr);
 		dta.SetDirID((uint16_t)(i + 1));
 		return true;
@@ -2208,7 +2208,7 @@ bool localDrive::SessionFindNext(DOS_DTA &dta) {
 }
 
 bool localDrive::FindNext(DOS_DTA & dta) {
-	if (INPUTNET_IsConnected() && lfn_filefind_handle>=LFN_FILEFIND_MAX) return SessionFindNext(dta);
+	if (STREAMNET_IsConnected() && lfn_filefind_handle>=LFN_FILEFIND_MAX) return SessionFindNext(dta);
 
 	char * dir_ent, *ldir_ent;
 	ht_stat_t stat_block, special_stat_block;
@@ -2322,7 +2322,7 @@ again:
 		find_time=6; 
 		find_date=4;
 	}
-	INPUTNET_FixFileTime(find_date,find_time);
+	STREAMNET_FixFileTime(find_date,find_time);
 	dta.SetResult(find_name,lfind_name,find_size,find_hsize,find_date,find_time,find_attr);
 	return true;
 }
@@ -2447,7 +2447,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
 #else
 				if (!(st.st_mode & S_IWUSR)) *attr |= DOS_ATTR_READ_ONLY;
 #endif
-				INPUTNET_FixFileAttr(*attr);
+				STREAMNET_FixFileAttr(*attr);
 				return true;
 			}
 			*attr = 0;
@@ -2478,7 +2478,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
 		return false;
 		}
 	*attr = attribs&0x3f;
-	INPUTNET_FixFileAttr(*attr);
+	STREAMNET_FixFileAttr(*attr);
 	return true;
 #else
 	ht_stat_t status;
@@ -2499,7 +2499,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
             if (len & 2) *attr|=DOS_ATTR_HIDDEN;
             if (len & 4) *attr|=DOS_ATTR_SYSTEM;
         }
-		INPUTNET_FixFileAttr(*attr);
+		STREAMNET_FixFileAttr(*attr);
 		return true;
 	}
 	*attr=0;
@@ -2579,7 +2579,7 @@ HANDLE localDrive::CreateOpenFile(const char* name) {
 }
 
 unsigned long localDrive::GetSerial() {
-	if (INPUTNET_IsConnected()) return 0x1234; /* the same on every shared input machine */
+	if (STREAMNET_IsConnected()) return 0x1234; /* the same on every shared input machine */
 	char newname[CROSS_LEN];
 	strcpy(newname,basedir);
 	CROSS_FILENAME(newname);
@@ -2755,14 +2755,14 @@ bool localDrive::Rename(const char * oldname,const char * newname) {
 #include <sys/statvfs.h>
 #endif
 
-/* Shared input (INPUTNET) machines must answer the guest identically, but host disks differ.
+/* Shared input (STREAMNET) machines must answer the guest identically, but host disks differ.
  * Unless the mount set a size, report the same 1 GB drive with 512 MB free on every machine. */
-static bool INPUTNET_FixedAllocation(bool sized) {
-    return !sized && INPUTNET_IsConnected();
+static bool STREAMNET_FixedAllocation(bool sized) {
+    return !sized && STREAMNET_IsConnected();
 }
 
 bool localDrive::AllocationInfo64(uint32_t* _bytes_sector, uint32_t* _sectors_cluster, uint64_t* _total_clusters, uint64_t* _free_clusters) {
-    if (INPUTNET_FixedAllocation(allocation.total_clusters || allocation.free_clusters)) {
+    if (STREAMNET_FixedAllocation(allocation.total_clusters || allocation.free_clusters)) {
         *_bytes_sector = 512; *_sectors_cluster = 32; *_total_clusters = 65535; *_free_clusters = 32768;
         return true;
     }
@@ -2889,7 +2889,7 @@ bool localDrive::AllocationInfo64(uint32_t* _bytes_sector, uint32_t* _sectors_cl
  }
 
  bool localDrive::AllocationInfo(uint16_t* _bytes_sector, uint8_t* _sectors_cluster, uint16_t* _total_clusters, uint16_t* _free_clusters) {
-     if (INPUTNET_FixedAllocation(allocation.total_clusters || allocation.free_clusters)) {
+     if (STREAMNET_FixedAllocation(allocation.total_clusters || allocation.free_clusters)) {
          *_bytes_sector = 512; *_sectors_cluster = 32; *_total_clusters = 65535; *_free_clusters = 32768;
          return true;
      }
@@ -3047,7 +3047,7 @@ bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
 				stat_block->time=DOS_PackTime((uint16_t)mtime->tm_hour,(uint16_t)mtime->tm_min,(uint16_t)mtime->tm_sec);
 				stat_block->date=DOS_PackDate((uint16_t)(mtime->tm_year+1900),(uint16_t)(mtime->tm_mon+1),(uint16_t)mtime->tm_mday);
 			}
-			INPUTNET_FixFileTime(stat_block->date,stat_block->time);
+			STREAMNET_FixFileTime(stat_block->date,stat_block->time);
 			stat_block->size=(uint32_t)st.st_size;
 			return true;
 		}
@@ -3081,7 +3081,7 @@ bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
 		stat_block->time=DOS_PackTime((uint16_t)time->tm_hour,(uint16_t)time->tm_min,(uint16_t)time->tm_sec);
 		stat_block->date=DOS_PackDate((uint16_t)(time->tm_year+1900),(uint16_t)(time->tm_mon+1),(uint16_t)time->tm_mday);
 	}
-	INPUTNET_FixFileTime(stat_block->date,stat_block->time);
+	STREAMNET_FixFileTime(stat_block->date,stat_block->time);
 	stat_block->size=(uint32_t)temp_stat.st_size;
 	return true;
 }
@@ -3610,7 +3610,7 @@ bool LocalFile::UpdateDateTimeFromHost(void) {
 	} else {
 		time=1;date=1;
 	}
-	INPUTNET_FixFileTime(date,time);
+	STREAMNET_FixFileTime(date,time);
 	return true;
 }
 

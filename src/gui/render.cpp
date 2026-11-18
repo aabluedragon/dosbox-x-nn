@@ -485,7 +485,7 @@ bool RENDER_StartUpdate(void) {
         }
     }
     render.updating = true;
-    { extern bool inputnet_rollback_resim; if (!inputnet_rollback_resim) render_frames_started++; }
+    { extern bool streamnet_rollback_resim; if (!streamnet_rollback_resim) render_frames_started++; }
     return true;
 }
 

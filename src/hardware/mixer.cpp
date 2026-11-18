@@ -784,7 +784,7 @@ void MIXER_MixSingle(Bitu /*val*/) {
     PIC_AddEvent(MIXER_MixSingle,1000.0 / mixer.freq);
 }
 
-/* RollbackNet (inputnet "mode = rollback"): while frames are replayed after a correction, the sound they produce
+/* RollbackNet (streamnet "mode = rollback"): while frames are replayed after a correction, the sound they produce
  * was already heard; it is rendered (the sound devices must run exactly as before) but not queued. */
 static bool mixer_rollback_discard = false;
 void MIXER_SetRollbackDiscard(bool on) { mixer_rollback_discard = on; }
@@ -793,8 +793,8 @@ Bitu MIXER_GetRate(void) { return (Bitu)mixer.freq; }   /* RollbackNet's setting
 /* RollbackNet needs the same number of samples per emulated millisecond on every participant (the Sound Blaster
  * and other devices are paced by it): a fixed rate that 1000 divides, whatever the host's audio device prefers. */
 static bool MIXER_RollbackMode(void) {
-    Section_prop *s = static_cast<Section_prop *>(control->GetSection("inputnet"));
-    return s != NULL && s->Get_bool("inputnet") && std::string(s->Get_string("mode")) == "rollback";
+    Section_prop *s = static_cast<Section_prop *>(control->GetSection("streamnet"));
+    return s != NULL && s->Get_bool("streamnet") && std::string(s->Get_string("mode")) == "rollback";
 }
 
 static void MIXER_Mix(void) {

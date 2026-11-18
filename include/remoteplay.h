@@ -1,12 +1,12 @@
 /*
- *  Inputnet remote play: the host runs the game and streams its picture and
+ *  StreamNet remote play: the host runs the game and streams its picture and
  *  sound; viewers only send keyboard and mouse input back.
  */
 
 #ifndef DOSBOX_REMOTEPLAY_H
 #define DOSBOX_REMOTEPLAY_H
 
-#include "inputnet.h"
+#include "streamnet.h"
 
 #include <stdint.h>
 #include <string>
@@ -19,7 +19,7 @@ class Program;
 extern bool remoteplay_streaming;
 
 /* Set while a remote play host does not show its picture on this machine
- * ([inputnet] hostscreen=false, -inputnet-hidescreen, or the "Show screen
+ * ([streamnet] hostscreen=false, -streamnet-hidescreen, or the "Show screen
  * (remote play)" menu item). The render code then only keeps the frame the
  * viewers are sent, the window shows a small placeholder, and the mixer
  * silences the local sound output (the viewers still get the sound). */
@@ -42,7 +42,7 @@ void REMOTEPLAY_AddAudio(unsigned rate,unsigned frames,const int16_t *samples);
  * play host, and whether it starts with the local screen hidden. */
 bool REMOTEPLAY_HostRequested(void);
 
-/* -inputnet-lockdown: this emulator runs a copy of a game for a remote player (NukemNet's IPX/NullModem-over-InputNet
+/* -streamnet-lockdown: this emulator runs a copy of a game for a remote player (NukemNet's IPX/NullModem-over-StreamNet
  * with a Windows guest), who controls the guest completely and could run anything inside it. Such a copy may not
  * change the host's files: folders are mounted read-only, a disk image is writable only through a disk layer
  * (IMGMOUNT -nnlayer, a private file the launcher deletes afterwards) and is read-only otherwise, nothing is captured

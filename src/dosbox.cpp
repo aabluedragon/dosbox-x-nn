@@ -82,7 +82,7 @@
 #include "pci_bus.h"
 #include "parport.h"
 #include "keyboard.h"
-#include "inputnet.h"
+#include "streamnet.h"
 #if defined(__linux__) && defined(__GLIBC__)
 #include <execinfo.h>
 #endif
@@ -556,14 +556,14 @@ static Bitu Normal_Loop(void) {
             } else {
                 /* RollbackNet replays frames at full speed after a correction: host events (input, window) wait
                  * until it has caught up with real time again. */
-                if (!inputnet_rollback_resim) GFX_Events();
-                else INPUTNET_ReplayPublish();  /* (our input keeps going out at real time meanwhile) */
+                if (!streamnet_rollback_resim) GFX_Events();
+                else STREAMNET_ReplayPublish();  /* (our input keeps going out at real time meanwhile) */
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
                     TIMER_AddTick();
                     ticksRemain--;
                     /* Every emulated millisecond starts here: a clean point (all tick handlers done, the mixer has
                      * finished the previous millisecond) to save, restore and replay frames. */
-                    if (inputnet_rollback_active) INPUTNET_RollbackTick();
+                    if (streamnet_rollback_active) STREAMNET_RollbackTick();
                 } else {
                     increaseticks();
                     return 0;
@@ -627,7 +627,7 @@ void DOSBOX_ApplyCycleMax(cpu_cycles_count_t newmax,bool reset_counters) {
  * distributes it, and applies it on every participant at the same emulated
  * time. Returns true if the new speed was applied here and now. */
 bool DOSBOX_SetCycleMax(cpu_cycles_count_t newmax,bool reset_counters) {
-    if (INPUTNET_ProposeCycleMax((uint32_t)newmax,reset_counters)) return false;
+    if (STREAMNET_ProposeCycleMax((uint32_t)newmax,reset_counters)) return false;
 
     DOSBOX_ApplyCycleMax(newmax,reset_counters);
     return true;
@@ -737,7 +737,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
      * and dropping that time made the shared game run behind real time: the computers' time sync then slowed the others
      * to match, and the whole game ran in slow motion (about 75% of real time at 220 ms, Nov 2026). Catch it up instead,
      * up to two seconds (beyond that, as after a resync's transfer, the time sync evens things out). */
-    const Bitu ticks_window = inputnet_rollback_active ? 2000u : 20u;
+    const Bitu ticks_window = streamnet_rollback_active ? 2000u : 20u;
     if (ticksRemain > ticks_window) {
         ticksRemain = ticks_window;
     }
@@ -748,7 +748,7 @@ void increaseticks() { //Make it return ticksRemain and set it in the function a
         return;
     // RollbackNet: the speed is part of the shared machine. A guess from this computer's own timing would differ on
     // every computer (cycles=max/auto stay at the speed the session started with).
-    if (inputnet_rollback_active)
+    if (streamnet_rollback_active)
         return;
 
     if (ticksScheduled >= 250 || ticksDone >= 250 || (ticksAdded > TICKS_GAP_PANIC && ticksScheduled >= 5)) {
@@ -902,7 +902,7 @@ volatile int runmachine_recursion = 0;
  * the innermost one still running (0 outside any). Host code runs nested loops for a program's EXEC from the shell, DOS
  * waiting for a key (CALLBACK_Idle), a page fault the normal core runs the guest's handler for, and every BIOS call DOS
  * makes for the console (CALLBACK_RunRealInt). Two moments with the same number have the same host stack, so a machine
- * state saved at the first can be loaded at the second (RollbackNet, inputnet.cpp); a nested loop that started and
+ * state saved at the first can be loaded at the second (RollbackNet, streamnet.cpp); a nested loop that started and
  * ended in between changes nothing. */
 uint32_t dosbox_runmachine_context = 0;
 static uint32_t dosbox_runmachine_next = 0;
@@ -931,7 +931,7 @@ void DOSBOX_RunMachine(void){
         static const bool ctxlog = getenv("NN_RB_CTXLOG") != NULL && *getenv("NN_RB_CTXLOG");
         static unsigned logged = 0;
         extern bool dos_shell_reading_input;
-        if (ctxlog && inputnet_rollback_active && !dos_shell_reading_input && logged < 60) {
+        if (ctxlog && streamnet_rollback_active && !dos_shell_reading_input && logged < 60) {
             void *frames[6];
             const int n = backtrace(frames, 6);
             char **names = backtrace_symbols(frames, n);
@@ -5445,26 +5445,26 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("Enable ipx over UDP/IP emulation.");
     Pbool->SetBasic(true);
 
-    const char* inputnetcyclesync[] = { "auto", "freeze", "off", 0 };
+    const char* streamnetcyclesync[] = { "auto", "freeze", "off", 0 };
 
-    secprop=control->AddSection_prop("inputnet",&Null_Init,true);
-    Pbool = secprop->Add_bool("inputnet",Property::Changeable::WhenIdle, false);
+    secprop=control->AddSection_prop("streamnet",&Null_Init,true);
+    Pbool = secprop->Add_bool("streamnet",Property::Changeable::WhenIdle, false);
     Pbool->Set_help("Enable shared keyboard/mouse input over UDP between DOSBox-X sessions.\n"
                     "This makes DOS games that only support two players on one PC (two sets of keys on the\n"
                     "same keyboard, no IPX or serial multiplayer) playable over a network: the participating\n"
                     "DOSBox-X sessions run the same machine in lockstep and every session receives the input\n"
                     "of every player. Only emulator state and input are exchanged, never video.\n"
-                    "Once enabled, use the INPUTNET command to host or join a session.\n"
+                    "Once enabled, use the STREAMNET command to host or join a session.\n"
                     "All participating sessions must run the same DOSBox-X version and the same configuration.\n"
                     "The emulated CPU speed is synchronized as well, so \"cycles=max\" and \"cycles=auto\" can be\n"
                     "used; see the \"cycle sync\" option below.");
     Pbool->SetBasic(true);
 
-    const char* inputnetmodes[] = { "remote", "lockstep", "rollback", 0 };
-    const char* inputnetpresent[] = { "flip", "retrace", "scanout", nullptr };
-    const char* inputnetscaling[] = { "nearest", "bilinear", "sharp", nullptr };
+    const char* streamnetmodes[] = { "remote", "lockstep", "rollback", 0 };
+    const char* streamnetpresent[] = { "flip", "retrace", "scanout", nullptr };
+    const char* streamnetscaling[] = { "nearest", "bilinear", "sharp", nullptr };
     Pstring = secprop->Add_string("mode",Property::Changeable::WhenIdle, "remote");
-    Pstring->Set_values(inputnetmodes);
+    Pstring->Set_values(streamnetmodes);
     Pstring->Set_help("How the players share the game.\n"
                       "  remote:   only the host runs the game. It sends its picture and sound to the other\n"
                       "            players, whose DOSBox-X only shows them and sends keyboard and mouse input\n"
@@ -5487,7 +5487,7 @@ void DOSBOX_SetupConfigSections(void) {
                    "game draws. Lower it to save upload bandwidth.");
 
     Pstring = secprop->Add_string("present",Property::Changeable::WhenIdle, "flip");
-    Pstring->Set_values(inputnetpresent);
+    Pstring->Set_values(streamnetpresent);
     Pstring->Set_help("Remote play host: when a frame is taken for the players (and for this screen).\n"
                       "  flip:    as soon as the game shows another page of video memory, and otherwise\n"
                       "           at the start of vertical retrace (the least delay).\n"
@@ -5502,7 +5502,7 @@ void DOSBOX_SetupConfigSections(void) {
                     "false turns all prediction off.");
 
     Pstring = secprop->Add_string("viewer scaling",Property::Changeable::WhenIdle, "nearest");
-    Pstring->Set_values(inputnetscaling);
+    Pstring->Set_values(streamnetscaling);
     Pstring->Set_help("Remote play viewer: how the host's picture is enlarged to the window. Only the viewer does it,\n"
                       "after the picture arrived, with the graphics card: the host sends the same small picture\n"
                       "whatever is chosen, so it costs no bandwidth and no latency.\n"
@@ -5533,20 +5533,20 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pbool = secprop->Add_bool("hostscreen",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("Remote play host: show the game on this machine too. If false (or with the command line\n"
-                    "option -inputnet-hidescreen), the window stays small, without the picture, does not take\n"
+                    "option -streamnet-hidescreen), the window stays small, without the picture, does not take\n"
                     "the focus when it opens and plays no sound here; the players still get the full picture\n"
                     "and sound. \"Show screen (remote play)\" in the Video menu shows or hides it at any time.");
 
     Pint = secprop->Add_int("port",Property::Changeable::WhenIdle, 2130);
-    Pint->Set_help("Default UDP port used by the INPUTNET command.");
+    Pint->Set_help("Default UDP port used by the STREAMNET command.");
 
     Pstring = secprop->Add_string("startserver",Property::Changeable::WhenIdle, "");
     Pstring->Set_help("If set to a port number, host a shared input session on that port when DOSBox-X starts.\n"
-                      "The command line option -inputnet-server takes precedence over this setting.");
+                      "The command line option -streamnet-server takes precedence over this setting.");
 
     Pstring = secprop->Add_string("connect",Property::Changeable::WhenIdle, "");
     Pstring->Set_help("If set to \"address\" or \"address:port\", join the shared input session hosted there when\n"
-                      "DOSBox-X starts. The command line option -inputnet-connect takes precedence over this setting.");
+                      "DOSBox-X starts. The command line option -streamnet-connect takes precedence over this setting.");
 
     Pint = secprop->Add_int("frame",Property::Changeable::WhenIdle, 10);
     Pint->Set_help("Length in emulated milliseconds of one shared input frame. Input is exchanged, and the\n"
@@ -5623,7 +5623,7 @@ void DOSBOX_SetupConfigSections(void) {
                     "where only the keyboard is used, so that each player keeps their own mouse pointer.");
 
     Pstring = secprop->Add_string("cycle sync",Property::Changeable::WhenIdle, "auto");
-    Pstring->Set_values(inputnetcyclesync);
+    Pstring->Set_values(streamnetcyclesync);
     Pstring->Set_help("How the emulated CPU speed is kept identical across the participating sessions, which is\n"
                       "required for them to stay in sync.\n"
                       "  auto:   the server owns the cycle count and publishes every change to the others, which\n"

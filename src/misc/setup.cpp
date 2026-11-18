@@ -857,6 +857,8 @@ bool Section_prop::HandleInputline(string const& gegevens) {
 	   ) val = val.substr(1,length - 2);
     /* trim the results in case there were spaces somewhere */
     trim(name);trim(val);
+    /* (the [streamnet] section's switch was called "inputnet" before the rename) */
+    if (!strcasecmp(name.c_str(),"inputnet") && !strcasecmp(GetName(),"streamnet")) name = "streamnet";
     for(it tel = properties.begin();tel != properties.end();++tel) {
         if (!strcasecmp((*tel)->propname.c_str(),name.c_str())) {
             if (!((*tel)->SetValue(val))) return false;
@@ -1194,6 +1196,9 @@ Section* Config::GetSection(string const& _sectionname) const{
     for (const_it tel = sectionlist.begin(); tel != sectionlist.end(); ++tel){
         if (!strcasecmp((*tel)->GetName(),_sectionname.c_str())) return (*tel);
     }
+    /* [inputnet]: the [streamnet] section's name before it was renamed (configuration files and NukemNet versions of
+     * that time use it) */
+    if (!strcasecmp(_sectionname.c_str(),"inputnet")) return GetSection(std::string("streamnet"));
     return NULL;
 }
 

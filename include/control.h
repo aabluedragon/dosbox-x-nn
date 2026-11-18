@@ -65,10 +65,10 @@ public:
     void ClearExtraData() { Section_prop *sec_prop; Section_line *sec_line; for (const_it tel = sectionlist.begin(); tel != sectionlist.end(); ++tel) {sec_prop = dynamic_cast<Section_prop *>(*tel); sec_line = dynamic_cast<Section_line *>(*tel); if (sec_prop) sec_prop->data = ""; else if (sec_line) sec_line->data = "";} }
 public:
     std::string opt_editconf,opt_opensaves,opt_opencaptures,opt_lang="",opt_machine="";
-    std::string opt_inputnet_connect="";    /* -inputnet-connect <host[:port]> */
-    int opt_inputnet_server = -1;           /* -inputnet-server [port], -1 = not requested */
-    bool opt_inputnet_hidescreen = false;   /* -inputnet-hidescreen: [inputnet] hostscreen=false */
-    bool opt_inputnet_lockdown = false;     /* -inputnet-lockdown: this copy plays for a remote player and may not change
+    std::string opt_streamnet_connect="";    /* -streamnet-connect <host[:port]> */
+    int opt_streamnet_server = -1;           /* -streamnet-server [port], -1 = not requested */
+    bool opt_streamnet_hidescreen = false;   /* -streamnet-hidescreen: [streamnet] hostscreen=false */
+    bool opt_streamnet_lockdown = false;     /* -streamnet-lockdown: this copy plays for a remote player and may not change
                                                anything on the host (see NN_Lockdown in src/hardware/remoteplay.cpp) */
 #if defined(C_DOSBOX_AGENT)
     std::string opt_agent_config;

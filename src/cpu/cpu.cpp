@@ -24,7 +24,7 @@
 #include "cpu.h"
 #include "debug.h"
 #include "mapper.h"
-#include "inputnet.h"
+#include "streamnet.h"
 #include "paging.h"
 #include "callback.h"
 #include "lazyflags.h"
@@ -100,9 +100,9 @@ extern bool use_dynamic_core_with_paging;
 extern bool auto_determine_dynamic_core_paging;
 
 uint64_t rdtsc_count_base = 0;
-extern bool inputnet_rollback_active;     /* inputnet.cpp (the CPU component's speed, SerializeCPU) */
-bool INPUTNET_PendingSpeed(uint32_t &frame, uint32_t &speed);
-void INPUTNET_ScheduleSpeed(uint32_t frame, uint32_t speed);
+extern bool streamnet_rollback_active;     /* streamnet.cpp (the CPU component's speed, SerializeCPU) */
+bool STREAMNET_PendingSpeed(uint32_t &frame, uint32_t &speed);
+void STREAMNET_ScheduleSpeed(uint32_t frame, uint32_t speed);
 pic_tickindex_t rdtsc_pic_base = 0;
 
 bool cpu_double_fault_enable;
@@ -3346,7 +3346,7 @@ void CPU_SyncCycleMaxToProp(void) {
  * the same speed. Leave the session first (the state is picked up again on
  * reconnect) if the speed needs adjusting. */
 static bool CPU_CycleChangeBlocked(void) {
-	if (!inputnet_capture_active) return false;
+	if (!streamnet_capture_active) return false;
 	LOG_MSG("CPU: the cycle count cannot be changed while a shared input session is running.");
 	return true;
 }
@@ -4249,7 +4249,7 @@ public:
 		if(CPU_CycleMax <= 0) {
 			/* RollbackNet at cycles=max: every machine starts at the same speed (the server then sets it from what
 			 * every computer measures); 3000 left a game crawling through its start until the speed had climbed */
-			Section_prop *in = static_cast<Section_prop*>(control->GetSection("inputnet"));
+			Section_prop *in = static_cast<Section_prop*>(control->GetSection("streamnet"));
 			const bool rollback = in != NULL && std::string(in->Get_string("mode")) == "rollback";   /* (hosts and joining players set only the mode) */
 			CPU_CycleMax = (rollback && CPU_CycleAutoAdjust) ? 40000 : 3000;
 		}
@@ -5073,7 +5073,7 @@ void getBytes(std::ostream& stream) override
         stream.write(reinterpret_cast<const char*>(&pic_lo), sizeof(pic_lo));
         /* the speed change still to come (RollbackNet schedules them ahead): a machine that loads this learns it */
         uint32_t at = 0, speed = 0;
-        if (!INPUTNET_PendingSpeed(at, speed)) at = speed = 0;
+        if (!STREAMNET_PendingSpeed(at, speed)) at = speed = 0;
         stream.write(reinterpret_cast<const char*>(&at), sizeof(at));
         stream.write(reinterpret_cast<const char*>(&speed), sizeof(speed));
     }
@@ -5143,14 +5143,14 @@ void setBytes(std::istream& stream) override
             stream.read(reinterpret_cast<char*>(&pic_hi), sizeof(pic_hi));
             stream.read(reinterpret_cast<char*>(&pic_lo), sizeof(pic_lo));
         }
-        if (got && stream.gcount() == (std::streamsize)sizeof(pic_lo) && inputnet_rollback_active && cmax > 0) {
+        if (got && stream.gcount() == (std::streamsize)sizeof(pic_lo) && streamnet_rollback_active && cmax > 0) {
             CPU_CycleMax = (cpu_cycles_count_t)cmax;
             rdtsc_count_base = count;
             rdtsc_pic_base = (pic_tickindex_t)pic_hi + (pic_tickindex_t)pic_lo;
             uint32_t at = 0, speed = 0;
             stream.read(reinterpret_cast<char*>(&at), sizeof(at));
             stream.read(reinterpret_cast<char*>(&speed), sizeof(speed));
-            if (stream.gcount() == (std::streamsize)sizeof(speed) && speed != 0) INPUTNET_ScheduleSpeed(at, speed);
+            if (stream.gcount() == (std::streamsize)sizeof(speed) && speed != 0) STREAMNET_ScheduleSpeed(at, speed);
         }
         stream.clear();
     }

@@ -539,9 +539,9 @@ int floppy_data_rate;
 
 void diskio_delay(Bits value/*bytes*/, int type = -1) {
     /* RollbackNet: no emulated disk speed. The delay idles through nested emulation loops inside the DOS call, and no
-     * rollback can cross those (inputnet.cpp, RB_HostContext): every file read would stop prediction for a while. */
-    extern bool inputnet_rollback_active;
-    if (inputnet_rollback_active) return;
+     * rollback can cross those (streamnet.cpp, RB_HostContext): every file read would stop prediction for a while. */
+    extern bool streamnet_rollback_active;
+    if (streamnet_rollback_active) return;
     if ((type == 0 && floppy_data_rate != 0) || (type != 0 && disk_data_rate != 0)) {
         double scalar;
         double endtime;
@@ -1033,7 +1033,7 @@ void DOS_FlushSTDIN(void) {
     }
 }
 
-uint32_t INPUTNET_TraceFrame(void);
+uint32_t STREAMNET_TraceFrame(void);
 static Bitu DOS_21TraceHandler(void) {
     const uint16_t ax = reg_ax, bx = reg_bx, cx = reg_cx, dx = reg_dx;
     char name[64] = {0};
@@ -1047,7 +1047,7 @@ static Bitu DOS_21TraceHandler(void) {
         char lname[LFN_NAMELENGTH+1]; uint32_t size, hsize; uint16_t date, time; uint8_t attr;
         dta.GetResult(found, lname, size, hsize, date, time, attr);
     }
-    LOG_MSG("RBDOS f=%u ax=%04x bx=%04x cx=%04x dx=%04x -> ax=%04x cf=%u%s%s%s%s", (unsigned)INPUTNET_TraceFrame(), ax, bx, cx, dx,
+    LOG_MSG("RBDOS f=%u ax=%04x bx=%04x cx=%04x dx=%04x -> ax=%04x cf=%u%s%s%s%s", (unsigned)STREAMNET_TraceFrame(), ax, bx, cx, dx,
         reg_ax, (unsigned)(reg_flags & 1), name[0] ? " name=" : "", name, found[0] ? " found=" : "", found);
     return r;
 }
@@ -4167,7 +4167,7 @@ static Bitu DOS_29Handler(void)
 
 void AddBPINT3(void);
 void IPX_Setup(Section*);
-void INPUTNET_Setup(Section*);
+void STREAMNET_Setup(Section*);
 void DOS_SetupIHSEG(void);
 void DOS_CreateDummyDeviceMCB(void);
 void DOS_MemStartChange(uint16_t adjto);
@@ -4826,7 +4826,7 @@ public:
 # endif
 #endif
 
-		INPUTNET_Setup(NULL);
+		STREAMNET_Setup(NULL);
 
 		DOS_SetupPrograms();
 		DOS_SetupMisc();							/* Some additional dos interrupts */

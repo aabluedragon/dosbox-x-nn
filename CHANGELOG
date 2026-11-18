@@ -1,8 +1,8 @@
 Next version:
-  - Added shared input ("inputnet") emulation and the INPUTNET command, so that
+  - Added shared input ("streamnet") emulation and the STREAMNET command, so that
     DOS games which only ever supported two players on one PC sharing one
     keyboard can be played over a network. One DOSBox-X session hosts
-    (INPUTNET STARTSERVER) and the others join (INPUTNET CONNECT address); the
+    (STREAMNET STARTSERVER) and the others join (STREAMNET CONNECT address); the
     host hands its complete emulator state to each joining session, after which
     the sessions run in lockstep and every session receives the keyboard and
     mouse input of every player. Only emulator state and input are exchanged,
@@ -13,8 +13,8 @@ Next version:
     the sessions run in lockstep it settles on a speed the slowest machine can
     sustain. A periodic machine checksum reports a loss of synchronization
     instead of letting it silently ruin the game. Enabled with
-    "inputnet=true" in the new [inputnet] section, or with the
-    -inputnet-server / -inputnet-connect command line options.
+    "streamnet=true" in the new [streamnet] section, or with the
+    -streamnet-server / -streamnet-connect command line options.
   - macOS: Switching to full screen or zooming the window with output=opengl
     no longer garbles the picture (the image sheared into several copies with
     video memory junk below). The window surface DOSBox-X also uses on the

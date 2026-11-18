@@ -20,7 +20,7 @@
 
 #include "dosbox.h"
 #include "keyboard.h"
-#include "inputnet.h"
+#include "streamnet.h"
 #include "logging.h"
 #include "support.h"
 #include "setup.h"
@@ -1910,7 +1910,7 @@ void KEYBOARD_AddKey(KBD_KEYS keytype,bool pressed) {
     /* While a shared input session is running the key is not applied here.
      * It is handed to the other DOSBox-X instances instead and every instance
      * (including this one) applies it at the same emulated time. */
-    if (inputnet_capture_active && INPUTNET_InterceptKey(keytype,pressed))
+    if (streamnet_capture_active && STREAMNET_InterceptKey(keytype,pressed))
         return;
 
     KEYBOARD_AddKeyRaw(keytype,pressed);

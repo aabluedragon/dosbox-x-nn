@@ -394,7 +394,7 @@ int GameLink::Init( const bool trackonly_mode )
 }
 
 // Guest RAM of our own (not the shared memory) starts on a host page: RollbackNet's write tracking
-// (inputnet.cpp, RBT_*) protects it page by page. malloc would put it 16 bytes into a page.
+// (streamnet.cpp, RBT_*) protects it page by page. malloc would put it 16 bytes into a page.
 static size_t gl_own_ram_size = 0;
 
 static uint8_t* gl_alloc_own_ram( const size_t size )

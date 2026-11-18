@@ -2805,7 +2805,7 @@ void unmount(int lcv) {
     }
 }
 
-/* Set while a shared input (INPUTNET) participant loads the server's state: every machine
+/* Set while a shared input (STREAMNET) participant loads the server's state: every machine
  * keeps the host folders and images it mounted itself, rather than the server's paths,
  * which usually do not exist here (another computer, often another operating system). */
 bool savestate_keep_local_drives = false;
@@ -2934,7 +2934,7 @@ void POD_Load_DOS_Files( std::istream& stream )
             char keep_info[sizeof(dinfo)] = {0};
             if (savestate_keep_local_drives && Drives[lcv]) strncpy(keep_info, Drives[lcv]->info, sizeof(keep_info)-1);
             else if (savestate_keep_local_drives && (!strncmp(dinfo,"local directory ",16) || !strncmp(dinfo,"isoDrive ",9) || !strncmp(dinfo,"fatDrive ",9)))
-                LOG_MSG("INPUTNET: drive %c: is not mounted here; mount it the same way on every computer",'A'+lcv);
+                LOG_MSG("STREAMNET: drive %c: is not mounted here; mount it the same way on every computer",'A'+lcv);
             if( !keep_info[0] && Drives[lcv] && strcasecmp(Drives[lcv]->info, dinfo) && (!strncmp(dinfo,"local directory ",16) || !strncmp(dinfo,"CDRom ",6) || !strncmp(dinfo,"PhysFS directory ",17) || !strncmp(dinfo,"PhysFS CDRom ",13) || (!strncmp(dinfo,"isoDrive ",9) || !strncmp(dinfo,"fatDrive ",9))))
                 unmount(lcv);
             if( !Drives[lcv] ) {

@@ -716,7 +716,7 @@ bool CRBNullModem::LoadRBExtra(const uint8_t *&p, const uint8_t *end) {
 	return true;
 }
 
-/* For RollbackNet (inputnet.cpp). Lines: bit 0 RTS, bit 1 DTR, bit 7 this copy has the port. */
+/* For RollbackNet (streamnet.cpp). Lines: bit 0 RTS, bit 1 DTR, bit 7 this copy has the port. */
 bool SERIAL_RBPresent(void) { return rb_nullmodem != NULL; }
 
 void SERIAL_RBTakeOutbox(std::vector<uint8_t> &bytes, uint8_t &lines) {
