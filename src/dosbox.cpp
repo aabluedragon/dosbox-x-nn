@@ -5609,6 +5609,17 @@ void DOSBOX_SetupConfigSections(void) {
                    "moment (start the game this way, never from each machine's own AUTOEXEC). Letters, digits, spaces and\n"
                    "the usual punctuation.");
 
+    Pstring = secprop->Add_string("rollback sync files",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("mode=rollback with a cluster: the game files a player may bring along (their own controls and\n"
+                   "settings, such as DUKE3D.CFG): DOS paths relative to a mounted folder, * and ? allowed, separated by\n"
+                   "spaces or ;. A name without a folder matches in any folder. When a game starts, each joining player's\n"
+                   "DOSBox-X-NN sends its own of these files and the server maps them over the copy that player plays, so\n"
+                   "that copy runs with them on every computer. Someone who joins a running game takes the server's.");
+    Pstring = secprop->Add_string("rollback match files",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("mode=rollback: game files that must be the same on every computer and are never sent (the game's\n"
+                   "programs, its data such as DUKE3D.GRP): a join where one differs or is missing is refused, naming it.\n"
+                   "Same format as \"rollback sync files\".");
+
     Pint = secprop->Add_int("redundancy",Property::Changeable::WhenIdle, 4);
     Pint->Set_help("Number of past input frames repeated in every packet, so that a lost UDP datagram does not\n"
                    "stall the session. Valid range is 1 to 32.");

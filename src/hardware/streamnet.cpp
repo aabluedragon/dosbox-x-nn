@@ -210,7 +210,10 @@ enum {
     INPKT_CL_BULKACK= 21,   /* either: u32 blob id, u32 bytes received in order */
     INPKT_CL_AT     = 22,   /* follower -> leader: u32 frame, u32 epoch, u32 hash hi, lo, u16 packets, (u16 len, bytes)... */
     INPKT_CL_GO     = 23,   /* leader -> follower: u32 frame, u32 epoch, u16 events, events, u16 packets, (u16 len, bytes)... */
-    INPKT_CL_REWIND = 24    /* leader -> follower: u32 target frame, u32 real-time frame, u32 epoch */
+    INPKT_CL_REWIND = 24,   /* leader -> follower: u32 target frame, u32 real-time frame, u32 epoch */
+    /* mode=rollback clusters, a joining computer's own files ("rollback sync files", RB_UploadSyncFiles) */
+    INPKT_SYNCUP    = 25,   /* client -> server, before its HELLO: u8 copy, u32 total, u32 offset, u16 length, bytes */
+    INPKT_SYNCUPACK = 26    /* server -> client: u32 total, u32 bytes received in order, u8 taken (the game is starting) */
 };
 
 /* Input event types */
@@ -508,6 +511,9 @@ static void RBC_LeaderRewind(uint32_t target);
 static bool RBC_FollowersCanLoad(uint32_t f, uint32_t now);
 static void RBC_ServerDrop(unsigned id, const char *why);
 static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsigned copies, unsigned want);
+static void RB_UploadSyncFiles(void);
+static void RB_ServerSyncUp(const IPaddress &from, unsigned copy, uint32_t total, uint32_t off, const uint8_t *b, unsigned n);
+static void RB_ServerSyncCleanup(void);
 static bool RBC_ClientJoin(uint32_t total, uint32_t server_frame, uint32_t welcomed_at, std::string &errmsg);
 static void RBC_FollowerTick(void);
 static void RBC_LeaderGather(void);
@@ -1479,6 +1485,56 @@ static bool RB_TakeManifest(std::vector<uint8_t> &blob, std::vector<RBFile> &m) 
     return true;
 }
 
+/* --- RollbackNet: the players' own files, and the files that must match ------------------------------------------------
+ * "rollback sync files" (NukemNet: a game's files marked allowSync, such as DUKE3D.CFG with the player's controls and
+ * name): when a game starts, each joining computer sends its own of these, from the copy its player plays, before its
+ * HELLO (RB_UploadSyncFiles); the server maps them over its copy for that player (RBC_CMD_FILEMAP) and lets nobody in
+ * before every expected player's have come (RB_ServerTakeSyncFiles). The lists of files it then sends hold them, so
+ * every computer's copy for a player runs with that player's files, and nothing goes back to the player. Only names
+ * the server's own rules allow are taken. Someone who joins a running game sends nothing that is used: they take the
+ * server's, as for any other file. "rollback match files" (mustMatch: the game's programs and data, such as DUKE3D.EXE
+ * and DUKE3D.GRP) are never sent, either way: a join where one differs or is missing is refused, naming it. */
+static std::vector<std::string> rb_sync_rules, rb_match_rules;
+
+static void RB_ParseRules(const char *s, std::vector<std::string> &out) {
+    out.clear();
+    std::string cur;
+    for (const char *c = s ? s : ""; ; c++) {
+        if (*c == 0 || *c == ' ' || *c == ';' || *c == '\t' || *c == ',') {
+            while (!cur.empty() && cur[0] == '\\') cur.erase(0, 1);   /* (relative to the mounted folder) */
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+            if (*c == 0) break;
+            continue;
+        }
+        cur += (*c == '/') ? '\\' : (char)toupper((unsigned char)*c);
+    }
+}
+
+/* DOS wildcards: * and ? within one name (never across a backslash). */
+static bool RB_Glob(const char *p, const char *s) {
+    if (*p == 0) return *s == 0;
+    if (*p == '*') {
+        for (;;) {
+            if (RB_Glob(p + 1, s)) return true;
+            if (*s == 0 || *s == '\\') return false;
+            s++;
+        }
+    }
+    if (*s == 0) return false;
+    if (*p == '?' ? *s == '\\' : *p != *s) return false;
+    return RB_Glob(p + 1, s + 1);
+}
+
+/* "path": a manifest's (upper case, no drive). A rule without a folder matches the name in any folder. */
+static bool RB_RuleMatches(const std::vector<std::string> &rules, const std::string &path) {
+    const size_t bs = path.find_last_of('\\');
+    const char *name = path.c_str() + (bs == std::string::npos ? 0 : bs + 1);
+    for (size_t i = 0; i < rules.size(); i++)
+        if (RB_Glob(rules[i].c_str(), rules[i].find('\\') == std::string::npos ? name : path.c_str())) return true;
+    return false;
+}
+
 /* Client: which of the server's files it needs (bits), or false with "err" when one cannot be taken over. "mine": our
  * own files (of the same copy, in a cluster). */
 static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std::vector<RBFile> &mine, std::vector<uint8_t> &bits, uint64_t &total, std::string &err) {
@@ -1490,6 +1546,11 @@ static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std
         const RBFile *my = NULL;
         for (size_t k = 0; k < mine.size(); k++) if (mine[k].drive == t.drive && mine[k].path == t.path) { my = &mine[k]; break; }
         if (my != NULL && my->size == t.size && my->hash == t.hash) continue;
+        if (RB_RuleMatches(rb_match_rules, t.path)) {      /* ("rollback match files": never sent) */
+            err = std::string(1, (char)('A' + t.drive)) + ":\\" + t.path + " " + (my ? "differs from the server's" : "is missing here") +
+                ": it has to be the same on every computer";
+            return false;
+        }
         if (t.size > RB_SYNC_FILE_MAX) {
             err = std::string(1, (char)('A' + t.drive)) + ":\\" + t.path + " (" + std::to_string((unsigned long long)(t.size >> 10)) +
                 " KB) " + (my ? "differs from the server's" : "is missing here") + ": every computer needs the same version of the game";
@@ -2170,6 +2231,17 @@ static void STREAMNET_HandlePacket(const IPaddress &from,const uint8_t *data,siz
             break;
         }
 
+        case INPKT_SYNCUP: {
+            if (!streamnet_is_server || !streamnet_rollback || rbc_copies < 2) return;
+            const unsigned copy = r.u8();
+            const uint32_t total = r.u32(), off = r.u32();
+            const unsigned n = r.u16();
+            const uint8_t *b = n ? r.bytes(n) : NULL;
+            if (r.bad()) return;
+            RB_ServerSyncUp(from, copy, total, off, b, n);
+            break;
+        }
+
         case INPKT_STATEACK: {
             if (!streamnet_is_server) return;
             StreamNetPeer *p = STREAMNET_PeerByAddr(from);
@@ -2526,6 +2598,8 @@ static bool STREAMNET_Connect(const char *host,uint16_t port,std::string &errmsg
     w.u8((uint8_t)token.size());
     if (!token.empty()) w.bytes(token.data(),token.size());
     if (rbc_copies) { w.u8((uint8_t)rbc_copies); w.u8((uint8_t)rbc_copy); }   /* a cluster: the copy our player plays */
+
+    if (streamnet_rollback && rbc_copies >= 2) RB_UploadSyncFiles();    /* (our own files first: the server waits for them) */
 
     uint32_t total = 0, server_frame = 0, welcomed_at = 0;
     bool welcomed = false;
@@ -5202,7 +5276,7 @@ static void RBC_FollowerCommands(void) {
                     if (ld->AddMountedFile(m[i].path.c_str(), m[i].host.c_str(), true))
                         rb_sync_mapped.push_back(std::make_pair((int)m[i].drive, m[i].path));
                 }
-                LOG_MSG("STREAMNET: cluster: using %u of the server's files in this copy", (unsigned)m.size());
+                LOG_MSG("STREAMNET: cluster: %u files mapped into this copy (the server's, or its player's own)", (unsigned)m.size());
                 break;
             }
             case RBC_CMD_LOADRESYNC: {      /* at a frame start: the server's machine for this copy at frame c.a */
@@ -5783,6 +5857,278 @@ static bool RBC_ServerManifest(std::vector<uint8_t> &out) {
 
 /* Server: someone asks to join (HELLO). Its player's copy is the one it names (the host plays copy 0); it gets the
  * game files now and the machines when it asks for them (RBC_JoinStep). */
+/* --- the players' own files ("rollback sync files", see RB_ParseRules) --- */
+#define RB_SYNCUP_CHUNK      1000u
+#define RB_SYNCUP_FILE_MAX   (256u << 10)
+#define RB_SYNCUP_TOTAL_MAX  (1u << 20)
+
+/* Server: whether a game is starting (its players' own files are taken), not running. */
+static bool RB_AtGameStart(void) {
+    return streamnet_is_server && rbc_copies >= 2 && !streamnet_rbautorun_done && dos_shell_reading_input;
+}
+
+/* Client: our own sync files, from this copy (the one our player plays): u32 count, then per file u8 drive, u16
+ * length, DOS path, u32 size, bytes. "names" lists them for the log. */
+static void RB_BuildSyncUpload(std::vector<uint8_t> &out, std::string &names) {
+    out.assign(4, 0);
+    names.clear();
+    if (rb_sync_rules.empty()) return;
+    std::vector<RBFile> m;
+    RB_BuildManifest(m);
+    uint32_t count = 0;
+    for (size_t i = 0; i < m.size(); i++) {
+        const RBFile &e = m[i];
+        if (!RB_RuleMatches(rb_sync_rules, e.path)) continue;
+        if (e.size > RB_SYNCUP_FILE_MAX || out.size() + e.size + e.path.size() + 8u > RB_SYNCUP_TOTAL_MAX) {
+            LOG_MSG("STREAMNET: %c:\\%s is too large to bring along (%llu KB)", (char)('A' + e.drive), e.path.c_str(), (unsigned long long)(e.size >> 10));
+            continue;
+        }
+        FILE *f = RB_OpenRead(e);
+        if (f == NULL) continue;
+        std::vector<uint8_t> data((size_t)e.size);
+        const size_t got = e.size ? fread(&data[0], 1, (size_t)e.size, f) : 0;
+        fclose(f);
+        if (got != e.size) continue;
+        const uint16_t len = (uint16_t)e.path.size();
+        const uint32_t size = (uint32_t)e.size;
+        out.push_back(e.drive);
+        out.insert(out.end(), (const uint8_t*)&len, (const uint8_t*)&len + 2);
+        out.insert(out.end(), e.path.begin(), e.path.end());
+        out.insert(out.end(), (const uint8_t*)&size, (const uint8_t*)&size + 4);
+        out.insert(out.end(), data.begin(), data.end());
+        count++;
+        names += (names.empty() ? "" : ", ") + std::string(1, (char)('A' + e.drive)) + ":\\" + e.path;
+    }
+    memcpy(&out[0], &count, 4);
+}
+
+/* Client (cluster), before its HELLO: our player's own sync files to the server, which maps them over its copy for
+ * our player when a game is starting (and ignores them when the game runs: we take its files then). */
+static void RB_UploadSyncFiles(void) {
+    std::vector<uint8_t> blob;
+    std::string names;
+    RB_BuildSyncUpload(blob, names);
+    uint32_t count = 0;
+    memcpy(&count, &blob[0], 4);
+    const uint32_t total = (uint32_t)blob.size();
+    LOG_MSG("STREAMNET: our own files for player %u's copy: %s", rbc_copy + 1u, count ? names.c_str() : "none");
+    uint32_t acked = 0, lastsend = 0, last_events = GetTicks();
+    bool answered = false, taken = false;
+    const uint32_t t0 = GetTicks();
+    while (!answered || acked < total) {
+        const uint32_t now = GetTicks();
+        if (now - t0 > 15000u) { LOG_MSG("STREAMNET: the server did not take our own files (%u of %u bytes): joining without", (unsigned)acked, (unsigned)total); return; }
+        if (lastsend == 0 || now - lastsend >= 200u) {
+            lastsend = now ? now : 1u;
+            for (uint32_t off = acked, k = 0; k < 32u && (off < total || (off == 0 && k == 0)); off += RB_SYNCUP_CHUNK, k++) {
+                const uint32_t n = std::min(RB_SYNCUP_CHUNK, total - off);
+                uint8_t buf[RB_SYNCUP_CHUNK + 48u];
+                StreamNetWriter w(buf, sizeof(buf));
+                STREAMNET_BeginPacket(w, INPKT_SYNCUP);
+                w.u8((uint8_t)rbc_copy); w.u32(total); w.u32(off); w.u16((uint16_t)n);
+                if (n) w.bytes(&blob[off], n);
+                STREAMNET_SendRaw(streamnet_server_addr, buf, w.size());
+                if (n == 0) break;
+            }
+        }
+        while (SDLNet_UDP_Recv(streamnet_socket, streamnet_recvpkt) > 0) {
+            StreamNetReader r((const uint8_t*)streamnet_recvpkt->data, (size_t)streamnet_recvpkt->len);
+            if (r.u32() != STREAMNET_MAGIC || r.u8() != (uint8_t)STREAMNET_PROTOVER) continue;
+            const uint8_t type = r.u8();
+            r.u8(); r.u8();
+            if (type != INPKT_SYNCUPACK) continue;
+            const uint32_t t = r.u32(), have = r.u32();
+            const uint8_t tk = r.u8();
+            if (r.bad() || t != total) continue;
+            answered = true;
+            taken = tk != 0;
+            if (have > acked) { acked = std::min(have, total); lastsend = 0; }
+        }
+        STREAMNET_Stall(last_events);
+    }
+    if (taken) LOG_MSG("STREAMNET: the server took our own files: player %u's copy runs with them on every computer", rbc_copy + 1u);
+    else LOG_MSG("STREAMNET: the game runs already: player %u's copy keeps the server's files", rbc_copy + 1u);
+}
+
+struct RBSyncUp {
+    IPaddress addr;
+    unsigned copy = 0;
+    uint32_t total = 0, have = 0, first = 0;
+    std::vector<uint8_t> data;
+    std::vector<bool> got;
+    bool applied = false;           /* taken (mapped over its copy), or given up on */
+};
+static std::vector<RBSyncUp> rbs_syncup;
+static std::vector<std::string> rbs_sync_temp;
+static std::string rbs_sync_dir;
+static uint32_t rbs_sync_wait_since = 0;
+
+static RBSyncUp *RB_FindSyncUp(const IPaddress &a) {
+    for (size_t i = 0; i < rbs_syncup.size(); i++)
+        if (rbs_syncup[i].addr.host == a.host && rbs_syncup[i].addr.port == a.port) return &rbs_syncup[i];
+    return NULL;
+}
+
+/* Server: a part of a joining computer's own files (any time; they are only used by RB_ServerTakeSyncFiles). */
+static void RB_ServerSyncUp(const IPaddress &from, unsigned copy, uint32_t total, uint32_t off, const uint8_t *b, unsigned n) {
+    if (copy >= rbc_copies || total < 4u || total > RB_SYNCUP_TOTAL_MAX + 4096u) return;
+    RBSyncUp *u = RB_FindSyncUp(from);
+    if (u != NULL && !u->applied && (u->total != total || u->copy != copy)) { *u = RBSyncUp(); u->addr = from; }
+    if (u == NULL) {
+        if (rbs_syncup.size() >= 32u) rbs_syncup.erase(rbs_syncup.begin());
+        rbs_syncup.push_back(RBSyncUp());
+        u = &rbs_syncup.back();
+        u->addr = from;
+    }
+    if (u->total == 0 && !u->applied) {
+        u->copy = copy; u->total = total; u->first = GetTicks();
+        u->data.assign(total, 0);
+        u->got.assign((total + RB_SYNCUP_CHUNK - 1u) / RB_SYNCUP_CHUNK, false);
+    }
+    if (!u->applied && u->total == total && (off % RB_SYNCUP_CHUNK) == 0 && off < total && n == std::min(RB_SYNCUP_CHUNK, total - off) && b != NULL) {
+        memcpy(&u->data[off], b, n);
+        u->got[off / RB_SYNCUP_CHUNK] = true;
+        while (u->have < u->total && u->got[u->have / RB_SYNCUP_CHUNK]) u->have = std::min(u->total, u->have + RB_SYNCUP_CHUNK);
+    }
+    uint8_t buf[32];
+    StreamNetWriter w(buf, sizeof(buf));
+    STREAMNET_BeginPacket(w, INPKT_SYNCUPACK);
+    w.u32(total); w.u32(u->applied ? total : u->have); w.u8(RB_AtGameStart() ? 1 : 0);
+    STREAMNET_SendRaw(from, buf, w.size());
+}
+
+/* Server: write the files a joining player brought (only names our own rules allow) and map them over our copy for
+ * that player. */
+static void RB_ServerApplySyncUp(const RBSyncUp &u, const std::string &name, unsigned copy) {
+    if (copy == rbc_copy || copy >= rbc_copies) return;     /* (our own player's copy keeps our files) */
+    const uint8_t *p = &u.data[0], *end = p + u.data.size();
+    uint32_t count = 0;
+    memcpy(&count, p, 4); p += 4;
+    if (rbs_sync_dir.empty()) {
+        std::string dir;
+#if defined(WIN32)
+        char tmp[MAX_PATH + 1];
+        const DWORD tl = GetTempPathA(sizeof(tmp), tmp);
+        dir = (tl > 0 && tl < sizeof(tmp)) ? std::string(tmp) : std::string(".\\");
+#else
+        const char *tmp = getenv("TMPDIR");
+        dir = (tmp != NULL && *tmp) ? std::string(tmp) : std::string("/tmp");
+#endif
+        if (!dir.empty() && dir[dir.size() - 1] != '/' && dir[dir.size() - 1] != '\\') dir += CROSS_FILESPLIT;
+        char sub[64];
+        snprintf(sub, sizeof(sub), "dosbox-x-nn-rollbacknet-own-%u", (unsigned)(GetTicks() ^ (uint32_t)(uintptr_t)&u));
+        dir += sub;
+        Cross::CreateDir(dir);
+        rbs_sync_dir = dir;
+    }
+    std::vector<RBFile> list;
+    std::string names;
+    for (uint32_t i = 0; i < count && i < 256u; i++) {
+        if (end - p < 3) break;
+        RBFile e;
+        e.drive = *p++;
+        uint16_t len; memcpy(&len, p, 2); p += 2;
+        if ((size_t)(end - p) < (size_t)len + 4u) break;
+        e.path.assign((const char*)p, len); p += len;
+        uint32_t size; memcpy(&size, p, 4); p += 4;
+        if ((size_t)(end - p) < size) break;
+        const uint8_t *data = p; p += size;
+        /* only a file our own rules let players bring, with a plain 8.3 path on one of our folders */
+        bool plain = !e.path.empty() && size <= RB_SYNCUP_FILE_MAX;
+        for (size_t from = 0; plain && from <= e.path.size(); ) {
+            size_t bs = e.path.find('\\', from);
+            if (bs == std::string::npos) bs = e.path.size();
+            plain = RB_Is83(e.path.substr(from, bs - from).c_str());
+            from = bs + 1;
+        }
+        if (!plain || e.drive >= DOS_DRIVES || dynamic_cast<localDrive*>(Drives[e.drive]) == NULL || !RB_RuleMatches(rb_sync_rules, e.path)) {
+            LOG_MSG("STREAMNET: \"%s\" sent %c:\\%s, which players may not bring: not used", name.c_str(), (char)('A' + (e.drive & 31u)), e.path.c_str());
+            continue;
+        }
+        const size_t bsl = e.path.find_last_of('\\');
+        const std::string base = (bsl == std::string::npos) ? e.path : e.path.substr(bsl + 1);
+        e.host = rbs_sync_dir + CROSS_FILESPLIT + std::to_string((unsigned long)copy) + "-" + std::to_string((unsigned long)i) + "-" + base;
+        FILE *f = fopen(e.host.c_str(), "wb");
+        if (f == NULL) continue;
+        const size_t put = size ? fwrite(data, 1, size, f) : 0;
+        fclose(f);
+        if (put != size) continue;
+        rbs_sync_temp.push_back(e.host);
+        e.size = size; e.mapped = true;
+        list.push_back(e);
+        names += (names.empty() ? "" : ", ") + std::string(1, (char)('A' + e.drive)) + ":\\" + e.path;
+    }
+    if (list.empty()) { LOG_MSG("STREAMNET: \"%s\" brought no files of its own: player %u's copy keeps ours", name.c_str(), copy + 1u); return; }
+    std::vector<uint8_t> payload;
+    RBC_PutManifestFull(payload, list);
+    if (!RBC_Command(copy, RBC_CMD_FILEMAP, 0, 0, 0, &payload, NULL)) { LOG_MSG("STREAMNET: player %u's copy did not take \"%s\"'s own files", copy + 1u, name.c_str()); return; }
+    LOG_MSG("STREAMNET: player %u's copy runs with \"%s\"'s own %s", copy + 1u, name.c_str(), names.c_str());
+}
+
+/* Server, a HELLO from a computer whose player plays "copy": while a game is starting, its own files are mapped over
+ * that copy, and nobody is let in before every expected player's are (the lists of files sent with the join then hold
+ * them all). False: not yet (it says hello again). */
+static bool RB_ServerTakeSyncFiles(const IPaddress &addr, const std::string &name, unsigned copy) {
+    if (rbc_copies < 2) return true;
+    RBSyncUp *u = RB_FindSyncUp(addr);
+    if (!RB_AtGameStart()) {                    /* a running game: it takes ours */
+        if (u != NULL) u->applied = true;
+        return true;
+    }
+    if (u == NULL) {                            /* nothing came from it (yet) */
+        rbs_syncup.push_back(RBSyncUp());
+        u = &rbs_syncup.back();
+        u->addr = addr; u->copy = copy; u->first = GetTicks();
+    }
+    if (!u->applied) {
+        if (u->total >= 4u && u->have >= u->total) {
+            if (u->copy == copy) RB_ServerApplySyncUp(*u, name, copy);
+            else LOG_MSG("STREAMNET: \"%s\" brought files for player %u's copy but plays player %u's: not used", name.c_str(), u->copy + 1u, copy + 1u);
+            u->applied = true;
+            u->copy = copy;
+            std::vector<uint8_t>().swap(u->data);
+        }
+        else if (GetTicks() - u->first > 10000u) {
+            LOG_MSG("STREAMNET: \"%s\" brought no files of its own (none came): player %u's copy keeps ours", name.c_str(), copy + 1u);
+            u->applied = true;
+            u->copy = copy;
+        }
+        else return false;
+    }
+    /* every expected player's before anybody gets the lists */
+    const unsigned need = streamnet_rbplayers > 1u ? streamnet_rbplayers - 1u : 0u;
+    unsigned have = 0;
+    uint32_t seen = 0;
+    for (size_t i = 0; i < rbs_syncup.size(); i++)
+        if (rbs_syncup[i].applied && rbs_syncup[i].copy < 32u && !(seen & (1u << rbs_syncup[i].copy))) { seen |= 1u << rbs_syncup[i].copy; have++; }
+    if (have < need) {
+        if (rbs_sync_wait_since == 0) {
+            rbs_sync_wait_since = GetTicks();
+            LOG_MSG("STREAMNET: %u of %u players' own files here: waiting for the others before anybody joins", have, need);
+        }
+        if (GetTicks() - rbs_sync_wait_since < 30000u) return false;
+        static bool told = false;
+        if (!told) { LOG_MSG("STREAMNET: not every player's own files came: letting the players in without"); told = true; }
+    }
+    return true;
+}
+
+/* Server, session over: the players' files written for it are deleted. */
+static void RB_ServerSyncCleanup(void) {
+    for (size_t i = 0; i < rbs_sync_temp.size(); i++) remove(rbs_sync_temp[i].c_str());
+    rbs_sync_temp.clear();
+    if (!rbs_sync_dir.empty()) {
+#if defined(WIN32)
+        RemoveDirectoryA(rbs_sync_dir.c_str());
+#else
+        rmdir(rbs_sync_dir.c_str());
+#endif
+        rbs_sync_dir.clear();
+    }
+    rbs_syncup.clear();
+    rbs_sync_wait_since = 0;
+}
+
 static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsigned copies, unsigned want) {
     if (streamnet_accepting) return;
     StreamNetPeer *p = STREAMNET_PeerByAddr(addr);
@@ -5806,6 +6152,7 @@ static void RBC_ServerHello(const IPaddress &addr, const std::string &name, unsi
         if (tell) { LOG_MSG("STREAMNET: refused \"%s\": player %u's copy is taken", name.c_str(), want + 1u); last_told = GetTicks(); }
         return;
     }
+    if (!RB_ServerTakeSyncFiles(addr, name, want)) return;     /* (a game starting: every player's own files first) */
     /* its participant number: the copy's, unless someone who moved to another copy has it */
     unsigned id = want;
     if (rbc_copies >= 2 && streamnet_peers[id].active) {
@@ -6804,6 +7151,7 @@ static void RB_SessionEnded(void) {
     LEAN_FreeRetiredFiles();
     RBT_Stop();
     RB_UnmapReceivedFiles();
+    RB_ServerSyncCleanup();
     rb_late.clear();
     rb_lockstep = false;
 }
@@ -7174,6 +7522,8 @@ public:
         streamnet_rbplayers = (unsigned int)((v >= 0 && v <= (int)STREAMNET_MAX_PEERS) ? v : 0);
         streamnet_rbautorun = section->Get_string("autorun");
         streamnet_rbautorun_done = false;
+        RB_ParseRules(section->Get_string("rollback sync files"), rb_sync_rules);
+        RB_ParseRules(section->Get_string("rollback match files"), rb_match_rules);
         /* RollbackNet runs a "cluster" of copies on every computer: one (the game itself, every player's input to it), or
          * one per player for IPX/NullModem-over-RollbackNet. Either way the host's session runs from the start and
          * others join it, before or during the game (RBC_ServerHello). */

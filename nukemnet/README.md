@@ -437,6 +437,19 @@ gets over its own for the session (FILEMOUNT /K, from a folder in the system's t
 session ends): its own files stay as they are. A file over 16 MB that differs means another version of the game and
 the join is refused, naming it.
 
+Two lists of file rules refine this (DOS paths relative to a mounted folder, `*` and `?` within a name, separated by
+spaces or `;`; a rule without a folder matches the name in any folder; NukemNet passes them from a game's files marked
+`allowSync` and `mustMatch`). `[streamnet] rollback match files` (the game's programs and data, such as DUKE3D.EXE and
+DUKE3D.GRP) are never sent, either way: a join where one differs or is missing is refused, naming it, whatever its
+size. `rollback sync files` (a player's own controls and settings, such as DUKE3D.CFG) travel with their player, in a
+cluster: before its HELLO a joining computer sends its own of them, from the copy its player plays (`INPKT_SYNCUP`,
+chunks the server acknowledges with `INPKT_SYNCUPACK`). While a game is starting (the server at its prompt, `autorun`
+not typed yet) the server maps them over its copy for that player (`RBC_CMD_FILEMAP`, only names its own rules allow,
+256 KB a file, 1 MB in all) and lets nobody in before every expected player's have come (`players` less one; 10 s for
+a computer that sent none, 30 s for them all). The lists sent with the joins then hold them, so every computer's copy
+for a player runs with that player's files and nothing goes back to the player. Once the game runs they are not used:
+someone who joins it takes the server's, as for any other file. Capability `rollbackNetFileRules`.
+
 File searches (FindFirst/FindNext) on a local folder drive during a session keep their place in the DTA, as DOS does
 (`localDrive::SessionFindNext`: `dirCluster` a key for the directory, `dirID` the index of the next entry), not in a
 host-side slot of the directory cache. The slot's number was written into the guest's DTA and depended on each
