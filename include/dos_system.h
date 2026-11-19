@@ -192,6 +192,10 @@ public:
 	uint32_t GetSeekPos(void) override;
 	FILE * fhandle;
 	bool other_handles = true; // other open handles for the same file may exist
+	/* RollbackNet copy-on-write (drive_local.cpp): a real file opened for writing, copied at the first write */
+	class localDrive *cow_drive = nullptr;
+	std::string cow_name;
+	bool CowMaterialize(void);
 private:
 	bool read_only_medium = false;
 	enum { NONE,READ,WRITE } last_action;

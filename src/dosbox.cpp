@@ -5557,8 +5557,9 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->Set_help("Number of frames local input is delayed by before it is applied, so that it can reach the\n"
                    "other sessions in time. This must cover the network latency between the sessions or the\n"
                    "emulation will stutter: frame*delay milliseconds should exceed the round trip time.\n"
-                   "Valid range is 1 to 64. With mode=rollback, 0 to 8: 0 applies local input in the next frame, and a\n"
-                   "frame or two of delay means fewer corrections when the other players press something.");
+                   "Valid range is 1 to 64. With mode=rollback, 0 to 30: 0 applies local input in the next frame, and a\n"
+                   "frame or more of delay means fewer corrections when the other players press something (with \"rollback\n"
+                   "auto delay\" off, exactly this; on, at least this).");
 
     Pint = secprop->Add_int("rollback window",Property::Changeable::WhenIdle, 16);
     Pint->Set_help("mode=rollback: how many frames a session may run ahead of the other participants' input before it\n"

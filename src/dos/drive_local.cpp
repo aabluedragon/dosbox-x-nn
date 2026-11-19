@@ -42,6 +42,17 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <ctype.h>
+#if defined(WIN32)
+#include <process.h>
+#include <direct.h>
+#define getpid _getpid
+#define rmdir _rmdir
+#else
+#include <unistd.h>
+#include <dirent.h>
+#include <signal.h>
+#endif
 
 #include "dosbox.h"
 #include "dos_inc.h"
@@ -1380,7 +1391,176 @@ std::string localDrive::MountedFileKey(const char* dosPath) {
 	return key;
 }
 
+/* --- Names that leave the mounted folder, and RollbackNet's copy-on-write ------------------------------------------------
+ * A name from the guest's DOS (DOS_MakeName) never has a ".." part or a drive; other callers (a save state from another
+ * computer, a RollbackNet file list) might: refuse what would leave the mounted folder or overflow a path buffer. */
+static bool LocalNameOK(const char *base, const char *name) {
+    if (name == NULL) return false;
+    if (strlen(base) + strlen(name) + 2 >= CROSS_LEN) return false;
+    const char *part = name;
+    for (const char *c = name; ; c++) {
+        if (*c == '\\' || *c == '/' || *c == 0) {
+            if (c - part == 2 && part[0] == '.' && part[1] == '.') return false;
+            if (*c == 0) break;
+            part = c + 1;
+        }
+        else if (*c == ':') return false;
+    }
+    return true;
+}
+#define LOCAL_NAME_OR(n, fail) do { if (!LocalNameOK(basedir,(n))) { DOS_SetError(DOSERR_PATH_NOT_FOUND); return fail; } } while (0)
+
+/* RollbackNet (src/hardware/streamnet.cpp, NN_CopyOnWrite): every copy of the game but the server's own runs a machine
+ * it got from another computer, whose code may do anything a DOS program can. Its mounted folders then never change:
+ * a file the guest writes, creates, deletes or renames becomes a FILEMOUNT /K mapping to a file in a temporary folder
+ * (a deleted file: a mapping to a file that is not there), which goes when the session ends. Folders it makes are
+ * real (empty ones, removed again at the end if still empty); it removes only those and renames no folder. The guest sees what it
+ * would see on the server; the player's own files stay as they were. */
+bool NN_CopyOnWrite(void);
+static std::string cow_dir;
+static std::vector<std::string> cow_files, cow_dirs;
+static unsigned cow_seq = 0;
+
+static void CowCleanup(void) {
+    for (size_t i = 0; i < cow_files.size(); i++) remove(cow_files[i].c_str());
+    for (size_t i = cow_dirs.size(); i-- > 0; ) rmdir(cow_dirs[i].c_str());   /* (real folders the guest made, if still empty) */
+    if (!cow_dir.empty()) rmdir(cow_dir.c_str());
+}
+
+/* The folders of copies that ended without cleaning up (killed): "dosbox-x-nn-cow-<pid>-<time>" whose process is gone. */
+static void CowRemoveStale(const std::string &tmpdir) {
+    const std::string prefix = "dosbox-x-nn-cow-";
+    std::vector<std::string> stale;
+#if defined(WIN32)
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((tmpdir + prefix + "*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const unsigned long pid = strtoul(fd.cFileName + prefix.size(), NULL, 10);
+        HANDLE proc = pid ? OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid) : NULL;
+        if (proc != NULL) { const bool alive = WaitForSingleObject(proc, 0) == WAIT_TIMEOUT; CloseHandle(proc); if (alive) continue; }
+        stale.push_back(tmpdir + fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    for (size_t i = 0; i < stale.size(); i++) {
+        HANDLE f = FindFirstFileA((stale[i] + "\\*").c_str(), &fd);
+        if (f != INVALID_HANDLE_VALUE) {
+            do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileA((stale[i] + "\\" + fd.cFileName).c_str()); } while (FindNextFileA(f, &fd));
+            FindClose(f);
+        }
+        RemoveDirectoryA(stale[i].c_str());
+    }
+#else
+    DIR *d = opendir(tmpdir.c_str());
+    if (d == NULL) return;
+    for (struct dirent *e; (e = readdir(d)) != NULL; ) {
+        if (strncmp(e->d_name, prefix.c_str(), prefix.size()) != 0) continue;
+        const long pid = strtol(e->d_name + prefix.size(), NULL, 10);
+        if (pid > 0 && (kill((pid_t)pid, 0) == 0 || errno == EPERM)) continue;
+        stale.push_back(tmpdir + e->d_name);
+    }
+    closedir(d);
+    for (size_t i = 0; i < stale.size(); i++) {
+        DIR *sd = opendir(stale[i].c_str());
+        if (sd != NULL) {
+            for (struct dirent *e; (e = readdir(sd)) != NULL; )
+                if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) remove((stale[i] + "/" + e->d_name).c_str());
+            closedir(sd);
+        }
+        rmdir(stale[i].c_str());
+    }
+#endif
+}
+
+static std::string CowNewHostPath(const char *name) {
+    if (cow_dir.empty()) {
+        std::string dir;
+#if defined(WIN32)
+        char tmp[MAX_PATH + 1];
+        const DWORD tl = GetTempPathA(sizeof(tmp), tmp);
+        dir = (tl > 0 && tl < sizeof(tmp)) ? std::string(tmp) : std::string(".\\");
+#else
+        const char *tmp = getenv("TMPDIR");
+        dir = (tmp != NULL && *tmp) ? std::string(tmp) : std::string("/tmp");
+#endif
+        if (!dir.empty() && dir[dir.size() - 1] != '/' && dir[dir.size() - 1] != '\\') dir += CROSS_FILESPLIT;
+        CowRemoveStale(dir);
+        char sub[64];
+        snprintf(sub, sizeof(sub), "dosbox-x-nn-cow-%lu-%u", (unsigned long)getpid(), (unsigned)time(NULL));
+        dir += sub;
+        Cross::CreateDir(dir);
+        cow_dir = dir;
+        atexit(CowCleanup);
+    }
+    std::string base;
+    for (const char *c = name; *c; c++) {
+        if (*c == '\\' || *c == '/') { base.clear(); continue; }
+        const unsigned char ch = (unsigned char)*c;
+        base += (isalnum(ch) || ch == '.' || ch == '_' || ch == '-') ? (char)ch : '_';
+    }
+    if (base.size() > 32) base.resize(32);
+    const std::string host = cow_dir + CROSS_FILESPLIT + std::to_string((unsigned long)cow_seq++) + "-" + base;
+    cow_files.push_back(host);
+    return host;
+}
+
+/* The real file under "name" (not a mapping), as the host sees it. */
+static FILE *CowOpenReal(const char *base, const char *name, DOS_Drive_Cache &cache) {
+    char full[CROSS_LEN];
+    strcpy(full, base);
+    strcat(full, name);
+    CROSS_FILENAME(full);
+    const char *expanded = cache.GetExpandName(full);
+    const host_cnv_char_t *h = CodePageGuestToHost(expanded);
+    if (h == NULL) return NULL;
+    ht_stat_t st;
+    if (ht_stat(h, &st) != 0 || (st.st_mode & S_IFDIR)) return NULL;
+#if defined(host_cnv_use_wchar)
+    return _wfopen(h, L"rb");
+#else
+    return fopen(h, "rb");
+#endif
+}
+
+static bool CowCopy(FILE *in, const std::string &to) {
+    FILE *out = fopen(to.c_str(), "wb");
+    if (out == NULL) return false;
+    char buf[65536];
+    size_t n;
+    bool ok = true;
+    while (in != NULL && (n = fread(buf, 1, sizeof(buf), in)) > 0) if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+    if (fclose(out) != 0) ok = false;
+    return ok;
+}
+
+bool localDrive::CowFileExists(const char *name) {
+    if (GetMountedFileHost(name) != NULL) {
+        struct stat st;
+        return stat(GetMountedFileHost(name), &st) == 0 && !(st.st_mode & S_IFDIR);
+    }
+    FILE *f = CowOpenReal(basedir, name, dirCache);
+    if (f == NULL) return false;
+    fclose(f);
+    return true;
+}
+
+/* Maps "name" to a new file in the temporary folder: with the contents it has now ("copy"), or none at all (the guest
+ * deleted it, or creates it). */
+bool localDrive::CowMap(const char *name, bool copy, const char *from) {
+    const std::string host = CowNewHostPath(name);
+    if (copy) {
+        const char *src = from != NULL ? from : name;
+        const char *mapped = GetMountedFileHost(src);
+        FILE *in = mapped != NULL ? fopen(mapped, "rb") : CowOpenReal(basedir, src, dirCache);
+        const bool ok = CowCopy(in, host);
+        if (in != NULL) fclose(in);
+        if (!ok) { remove(host.c_str()); return false; }
+    }
+    return AddMountedFile(name, host.c_str(), true);
+}
+
 bool localDrive::AddMountedFile(const char* dosPath, const char* hostPath, bool keep) {
+	if (!LocalNameOK("", dosPath)) return false;
 	std::string key = MountedFileKey(dosPath);
 	if (key.empty()) return false;
 	mounted_files[key] = hostPath;
@@ -1476,6 +1656,7 @@ bool localDrive::MountedFileFindNext(DOS_DTA &dta,uint16_t id) {
 }
 
 bool localDrive::FileCreate(DOS_File * * file,const char * name,uint16_t attributes) {
+    LOCAL_NAME_OR(name, false);
     if (nocachedir) EmptyCache();
 
     if (readonly) {
@@ -1507,6 +1688,11 @@ bool localDrive::FileCreate(DOS_File * * file,const char * name,uint16_t attribu
     }
 
     assert(file != NULL);
+
+	if (NN_CopyOnWrite() && GetMountedFileHost(name) == NULL && !CowMap(name, false)) {
+		DOS_SetError(DOSERR_ACCESS_DENIED);
+		return false;
+	}
 
 	{
 		const char* mounted_host = GetMountedFileHost(name);
@@ -1737,6 +1923,7 @@ static bool FlushOtherHandles(uint8_t drive, const char *name, const DOS_File *s
 }
 
 bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
+    LOCAL_NAME_OR(name, false);
     if (nocachedir) EmptyCache();
 
     if (readonly) {
@@ -1756,6 +1943,11 @@ bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
 		DOS_SetError(DOSERR_ACCESS_CODE_INVALID);
 		return false;
 	}
+
+	/* copy-on-write: a real file opened for writing is opened for reading only, and copied at its first write
+	 * (LocalFile::CowMaterialize): games often open their data for writing and never write (Duke Nukem 3D's GRP) */
+	const bool cow_lazy = NN_CopyOnWrite() && ((flags&0xf) == OPEN_WRITE || (flags&0xf) == OPEN_READWRITE) && GetMountedFileHost(name) == NULL;
+	if (cow_lazy) type = _HT("rb");
 
 	{
 		const char* mounted_host = GetMountedFileHost(name);
@@ -1799,7 +1991,7 @@ bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
     }
 
     FILE * hand;
-    if (enable_share_exe) {
+    if (enable_share_exe && !cow_lazy) {
 #if defined(WIN32)
         int ohFlag = (flags&0xf)==OPEN_READ||(flags&0xf)==OPEN_READ_NO_MOD?GENERIC_READ:((flags&0xf)==OPEN_WRITE?GENERIC_WRITE:GENERIC_READ|GENERIC_WRITE);
         int shhFlag = (flags&0x70)==0x10?0:((flags&0x70)==0x20?FILE_SHARE_READ:((flags&0x70)==0x30?FILE_SHARE_WRITE:FILE_SHARE_READ|FILE_SHARE_WRITE));
@@ -1848,11 +2040,34 @@ bool localDrive::FileOpen(DOS_File * * file,const char * name,uint32_t flags) {
 
 	*file=new LocalFile(name,hand);
 	(*file)->flags=flags;  //for the inheritance flag and maybe check for others.
+	if (cow_lazy) { static_cast<LocalFile*>(*file)->cow_drive = this; static_cast<LocalFile*>(*file)->cow_name = name; }
 //	(*file)->SetFileName(host_name);
 	return true;
 }
 
+/* Copy-on-write (NN_CopyOnWrite): the first write through a handle on a real file copies the file to the temporary
+ * folder (or takes the copy another handle made), maps it, and carries on with the copy at the same position. */
+bool LocalFile::CowMaterialize(void) {
+	if (cow_drive == NULL) return true;
+	localDrive *ld = cow_drive;
+	const long pos = ftell(fhandle);
+	const char *host = ld->CowHost(cow_name.c_str());
+	if (host == NULL) {
+		if (!ld->CowMap(cow_name.c_str(), true)) return false;
+		host = ld->CowHost(cow_name.c_str());
+		if (host == NULL) return false;
+	}
+	FILE *copy = fopen(host, "rb+");
+	if (copy == NULL) return false;
+	if (pos > 0) fseek(copy, pos, SEEK_SET);
+	fclose(fhandle);
+	fhandle = copy;
+	cow_drive = NULL;
+	return true;
+}
+
 FILE * localDrive::GetSystemFilePtr(char const * const name, char const * const type) {
+    if (!LocalNameOK(basedir,name)) return NULL;
 
 	const char* mounted_host = GetMountedFileHost(name);
 	if (mounted_host != NULL) return fopen(mounted_host,type);
@@ -1886,6 +2101,7 @@ FILE * localDrive::GetSystemFilePtr(char const * const name, char const * const 
 }
 
 bool localDrive::GetSystemFilename(char *sysName, char const * const dosName) {
+    LOCAL_NAME_OR(dosName, false);
 
 	const char* mounted_host = GetMountedFileHost(dosName);
 	if (mounted_host != NULL) {
@@ -1915,10 +2131,19 @@ bool localDrive::GetSystemFilename(char *sysName, char const * const dosName) {
 }
 
 bool localDrive::FileUnlink(const char * name) {
+    LOCAL_NAME_OR(name, false);
     if (readonly) {
         DOS_SetError(DOSERR_WRITE_PROTECTED);
         return false;
     }
+
+	if (NN_CopyOnWrite() && GetMountedFileHost(name) == NULL) {
+		if (!CowFileExists(name)) {
+			DOS_SetError(DOSERR_FILE_NOT_FOUND);
+			return false;
+		}
+		return CowMap(name, false);     /* (a mapping to a file that is not there: gone for the guest only) */
+	}
 
 	if (const char* mounted_host = GetMountedFileHost(name)) {
 		if (IsMountedFileKept(name)) {
@@ -2006,6 +2231,7 @@ bool localDrive::FileUnlink(const char * name) {
 }
 
 bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
+    LOCAL_NAME_OR(_dir, false);
 	char tempDir[CROSS_LEN];
 	strcpy(tempDir,basedir);
 	strcat(tempDir,_dir);
@@ -2382,8 +2608,9 @@ bool localDrive::add_special_file_to_disk(const char* dosname, const char* opera
 }
 
 bool localDrive::SetFileAttr(const char * name,uint16_t attr) {
-	if (GetMountedFileHost(name) != NULL) {
-		/* attribute changes on mounted files are accepted but not persisted */
+    LOCAL_NAME_OR(name, false);
+	if (GetMountedFileHost(name) != NULL || NN_CopyOnWrite()) {
+		/* attribute changes on mounted files are accepted but not persisted (nor on any file under copy-on-write) */
 		return true;
 	}
 
@@ -2434,6 +2661,7 @@ bool localDrive::SetFileAttr(const char * name,uint16_t attr) {
 }
 
 bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
+    LOCAL_NAME_OR(name, false);
     if (nocachedir) EmptyCache();
 
 	{
@@ -2508,6 +2736,7 @@ bool localDrive::GetFileAttr(const char * name,uint16_t * attr) {
 }
 
 bool localDrive::GetFileAttrEx(char* name, struct stat *status) {
+    LOCAL_NAME_OR(name, false);
 	const char* mounted_host = GetMountedFileHost(name);
 	if (mounted_host != NULL) return !stat(mounted_host,status);
 
@@ -2520,6 +2749,7 @@ bool localDrive::GetFileAttrEx(char* name, struct stat *status) {
 }
 
 std::string localDrive::GetHostName(const char * name) {
+    if (!LocalNameOK(basedir,name)) return std::string();
 	const char* mounted_host = GetMountedFileHost(name);
 	if (mounted_host != NULL) {
 		struct stat mst;
@@ -2597,6 +2827,7 @@ unsigned long localDrive::GetSerial() {
 #endif
 
 bool localDrive::MakeDir(const char * dir) {
+    LOCAL_NAME_OR(dir, false);
     if (nocachedir) EmptyCache();
 
     if (readonly) {
@@ -2625,11 +2856,32 @@ bool localDrive::MakeDir(const char * dir) {
 	int temp=mkdir(host_name,0775);
 #endif
 	if (temp==0) dirCache.CacheOut(newdir,true);
+	if (temp==0 && NN_CopyOnWrite()) cow_dirs.push_back(newdir);   /* (removed at the end if still empty) */
 	return (temp==0);// || ((temp!=0) && (errno==EEXIST));
 }
 
 bool localDrive::RemoveDir(const char * dir) {
+    LOCAL_NAME_OR(dir, false);
     if (nocachedir) EmptyCache();
+	if (NN_CopyOnWrite()) {
+		/* only a folder this session made, with none of the guest's files in it */
+		char made[CROSS_LEN];
+		strcpy(made,basedir);
+		strcat(made,dir);
+		CROSS_FILENAME(made);
+		const std::string m = dirCache.GetExpandName(made);
+		bool ours = false;
+		for (size_t i = 0; i < cow_dirs.size() && !ours; i++) ours = cow_dirs[i] == m;
+		const std::string prefix = MountedFileKey(dir) + "\\";
+		for (auto it = mounted_files.begin(); ours && it != mounted_files.end(); ++it) {
+			struct stat st;
+			if (it->first.compare(0, prefix.size(), prefix) == 0 && stat(it->second.c_str(), &st) == 0) ours = false;
+		}
+		if (!ours) {
+			DOS_SetError(DOSERR_ACCESS_DENIED);
+			return false;
+		}
+	}
 
     if (readonly) {
         DOS_SetError(DOSERR_WRITE_PROTECTED);
@@ -2661,6 +2913,7 @@ bool localDrive::RemoveDir(const char * dir) {
 }
 
 bool localDrive::TestDir(const char * dir) {
+    LOCAL_NAME_OR(dir, false);
     if (nocachedir) EmptyCache();
 
 	char newdir[CROSS_LEN];
@@ -2692,6 +2945,20 @@ bool localDrive::TestDir(const char * dir) {
 }
 
 bool localDrive::Rename(const char * oldname,const char * newname) {
+    LOCAL_NAME_OR(oldname, false);
+    LOCAL_NAME_OR(newname, false);
+	if (NN_CopyOnWrite()) {
+		/* a copy under the new name, and the old one gone (for the guest) */
+		if (!CowFileExists(oldname)) {
+			DOS_SetError(TestDir(oldname) ? DOSERR_ACCESS_DENIED : DOSERR_FILE_NOT_FOUND);
+			return false;
+		}
+		if (CowFileExists(newname) || TestDir(newname) || !CowMap(newname, true, oldname) || !CowMap(oldname, false)) {
+			DOS_SetError(DOSERR_ACCESS_DENIED);
+			return false;
+		}
+		return true;
+	}
 	if (GetMountedFileHost(oldname) != NULL || GetMountedFileHost(newname) != NULL) {
 		/* renaming mounted files (or over them) is not supported */
 		DOS_SetError(DOSERR_ACCESS_DENIED);
@@ -2997,6 +3264,7 @@ bool localDrive::AllocationInfo64(uint32_t* _bytes_sector, uint32_t* _sectors_cl
 }
 
 bool localDrive::FileExists(const char* name) {
+    LOCAL_NAME_OR(name, false);
     if (nocachedir) EmptyCache();
 
 	{
@@ -3027,6 +3295,7 @@ bool localDrive::FileExists(const char* name) {
 }
 
 bool localDrive::FileStat(const char* name, FileStat_Block * const stat_block) {
+    LOCAL_NAME_OR(name, false);
     if (nocachedir) EmptyCache();
 
 	{
@@ -3301,6 +3570,10 @@ bool LocalFile::Write(const uint8_t * data,uint16_t * size) {
 		DOS_SetError(DOSERR_ACCESS_DENIED);
 		return false;
 	}
+	if (cow_drive != NULL && !CowMaterialize()) {
+		DOS_SetError(DOSERR_ACCESS_DENIED);
+		return false;
+	}
 #if defined(WIN32)
     if (file_access_tries>0) {
         HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(fhandle));
@@ -3506,6 +3779,8 @@ bool LocalFile::Seek(uint32_t * pos,uint32_t type) {
 }
 
 bool LocalFile::Close() {
+    /* (copy-on-write: a date set through a handle opened only for reading would change the real file) */
+    if (newtime && NN_CopyOnWrite() && (cow_drive != NULL || (flags&0xf) == OPEN_READ || (flags&0xf) == OPEN_READ_NO_MOD)) newtime = false;
     if (!newtime && fhandle && last_action == WRITE) UpdateLocalDateTime();
     if (newtime && fhandle) {
         // force STDIO to flush buffers on this file handle, or else fclose() will write buffered data

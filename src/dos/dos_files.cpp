@@ -2907,7 +2907,8 @@ void POD_Load_DOS_Files( std::istream& stream )
 			// - reloc ptr
 			READ_POD( &drive_valid, drive_valid );
 			if( drive_valid == 0xff ) {
-                if (Drives[lcv] && lcv<DOS_DRIVES-1) unmount(lcv);
+                /* (a StreamNet load keeps this computer's drives: the state comes from another computer) */
+                if (Drives[lcv] && lcv<DOS_DRIVES-1 && !savestate_keep_local_drives) unmount(lcv);
                 continue;
             }
 
@@ -2937,6 +2938,14 @@ void POD_Load_DOS_Files( std::istream& stream )
                 LOG_MSG("STREAMNET: drive %c: is not mounted here; mount it the same way on every computer",'A'+lcv);
             if( !keep_info[0] && Drives[lcv] && strcasecmp(Drives[lcv]->info, dinfo) && (!strncmp(dinfo,"local directory ",16) || !strncmp(dinfo,"CDRom ",6) || !strncmp(dinfo,"PhysFS directory ",17) || !strncmp(dinfo,"PhysFS CDRom ",13) || (!strncmp(dinfo,"isoDrive ",9) || !strncmp(dinfo,"fatDrive ",9))))
                 unmount(lcv);
+            /* A StreamNet load (savestate_keep_local_drives: the state comes from another computer) never makes a drive:
+             * its folder or image path is the other computer's, and one it chose would be mounted here (any folder,
+             * an overlay written anywhere, a disk image written to). The drive's own state is skipped. */
+            if( !Drives[lcv] && savestate_keep_local_drives ) {
+                bool skip_b; char skip_dir[DOS_PATHLENGTH]; char skip_info[256];
+                READ_POD( &skip_b, skip_b ); READ_POD( &skip_b, skip_b ); READ_POD( &skip_dir, skip_dir ); READ_POD( &skip_info, skip_info );
+                continue;
+            }
             if( !Drives[lcv] ) {
                 std::vector<std::string> options;
                 if (!strncmp(dinfo,"local directory ",16)) {
@@ -3049,8 +3058,10 @@ void POD_Load_DOS_Files( std::istream& stream )
 #endif
                 }
             }
+			const bool keep_readonly = Drives[lcv] ? Drives[lcv]->readonly : false;
 			if( Drives[lcv] ) Drives[lcv]->LoadState(stream);
 			if( keep_info[0] && Drives[lcv] ) memcpy(Drives[lcv]->info, keep_info, sizeof(keep_info));
+			if( keep_info[0] && Drives[lcv] ) Drives[lcv]->readonly = keep_readonly;     /* (ours, not the other computer's) */
 		}
 
 		//Alien Carnage - game creates and unlinks temp files
@@ -3139,10 +3150,11 @@ void POD_Load_DOS_Files( std::istream& stream )
 
 			READ_POD( &drive_valid, drive_valid );
 			if( drive_valid == 0xff ) {
-                if (Drives[lcv]) unmount(lcv);
+                if (Drives[lcv] && !savestate_keep_local_drives) unmount(lcv);
                 continue;
             }
             READ_POD( &dinfo, dinfo);
+            if( savestate_keep_local_drives ) continue;     /* (a StreamNet load keeps this computer's drives, as above) */
             if( Drives[lcv] && strcasecmp(Drives[lcv]->info, dinfo))
                 unmount(lcv);
             if (!Drives[lcv] && !strncmp(dinfo,"isoDrive ",9)) {

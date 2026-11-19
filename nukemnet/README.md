@@ -490,6 +490,29 @@ guest's retrace timing), mouse motion (applied as relative motion), the Sound Bl
 its timer events when a game's DMA turns Goldplay off). Nothing of a replayed frame is drawn, and the whole picture is
 drawn again afterwards.
 
+### Security: what another computer can do
+
+A joining computer runs the server's machine (its state, its files that differ, its typing), and the server runs every
+player's input, so neither side's data is trusted:
+- **Copy-on-write** (`NN_CopyOnWrite`, `src/dos/drive_local.cpp`): every copy but the server's own (joining computers,
+  and the server's hidden copies) never changes its mounted folders. A file the guest writes is copied to a temporary
+  folder at its first write (a file opened for writing and never written is not copied: Duke Nukem 3D's GRP), a new
+  one is created there, a deleted or renamed one is hidden by a FILEMOUNT /K mapping; folders it makes are real and
+  removed again when still empty, it removes no other folder. The temporary folder (`dosbox-x-nn-cow-<pid>-<time>`)
+  goes when the copy ends, or at the next start after a killed one. So a server whose batch file or machine runs
+  `DEL *.*` deletes nothing on the other computers; secure mode already refuses MOUNT, IMGMOUNT and BOOT.
+- **State loads keep this computer's drives**: a state from another computer never mounts a drive (the folder or
+  image path in it is the other computer's), never unmounts one, and never changes whether one is read-only.
+- **Paths**: every received file list (the server's, a player's own files, a cluster copy's) takes only plain 8.3
+  paths, at most 9 parts and 80 characters; an entry of the server's list that is not plain is never asked for. Local
+  drives refuse names with a `..` part, a colon or a length that would overflow a path buffer, whoever calls them.
+- **Who may send what**: a player's input is taken only from its own address (a joining computer takes it only from
+  the server), and only the server's input may carry the autorun flag (typing at the DOS prompt) or speed changes. The
+  server answers resync requests and acknowledgements only from players, each for itself, sends only the files a
+  joining computer may take over (within the size limits, never `rollback match files`) and only to the computer that
+  is joining. A joining computer takes the welcome and the state only from the server's address, at most 256 MB, and
+  types a server's start command only when it is a plain name (letters, digits, `_`, up to 8).
+
 ### cycles=max
 
 The speed is part of the shared machine, so `cycles=max` cannot mean what it means elsewhere (each computer guessing

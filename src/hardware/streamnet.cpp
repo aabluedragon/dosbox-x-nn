@@ -71,6 +71,7 @@ bool streamnet_rollback_resim = false;
 #include <errno.h>
 
 #include <algorithm>
+#include <new>
 #include <functional>
 #include <map>
 #include <deque>
@@ -1330,12 +1331,14 @@ struct RBFile {
     uint64_t size = 0, hash = 0;
     std::string host;           /* where to read it: a guest code page path, or a mapped file's host path */
     bool mapped = false;
+    bool unplain = false;       /* (a received list's entry whose path is not a plain DOS path: never asked for or mapped) */
 };
 
 static std::vector<RBFile> rb_srv_manifest;         /* server: the list sent to the joining participant */
 static std::vector<uint8_t> rb_filereq_bits;        /* server: what it asked for (one bit per manifest entry) */
 static std::vector<bool> rb_filereq_part;           /* server: which request packets arrived */
 static bool rb_filereq_ready = false;
+static int rbs_filereq_peer = -1;               /* whose file request rb_filereq_* hold */
 static std::vector<RBFile> rb_cli_need;             /* client: the server's files it asked for */
 static std::vector<std::pair<int,std::string> > rb_sync_mapped;   /* client: (drive, DOS path) mapped for the session */
 static std::vector<std::string> rb_sync_temp;       /* client: their temporary copies */
@@ -1351,6 +1354,21 @@ static bool RB_Is83(const char *n) {
         if (ch == '.') { if (dot || base == 0) return false; dot = true; continue; }
         if (ch <= ' ' || ch >= 0x7f || strchr("\"*+,/:;<=>?[\\]|", ch)) return false;
         if (dot) { if (++ext > 3) return false; } else if (++base > 8) return false;
+    }
+    return true;
+}
+
+/* A DOS path as the file lists carry it: 8.3 names joined by backslashes, at most 8 folders deep and 80 characters,
+ * no drive, no "." or "..". Lists come from another computer (a joining player's own files, the server's list for a
+ * joining computer), and these paths become host paths under a mounted folder and temporary files' names. */
+static bool RB_PlainPath(const std::string &path) {
+    if (path.empty() || path.size() > 80u) return false;
+    unsigned depth = 0;
+    for (size_t from = 0; from <= path.size(); ) {
+        size_t bs = path.find('\\', from);
+        if (bs == std::string::npos) bs = path.size();
+        if (!RB_Is83(path.substr(from, bs - from).c_str()) || ++depth > 9u) return false;
+        from = bs + 1;
     }
     return true;
 }
@@ -1479,6 +1497,7 @@ static bool RB_TakeManifest(std::vector<uint8_t> &blob, std::vector<RBFile> &m) 
         if (!get(&e.drive, 1) || !get(&len, 2) || pos + len > start + mlen) return false;
         e.path.assign((const char*)&blob[pos], len); pos += len;
         if (!get(&e.size, 8) || !get(&e.hash, 8)) return false;
+        e.unplain = !RB_PlainPath(e.path);      /* (kept, so the list's numbering stays the server's) */
         m.push_back(e);
     }
     blob.resize(start);
@@ -1535,6 +1554,13 @@ static bool RB_RuleMatches(const std::vector<std::string> &rules, const std::str
     return false;
 }
 
+/* RollbackNet: whether this copy's mounted folders are copy-on-write (src/dos/drive_local.cpp): every copy but the
+ * server's own runs a machine it got from another computer (the server's state, files and typing), so nothing it does
+ * changes this computer's files. The server's own copy runs its own game and writes as usual. */
+bool NN_CopyOnWrite(void) {
+    return streamnet_enabled && streamnet_rollback && control->opt_streamnet_server < 0;
+}
+
 /* The same rules for remote play's player files (NNVIEWERFILES, remoteplay.cpp): "rules" as the settings write them. */
 bool STREAMNET_RuleMatches(const char *rules, const std::string &path) {
     std::vector<std::string> r;
@@ -1550,6 +1576,10 @@ static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std
     unsigned differ = 0, missing = 0;
     for (size_t i = 0; i < theirs.size(); i++) {
         const RBFile &t = theirs[i];
+        if (t.unplain) {
+            LOG_MSG("STREAMNET: the server lists a file whose path is not a plain DOS path (\"%.40s\"): not taken over", t.path.c_str());
+            continue;
+        }
         const RBFile *my = NULL;
         for (size_t k = 0; k < mine.size(); k++) if (mine[k].drive == t.drive && mine[k].path == t.path) { my = &mine[k]; break; }
         if (my != NULL && my->size == t.size && my->hash == t.hash) continue;
@@ -1627,9 +1657,16 @@ static void RB_HandleFileRequest(StreamNetReader &r) {
 /* Server: the requested files, one after the other in the list's order. */
 static bool RB_BuildFileBlob(std::vector<uint8_t> &out) {
     out.clear();
+    uint64_t total = 0;
     for (size_t i = 0; i < rb_srv_manifest.size(); i++) {
         if (!(rb_filereq_bits[i / 8u] & (1u << (i % 8u)))) continue;
         const RBFile &e = rb_srv_manifest[i];
+        /* (the joining computer's own limits, checked here too: a changed one could ask for every file) */
+        total += e.size;
+        if (e.size > RB_SYNC_FILE_MAX || total > RB_SYNC_TOTAL_MAX || RB_RuleMatches(rb_match_rules, e.path)) {
+            LOG_MSG("STREAMNET: a joining computer asked for %c:\\%s, which is never sent: refused", (char)('A' + (e.drive & 31u)), e.path.c_str());
+            return false;
+        }
         FILE *f = RB_OpenRead(e);
         if (f == NULL) return false;
         const size_t at = out.size();
@@ -1780,9 +1817,11 @@ static bool STREAMNET_SendStateTo(StreamNetPeer &p,const std::vector<uint8_t> &s
 /* Client side: collect the snapshot the server is pushing at us. */
 static bool STREAMNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,void (*nudge)(void) = NULL,uint8_t type = INPKT_STATE) {
     if (total == 0) return true;
+    if (total > (256u << 20)) { LOG_MSG("STREAMNET: the server's state would be %u MB: refused", (unsigned)(total >> 20)); return false; }
     uint32_t lastnudge = 0;
 
-    state.assign(total,0);
+    try { state.assign(total,0); }
+    catch (const std::bad_alloc &) { LOG_MSG("STREAMNET: no memory for the server's state"); return false; }
 
     const uint32_t nchunks = (total + STREAMNET_STATE_CHUNK - 1u) / STREAMNET_STATE_CHUNK;
     std::vector<bool> got(nchunks,false);
@@ -1797,6 +1836,7 @@ static bool STREAMNET_ReceiveState(std::vector<uint8_t> &state,uint32_t total,vo
         for (;;) {
             if (streamnet_socket == NULL) return false;
             if (SDLNet_UDP_Recv(streamnet_socket,streamnet_recvpkt) <= 0) break;
+            if (!STREAMNET_SameAddr(streamnet_recvpkt->address,streamnet_server_addr)) continue;   /* (the server's only) */
 
             StreamNetReader r((const uint8_t*)streamnet_recvpkt->data,(size_t)streamnet_recvpkt->len);
             if (r.u32() != STREAMNET_MAGIC) continue;
@@ -2264,7 +2304,7 @@ static void STREAMNET_HandlePacket(const IPaddress &from,const uint8_t *data,siz
         case INPKT_FILEREQ: {
             if (!streamnet_is_server || !streamnet_rollback) return;
             StreamNetPeer *p = STREAMNET_PeerByAddr(from);
-            if (p == NULL || p->ready) return;
+            if (p == NULL || p->ready || rbs_filereq_peer < 0 || p != &streamnet_peers[rbs_filereq_peer]) return;
             RB_HandleFileRequest(r);
             p->lastheard = GetTicks();
             break;
@@ -2342,6 +2382,8 @@ static void STREAMNET_HandlePacket(const IPaddress &from,const uint8_t *data,siz
         case INPKT_INPUT: {
             if (peerid >= STREAMNET_MAX_PEERS) return;
             if (peerid == streamnet_selfid) return;
+            /* (a player's input comes from its own address; the server relays everybody's to a client) */
+            if (streamnet_is_server ? STREAMNET_PeerByAddr(from) != &streamnet_peers[peerid] : !STREAMNET_SameAddr(from,streamnet_server_addr)) return;
 
             StreamNetPeer &p = streamnet_peers[peerid];
             if (!p.active) {
@@ -2368,6 +2410,8 @@ static void STREAMNET_HandlePacket(const IPaddress &from,const uint8_t *data,siz
         case INPKT_RBINPUT: {
             if (!streamnet_rollback || !streamnet_session) return;
             if (peerid >= STREAMNET_MAX_PEERS || peerid == streamnet_selfid) return;
+            /* (a player's input comes from its own address; the server relays everybody's to a client) */
+            if (streamnet_is_server ? STREAMNET_PeerByAddr(from) != &streamnet_peers[peerid] : !STREAMNET_SameAddr(from,streamnet_server_addr)) return;
             StreamNetPeer &p = streamnet_peers[peerid];
             if (!p.active) {
                 if (streamnet_is_server) return;
@@ -2618,7 +2662,7 @@ static bool STREAMNET_Connect(const char *host,uint16_t port,std::string &errmsg
 
         const uint32_t round = GetTicks();
         while (!welcomed && (GetTicks() - round) < 250u) {
-            if (SDLNet_UDP_Recv(streamnet_socket,streamnet_recvpkt) > 0) {
+            if (SDLNet_UDP_Recv(streamnet_socket,streamnet_recvpkt) > 0 && STREAMNET_SameAddr(streamnet_recvpkt->address,streamnet_server_addr)) {
                 StreamNetReader r((const uint8_t*)streamnet_recvpkt->data,(size_t)streamnet_recvpkt->len);
                 if (r.u32() == STREAMNET_MAGIC && r.u8() == (uint8_t)STREAMNET_PROTOVER) {
                     const uint8_t type = r.u8();
@@ -2708,6 +2752,11 @@ static bool STREAMNET_Connect(const char *host,uint16_t port,std::string &errmsg
                                     const unsigned al = r.u16();
                                     const uint8_t *ab = r.bytes(al);
                                     rbj_autorun = (ab != NULL) ? std::string((const char*)ab, al) : std::string();
+                                    /* (typed at this computer's DOS prompt: a batch file's or program's name, nothing else) */
+                                    bool plain_name = !rbj_autorun.empty() && rbj_autorun.size() <= 8u;
+                                    for (size_t k = 0; plain_name && k < rbj_autorun.size(); k++)
+                                        plain_name = isalnum((unsigned char)rbj_autorun[k]) || rbj_autorun[k] == '_';
+                                    if (!plain_name && !rbj_autorun.empty()) { LOG_MSG("STREAMNET: the server's start command is not a plain name: not typed here"); rbj_autorun.clear(); }
                                     /* (the machines bring their own clock etc. later: RBCExtras) */
                                     streamnet_have_pending_clock = streamnet_have_pending_tsc = streamnet_have_pending_vga = false;
                                     welcomed_at = GetTicks();
@@ -3927,6 +3976,12 @@ static void RB_HandleInput(StreamNetPeer &p, unsigned peerid, StreamNetReader &r
         for (unsigned e = 0; e < n; e++) {
             StreamNetEvent ev;
             if (!STREAMNET_ReadEvent(r,ev)) return;
+            /* Only the server (player 1) types its autorun at the DOS prompt and sets the speed: from anyone else, a
+             * key with the autorun flag is an ordinary key (dropped at the prompt) and a speed event is dropped. */
+            if (peerid != 0) {
+                if (ev.type == INEV_CYCLEMAX) continue;
+                if (ev.type == INEV_KEY) ev.pressed &= 1u;
+            }
             slot.events.push_back(ev);
         }
     }
@@ -4554,7 +4609,6 @@ static bool RB_CopyFree(const uint8_t *seats, unsigned c) {
     const uint8_t s = seats[c];
     return s >= STREAMNET_MAX_PEERS || !streamnet_peers[s].active;
 }
-static int rbs_filereq_peer = -1;               /* whose file request rb_filereq_* hold */
 
 /* What a save state leaves out of a copy: its clock, the processor's time stamp counter, the VGA frame clock. */
 struct RBCExtras {
@@ -5267,7 +5321,7 @@ static void RBC_FollowerCommands(void) {
                 if (p == NULL || !RBC_TakeManifestFull(p, end, m)) break;
                 for (size_t i = 0; i < m.size(); i++) {
                     localDrive *ld = (m[i].drive < DOS_DRIVES) ? dynamic_cast<localDrive*>(Drives[m[i].drive]) : NULL;
-                    if (ld == NULL) continue;
+                    if (ld == NULL || !RB_PlainPath(m[i].path)) continue;
                     const size_t bs = m[i].path.find_last_of('\\');
                     if (bs != std::string::npos) {
                         size_t from = 0;
@@ -6042,13 +6096,7 @@ static void RB_ServerApplySyncUp(const RBSyncUp &u, const std::string &name, uns
         if ((size_t)(end - p) < size) break;
         const uint8_t *data = p; p += size;
         /* only a file our own rules let players bring, with a plain 8.3 path on one of our folders */
-        bool plain = !e.path.empty() && size <= RB_SYNCUP_FILE_MAX;
-        for (size_t from = 0; plain && from <= e.path.size(); ) {
-            size_t bs = e.path.find('\\', from);
-            if (bs == std::string::npos) bs = e.path.size();
-            plain = RB_Is83(e.path.substr(from, bs - from).c_str());
-            from = bs + 1;
-        }
+        const bool plain = size <= RB_SYNCUP_FILE_MAX && RB_PlainPath(e.path);
         if (!plain || e.drive >= DOS_DRIVES || dynamic_cast<localDrive*>(Drives[e.drive]) == NULL || !RB_RuleMatches(rb_sync_rules, e.path)) {
             LOG_MSG("STREAMNET: \"%s\" sent %c:\\%s, which players may not bring: not used", name.c_str(), (char)('A' + (e.drive & 31u)), e.path.c_str());
             continue;
@@ -6551,6 +6599,7 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
     if (r.bad()) return;
     if (sub == 0) {                 /* request from a client (a cluster's joining computer: it is ready for the machines) */
         if (!streamnet_is_server) return;
+        if (STREAMNET_PeerByAddr(from) == NULL) return;     /* (players only) */
         const bool join = r.remain() >= 1 && r.u8() == 1;
         if (rbc_copies) {
             StreamNetPeer *p = STREAMNET_PeerByAddr(from);
@@ -6563,6 +6612,9 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
     }
     if (sub == 3) {                 /* acknowledgement */
         if (!streamnet_is_server) return;
+        StreamNetPeer *src = STREAMNET_PeerByAddr(from);    /* (players only, each for itself) */
+        if (src == NULL) return;
+        peerid = (unsigned)(src - streamnet_peers);
         r.u32();
         const uint32_t count = r.u32();
         if (r.bad()) return;
@@ -6576,6 +6628,8 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
         if (r.bad() || total == 0 || total > (256u << 20) || rawsize > (1024u << 20)) return;
         if (id == rb_resync_done_id) { RB_SendResyncAck(id, rb_resync_done_count); return; }   /* (our acks got lost) */
         if (id == rb_resync_id) return;     /* a repeated header of a transfer we already have */
+        static bool receiving = false;      /* (another header while one is received below: ignored, not nested) */
+        if (receiving) return;
         std::vector<uint8_t> joined, left;  /* who plays from this frame on */
         if (r.remain() >= 1) { const unsigned nj = r.u8(); for (unsigned j = 0; j < nj; j++) joined.push_back(r.u8()); }
         if (r.remain() >= 1) { const unsigned nl = r.u8(); for (unsigned j = 0; j < nl; j++) left.push_back(r.u8()); }
@@ -6610,9 +6664,11 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
         rb_resync_id = id;
         rb_resync_frame = frame;
         rb_resync_total = total;
-        rb_resync_buf.assign(total, 0);
+        try { rb_resync_buf.assign(total, 0); }
+        catch (const std::bad_alloc &) { LOG_MSG("STREAMNET: resync: no memory for %u bytes", (unsigned)total); rb_resync_id = 0; return; }
         const uint32_t nchunks = (total + RB_RESYNC_CHUNK - 1u) / RB_RESYNC_CHUNK;
         rb_resync_have.assign(nchunks, false);
+        struct Receiving { bool &b; Receiving(bool &x) : b(x) { b = true; } ~Receiving() { b = false; } } receiving_now(receiving);
         rb_resync_got = 0;
         uint32_t contiguous = 0;
         const uint32_t start = GetTicks();
@@ -6638,7 +6694,8 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
         rb_resync_ready_raw = rawsize;
         std::vector<uint8_t>().swap(rb_resync_buf);
         if (rbc_copies) {           /* (the copies' DOS prompt flags say where it can be loaded) */
-            rbc_resync_raw.assign(rawsize, 0);
+            try { rbc_resync_raw.assign(rawsize, 0); }
+            catch (const std::bad_alloc &) { LOG_MSG("STREAMNET: resync: no memory to unpack the server's machines"); std::vector<uint8_t>().swap(rb_resync_ready); return; }
             uLongf rlen = rawsize;
             if (rawsize == 0 || uncompress(&rbc_resync_raw[0], &rlen, &rb_resync_ready[0], (uLong)rb_resync_ready.size()) != Z_OK || rlen != rawsize) {
                 LOG_MSG("STREAMNET: resync: the server's machines did not unpack");
@@ -7515,7 +7572,7 @@ public:
         if (streamnet_rollback) streamnet_capture_active = true;
 
         v = section->Get_int("delay");
-        if (streamnet_rollback) streamnet_delay = (unsigned int)((v >= 0 && v <= 8) ? v : 0);
+        if (streamnet_rollback) streamnet_delay = (unsigned int)((v >= 0 && v <= 30) ? v : 0);   /* (up to 300 ms: NukemNet's room choice) */
         else streamnet_delay = (unsigned int)((v >= 1 && v <= 64) ? v : 3);
 
         v = section->Get_int("rollback window");

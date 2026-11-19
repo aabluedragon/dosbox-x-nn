@@ -119,6 +119,10 @@ public:
 	 * guest's next create makes it again), for files a program writes that should not land in the mounted folder. */
 	bool IsMountedFileKept(const char* dosPath) const { return mounted_files_kept.count(MountedFileKey(dosPath)) != 0; }
 	const std::map<std::string,std::string>& GetMountedFiles() const { return mounted_files; }
+	/* RollbackNet's copy-on-write (drive_local.cpp, NN_CopyOnWrite) */
+	bool CowFileExists(const char *name);
+	bool CowMap(const char *name, bool copy, const char *from = NULL);
+	const char *CowHost(const char *name) { return GetMountedFileHost(name); }
 	static std::string MountedFileKey(const char* dosPath);
 	struct {
 		uint16_t bytes_sector;
