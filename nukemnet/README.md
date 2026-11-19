@@ -439,7 +439,7 @@ the join is refused, naming it.
 
 Two lists of file rules refine this (DOS paths relative to a mounted folder, `*` and `?` within a name, separated by
 spaces or `;`; a rule without a folder matches the name in any folder; NukemNet passes them from a game's files marked
-`allowSync` and `mustMatch`). `[streamnet] rollback match files` (the game's programs and data, such as DUKE3D.EXE and
+`same: {allowSync: true}` and `same: true`). `[streamnet] rollback match files` (the game's programs and data, such as DUKE3D.EXE and
 DUKE3D.GRP) are never sent, either way: a join where one differs or is missing is refused, naming it, whatever its
 size. `rollback sync files` (a player's own controls and settings, such as DUKE3D.CFG) travel with their player, in a
 cluster: before its HELLO a joining computer sends its own of them, from the copy its player plays (`INPKT_SYNCUP`,

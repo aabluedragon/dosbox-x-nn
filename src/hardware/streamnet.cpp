@@ -1486,13 +1486,13 @@ static bool RB_TakeManifest(std::vector<uint8_t> &blob, std::vector<RBFile> &m) 
 }
 
 /* --- RollbackNet: the players' own files, and the files that must match ------------------------------------------------
- * "rollback sync files" (NukemNet: a game's files marked allowSync, such as DUKE3D.CFG with the player's controls and
+ * "rollback sync files" (NukemNet: a game's files marked same: {allowSync: true}, such as DUKE3D.CFG with the player's controls and
  * name): when a game starts, each joining computer sends its own of these, from the copy its player plays, before its
  * HELLO (RB_UploadSyncFiles); the server maps them over its copy for that player (RBC_CMD_FILEMAP) and lets nobody in
  * before every expected player's have come (RB_ServerTakeSyncFiles). The lists of files it then sends hold them, so
  * every computer's copy for a player runs with that player's files, and nothing goes back to the player. Only names
  * the server's own rules allow are taken. Someone who joins a running game sends nothing that is used: they take the
- * server's, as for any other file. "rollback match files" (mustMatch: the game's programs and data, such as DUKE3D.EXE
+ * server's, as for any other file. "rollback match files" (same: true: the game's programs and data, such as DUKE3D.EXE
  * and DUKE3D.GRP) are never sent, either way: a join where one differs or is missing is refused, naming it. */
 static std::vector<std::string> rb_sync_rules, rb_match_rules;
 
