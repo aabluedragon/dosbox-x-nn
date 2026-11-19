@@ -2399,7 +2399,8 @@ static void SyncOverlay_Text(SDL_Surface *surf, int x0, int y0, const char *text
 }
 
 static void SyncOverlay_Fill(SDL_Surface *surf, int x0, int y0, int w, int h, uint32_t color) {
-    SDL_Rect r = { x0, y0, w, h };
+    SDL_Rect r;     /* (SDL1's fields are 16-bit: no narrowing in an initializer list) */
+    r.x = (decltype(r.x))x0; r.y = (decltype(r.y))y0; r.w = (decltype(r.w))w; r.h = (decltype(r.h))h;
     SDL_FillRect(surf, &r, color);
 }
 
