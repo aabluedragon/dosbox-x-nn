@@ -96,6 +96,7 @@ SHELL_Cmd cmd_list[]={
 {	"EXIT",			0,		&DOS_Shell::CMD_EXIT,		"SHELL_CMD_EXIT_HELP"},
 #if !defined(OSFREE)
 {	"FILEMOUNT",	1,		&DOS_Shell::CMD_FILEMOUNT,	"SHELL_CMD_FILEMOUNT_HELP"},
+{	"NNVIEWERFILES",	1,		&DOS_Shell::CMD_NNVIEWERFILES,	"SHELL_CMD_NNVIEWERFILES_HELP"},
 #endif
 {	"FOR",			1,		&DOS_Shell::CMD_FOR,		"SHELL_CMD_FOR_HELP"},
 {	"GOTO",			1,		&DOS_Shell::CMD_GOTO,		"SHELL_CMD_GOTO_HELP"},
@@ -3914,6 +3915,81 @@ bool ZipResolve(const std::string &path,std::string &host,std::string &error) {
 }
 
 } /* namespace */
+
+/* NNVIEWERFILES [seconds]: a copy of an IPX/NullModem-over-StreamNet game that NukemNet starts for a player who was in
+ * the room when the game started waits here, before the game, for that player's own files (their controls: [streamnet]
+ * viewer files names which, NN_RP_SYNC_FILES on their computer where they are; remoteplay.cpp RP_FILES), and maps them
+ * over the game's own for the session (as FILEMOUNT /K, from copies in the system's temporary folder): the game then
+ * starts with that player's settings. Nothing comes (no copy of the game there, or no answer in time): the game's own
+ * are used. The game's files are never changed. */
+bool REMOTEPLAY_ViewerFilesOpen(bool open);
+bool REMOTEPLAY_TakeViewerFiles(std::vector<std::pair<std::string,std::vector<uint8_t> > > &out);
+bool STREAMNET_RuleMatches(const char *rules, const std::string &path);
+static std::vector<std::string> nnviewerfiles_temp;
+static void NNVIEWERFILES_Cleanup(void) { for (size_t i = 0; i < nnviewerfiles_temp.size(); i++) remove(nnviewerfiles_temp[i].c_str()); }
+
+void DOS_Shell::CMD_NNVIEWERFILES(char * args) {
+	HELP("NNVIEWERFILES");
+	Section_prop *sec = static_cast<Section_prop *>(control->GetSection("streamnet"));
+	const std::string rules = sec ? sec->Get_string("viewer files") : "";
+	unsigned seconds = (unsigned)atoi(args);
+	if (seconds == 0 || seconds > 120) seconds = 20;
+	if (rules.empty() || !REMOTEPLAY_ViewerFilesOpen(true)) return;
+	WriteOut("Waiting for the player's own settings...\n");
+	std::vector<std::pair<std::string,std::vector<uint8_t> > > files;
+	bool got = false;
+	const uint32_t t0 = GetTicks();
+	while (GetTicks() - t0 < seconds * 1000u) {
+		if (REMOTEPLAY_TakeViewerFiles(files)) { got = true; break; }
+		CALLBACK_Idle();
+	}
+	REMOTEPLAY_ViewerFilesOpen(false);
+	if (!got) {
+		WriteOut("None came: the game's own settings are used.\n");
+		LOG_MSG("STREAMNET: remote play: no files came from the player in %u s: the game's own are used", seconds);
+		return;
+	}
+	std::string dir;
+#if defined(WIN32)
+	char tmp[MAX_PATH + 1];
+	const DWORD tl = GetTempPathA(sizeof(tmp), tmp);
+	dir = (tl > 0 && tl < sizeof(tmp)) ? std::string(tmp) : std::string(".\\");
+#else
+	const char *tmpenv = getenv("TMPDIR");
+	dir = (tmpenv != NULL && *tmpenv) ? std::string(tmpenv) : std::string("/tmp");
+#endif
+	if (!dir.empty() && dir[dir.size() - 1] != '/' && dir[dir.size() - 1] != '\\') dir += CROSS_FILESPLIT;
+	unsigned used = 0;
+	for (size_t i = 0; i < files.size(); i++) {
+		std::string p = files[i].first;
+		for (size_t k = 0; k < p.size(); k++) p[k] = (p[k] == '/') ? '\\' : (char)toupper((unsigned char)p[k]);
+		if (p.size() < 4 || p[1] != ':' || p[2] != '\\' || p[0] < 'A' || p[0] > 'Z' || p.find("..") != std::string::npos) continue;
+		const int drive = p[0] - 'A';
+		const std::string rel = p.substr(3);
+		localDrive *ld = (drive < DOS_DRIVES && Drives[drive] != NULL) ? dynamic_cast<localDrive*>(Drives[drive]) : NULL;
+		if (ld == NULL || !STREAMNET_RuleMatches(rules.c_str(), rel)) {
+			LOG_MSG("STREAMNET: remote play: the player sent %s, which players may not bring: not used", p.c_str());
+			continue;
+		}
+		const size_t bs = rel.find_last_of('\\');
+		char name[64];
+		snprintf(name, sizeof(name), "dosbox-x-nn-player-%u-%u-", (unsigned)(GetTicks() & 0xFFFFFu), (unsigned)i);
+		const std::string host = dir + name + (bs == std::string::npos ? rel : rel.substr(bs + 1));
+		FILE *f = fopen(host.c_str(), "wb");
+		if (f == NULL) continue;
+		const size_t n = files[i].second.size();
+		const size_t put = n ? fwrite(&files[i].second[0], 1, n, f) : 0;
+		fclose(f);
+		if (put != n) { remove(host.c_str()); continue; }
+		if (nnviewerfiles_temp.empty()) atexit(NNVIEWERFILES_Cleanup);
+		nnviewerfiles_temp.push_back(host);
+		if (!ld->AddMountedFile(rel.c_str(), host.c_str(), true)) continue;
+		used++;
+		WriteOut("Using the player's own %s\n", p.c_str());
+		LOG_MSG("STREAMNET: remote play: using the player's own %s", p.c_str());
+	}
+	if (used == 0) WriteOut("The player has none of these files: the game's own settings are used.\n");
+}
 
 void DOS_Shell::CMD_FILEMOUNT(char * args) {
 	HELP("FILEMOUNT");

@@ -188,6 +188,15 @@ This fork is the DOSBox-X that [NukemNet](https://nukemnet.com) downloads automa
   scaling = nearest | bilinear | sharp`, Ctrl+F7 in the viewer switches. Only the viewer does it, with the graphics card,
   after the frame arrived: the host sends the same picture whatever is chosen (no bandwidth, no latency); a software
   renderer keeps nearest. sharp enlarges by whole pixels into a render target, then linearly to the window.
+- A player's own settings files for the copy that plays for them (capability `streamnetViewerFiles`; NukemNet's
+  IPX/NullModem-over-StreamNet copies for the players in the room when the game starts). The copy's AUTOEXEC runs
+  `NNVIEWERFILES [seconds]` (20 by default) before the game: it waits for its viewer's files, takes only the names
+  `[streamnet] viewer files` allows (rules as for `rollback sync files`), and maps them over the game's own for the
+  session (as FILEMOUNT /K, from copies in the system's temporary folder, deleted when DOSBox-X-NN exits); the game's
+  files are never changed. The viewer sends what env `NN_RP_SYNC_FILES` names ("C:\\DOS\\PATH<tab>host path" a line;
+  NukemNet looks for the game's files in the player's own game folder) as `RP_FILES` once it is welcomed, the copy
+  acknowledging with `RP_FILESACK`; a viewer with no files sends an empty set, so the copy goes on at once. Once the copy
+  has gone on (a Pre-sit copy, a player joining a running game) the files are not used: it plays with the host's.
 - Who may connect to a remote play host (capability `streamnetAuth`, feature bit 32 in a viewer's HELLO). A host started
   with env `NN_RP_AUTH_SECRET` (16+ characters; NukemNet gives one per room, from the environment because other users
   can read a command line) lets in only viewers whose HELLO carries, after the features, a token (u8 length + text) for
@@ -448,7 +457,9 @@ not typed yet) the server maps them over its copy for that player (`RBC_CMD_FILE
 256 KB a file, 1 MB in all) and lets nobody in before every expected player's have come (`players` less one; 10 s for
 a computer that sent none, 30 s for them all). The lists sent with the joins then hold them, so every computer's copy
 for a player runs with that player's files and nothing goes back to the player. Once the game runs they are not used:
-someone who joins it takes the server's, as for any other file. Capability `rollbackNetFileRules`.
+someone who joins it takes the server's, as for any other file. A player who has none of a game's sync files (no
+DUKE3D.CFG) sends none: the server's copy for them keeps its own, which they then take like any missing file.
+Capability `rollbackNetFileRules`.
 
 File searches (FindFirst/FindNext) on a local folder drive during a session keep their place in the DTA, as DOS does
 (`localDrive::SessionFindNext`: `dirCluster` a key for the directory, `dirID` the index of the next entry), not in a

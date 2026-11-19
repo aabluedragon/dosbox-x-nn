@@ -268,6 +268,7 @@ public:
     /*! \brief      Map a host file into a mounted drive's directory (FILEMOUNT)
      */
 	void CMD_FILEMOUNT(char* args);
+	void CMD_NNVIEWERFILES(char* args);
 
     /*! \brief      Load a program into high memory if possible
      */

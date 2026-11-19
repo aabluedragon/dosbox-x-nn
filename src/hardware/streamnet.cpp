@@ -1535,6 +1535,13 @@ static bool RB_RuleMatches(const std::vector<std::string> &rules, const std::str
     return false;
 }
 
+/* The same rules for remote play's player files (NNVIEWERFILES, remoteplay.cpp): "rules" as the settings write them. */
+bool STREAMNET_RuleMatches(const char *rules, const std::string &path) {
+    std::vector<std::string> r;
+    RB_ParseRules(rules, r);
+    return RB_RuleMatches(r, path);
+}
+
 /* Client: which of the server's files it needs (bits), or false with "err" when one cannot be taken over. "mine": our
  * own files (of the same copy, in a cluster). */
 static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std::vector<RBFile> &mine, std::vector<uint8_t> &bits, uint64_t &total, std::string &err) {
@@ -5946,7 +5953,8 @@ static void RB_UploadSyncFiles(void) {
         }
         STREAMNET_Stall(last_events);
     }
-    if (taken) LOG_MSG("STREAMNET: the server took our own files: player %u's copy runs with them on every computer", rbc_copy + 1u);
+    if (taken && count == 0) LOG_MSG("STREAMNET: we have none of these files: player %u's copy uses the server's", rbc_copy + 1u);
+    else if (taken) LOG_MSG("STREAMNET: the server took our own files: player %u's copy runs with them on every computer", rbc_copy + 1u);
     else LOG_MSG("STREAMNET: the game runs already: player %u's copy keeps the server's files", rbc_copy + 1u);
 }
 
@@ -7697,6 +7705,7 @@ bool STREAMNET_RollbackSeat(const std::string &name, unsigned copy) {
 
 #include <string>
 bool STREAMNET_RollbackSeat(const std::string &, unsigned) { return false; }
+bool STREAMNET_RuleMatches(const char *, const std::string &) { return false; }
 bool STREAMNET_PendingSpeed(uint32_t &, uint32_t &) { return false; }
 void STREAMNET_ScheduleSpeed(uint32_t, uint32_t) { }
 uint32_t STREAMNET_TraceFrame(void) { return 0; }

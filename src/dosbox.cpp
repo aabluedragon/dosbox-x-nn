@@ -5615,6 +5615,11 @@ void DOSBOX_SetupConfigSections(void) {
                    "spaces or ;. A name without a folder matches in any folder. When a game starts, each joining player's\n"
                    "DOSBox-X-NN sends its own of these files and the server maps them over the copy that player plays, so\n"
                    "that copy runs with them on every computer. Someone who joins a running game takes the server's.");
+    Pstring = secprop->Add_string("viewer files",Property::Changeable::WhenIdle, "");
+    Pstring->Set_help("Remote play host (a copy NukemNet starts for one player of an IPX/NullModem-over-StreamNet game): the\n"
+                   "game files its player's viewer may bring (their own controls, such as DUKE3D.CFG), same format as\n"
+                   "\"rollback sync files\". The batch command NNVIEWERFILES waits for them before the game starts and maps\n"
+                   "them over the game's own; the viewer sends the files NukemNet names in NN_RP_SYNC_FILES.");
     Pstring = secprop->Add_string("rollback match files",Property::Changeable::WhenIdle, "");
     Pstring->Set_help("mode=rollback: game files that must be the same on every computer and are never sent (the game's\n"
                    "programs, its data such as DUKE3D.GRP): a join where one differs or is missing is refused, naming it.\n"

@@ -125,6 +125,9 @@ enum {
                            low 32 bits; then u8 1 when the DOS mouse driver's pointer follows: u16 x, u16 y (its
                            place as parts of its range, 65535 = the far end) and four f32: how far one count of
                            mouse motion moves it, x and y, for a motion of one count and for a larger one */
+    RP_FILES    = 13,   /* viewer -> host: u32 session, u32 total, u32 offset, u16 length, bytes: its player's own game
+                           files (NN_RP_SYNC_FILES): u32 count, then per file u16 length, DOS path, u32 size, bytes */
+    RP_FILESACK = 14,   /* host -> viewer: u32 total, u32 bytes received in order, u8 taken (NNVIEWERFILES waits) */
     RP_MOVED    = 12    /* to a viewer with RP_FEAT_MOVE, from what stands between it and the hosts (NukemNet's proxy,
                            which gives each player one of several copies of a game): this player's copy is another one
                            now. The viewer keeps its window and starts over there as a new session. */
@@ -1685,6 +1688,41 @@ void Host_ApplyEvent(Viewer &v,Reader &r) {
     }
 }
 
+/* A player's own game files (RP_FILES): taken while the batch command NNVIEWERFILES waits for them, before the game
+ * starts; the shell maps them over the game's (REMOTEPLAY_TakeViewerFiles). Once it has gone on they are not used: the
+ * game read its own already (someone who joins a running game plays with the host's settings). */
+bool host_files_open = false;           /* NNVIEWERFILES is waiting */
+bool host_files_ready = false;          /* a whole set came while it waited */
+uint32_t host_files_session = 0, host_files_total = 0, host_files_have = 0;
+std::vector<uint8_t> host_files_data;
+std::vector<bool> host_files_got;
+const uint32_t RP_FILES_CHUNK = 1000, RP_FILES_MAX = 1u << 20;
+
+void Host_Files(Viewer &v,const IPaddress &from,Reader &r) {
+    if (r.u32() != v.session) return;
+    const uint32_t total = r.u32(), off = r.u32();
+    const unsigned n = r.u16();
+    if (!r.ok || total < 4 || total > RP_FILES_MAX || n > RP_FILES_CHUNK || r.pos + n > r.len) return;
+    const bool taken = host_files_open && !host_files_ready;
+    if (taken) {
+        if (host_files_session != v.session || host_files_total != total) {
+            host_files_session = v.session; host_files_total = total; host_files_have = 0;
+            host_files_data.assign(total,0);
+            host_files_got.assign((total + RP_FILES_CHUNK - 1) / RP_FILES_CHUNK,false);
+        }
+        if ((off % RP_FILES_CHUNK) == 0 && off < total && n == std::min(RP_FILES_CHUNK,total - off)) {
+            memcpy(&host_files_data[off],r.p + r.pos,n);
+            host_files_got[off / RP_FILES_CHUNK] = true;
+            while (host_files_have < total && host_files_got[host_files_have / RP_FILES_CHUNK])
+                host_files_have = std::min(total,host_files_have + RP_FILES_CHUNK);
+            if (host_files_have >= total) host_files_ready = true;
+        }
+    }
+    HostWriter w(RP_FILESACK);
+    w.u32(total); w.u32(taken || host_files_ready ? host_files_have : total); w.u8(taken || (host_files_ready && host_files_session == v.session) ? 1 : 0);
+    Host_SendTo(from,w.buf,w.len);
+}
+
 /* WELCOME: the viewer's slot and the sound rate; an auth host adds the cookie the viewer's next HELLO echoes and the
  * stream id its packets carry from now on. */
 void Host_Welcome(const Viewer &v,const IPaddress &to) {
@@ -1792,6 +1830,10 @@ void Host_HandlePacket(const IPaddress &from,const uint8_t *data,size_t len) {
     v->lastheard = SDL_GetTicks();
 
     switch (type) {
+        case RP_FILES:
+            if (host_auth && !v->proven) break;
+            Host_Files(*v,from,r);
+            break;
         case RP_INPUT: {
             if (r.u32() != v->session) break;
             const uint32_t first = r.u32();
@@ -2278,6 +2320,35 @@ bool REMOTEPLAY_HostRequested(void) {
     if (control->opt_streamnet_server >= 0) return true;
     if (!control->opt_streamnet_connect.empty() || !sec->Get_bool("streamnet")) return false;
     return std::string(sec->Get_string("connect")).empty() && !std::string(sec->Get_string("startserver")).empty();
+}
+
+/* NNVIEWERFILES (shell): from now on (open) a player's own files are taken, or no more. */
+bool REMOTEPLAY_ViewerFilesOpen(bool open) {
+    host_files_open = open && host_running;
+    if (open) { host_files_ready = false; host_files_session = 0; host_files_total = 0; host_files_have = 0; }
+    return host_files_open;
+}
+
+/* NNVIEWERFILES: the files of a whole set that came (DOS path with its drive, contents), once. */
+bool REMOTEPLAY_TakeViewerFiles(std::vector<std::pair<std::string,std::vector<uint8_t> > > &out) {
+    out.clear();
+    if (!host_files_ready || host_files_data.size() < 4) return false;
+    const uint8_t *p = &host_files_data[0], *end = p + host_files_data.size();
+    uint32_t count = 0;
+    memcpy(&count,p,4); p += 4;
+    for (uint32_t i = 0; i < count && i < 64u; i++) {
+        if (end - p < 2) break;
+        uint16_t len; memcpy(&len,p,2); p += 2;
+        if ((size_t)(end - p) < (size_t)len + 4u) break;
+        std::string path((const char*)p,len); p += len;
+        uint32_t size; memcpy(&size,p,4); p += 4;
+        if ((size_t)(end - p) < size) break;
+        out.push_back(std::make_pair(path,std::vector<uint8_t>(p,p + size)));
+        p += size;
+    }
+    std::vector<uint8_t>().swap(host_files_data);
+    host_files_ready = false;
+    return true;
 }
 
 bool REMOTEPLAY_HideScreenRequested(void) {
@@ -5126,6 +5197,55 @@ public:
     uint32_t connect_since = 0;         /* since when HELLOs go out unanswered (0: welcomed, or not started) */
     uint32_t auth_cookie = 0, auth_stream = 0;
     unsigned timeout = 10000;
+    /* our player's own game files for the copy that plays for us (env NN_RP_SYNC_FILES, see RP_FILES) */
+    std::vector<uint8_t> files_blob;
+    uint32_t files_acked = 0, files_lastsend = 0;
+    bool files_done = false;
+
+    void loadFiles(void) {
+        files_blob.assign(4,0);
+        uint32_t count = 0;
+        const char *env = getenv("NN_RP_SYNC_FILES");
+        std::string names;
+        for (const char *line = env ? env : ""; *line; ) {
+            const char *eol = strchr(line,'\n');
+            const std::string entry(line,eol ? (size_t)(eol - line) : strlen(line));
+            line = eol ? eol + 1 : line + entry.size();
+            const size_t tab = entry.find('\t');
+            if (tab == std::string::npos || tab == 0 || tab > 200) continue;
+            const std::string dos = entry.substr(0,tab), host = entry.substr(tab + 1);
+            FILE *f = fopen(host.c_str(),"rb");
+            if (f == NULL) continue;
+            std::vector<uint8_t> data;
+            uint8_t buf[16384];
+            size_t got;
+            while ((got = fread(buf,1,sizeof(buf),f)) > 0 && data.size() <= (256u << 10)) data.insert(data.end(),buf,buf + got);
+            fclose(f);
+            if (data.size() > (256u << 10) || files_blob.size() + data.size() + dos.size() + 6 > RP_FILES_MAX) continue;
+            const uint16_t len = (uint16_t)dos.size();
+            const uint32_t size = (uint32_t)data.size();
+            files_blob.insert(files_blob.end(),(const uint8_t*)&len,(const uint8_t*)&len + 2);
+            files_blob.insert(files_blob.end(),dos.begin(),dos.end());
+            files_blob.insert(files_blob.end(),(const uint8_t*)&size,(const uint8_t*)&size + 4);
+            files_blob.insert(files_blob.end(),data.begin(),data.end());
+            count++;
+            names += (names.empty() ? "" : ", ") + dos;
+        }
+        memcpy(&files_blob[0],&count,4);
+        if (count) LOG_MSG("STREAMNET: remote play: our own files for the copy we play: %s",names.c_str());
+    }
+
+    void sendFiles(void) {
+        files_lastsend = SDL_GetTicks();
+        const uint32_t total = (uint32_t)files_blob.size();
+        for (uint32_t off = files_acked, k = 0; off < total && k < 16u; off += RP_FILES_CHUNK, k++) {
+            Writer w(RP_FILES);
+            const uint32_t n = std::min(RP_FILES_CHUNK,total - off);
+            w.u32(session); w.u32(total); w.u32(off); w.u16((uint16_t)n);
+            for (uint32_t i = 0; i < n; i++) w.u8(files_blob[off + i]);
+            send(w);
+        }
+    }
 
     /* video */
     Assembly asm_slots[4];
@@ -5267,6 +5387,7 @@ public:
         LOG_MSG("STREAMNET: %s",title_note.c_str());
         newSession();
         welcomed = false;
+        files_acked = 0; files_done = false;    /* (the new copy may be waiting for them) */
         for (Assembly &a : asm_slots) a.used = false;
         hist.clear();
         haveframe = havekey = false;
@@ -6305,6 +6426,26 @@ public:
                 vp.pointerTold(f.id,f.seq,f.ptr);
                 break;
             }
+            case RP_FILESACK: {
+                const uint32_t total = r.u32(), have = r.u32();
+                const uint8_t taken = r.u8();
+                if (!r.ok || total != (uint32_t)files_blob.size() || files_done) break;
+                if (!taken) {
+                    files_done = true;
+                    LOG_MSG("STREAMNET: remote play: the game runs already (or takes no files): the host's settings are used");
+                }
+                else if (have > files_acked) {
+                    files_acked = std::min(have,total);
+                    if (files_acked >= total) {
+                        files_done = true;
+                        uint32_t count = 0;
+                        memcpy(&count,&files_blob[0],4);
+                        if (count) LOG_MSG("STREAMNET: remote play: the host took our own files");
+                    }
+                    else sendFiles();
+                }
+                break;
+            }
             case RP_INPUTACK: {
                 const uint32_t ack = r.u32();
                 if (!r.ok) break;
@@ -6417,6 +6558,10 @@ public:
             const uint32_t now = SDL_GetTicks();
             if (title_note_until && (int32_t)(now - title_note_until) >= 0) { title_note_until = 0; updateTitle(); }
             if (now - lasthello >= (welcomed ? 1000u : 500u)) sendHello();
+            if (welcomed && !files_done && now - files_lastsend >= 250u) {
+                if (files_blob.empty()) loadFiles();
+                sendFiles();
+            }
             if ((acc_xrel != 0 || acc_yrel != 0 || motion_dirty) && now - lastmove >= 4) flushMotion();
             if (!pending.empty() && (input_dirty || now - lastinput >= 30)) sendInput();
             if (welcomed && now - lastack >= 100) sendAck();   /* also reports loss when no frame completes */
@@ -6532,6 +6677,8 @@ void REMOTEPLAY_Init(void) { }
 void REMOTEPLAY_ProcessEnded(void) { }
 bool REMOTEPLAY_HostRequested(void) { return false; }
 bool REMOTEPLAY_HideScreenRequested(void) { return false; }
+bool REMOTEPLAY_ViewerFilesOpen(bool) { return false; }
+bool REMOTEPLAY_TakeViewerFiles(std::vector<std::pair<std::string,std::vector<uint8_t> > > &out) { out.clear(); return false; }
 bool REMOTEPLAY_ShellInFront(void) { return false; }
 bool REMOTEPLAY_StartServer(uint16_t) { return false; }
 void REMOTEPLAY_StopServer(const char *) { }

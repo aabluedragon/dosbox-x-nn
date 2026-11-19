@@ -2067,6 +2067,7 @@ void SHELL_MessagesInit() {
 			"  /D            Deletes a mounted or substituted drive.\n\n"
 			"Type SUBST with no parameters to display a list of mounted local drives.\n");
 	MSG_Add("SHELL_CMD_FILEMOUNT_HELP","Maps a host file into a mounted drive's directory tree.\n");
+	MSG_Add("SHELL_CMD_NNVIEWERFILES_HELP","NukemNet: waits for the remote player's own game files ([streamnet] viewer files) and maps them.\n");
 	MSG_Add("SHELL_CMD_FILEMOUNT_HELP_LONG","FILEMOUNT [/K] [drive:][path]filename hostfile\nFILEMOUNT /D [drive:][path]filename\nFILEMOUNT\n\n"
 			"  [drive:][path]filename  The DOS path where the host file should appear.\n"
 			"                          The drive must be a mounted local directory and\n"
