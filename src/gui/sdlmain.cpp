@@ -140,6 +140,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include "control.h"
 #include "dos_inc.h"
 #include "dosbox.h"
+#include "nn_version.h"
 #include "menudef.h"
 #include "pic.h"
 #include "timer.h"
@@ -1274,14 +1275,14 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
 //  if (frameskip != -1) internal_frameskip = frameskip;
 
 #ifdef C_OSFREE
-    constexpr const char* dosbox_name = "DOSBox-X OSFREE";
+    constexpr const char* dosbox_name = "DOSBox-X-NN OSFREE";
 #else
-    constexpr const char* dosbox_name = "DOSBox-X";
+    constexpr const char* dosbox_name = "DOSBox-X-NN";  /* NukemNet's fork: its window says so */
 #endif
 
     bool showbasic = section->Get_bool("showbasic");
     if (showbasic) {
-        sprintf(title, "%s%s%s %s", dosbox_title.c_str(), dosbox_title.empty() ? "" : " - ", dosbox_name, VERSION);
+        sprintf(title, "%s%s%s %s", dosbox_title.c_str(), dosbox_title.empty() ? "" : " - ", dosbox_name, NN_RELEASE);
 
         const char *what = RunningProgram.c_str();
         if (!RunningProgram.empty()) {
@@ -4822,7 +4823,7 @@ static void GUI_StartUp() {
 #endif
 
 #if defined(C_SDL2)
-    SDL_SetWindowTitle(sdl.window,"DOSBox-X");
+    SDL_SetWindowTitle(sdl.window,"DOSBox-X-NN");
     if (posx >= 0 && posy >= 0) {
 #if WIN32
         HWND hwnd = GetHWND();
@@ -4861,7 +4862,7 @@ static void GUI_StartUp() {
 #endif
     }
 #else
-    SDL_WM_SetCaption("DOSBox-X",VERSION);
+    SDL_WM_SetCaption("DOSBox-X-NN",VERSION);
 #endif
 
 #if defined(C_SDL2)
@@ -10078,7 +10079,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 #endif
 
         /* -- Welcome to DOSBox-X! */
-        LOG_MSG("DOSBox-X version %s Commit %s (%s %s %d-bit)",VERSION, GIT_COMMIT_HASH, OS_PLATFORM_LONG, SDL_STRING, OS_BIT_INT);
+        LOG_MSG("DOSBox-X-NN %s, based on DOSBox-X version %s Commit %s (%s %s %d-bit)",NN_RELEASE, VERSION, GIT_COMMIT_HASH, OS_PLATFORM_LONG, SDL_STRING, OS_BIT_INT);
         LOG(LOG_MISC,LOG_NORMAL)("Copyright 2011-%s The DOSBox-X Team. Project maintainer: joncampbell123 (The Great Codeholio). DOSBox-X published under GNU GPL.",std::string(COPYRIGHT_END_YEAR).c_str());
 
 #if defined(MACOSX)

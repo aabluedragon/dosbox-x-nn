@@ -24,6 +24,9 @@ root.mkdir(exist_ok=True)
 (root / 'licenses').mkdir(exist_ok=True)
 shutil.copy2(source / 'src/dosbox-x', root / 'bin/dosbox-x')
 subprocess.run([triple + '-strip', str(root / 'bin/dosbox-x')], check=True)
+# The window title and boot screen show the release (include/nn_version.h): it must be the one packaged.
+if release.encode() + b'\0' not in (root / 'bin/dosbox-x').read_bytes():
+    raise SystemExit(f'dosbox-x was not built as release {release}: set NN_RELEASE in include/nn_version.h')
 directories = [Path(p) for p in ['/opt/nn-dosbox/lib', '/lib/' + triple,
     '/usr/lib/' + triple, '/usr/lib/' + triple + '/pulseaudio']]
 queue = [root / 'bin/dosbox-x']
@@ -88,7 +91,7 @@ exec "$base/lib/core/{loader}" --library-path "$base/lib:$base/lib/core" "$base/
 (root / 'dosbox-x').chmod(0o755)
 (root / 'portable.conf').write_text('[sdl]\noutput=surface\n')
 (root / 'sources.json').write_text(json.dumps(packages, indent=2) + '\n')
-(root / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"streamnetRemote":true,"filemount":true,"streamnetHideScreen":true,"streamnetShellGuard":true,"streamnetMouse":true,"streamnetMotion":true,"filemountAsar":true,"streamnetAdaptive":true,"streamnetPointer":true,"diskLayer":true,"streamnetLockdown":true,"streamnetPredict":true,"streamnetPredictView":true,"streamnetBlockKeys":true,"streamnetReportInput":true,"nnControl":true,"streamnetBlockKeysLive":true,"streamnetMove":true,"streamnetViewerScaling":true,"streamnetAuth":true,"streamnetLocalLinks":true,"filemountKeep":true,"rollbackNet":true,"rollbackNetCluster":true,"rollbackNetSeats":true,"rollbackNetMaxCycles":true,"rollbackNetFileRules":true,"streamnetViewerFiles":true}\n')
+(root / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"streamnetRemote":true,"filemount":true,"streamnetHideScreen":true,"streamnetShellGuard":true,"streamnetMouse":true,"streamnetMotion":true,"filemountAsar":true,"streamnetAdaptive":true,"streamnetPointer":true,"diskLayer":true,"streamnetLockdown":true,"streamnetPredict":true,"streamnetPredictView":true,"streamnetBlockKeys":true,"streamnetReportInput":true,"nnControl":true,"streamnetBlockKeysLive":true,"streamnetMove":true,"streamnetViewerScaling":true,"streamnetAuth":true,"streamnetLocalLinks":true,"filemountKeep":true,"rollbackNet":true,"rollbackNetCluster":true,"rollbackNetSeats":true,"rollbackNetMaxCycles":true,"rollbackNetFileRules":true,"rollbackNetForceFiles":true,"streamnetViewerFiles":true}\n')
 (root / 'README.txt').write_text(f'''DOSBox-X (dosbox-x-nn {release}) — NukemNet portable Linux {arch} build
 Built from NukemNet's DOSBox-X fork, which is based on DOSBox-X 2026.10.01 and later upstream changes.
 Requires Linux {arch} and an X11/XWayland display. ARMv7 requires VFPv3-D16 (hard float).

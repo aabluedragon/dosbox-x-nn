@@ -959,7 +959,7 @@ void ApplySetting(std::string pvar, std::string inputline, bool quiet) {
                     }
 #if defined(C_SDL2)
                     SDL_Window* GFX_GetSDLWindow(void);
-                    SDL_SetWindowTitle(GFX_GetSDLWindow(),"DOSBox-X");
+                    SDL_SetWindowTitle(GFX_GetSDLWindow(),"DOSBox-X-NN");
                     if (posx < 0 || posy < 0) {
                         SDL_DisplayMode dm;
                         int w = 640,h = 480;

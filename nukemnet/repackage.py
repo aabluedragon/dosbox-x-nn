@@ -45,7 +45,11 @@ for folder in keep:
     executable = (stage / folder / 'dosbox-x.app') if macos else (stage / folder / 'dosbox-x.exe')
     if not executable.exists():
         sys.exit(f'{executable} is missing')
-    (stage / folder / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"streamnetRemote":true,"filemount":true,"streamnetHideScreen":true,"streamnetShellGuard":true,"streamnetMouse":true,"streamnetMotion":true,"filemountAsar":true,"streamnetAdaptive":true,"streamnetPointer":true,"diskLayer":true,"streamnetLockdown":true,"streamnetPredict":true,"streamnetPredictView":true,"streamnetBlockKeys":true,"streamnetReportInput":true,"nnControl":true,"streamnetBlockKeysLive":true,"streamnetMove":true,"streamnetViewerScaling":true,"streamnetAuth":true,"streamnetLocalLinks":true,"filemountKeep":true,"rollbackNet":true,"rollbackNetCluster":true,"rollbackNetSeats":true,"rollbackNetMaxCycles":true,"rollbackNetFileRules":true,"streamnetViewerFiles":true}\n')
+    # The window title and boot screen show the release (include/nn_version.h): it must be the one packaged.
+    binary = (executable / 'Contents' / 'MacOS' / 'dosbox-x') if macos else executable
+    if f'{release}, '.encode() not in binary.read_bytes() and release.encode() + b'\0' not in binary.read_bytes():
+        sys.exit(f'{binary} was not built as release {release}: set NN_RELEASE in include/nn_version.h, build again')
+    (stage / folder / 'nn-capabilities.json').write_text('{"win95Ipx":true,"win95FastBoot":true,"streamnetRemote":true,"filemount":true,"streamnetHideScreen":true,"streamnetShellGuard":true,"streamnetMouse":true,"streamnetMotion":true,"filemountAsar":true,"streamnetAdaptive":true,"streamnetPointer":true,"diskLayer":true,"streamnetLockdown":true,"streamnetPredict":true,"streamnetPredictView":true,"streamnetBlockKeys":true,"streamnetReportInput":true,"nnControl":true,"streamnetBlockKeysLive":true,"streamnetMove":true,"streamnetViewerScaling":true,"streamnetAuth":true,"streamnetLocalLinks":true,"filemountKeep":true,"rollbackNet":true,"rollbackNetCluster":true,"rollbackNetSeats":true,"rollbackNetMaxCycles":true,"rollbackNetFileRules":true,"rollbackNetForceFiles":true,"streamnetViewerFiles":true}\n')
 license_file = next((root / name for name in ['COPYING', 'COPYING.txt'] if (root / name).is_file()), None)
 if license_file:
     shutil.copy2(license_file, stage / 'COPYING')

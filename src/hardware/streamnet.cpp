@@ -1385,6 +1385,64 @@ static FILE *RB_OpenRead(const RBFile &e) {
 }
 
 /* 64-bit hash of a file: all of it up to 8 MB, else its first and last megabyte (enough to tell versions apart). */
+/* MD5 (RFC 1321), for the files that must match in RollbackNet (RB_HashFile). */
+struct RBMd5 {
+    uint32_t a = 0x67452301u, b = 0xefcdab89u, c = 0x98badcfeu, d = 0x10325476u;
+    uint64_t len = 0;
+    uint8_t block[64];
+    size_t fill = 0;
+    static uint32_t rol(uint32_t x, unsigned n) { return (x << n) | (x >> (32u - n)); }
+    void transform(const uint8_t *p) {
+        static const uint32_t K[64] = {
+            0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+            0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+            0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+            0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+        static const unsigned S[64] = { 7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22, 5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+            4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23, 6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+        uint32_t m[16];
+        for (unsigned i = 0; i < 16; i++) m[i] = (uint32_t)p[i*4] | ((uint32_t)p[i*4+1] << 8) | ((uint32_t)p[i*4+2] << 16) | ((uint32_t)p[i*4+3] << 24);
+        uint32_t A = a, B = b, C = c, D = d;
+        for (unsigned i = 0; i < 64; i++) {
+            uint32_t F; unsigned g;
+            if (i < 16) { F = (B & C) | (~B & D); g = i; }
+            else if (i < 32) { F = (D & B) | (~D & C); g = (5u * i + 1u) % 16u; }
+            else if (i < 48) { F = B ^ C ^ D; g = (3u * i + 5u) % 16u; }
+            else { F = C ^ (B | ~D); g = (7u * i) % 16u; }
+            const uint32_t t = D; D = C; C = B;
+            B = B + rol(A + F + K[i] + m[g], S[i]);
+            A = t;
+        }
+        a += A; b += B; c += C; d += D;
+    }
+    void update(const uint8_t *p, size_t n) {
+        len += n;
+        while (n > 0) {
+            const size_t k = std::min(n, (size_t)64u - fill);
+            memcpy(block + fill, p, k); fill += k; p += k; n -= k;
+            if (fill == 64u) { transform(block); fill = 0; }
+        }
+    }
+    void final(uint8_t out[16]) {
+        const uint64_t bits = len * 8u;
+        const uint8_t one = 0x80, zero = 0;
+        update(&one, 1);
+        while (fill != 56u) update(&zero, 1);
+        uint8_t l[8];
+        for (unsigned i = 0; i < 8; i++) l[i] = (uint8_t)(bits >> (8u * i));
+        update(l, 8);
+        const uint32_t v[4] = { a, b, c, d };
+        for (unsigned i = 0; i < 4; i++) for (unsigned k = 0; k < 4; k++) out[i*4+k] = (uint8_t)(v[i] >> (8u * k));
+    }
+};
+
+static std::vector<std::string> rb_sync_rules, rb_match_rules;   /* ("rollback sync/match files", below) */
+static bool rb_match_force = false;                              /* "rollback match force": a difference is not refused */
+static bool RB_RuleMatches(const std::vector<std::string> &rules, const std::string &path);
+
+/* A file's size and hash. A file that must be the same on every computer ("rollback match files": the game's programs
+ * and data) is hashed whole with MD5 (the first 8 bytes of it: a game's GRP or WAD can differ only in its middle);
+ * any other file with FNV-1a, whole up to 8 MB, else its first and last megabyte (it is sent when it differs). */
 static bool RB_HashFile(const RBFile &e, uint64_t &size, uint64_t &hash) {
     FILE *f = RB_OpenRead(e);
     if (f == NULL) return false;
@@ -1392,6 +1450,25 @@ static bool RB_HashFile(const RBFile &e, uint64_t &size, uint64_t &hash) {
     const long end = ftell(f);
     if (end < 0) { fclose(f); return false; }
     size = (uint64_t)end;
+    if (RB_RuleMatches(rb_match_rules, e.path)) {
+        RBMd5 md5;
+        std::vector<uint8_t> buf(1u << 16);
+        fseek(f, 0, SEEK_SET);
+        uint64_t left = size;
+        while (left > 0) {
+            const size_t got = fread(&buf[0], 1, (size_t)std::min<uint64_t>(left, buf.size()), f);
+            if (got == 0) break;
+            md5.update(&buf[0], got);
+            left -= got;
+        }
+        fclose(f);
+        if (left != 0) return false;
+        uint8_t dig[16];
+        md5.final(dig);
+        hash = 0;
+        for (unsigned i = 0; i < 8; i++) hash = (hash << 8u) | dig[i];
+        return true;
+    }
     uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
     std::vector<uint8_t> buf(1u << 16);
     auto eat = [&](uint64_t from, uint64_t len) {
@@ -1513,8 +1590,6 @@ static bool RB_TakeManifest(std::vector<uint8_t> &blob, std::vector<RBFile> &m) 
  * the server's own rules allow are taken. Someone who joins a running game sends nothing that is used: they take the
  * server's, as for any other file. "rollback match files" (same: true: the game's programs and data, such as DUKE3D.EXE
  * and DUKE3D.GRP) are never sent, either way: a join where one differs or is missing is refused, naming it. */
-static std::vector<std::string> rb_sync_rules, rb_match_rules;
-
 static void RB_ParseRules(const char *s, std::vector<std::string> &out) {
     out.clear();
     std::string cur;
@@ -1584,7 +1659,14 @@ static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std
         for (size_t k = 0; k < mine.size(); k++) if (mine[k].drive == t.drive && mine[k].path == t.path) { my = &mine[k]; break; }
         if (my != NULL && my->size == t.size && my->hash == t.hash) continue;
         if (RB_RuleMatches(rb_match_rules, t.path)) {      /* ("rollback match files": never sent) */
-            err = std::string(1, (char)('A' + t.drive)) + ":\\" + t.path + " " + (my ? "differs from the server's" : "is missing here") +
+            if (rb_match_force) {   /* (the player chose to join anyway: our own file stays) */
+                LOG_MSG("STREAMNET: %c:\\%s %s; joining anyway (rollback match force): the game may go out of step",
+                    (char)('A' + t.drive), t.path.c_str(), my ? "differs from the server's" : "is missing here");
+                continue;
+            }
+            char md5s[80] = "";
+            if (my) snprintf(md5s, sizeof(md5s), " (MD5 %016llx... here, %016llx... on the server)", (unsigned long long)my->hash, (unsigned long long)t.hash);
+            err = std::string(1, (char)('A' + t.drive)) + ":\\" + t.path + " " + (my ? "differs from the server's" : "is missing here") + md5s +
                 ": it has to be the same on every computer";
             return false;
         }
@@ -3110,6 +3192,7 @@ static uint64_t rb_stat_replay_us = 0, rb_stat_replay_max_us = 0, rb_stat_replay
 /* where replays' time goes (5 s): loading the frame (and the copies'), saving frames, waiting for the copies */
 static uint64_t rb_stat_rp_restore_us = 0, rb_stat_rp_save_us = 0, rb_stat_rp_wait_us = 0;
 static uint64_t rb_replay_us_total = 0;     /* every replay's time since the start (RB_Propose's replay reserve) */
+static uint64_t rb_ad_replayed_total = 0, rb_ad_rollbacks_total = 0;  /* every replay's frames, and replays (RB_AdTick) */
 static uint32_t rb_stat_last_log = 0;
 
 extern bool dos_shell_reading_input;
@@ -3769,6 +3852,7 @@ static bool RB_Rollback(uint32_t target, uint32_t frame) {
     const uint32_t depth = frame - target;
     rb_stat_rollbacks++;
     rb_stat_replayed += depth;
+    rb_ad_replayed_total += depth; rb_ad_rollbacks_total++;
     if (depth > rb_stat_maxdepth) rb_stat_maxdepth = depth;
 
     streamnet_rollback_resim = true;
@@ -3795,8 +3879,7 @@ static unsigned int rb_auto_d = 0;
  * ms instead of 355 to 561, real time 94% instead of 90%). It steps down 15 ms below the step (no going back and forth
  * on a distance that wavers). Our input is never put into a frame already sent (STREAMNET_ScheduleFrame), so it can
  * change during a game. */
-static unsigned int RB_AutoDelay(void) {
-    if (!rb_auto_delay) return 0;
+static unsigned int RB_TableDelay(void) {
     uint32_t rtt = 0;
     for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) if (streamnet_peers[i].active && streamnet_peers[i].ready && !streamnet_peers[i].local) rtt = std::max(rtt, rb_rtt[i]);
     unsigned int d = rb_auto_d;
@@ -3809,6 +3892,164 @@ static unsigned int RB_AutoDelay(void) {
         rb_auto_d = d;
     }
     return d;
+}
+
+/* "rollback auto delay", measured (DOSBox-X-NN 20261120): our input delay shortens the others' corrections, not ours,
+ * so each computer watches what the others' input costs it and asks them for the delay it needs.
+ * - For each peer: how many frames late its input arrives (input that changes something, in 9 cases of 10 over the
+ *   last 3 s, no later than the distance explains, nothing from the 2 s after a stall here), and the delay that peer
+ *   says it uses.
+ * - Here: the longest gap between two frames, per second (what a player sees as stutter).
+ * - The wish for each peer (RB_AdWishFor) goes to it with our input. Our own delay: the highest wish of the others, up
+ *   at most a frame every 500 ms, down only after 3 s of lower wishes and a frame a second, never more than half the
+ *   round trip and 15 ms, at most 12 frames. Peers that send no wish (an older build) keep the distance table above as
+ *   the least. NN_RB_AD_GAP (ms, default 100) sets the high mark; NN_RB_AD_OFF=1 uses the table only (tests). */
+static const unsigned int RB_AD_MAX = 12u;
+static uint8_t rb_ad_wish_in[STREAMNET_MAX_PEERS];          /* frames peer i asks of us */
+static uint32_t rb_ad_wish_in_at[STREAMNET_MAX_PEERS];      /* when (0: never: an older build) */
+static uint8_t rb_ad_peer_delay[STREAMNET_MAX_PEERS];       /* the delay peer i says it uses (0xFF: not known) */
+static const unsigned int RB_AD_BINS = 32u;
+static uint16_t rb_ad_late[STREAMNET_MAX_PEERS][3][RB_AD_BINS];  /* how late peer i's changing input came: counts per frame
+                                                                   * of lateness, per second (the last three) */
+static uint32_t rb_ad_second_at = 0;
+static uint64_t rb_ad_last_us = 0, rb_ad_last_replayed = 0, rb_ad_last_rollbacks = 0, rb_ad_last_t = 0;
+static double rb_ad_share = 0.0, rb_ad_depth = 0.0, rb_ad_frame_us = 0.0;  /* replays: share of time, depth, per frame */
+static uint64_t rb_ad_gap_us[5];                            /* the longest gap between frames here, per second (the last 5) */
+static int rb_ad_ask[STREAMNET_MAX_PEERS];                  /* what we ask of peer i (-1: nothing yet) */
+static uint32_t rb_ad_ask_up_at[STREAMNET_MAX_PEERS], rb_ad_ask_down_at[STREAMNET_MAX_PEERS];
+static unsigned int rb_ad_d = 0;                            /* our delay from the wishes */
+static uint32_t rb_ad_changed_at = 0, rb_ad_lower_since = 0;
+static bool rb_ad_on = false;                               /* the wishes decide (RB_AutoDelay) */
+
+static unsigned int RB_AdGapUs(void) {
+    static const char *e = getenv("NN_RB_AD_GAP");
+    static const unsigned int v = (e && atoi(e) > 0) ? (unsigned int)atoi(e) * 1000u : 100000u;
+    return v;
+}
+
+/* A peer (re)joined: nothing known of it yet. */
+static void RB_AdResetPeer(unsigned i) {
+    rb_ad_wish_in[i] = 0; rb_ad_wish_in_at[i] = 0; rb_ad_peer_delay[i] = 0xFFu;
+    rb_ad_ask[i] = -1; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = 0;
+    memset(rb_ad_late[i], 0, sizeof(rb_ad_late[i]));
+}
+
+/* A peer's input for frame f arrived (RB_HandleInput): how many frames ago its prediction ran. */
+static uint64_t rb_ad_quiet_until = 0;  /* after a long gap here (a stall, a load): what arrives says nothing of the distance */
+static void RB_AdNoteLate(unsigned peerid, uint32_t f) {
+    if (rb_lockstep || streamnet_rollback_resim || RB_MicroTicks() < rb_ad_quiet_until) return;
+    uint32_t late = (rb_realframe >= f) ? rb_realframe - f + 1u : 0u;
+    /* no later than the distance explains (half the round trip and 30 ms, less the delay that peer uses): more is a
+     * hiccup of one of the two computers, which a delay would not help */
+    if (rb_rtt[peerid] != 0 && rb_ad_peer_delay[peerid] != 0xFFu) {
+        const uint32_t owl = (rb_rtt[peerid] / 2u + 30u) / std::max(streamnet_frame_ms, 1u);
+        late = std::min(late, owl > rb_ad_peer_delay[peerid] ? owl - rb_ad_peer_delay[peerid] : 0u);
+    }
+    uint16_t &bin = rb_ad_late[peerid][0][std::min(late, RB_AD_BINS - 1u)];
+    if (bin != 0xFFFFu) bin++;
+}
+
+/* How late peer i's changing input came in 9 cases of 10, over the last three seconds (0: nothing came). */
+static uint32_t RB_AdLate(unsigned i) {
+    uint32_t counts[RB_AD_BINS], total = 0;
+    for (unsigned b = 0; b < RB_AD_BINS; b++) { counts[b] = (uint32_t)rb_ad_late[i][0][b] + rb_ad_late[i][1][b] + rb_ad_late[i][2][b]; total += counts[b]; }
+    if (total == 0) return 0;
+    uint32_t seen = 0;
+    for (unsigned b = 0; b < RB_AD_BINS; b++) { seen += counts[b]; if (seen * 10u >= total * 9u) return b; }
+    return RB_AD_BINS - 1u;
+}
+
+/* Once a second: the latest second's lateness bucket, and the replays' figures. */
+static void RB_AdTick(void) {
+    const uint32_t now = GetTicks();
+    if (rb_ad_second_at != 0 && now - rb_ad_second_at < 1000u) return;
+    rb_ad_second_at = now;
+    for (unsigned k = 4; k > 0; k--) rb_ad_gap_us[k] = rb_ad_gap_us[k - 1];
+    rb_ad_gap_us[0] = 0;
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        memcpy(rb_ad_late[i][2], rb_ad_late[i][1], sizeof(rb_ad_late[i][1]));
+        memcpy(rb_ad_late[i][1], rb_ad_late[i][0], sizeof(rb_ad_late[i][0]));
+        memset(rb_ad_late[i][0], 0, sizeof(rb_ad_late[i][0]));
+    }
+    const uint64_t t = RB_MicroTicks();
+    if (rb_ad_last_t != 0 && t > rb_ad_last_t) {
+        const double us = (double)(rb_replay_us_total - rb_ad_last_us);
+        const double frames = (double)(rb_ad_replayed_total - rb_ad_last_replayed);
+        const double replays = (double)(rb_ad_rollbacks_total - rb_ad_last_rollbacks);
+        const double share = std::min(1.0, us / (double)(t - rb_ad_last_t));
+        rb_ad_share = rb_ad_share * 0.5 + share * 0.5;
+        if (replays > 0) rb_ad_depth = rb_ad_depth > 0 ? rb_ad_depth * 0.5 + (frames / replays) * 0.5 : frames / replays;
+        if (frames > 0) rb_ad_frame_us = rb_ad_frame_us > 0 ? rb_ad_frame_us * 0.5 + (us / frames) * 0.5 : us / frames;
+    }
+    rb_ad_last_t = t; rb_ad_last_us = rb_replay_us_total; rb_ad_last_replayed = rb_ad_replayed_total; rb_ad_last_rollbacks = rb_ad_rollbacks_total;
+}
+
+/* The delay to ask of peer i (0xFF: nothing to ask: its delay is not known yet). It steers by what the players see
+ * here: the longest gap between two frames (replays and waiting for input, both shorter with more delay of the peers
+ * whose input comes late). Over the high mark in the last 2 s: one frame more (at most every 2 s); under 60% of it for
+ * 5 s: one frame less (at most every 5 s); between them it stays, so it settles instead of swinging. A peer whose input
+ * is not late (in 9 cases of 10) costs nothing here: it is asked for a frame less. Never more than the distance needs
+ * (half the round trip and 15 ms), at most RB_AD_MAX. Measured Nov 2026 at 220 ms, both players moving: replay share
+ * and depth (the first version's rule) swung the delay between 4 and 12 frames; the gaps are what the players feel. */
+static uint8_t RB_AdWishFor(unsigned i) {
+    if (rb_lockstep || rb_ad_peer_delay[i] == 0xFFu) return 0xFFu;
+    const uint32_t now = GetTicks();
+    const int theirs = (int)rb_ad_peer_delay[i];
+    if (rb_ad_ask[i] < 0) { rb_ad_ask[i] = theirs; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = now; }
+    const uint64_t high = RB_AdGapUs(), low = high * 6u / 10u;
+    const uint64_t gap2 = std::max(rb_ad_gap_us[0], rb_ad_gap_us[1]);
+    uint64_t gap5 = 0;
+    for (unsigned k = 0; k < 5; k++) gap5 = std::max(gap5, rb_ad_gap_us[k]);
+    const uint32_t late = RB_AdLate(i);
+    int ask = rb_ad_ask[i];
+    if (late == 0) {
+        if (now - rb_ad_ask_down_at[i] >= 2000u && ask > 0) { ask = std::min(ask, theirs) - 1; rb_ad_ask_down_at[i] = now; }
+    }
+    else if (gap2 > high) {
+        if (now - rb_ad_ask_up_at[i] >= 2000u) { ask = std::max(ask, theirs) + 1; rb_ad_ask_up_at[i] = now; rb_ad_ask_down_at[i] = now; }
+    }
+    else if (gap5 < low) {
+        if (now - rb_ad_ask_down_at[i] >= 5000u && now - rb_ad_ask_up_at[i] >= 5000u && ask > 0) { ask = std::min(ask, theirs) - 1; rb_ad_ask_down_at[i] = now; }
+    }
+    const int cap = (int)std::min(RB_AD_MAX, (unsigned int)((rb_rtt[i] / 2u + 15u) / std::max(streamnet_frame_ms, 1u)));
+    rb_ad_ask[i] = std::max(0, std::min(cap, ask));
+    return (uint8_t)rb_ad_ask[i];
+}
+
+static unsigned int RB_AutoDelay(void) {
+    if (!rb_auto_delay) return 0;
+    const unsigned int table = RB_TableDelay();
+    const uint32_t now = GetTicks();
+    bool any = false, all = true;
+    unsigned int want = 0;
+    uint32_t rtt = 0;
+    for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+        const StreamNetPeer &p = streamnet_peers[i];
+        if (!p.active || !p.ready || p.local) continue;
+        rtt = std::max(rtt, rb_rtt[i]);
+        if (rb_ad_wish_in_at[i] != 0 && now - rb_ad_wish_in_at[i] < 3000u) { any = true; want = std::max(want, (unsigned int)rb_ad_wish_in[i]); }
+        else all = false;
+    }
+    static const bool off = getenv("NN_RB_AD_OFF") != NULL && *getenv("NN_RB_AD_OFF");  /* (tests: the distance table only) */
+    if (!any || off) { rb_ad_on = false; rb_ad_d = table; rb_ad_lower_since = 0; return table; }
+    const unsigned int cap = std::min(RB_AD_MAX, (unsigned int)((rtt / 2u + 15u) / std::max(streamnet_frame_ms, 1u)));
+    want = std::min(want, cap);
+    if (!all) want = std::max(want, table);
+    if (!rb_ad_on) { rb_ad_on = true; rb_ad_changed_at = now; }
+    unsigned int was = rb_ad_d;
+    if (want > rb_ad_d) {
+        rb_ad_lower_since = 0;
+        if (now - rb_ad_changed_at >= 500u) { rb_ad_d++; rb_ad_changed_at = now; }
+    }
+    else if (want < rb_ad_d) {
+        if (rb_ad_lower_since == 0) rb_ad_lower_since = now;
+        else if (now - rb_ad_lower_since >= 3000u && now - rb_ad_changed_at >= 1000u) { rb_ad_d--; rb_ad_changed_at = now; }
+    }
+    else rb_ad_lower_since = 0;
+    if (rb_ad_d != was)
+        LOG_MSG("STREAMNET: our input waits %u frame(s) now (the others ask for %u; round trip %u ms; [streamnet] rollback auto delay)",
+            rb_ad_d, want, (unsigned)rtt);
+    return rb_ad_d;
 }
 
 static unsigned int RB_EffectiveDelay(void) {
@@ -3926,6 +4167,22 @@ static void RB_SendInputEx(uint32_t frame, bool with_check, uint32_t realframe) 
 
     w.u32(rb_cap_local);            /* this computer's speed proposal at cycles=max (RB_MaxCycles; 0: none) */
 
+    /* the measured auto delay (RB_AdWishFor): the delay our input uses now (0xFF at the DOS prompt), and what we ask
+     * of each of the others (older builds stop reading before this) */
+    w.u8(rb_lockstep ? 0xFFu : (uint8_t)std::min(RB_EffectiveDelay(), 0xFEu));
+    {
+        uint8_t ids[STREAMNET_MAX_PEERS], wishes[STREAMNET_MAX_PEERS], n = 0;
+        for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+            const StreamNetPeer &p = streamnet_peers[i];
+            if (!p.active || !p.ready || p.local) continue;
+            const uint8_t wish = RB_AdWishFor(i);
+            if (wish == 0xFFu) continue;
+            ids[n] = (uint8_t)i; wishes[n] = wish; n++;
+        }
+        w.u8(n);
+        for (uint8_t k = 0; k < n; k++) { w.u8(ids[k]); w.u8(wishes[k]); }
+    }
+
     if (w.overflow()) {
         LOG(LOG_MISC,LOG_WARN)("STREAMNET: rollback input packet overflow");
         return;
@@ -3973,6 +4230,7 @@ static void RB_HandleInput(StreamNetPeer &p, unsigned peerid, StreamNetReader &r
             continue;
         }
         StreamNetFrame &slot = STREAMNET_FrameSlot(p,f);
+        if (n != 0) RB_AdNoteLate(peerid, f);
         for (unsigned e = 0; e < n; e++) {
             StreamNetEvent ev;
             if (!STREAMNET_ReadEvent(r,ev)) return;
@@ -4020,6 +4278,17 @@ static void RB_HandleInput(StreamNetPeer &p, unsigned peerid, StreamNetReader &r
     if (r.remain() >= 4) {
         const uint32_t cap = r.u32();
         if (!r.bad() && cap != 0) { rb_cap_peer[peerid] = cap; rb_cap_peer_at[peerid] = now; }
+    }
+    if (r.remain() >= 2) {
+        const uint8_t delay = r.u8();
+        const unsigned n = r.u8();
+        if (r.bad()) return;
+        rb_ad_peer_delay[peerid] = delay;
+        for (unsigned k = 0; k < n; k++) {
+            const uint8_t who = r.u8(), wish = r.u8();
+            if (r.bad()) return;
+            if (who == streamnet_selfid) { rb_ad_wish_in[peerid] = std::min<uint8_t>(wish, (uint8_t)RB_AD_MAX); rb_ad_wish_in_at[peerid] = now ? now : 1u; }
+        }
     }
 }
 
@@ -4331,6 +4600,26 @@ static void RB_LogStats(void) {
             (unsigned)rb_stat_hitches, (double)rb_stat_maxgap_us / 1000.0, (unsigned)rb_stat_trims, secs > 0 ? (double)(vga_shown_flips - flips_last) / secs : 0.0,
             secs > 0 ? (double)(render_changed_frames - changed_last) / secs : 0.0);
         flips_last = vga_shown_flips; changed_last = render_changed_frames; flips_at = tnow;
+    }
+    if (rb_auto_delay && !rb_lockstep) {
+        std::string peers;
+        for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
+            const StreamNetPeer &p = streamnet_peers[i];
+            if (!p.active || !p.ready || p.local) continue;
+            char b[160];
+            const uint8_t wish = RB_AdWishFor(i);
+            snprintf(b, sizeof(b), "; player %u: input %u frames late (9 in 10), delay %s, we ask %s, asks us %s", i + 1u,
+                (unsigned)RB_AdLate(i),
+                rb_ad_peer_delay[i] == 0xFFu ? "?" : std::to_string((unsigned)rb_ad_peer_delay[i]).c_str(),
+                wish == 0xFFu ? "-" : std::to_string((unsigned)wish).c_str(),
+                rb_ad_wish_in_at[i] ? std::to_string((unsigned)rb_ad_wish_in[i]).c_str() : "-");
+            peers += b;
+        }
+        uint64_t gap5 = 0;
+        for (unsigned k = 0; k < 5; k++) gap5 = std::max(gap5, rb_ad_gap_us[k]);
+        LOG_MSG("STREAMNET: auto delay: ours %u frame(s)%s; the longest gap of the last 5 s %.0f ms; replays %.0f%% of the time, %.1f frames deep, %.2f ms a frame%s",
+            RB_EffectiveDelay(), rb_ad_on ? " (from the wishes)" : " (from the distance)", (double)gap5 / 1000.0, rb_ad_share * 100.0, rb_ad_depth,
+            rb_ad_frame_us / 1000.0, peers.c_str());
     }
     rb_stat_hitches = 0; rb_stat_maxgap_us = 0; rb_stat_trims = 0;
     rb_stat_scan_us = 0; rb_stat_lean_us = 0; rb_stat_lockstep = 0; rb_stat_ctxchanges = 0;
@@ -6518,7 +6807,7 @@ static bool RB_ServerResync(uint32_t frame) {
             p.lastheard = GetTicks();
             rbs_joining[i] = false; rbs_wants[i] = false;
             rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame;
-            rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_rtt[i] = 0;
+            rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_rtt[i] = 0; RB_AdResetPeer(i);
             for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
             for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
             LOG_MSG("STREAMNET: \"%s\" plays copy %u from frame %u", p.name.c_str(), (unsigned)(RB_CopyOf(rb_seat, i) + 1), (unsigned)frame);
@@ -6650,7 +6939,7 @@ static void RB_HandleResync(StreamNetReader &r,const IPaddress &from,unsigned pe
             StreamNetPeer &p = streamnet_peers[i];
             p.active = true; p.ready = true; p.local = false; p.addr = streamnet_server_addr; p.lastheard = GetTicks();
             p.resetFrames();
-            rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame; rb_peerframe_at[i] = 0; rb_rtt[i] = 0;
+            rb_have[i] = frame; rb_checked[i] = frame; rb_acked[i] = frame; rb_peerframe_at[i] = 0; rb_rtt[i] = 0; RB_AdResetPeer(i);
             for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
             for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
             LOG_MSG("STREAMNET: player %u joins at frame %u", i + 1u, (unsigned)frame);
@@ -7053,6 +7342,8 @@ static void RB_FrameBoundary(uint32_t frame) {
         if (rb_hitch_last != 0 && t > rb_hitch_last) {
             const uint64_t gap = t - rb_hitch_last;
             if (gap > 30000u) rb_stat_hitches++;
+            if (gap > 300000u) rb_ad_quiet_until = t + 2000000u;   /* (RB_AdNoteLate) */
+            if (gap < 1000000u && !rb_lockstep && gap > rb_ad_gap_us[0]) rb_ad_gap_us[0] = gap;   /* (RB_AdWishFor) */
             if (gap > 200000u && rb_stat_rollbacks != replays_before) rb_replay_hitch = true;
             rb_stat_maxgap_us = std::max(rb_stat_maxgap_us, gap);
             /* (debugging long hitches: what happened since the frame before) */
@@ -7067,6 +7358,7 @@ static void RB_FrameBoundary(uint32_t frame) {
         rb_hitch_last = t;
     }
     RB_MaxCycles();
+    RB_AdTick();
     RB_LogStats();
 }
 
@@ -7158,11 +7450,14 @@ static std::string RB_FingerprintDiff(const std::string &theirs, const std::stri
 
 static void RB_SessionStarted(void) {
     RB_SeatsReset();
+    rb_ad_d = 0; rb_ad_on = false; rb_ad_changed_at = 0; rb_ad_lower_since = 0; rb_ad_second_at = 0; rb_ad_last_t = 0;
+    rb_ad_share = 0; rb_ad_depth = 0; rb_ad_frame_us = 0;
+    for (unsigned k = 0; k < 5; k++) rb_ad_gap_us[k] = 0;
     rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_speed_sched.clear(); rbc_injected.clear(); rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_ml_share_s = 0; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
     for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
     for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) {
         rb_have[i] = 0; rb_checked[i] = 0; rb_acked[i] = 0;
-        rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_peerstamp[i] = 0; rb_peerstamp_at[i] = 0; rb_rtt[i] = 0;
+        rb_peerframe[i] = 0; rb_peerframe_at[i] = 0; rb_peerstamp[i] = 0; rb_peerstamp_at[i] = 0; rb_rtt[i] = 0; RB_AdResetPeer(i);
         for (unsigned k = 0; k < RB_RING; k++) rb_predicted[i][k] = 0;
         for (unsigned k = 0; k < STREAMNET_CHECK_RING; k++) rb_peercheck[i][k].valid = false;
     }
@@ -7589,6 +7884,7 @@ public:
         streamnet_rbautorun_done = false;
         RB_ParseRules(section->Get_string("rollback sync files"), rb_sync_rules);
         RB_ParseRules(section->Get_string("rollback match files"), rb_match_rules);
+        rb_match_force = section->Get_bool("rollback match force");
         /* RollbackNet runs a "cluster" of copies on every computer: one (the game itself, every player's input to it), or
          * one per player for IPX/NullModem-over-RollbackNet. Either way the host's session runs from the start and
          * others join it, before or during the game (RBC_ServerHello). */
