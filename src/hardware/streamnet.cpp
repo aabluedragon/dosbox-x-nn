@@ -3924,11 +3924,12 @@ static unsigned int RB_TableDelay(void) {
  * - For each peer: how many frames late its input arrives (input that changes something, in 9 cases of 10 over the
  *   last 3 s, no later than the distance explains, nothing from the 2 s after a stall here), and the delay that peer
  *   says it uses.
- * - Here: the longest gap between two frames, per second (what a player sees as stutter).
+ * - Here: the longest gap between two frames in which a replay ran or input was awaited, per second (what a player
+ *   sees as stutter, as far as more delay of the others shortens it).
  * - The wish for each peer (RB_AdWishFor) goes to it with our input. Our own delay: the highest wish of the others, up
  *   at most a frame every 500 ms, down only after 3 s of lower wishes and a frame a second, never more than half the
- *   round trip and 15 ms, at most 12 frames. Peers that send no wish (an older build) keep the distance table above as
- *   the least. NN_RB_AD_GAP (ms, default 100) sets the high mark; NN_RB_AD_OFF=1 uses the table only (tests). */
+ *   round trip and 30 ms, at most 12 frames. Peers that send no wish (an older build) keep the distance table above as
+ *   the least. NN_RB_AD_GAP (ms, default 35) sets the stutter mark; NN_RB_AD_OFF=1 uses the table only (tests). */
 static const unsigned int RB_AD_MAX = 12u;
 static uint8_t rb_ad_wish_in[STREAMNET_MAX_PEERS];          /* frames peer i asks of us */
 static uint32_t rb_ad_wish_in_at[STREAMNET_MAX_PEERS];      /* when (0: never: an older build) */
@@ -3939,23 +3940,26 @@ static uint16_t rb_ad_late[STREAMNET_MAX_PEERS][3][RB_AD_BINS];  /* how late pee
 static uint32_t rb_ad_second_at = 0;
 static uint64_t rb_ad_last_us = 0, rb_ad_last_replayed = 0, rb_ad_last_rollbacks = 0, rb_ad_last_t = 0;
 static double rb_ad_share = 0.0, rb_ad_depth = 0.0, rb_ad_frame_us = 0.0;  /* replays: share of time, depth, per frame */
-static uint64_t rb_ad_gap_us[5];                            /* the longest gap between frames here, per second (the last 5) */
+static uint64_t rb_ad_gap_us[5];                            /* the longest gap between frames here, per second (the last 5),
+                                                             * counting only gaps in which a replay ran or input was awaited */
 static int rb_ad_ask[STREAMNET_MAX_PEERS];                  /* what we ask of peer i (-1: nothing yet) */
 static uint32_t rb_ad_ask_up_at[STREAMNET_MAX_PEERS], rb_ad_ask_down_at[STREAMNET_MAX_PEERS];
+static uint32_t rb_ad_probe_wait[STREAMNET_MAX_PEERS];      /* how long without a stutter before asking for a frame less */
+static uint32_t rb_ad_stutter_at = 0;                       /* the last stutter here: a network gap over the mark */
 static unsigned int rb_ad_d = 0;                            /* our delay from the wishes */
 static uint32_t rb_ad_changed_at = 0, rb_ad_lower_since = 0;
 static bool rb_ad_on = false;                               /* the wishes decide (RB_AutoDelay) */
 
 static unsigned int RB_AdGapUs(void) {
     static const char *e = getenv("NN_RB_AD_GAP");
-    static const unsigned int v = (e && atoi(e) > 0) ? (unsigned int)atoi(e) * 1000u : 100000u;
+    static const unsigned int v = (e && atoi(e) > 0) ? (unsigned int)atoi(e) * 1000u : 35000u;
     return v;
 }
 
 /* A peer (re)joined: nothing known of it yet. */
 static void RB_AdResetPeer(unsigned i) {
     rb_ad_wish_in[i] = 0; rb_ad_wish_in_at[i] = 0; rb_ad_peer_delay[i] = 0xFFu;
-    rb_ad_ask[i] = -1; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = 0;
+    rb_ad_ask[i] = -1; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = 0; rb_ad_probe_wait[i] = 0;
     memset(rb_ad_late[i], 0, sizeof(rb_ad_late[i]));
 }
 
@@ -4009,34 +4013,46 @@ static void RB_AdTick(void) {
     rb_ad_last_t = t; rb_ad_last_us = rb_replay_us_total; rb_ad_last_replayed = rb_ad_replayed_total; rb_ad_last_rollbacks = rb_ad_rollbacks_total;
 }
 
-/* The delay to ask of peer i (0xFF: nothing to ask: its delay is not known yet). It steers by what the players see
- * here: the longest gap between two frames (replays and waiting for input, both shorter with more delay of the peers
- * whose input comes late). Over the high mark in the last 2 s: one frame more (at most every 2 s); under 60% of it for
- * 5 s: one frame less (at most every 5 s); between them it stays, so it settles instead of swinging. A peer whose input
- * is not late (in 9 cases of 10) costs nothing here: it is asked for a frame less. Never more than the distance needs
- * (half the round trip and 15 ms), at most RB_AD_MAX. Measured Nov 2026 at 220 ms, both players moving: replay share
- * and depth (the first version's rule) swung the delay between 4 and 12 frames; the gaps are what the players feel. */
+/* The delay to ask of peer i (0xFF: nothing to ask: its delay is not known yet): the least that keeps the game here
+ * free of stutters. A stutter is a gap between two frames over the mark (35 ms: more than two pictures at 60 Hz) in
+ * which a replay ran, which more delay of the peers whose input comes late shortens (waits and this computer's own
+ * hiccups do not count: more delay would not help them). Frames normally come every 10 to
+ * 14 ms, and a replayed frame costs a few ms, so a stutter means input that came several frames late.
+ * - A stutter in the last 2 s: a frame more at once, or up to three when the gap was far over the mark (one per
+ *   replayed frame's time it was over by), at most every second.
+ * - No stutter for a while (8 s at first): a frame less, as a probe. When a stutter follows within 3 s the probe
+ *   failed: the frame comes back and the next probe waits twice as long (up to 60 s); a probe that holds for 10 s
+ *   sets the wait back to 8 s. So it settles on the least smooth delay and only rarely tries below it.
+ * Never more than the distance needs (half the round trip and 30 ms of jitter), at most RB_AD_MAX. Measured Nov 2026
+ * at 220 ms, both players moving: steering by the replays' share swung the delay between 4 and 12 frames; a "come
+ * down only when gaps stay under 20 ms" rule could never come down while any 1-frame replay ran (such a frame's gap
+ * is 25 to 35 ms here) and climbed to the cap. */
 static uint8_t RB_AdWishFor(unsigned i) {
     if (rb_lockstep || rb_ad_peer_delay[i] == 0xFFu) return 0xFFu;
     const uint32_t now = GetTicks();
     const int theirs = (int)rb_ad_peer_delay[i];
-    if (rb_ad_ask[i] < 0) { rb_ad_ask[i] = theirs; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = now; }
-    const uint64_t high = RB_AdGapUs(), low = high * 6u / 10u;
+    if (rb_ad_ask[i] < 0) { rb_ad_ask[i] = theirs; rb_ad_ask_up_at[i] = now; rb_ad_ask_down_at[i] = 0; rb_ad_probe_wait[i] = 8000u; }
+    const uint64_t high = RB_AdGapUs();
     const uint64_t gap2 = std::max(rb_ad_gap_us[0], rb_ad_gap_us[1]);
-    uint64_t gap5 = 0;
-    for (unsigned k = 0; k < 5; k++) gap5 = std::max(gap5, rb_ad_gap_us[k]);
-    const uint32_t late = RB_AdLate(i);
     int ask = rb_ad_ask[i];
-    if (late == 0) {
-        if (now - rb_ad_ask_down_at[i] >= 2000u && ask > 0) { ask = std::min(ask, theirs) - 1; rb_ad_ask_down_at[i] = now; }
+    const bool stutter = rb_ad_stutter_at != 0 && now - rb_ad_stutter_at < 2000u;
+    if (stutter && RB_AdLate(i) > 0) {
+        if (now - rb_ad_ask_up_at[i] >= 1000u) {
+            const double frame_us = rb_ad_frame_us > 0 ? rb_ad_frame_us : (double)streamnet_frame_ms * 1000.0 * 0.5;
+            const int step = gap2 > high ? std::max(1, std::min(3, (int)((double)(gap2 - high) / std::max(frame_us, 1000.0)) + 1)) : 1;
+            if (rb_ad_ask_down_at[i] != 0 && now - rb_ad_ask_down_at[i] < 3000u)     /* the probe failed */
+                rb_ad_probe_wait[i] = std::min(60000u, rb_ad_probe_wait[i] * 2u);
+            ask = std::max(ask, theirs) + step; rb_ad_ask_up_at[i] = now; rb_ad_ask_down_at[i] = 0;
+        }
     }
-    else if (gap2 > high) {
-        if (now - rb_ad_ask_up_at[i] >= 2000u) { ask = std::max(ask, theirs) + 1; rb_ad_ask_up_at[i] = now; rb_ad_ask_down_at[i] = now; }
+    else if (ask > 0) {
+        const uint32_t calm = rb_ad_stutter_at == 0 ? now - rb_ad_ask_up_at[i] : std::min(now - rb_ad_stutter_at, now - rb_ad_ask_up_at[i]);
+        if (rb_ad_ask_down_at[i] != 0 && now - rb_ad_ask_down_at[i] >= 10000u) { rb_ad_probe_wait[i] = 8000u; rb_ad_ask_down_at[i] = 0; }   /* it held */
+        if (calm >= rb_ad_probe_wait[i] && (rb_ad_ask_down_at[i] == 0 || now - rb_ad_ask_down_at[i] >= rb_ad_probe_wait[i])) {
+            ask = std::min(ask, theirs) - 1; rb_ad_ask_down_at[i] = now;
+        }
     }
-    else if (gap5 < low) {
-        if (now - rb_ad_ask_down_at[i] >= 5000u && now - rb_ad_ask_up_at[i] >= 5000u && ask > 0) { ask = std::min(ask, theirs) - 1; rb_ad_ask_down_at[i] = now; }
-    }
-    const int cap = (int)std::min(RB_AD_MAX, (unsigned int)((rb_rtt[i] / 2u + 15u) / std::max(streamnet_frame_ms, 1u)));
+    const int cap = (int)std::min(RB_AD_MAX, (unsigned int)((rb_rtt[i] / 2u + 30u) / std::max(streamnet_frame_ms, 1u)));
     rb_ad_ask[i] = std::max(0, std::min(cap, ask));
     return (uint8_t)rb_ad_ask[i];
 }
@@ -4057,7 +4073,7 @@ static unsigned int RB_AutoDelay(void) {
     }
     static const bool off = getenv("NN_RB_AD_OFF") != NULL && *getenv("NN_RB_AD_OFF");  /* (tests: the distance table only) */
     if (!any || off) { rb_ad_on = false; rb_ad_d = table; rb_ad_lower_since = 0; return table; }
-    const unsigned int cap = std::min(RB_AD_MAX, (unsigned int)((rtt / 2u + 15u) / std::max(streamnet_frame_ms, 1u)));
+    const unsigned int cap = std::min(RB_AD_MAX, (unsigned int)((rtt / 2u + 30u) / std::max(streamnet_frame_ms, 1u)));
     want = std::min(want, cap);
     if (!all) want = std::max(want, table);
     if (!rb_ad_on) { rb_ad_on = true; rb_ad_changed_at = now; }
@@ -7373,7 +7389,12 @@ static void RB_FrameBoundary(uint32_t frame) {
             const uint64_t gap = t - rb_hitch_last;
             if (gap > 30000u) rb_stat_hitches++;
             if (gap > 300000u) rb_ad_quiet_until = t + 2000000u;   /* (RB_AdNoteLate) */
-            if (gap < 1000000u && !rb_lockstep && gap > rb_ad_gap_us[0]) rb_ad_gap_us[0] = gap;   /* (RB_AdWishFor) */
+            /* (RB_AdWishFor: only what more delay of the others shortens, a gap in which a replay ran. Not waits: they are
+             * for this computer's own copies of a cluster, or behind another computer's hiccup, and a hiccup of this
+             * computer's own would only push the delay up for nothing.) */
+            const bool net = rb_stat_rollbacks != replays_before;
+            if (net && gap < 1000000u && !rb_lockstep && gap > rb_ad_gap_us[0]) rb_ad_gap_us[0] = gap;
+            if (net && gap < 1000000u && !rb_lockstep && gap > RB_AdGapUs()) rb_ad_stutter_at = GetTicks();
             if (gap > 200000u && rb_stat_rollbacks != replays_before) rb_replay_hitch = true;
             rb_stat_maxgap_us = std::max(rb_stat_maxgap_us, gap);
             /* (debugging long hitches: what happened since the frame before) */
@@ -7481,7 +7502,7 @@ static std::string RB_FingerprintDiff(const std::string &theirs, const std::stri
 static void RB_SessionStarted(void) {
     RB_SeatsReset();
     rb_ad_d = 0; rb_ad_on = false; rb_ad_changed_at = 0; rb_ad_lower_since = 0; rb_ad_second_at = 0; rb_ad_last_t = 0;
-    rb_ad_share = 0; rb_ad_depth = 0; rb_ad_frame_us = 0;
+    rb_ad_share = 0; rb_ad_depth = 0; rb_ad_frame_us = 0; rb_ad_stutter_at = 0;
     for (unsigned k = 0; k < 5; k++) rb_ad_gap_us[k] = 0;
     rb_cap_local = 0; rb_ml_t0 = 0; rb_ml_changed_at = 0; rb_speed_sched.clear(); rbc_injected.clear(); rb_ml_cost_s = -1; rb_ml_fixed_s = -1; rb_ml_share_s = 0; rb_rp_n = 0; rb_rp_pos = 0; rb_rp_t0 = 0;
     for (unsigned i = 0; i < STREAMNET_MAX_PEERS; i++) { rb_cap_peer[i] = 0; rb_cap_peer_at[i] = 0; }
