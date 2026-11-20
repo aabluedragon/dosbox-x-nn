@@ -13,7 +13,7 @@ triple, loader = {
     'arm64': ('aarch64-linux-gnu', 'ld-linux-aarch64.so.1'),
     'armv7l': ('arm-linux-gnueabihf', 'ld-linux-armhf.so.3'),
 }[arch]
-release = '20261119-2'  # dosbox-x-nn commit 91b927b (keep in step with build.sh)
+release = '20261120'  # dosbox-x-nn commit 082ce32 (keep in step with build.sh)
 root = Path('/build/portable')
 source = Path('/build/src')
 if root.exists():
