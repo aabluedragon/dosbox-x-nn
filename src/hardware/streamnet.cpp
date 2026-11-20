@@ -1324,11 +1324,14 @@ char *CodePageHostToGuest(const host_cnv_char_t *s);
 #define RB_SYNC_TOTAL_MAX  (64u << 20)
 #define RB_MANIFEST_MAGIC  0x4D464252u  /* "RBFM" */
 #define RB_MANIFEST_END    0x45464252u  /* "RBFE", the trailer after the save state */
+#define RB_MANIFEST_MD5    0x35464252u  /* "RBF5": after the entries, each one's MD5 (older builds stop reading before it) */
 
 struct RBFile {
     uint8_t drive = 0;
     std::string path;           /* DOS path without the drive, upper case: "SUB\\FILE.EXT" */
     uint64_t size = 0, hash = 0;
+    uint64_t md5 = 0;           /* a "rollback match files" file: the first 8 bytes of its whole-file MD5 (has_md5) */
+    bool has_md5 = false;       /* (lists from builds before 20261120 have none: compare "hash" then) */
     std::string host;           /* where to read it: a guest code page path, or a mapped file's host path */
     bool mapped = false;
     bool unplain = false;       /* (a received list's entry whose path is not a plain DOS path: never asked for or mapped) */
@@ -1440,16 +1443,18 @@ static std::vector<std::string> rb_sync_rules, rb_match_rules;   /* ("rollback s
 static bool rb_match_force = false;                              /* "rollback match force": a difference is not refused */
 static bool RB_RuleMatches(const std::vector<std::string> &rules, const std::string &path);
 
-/* A file's size and hash. A file that must be the same on every computer ("rollback match files": the game's programs
- * and data) is hashed whole with MD5 (the first 8 bytes of it: a game's GRP or WAD can differ only in its middle);
- * any other file with FNV-1a, whole up to 8 MB, else its first and last megabyte (it is sent when it differs). */
-static bool RB_HashFile(const RBFile &e, uint64_t &size, uint64_t &hash) {
+/* A file's size and hash: FNV-1a, whole up to 8 MB, else its first and last megabyte (every build compares this, so it
+ * stays as it was). A file that must be the same on every computer ("rollback match files": the game's programs and
+ * data) also gets the MD5 of all of it (e.md5), which builds from 20261120 compare when both sides have it: a game's
+ * GRP or WAD can differ only in its middle. */
+static bool RB_HashFile(RBFile &e, uint64_t &size, uint64_t &hash) {
     FILE *f = RB_OpenRead(e);
     if (f == NULL) return false;
     fseek(f, 0, SEEK_END);
     const long end = ftell(f);
     if (end < 0) { fclose(f); return false; }
     size = (uint64_t)end;
+    e.has_md5 = false; e.md5 = 0;
     if (RB_RuleMatches(rb_match_rules, e.path)) {
         RBMd5 md5;
         std::vector<uint8_t> buf(1u << 16);
@@ -1461,13 +1466,11 @@ static bool RB_HashFile(const RBFile &e, uint64_t &size, uint64_t &hash) {
             md5.update(&buf[0], got);
             left -= got;
         }
-        fclose(f);
-        if (left != 0) return false;
+        if (left != 0) { fclose(f); return false; }
         uint8_t dig[16];
         md5.final(dig);
-        hash = 0;
-        for (unsigned i = 0; i < 8; i++) hash = (hash << 8u) | dig[i];
-        return true;
+        for (unsigned i = 0; i < 8; i++) e.md5 = (e.md5 << 8u) | dig[i];
+        e.has_md5 = true;
     }
     uint64_t h = 0x9E3779B97F4A7C15ull ^ size;
     std::vector<uint8_t> buf(1u << 16);
@@ -1551,6 +1554,9 @@ static void RB_PutManifest(std::vector<uint8_t> &out, const std::vector<RBFile> 
         const uint16_t len = (uint16_t)m[i].path.size();
         put(&m[i].drive, 1); put(&len, 2); put(m[i].path.data(), len); put(&m[i].size, 8); put(&m[i].hash, 8);
     }
+    const uint32_t md5magic = RB_MANIFEST_MD5;
+    put(&md5magic, 4);
+    for (size_t i = 0; i < m.size(); i++) { const uint8_t has = m[i].has_md5 ? 1u : 0u; put(&has, 1); put(&m[i].md5, 8); }
     const uint32_t mlen = (uint32_t)(out.size() - start), endmagic = RB_MANIFEST_END;
     put(&mlen, 4); put(&endmagic, 4);
 }
@@ -1576,6 +1582,14 @@ static bool RB_TakeManifest(std::vector<uint8_t> &blob, std::vector<RBFile> &m) 
         if (!get(&e.size, 8) || !get(&e.hash, 8)) return false;
         e.unplain = !RB_PlainPath(e.path);      /* (kept, so the list's numbering stays the server's) */
         m.push_back(e);
+    }
+    uint32_t md5magic = 0;
+    if (pos + 4u <= start + mlen && get(&md5magic, 4) && md5magic == RB_MANIFEST_MD5) {
+        for (size_t i = 0; i < m.size(); i++) {
+            uint8_t has = 0;
+            if (!get(&has, 1) || !get(&m[i].md5, 8)) { for (size_t k = 0; k < m.size(); k++) { m[k].has_md5 = false; m[k].md5 = 0; } break; }
+            m[i].has_md5 = has != 0;
+        }
     }
     blob.resize(start);
     return true;
@@ -1657,7 +1671,8 @@ static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std
         }
         const RBFile *my = NULL;
         for (size_t k = 0; k < mine.size(); k++) if (mine[k].drive == t.drive && mine[k].path == t.path) { my = &mine[k]; break; }
-        if (my != NULL && my->size == t.size && my->hash == t.hash) continue;
+        /* (MD5 where both lists have it: a must-match file; else the hash every build has) */
+        if (my != NULL && my->size == t.size && (my->has_md5 && t.has_md5 ? my->md5 == t.md5 : my->hash == t.hash)) continue;
         if (RB_RuleMatches(rb_match_rules, t.path)) {      /* ("rollback match files": never sent) */
             if (rb_match_force) {   /* (the player chose to join anyway: our own file stays) */
                 LOG_MSG("STREAMNET: %c:\\%s %s; joining anyway (rollback match force): the game may go out of step",
@@ -1665,7 +1680,7 @@ static bool RB_CompareManifestsWith(const std::vector<RBFile> &theirs, const std
                 continue;
             }
             char md5s[80] = "";
-            if (my) snprintf(md5s, sizeof(md5s), " (MD5 %016llx... here, %016llx... on the server)", (unsigned long long)my->hash, (unsigned long long)t.hash);
+            if (my && my->has_md5 && t.has_md5) snprintf(md5s, sizeof(md5s), " (MD5 %016llx... here, %016llx... on the server)", (unsigned long long)my->md5, (unsigned long long)t.md5);
             err = std::string(1, (char)('A' + t.drive)) + ":\\" + t.path + " " + (my ? "differs from the server's" : "is missing here") + md5s +
                 ": it has to be the same on every computer";
             return false;
@@ -3033,8 +3048,18 @@ static void STREAMNET_TickHandler(void) {
             }
 
             std::string err;
-            if (!STREAMNET_Connect(host.c_str(),port,err))
+            if (!STREAMNET_Connect(host.c_str(),port,err)) {
                 LOG_MSG("STREAMNET: auto connect to %s failed: %s",host.c_str(),err.c_str());
+                /* RollbackNet: a join that cannot be made (game files that differ, another build) says why and ends,
+                 * instead of leaving the player at a DOS prompt that waits for nothing */
+                if (streamnet_rollback) {
+#if defined(C_SDL2)
+                    const std::string msg = "Could not join the game: " + err + ".";
+                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "DOSBox-X-NN RollbackNet", msg.c_str(), NULL);
+#endif
+                    throw(0);
+                }
+            }
         }
     }
 
@@ -5533,6 +5558,8 @@ static void RBC_PutManifestFull(std::vector<uint8_t> &out, const std::vector<RBF
         RBC_Put(out, &m[i].drive, 1); RBC_Put(out, &len, 2); RBC_Put(out, m[i].path.data(), len);
         RBC_Put(out, &m[i].size, 8); RBC_Put(out, &m[i].hash, 8);
         RBC_Put(out, &mapped, 1); RBC_Put(out, &hlen, 2); RBC_Put(out, m[i].host.data(), hlen);
+        const uint8_t has = m[i].has_md5 ? 1 : 0;
+        RBC_Put(out, &has, 1); RBC_Put(out, &m[i].md5, 8);
     }
 }
 
@@ -5548,6 +5575,9 @@ static bool RBC_TakeManifestFull(const uint8_t *&p, const uint8_t *end, std::vec
             !RBC_Get(p, end, &hlen, 2) || (size_t)(end - p) < hlen) return false;
         e.host.assign((const char*)p, hlen); p += hlen;
         e.mapped = mapped != 0;
+        uint8_t has = 0;
+        if (!RBC_Get(p, end, &has, 1) || !RBC_Get(p, end, &e.md5, 8)) return false;
+        e.has_md5 = has != 0;
         m.push_back(e);
     }
     return true;
