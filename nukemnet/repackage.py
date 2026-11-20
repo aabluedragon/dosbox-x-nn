@@ -3,7 +3,7 @@
 
     repackage.py <platform> <artifact directory> <output directory> <release> <commit>
 
-platform: windows-x64, windows-ia32, windows-arm64, macos-x64 or macos-arm64. The artifact
+platform: windows-x64, windows-ia32, windows-arm64, winxp-ia32, macos-x64 or macos-arm64. The artifact
 directory holds the extracted CI artifact (for macOS, the zip inside it is extracted too).
 Only the folders NukemNet runs are kept: the SDL2 build on Windows, both SDL builds on macOS
 (SDL1 serves Macs older than macOS 12). nn-capabilities.json goes beside each executable, or
@@ -20,6 +20,8 @@ keep = {
     'windows-x64': ['mingw-build/mingw-sdl2'],
     'windows-ia32': ['mingw-build/mingw-sdl2'],
     'windows-arm64': ['bin/ARM64/Release SDL2'],
+    # nukemnet-winxp.yml: the 32-bit Visual Studio SDL2 build for Windows XP and Vista.
+    'winxp-ia32': ['winxp-sdl2'],
     'macos-x64': ['dosbox-x', 'dosbox-x-sdl2'],
     'macos-arm64': ['dosbox-x', 'dosbox-x-sdl2'],
 }[platform]
