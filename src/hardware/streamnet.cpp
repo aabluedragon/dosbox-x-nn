@@ -3945,6 +3945,7 @@ static uint64_t rb_ad_gap_us[5];                            /* the longest gap b
 static int rb_ad_ask[STREAMNET_MAX_PEERS];                  /* what we ask of peer i (-1: nothing yet) */
 static uint32_t rb_ad_ask_up_at[STREAMNET_MAX_PEERS], rb_ad_ask_down_at[STREAMNET_MAX_PEERS];
 static uint32_t rb_ad_probe_wait[STREAMNET_MAX_PEERS];      /* how long without a stutter before asking for a frame less */
+static uint32_t rb_ad_probe_used_at[STREAMNET_MAX_PEERS];   /* when the peer started using the delay a probe asked for */
 static uint32_t rb_ad_stutter_at = 0;                       /* the last stutter here: a network gap over the mark */
 static unsigned int rb_ad_d = 0;                            /* our delay from the wishes */
 static uint32_t rb_ad_changed_at = 0, rb_ad_lower_since = 0;
@@ -3959,7 +3960,7 @@ static unsigned int RB_AdGapUs(void) {
 /* A peer (re)joined: nothing known of it yet. */
 static void RB_AdResetPeer(unsigned i) {
     rb_ad_wish_in[i] = 0; rb_ad_wish_in_at[i] = 0; rb_ad_peer_delay[i] = 0xFFu;
-    rb_ad_ask[i] = -1; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = 0; rb_ad_probe_wait[i] = 0;
+    rb_ad_ask[i] = -1; rb_ad_ask_up_at[i] = rb_ad_ask_down_at[i] = 0; rb_ad_probe_wait[i] = 0; rb_ad_probe_used_at[i] = 0;
     memset(rb_ad_late[i], 0, sizeof(rb_ad_late[i]));
 }
 
@@ -4019,9 +4020,10 @@ static void RB_AdTick(void) {
  * hiccups do not count: more delay would not help them). Frames normally come every 10 to
  * 14 ms, and a replayed frame costs a few ms, so a stutter means input that came several frames late.
  * - A stutter in the last 2 s: a frame more at once, or up to three when the gap was far over the mark (one per
- *   replayed frame's time it was over by), at most every second.
+ *   replayed frame's time it was over by); then nothing more until the peer reports that delay and a second has
+ *   passed (until then the stutters are the same ones: raising again overshot to the cap between two computers).
  * - No stutter for a while (8 s at first): a frame less, as a probe. When a stutter follows within 3 s the probe
- *   failed: the frame comes back and the next probe waits twice as long (up to 60 s); a probe that holds for 10 s
+ *   failed: exactly that frame comes back and the next probe waits twice as long (up to 60 s); a probe that holds for 10 s
  *   sets the wait back to 8 s. So it settles on the least smooth delay and only rarely tries below it.
  * Never more than the distance needs (half the round trip and 30 ms of jitter), at most RB_AD_MAX. Measured Nov 2026
  * at 220 ms, both players moving: steering by the replays' share swung the delay between 4 and 12 frames; a "come
@@ -4036,21 +4038,33 @@ static uint8_t RB_AdWishFor(unsigned i) {
     const uint64_t gap2 = std::max(rb_ad_gap_us[0], rb_ad_gap_us[1]);
     int ask = rb_ad_ask[i];
     const bool stutter = rb_ad_stutter_at != 0 && now - rb_ad_stutter_at < 2000u;
-    if (stutter && RB_AdLate(i) > 0) {
-        if (now - rb_ad_ask_up_at[i] >= 1000u) {
-            const double frame_us = rb_ad_frame_us > 0 ? rb_ad_frame_us : (double)streamnet_frame_ms * 1000.0 * 0.5;
-            const int step = gap2 > high ? std::max(1, std::min(3, (int)((double)(gap2 - high) / std::max(frame_us, 1000.0)) + 1)) : 1;
-            if (rb_ad_ask_down_at[i] != 0 && now - rb_ad_ask_down_at[i] < 3000u)     /* the probe failed */
-                rb_ad_probe_wait[i] = std::min(60000u, rb_ad_probe_wait[i] * 2u);
-            ask = std::max(ask, theirs) + step; rb_ad_ask_up_at[i] = now; rb_ad_ask_down_at[i] = 0;
+    /* A probe (a frame less, asked at rb_ad_ask_down_at) runs from when the peer uses it (it smooths its own delay down,
+     * a few seconds later) until it held for 10 s or a stutter failed it. */
+    if (rb_ad_ask_down_at[i] != 0) {
+        if (rb_ad_probe_used_at[i] == 0 && theirs <= ask) rb_ad_probe_used_at[i] = now;
+        if (rb_ad_probe_used_at[i] != 0 && now - rb_ad_probe_used_at[i] >= 10000u) {     /* it held */
+            rb_ad_probe_wait[i] = 8000u; rb_ad_ask_down_at[i] = 0; rb_ad_probe_used_at[i] = 0;
         }
     }
-    else if (ask > 0) {
-        const uint32_t calm = rb_ad_stutter_at == 0 ? now - rb_ad_ask_up_at[i] : std::min(now - rb_ad_stutter_at, now - rb_ad_ask_up_at[i]);
-        if (rb_ad_ask_down_at[i] != 0 && now - rb_ad_ask_down_at[i] >= 10000u) { rb_ad_probe_wait[i] = 8000u; rb_ad_ask_down_at[i] = 0; }   /* it held */
-        if (calm >= rb_ad_probe_wait[i] && (rb_ad_ask_down_at[i] == 0 || now - rb_ad_ask_down_at[i] >= rb_ad_probe_wait[i])) {
-            ask = std::min(ask, theirs) - 1; rb_ad_ask_down_at[i] = now;
+    const bool probing = rb_ad_ask_down_at[i] != 0;
+    /* (a raise takes effect only once the peer uses it and its input crossed the network: until the peer reports the
+     * delay asked for, and a second after, more stutters are the same ones, and raising again would overshoot) */
+    const bool settled = theirs >= ask && now - rb_ad_ask_up_at[i] >= 1000u;
+    if (stutter && RB_AdLate(i) > 0 && (settled || probing)) {
+        if (probing) {      /* the probe failed: exactly that frame comes back, and the next probe waits longer */
+            rb_ad_probe_wait[i] = std::min(60000u, rb_ad_probe_wait[i] * 2u);
+            ask = ask + 1;
         }
+        else {
+            const double frame_us = rb_ad_frame_us > 0 ? rb_ad_frame_us : (double)streamnet_frame_ms * 1000.0 * 0.5;
+            const int step = gap2 > high ? std::max(1, std::min(3, (int)((double)(gap2 - high) / std::max(frame_us, 1000.0)) + 1)) : 1;
+            ask = std::max(ask, theirs) + step;
+        }
+        rb_ad_ask_up_at[i] = now; rb_ad_ask_down_at[i] = 0; rb_ad_probe_used_at[i] = 0;
+    }
+    else if (ask > 0 && !probing) {
+        const uint32_t calm = rb_ad_stutter_at == 0 ? now - rb_ad_ask_up_at[i] : std::min(now - rb_ad_stutter_at, now - rb_ad_ask_up_at[i]);
+        if (calm >= rb_ad_probe_wait[i] && theirs <= ask) { ask = ask - 1; rb_ad_ask_down_at[i] = now; rb_ad_probe_used_at[i] = 0; }
     }
     const int cap = (int)std::min(RB_AD_MAX, (unsigned int)((rb_rtt[i] / 2u + 30u) / std::max(streamnet_frame_ms, 1u)));
     rb_ad_ask[i] = std::max(0, std::min(cap, ask));
