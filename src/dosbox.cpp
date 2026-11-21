@@ -5577,10 +5577,10 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pbool = secprop->Add_bool("rollback auto delay",Property::Changeable::WhenIdle, true);
     Pbool->Set_help("mode=rollback: this computer's input waits as little as the others need (\"delay\" stays the least).\n"
-                    "Every computer watches the longest gap between its frames and how late each player's input arrives,\n"
-                    "and asks a late player for a frame more while gaps go over 100 ms, a frame less after 5 s under 60 ms;\n"
-                    "each takes the highest request (up quickly, down slowly). Players with an older build: 1 frame from\n"
-                    "150 ms round trip, 2 from 200 ms.");
+                    "Every computer watches for stutters (a gap over 35 ms between its frames caused by a replay) and asks\n"
+                    "the players whose input comes late for a frame more; after a calm while it tries a frame less, and keeps\n"
+                    "it unless a stutter follows. So the delay settles on the least that keeps the game smooth, during play.\n"
+                    "Players with an older build: 1 frame from 150 ms round trip, 2 from 200 ms.");
 
     Pint = secprop->Add_int("cluster",Property::Changeable::WhenIdle, 0);
     Pint->Set_help("mode=rollback: IPX/NullModem-over-RollbackNet. Every computer runs a copy of the game for every\n"

@@ -599,6 +599,25 @@ the speed climbed), and a fully busy second never lowers the speed below 10,000 
 replays from about 18 to 11 frames.
 Capability `rollbackNetMaxCycles`.
 
+**Measured auto delay** (from 20261121; `[streamnet] rollback auto delay`, on by default). More input delay of a player
+makes every other computer's corrections of that player's moves shorter, so each computer decides what it needs from
+the others and asks them, with its input (two trailing fields after the speed proposal that older builds stop reading
+before: the delay it uses, and a wish per peer). Each computer takes the highest wish (up a frame per 500 ms, down
+after 3 s of lower wishes, a frame a second), never more than half the round trip and 30 ms. A computer's wishes steer
+by stutters: a gap between two frames over 35 ms (`NN_RB_AD_GAP`) in which a replay ran. Waits (for a cluster's own
+copies, or behind another computer's hiccup) and this computer's own hiccups do not count: more delay would not help
+them. A stutter asks the late peers for a frame more (up to three when far over the mark), then nothing more until the
+peer reports that delay and a second has passed (the stutters until then are the same ones). After a calm while (8 s
+at first) it asks for a frame less, as a probe, judged from when the peer starts using it: a stutter within 10 s fails
+it (exactly that frame comes back and the next probe waits twice as long, up to 60 s), a probe that holds resets the
+wait. The log says each change ("our input waits N frame(s) now") and every 5 s the figures ("auto delay: ...").
+Measured Nov 2026 between this Linux computer and the Windows laptop (Duke Nukem 3D shareware, IPX-over-RollbackNet,
+both players moving for 3 minutes, the laptop hosting): at 220 ms round trip 0.07 and 0.09 hitches a second (frames
+more than 30 ms late; the distance table's 2 frames: 2.06), the longest gap of each 5 s 21-22 ms in the median
+(72 ms), the delay between 7 and 12 frames; at 64 ms 0.11 and 0.16 hitches a second, 0 to 6 frames; 0 desyncs.
+Tried and dropped: steering by the replays' share of the time (the delay swung between 4 and 12 frames), and coming
+down only while gaps stayed under 20 ms (a frame with a 1-frame replay takes 25 to 35 ms here: it never came down).
+
 ### Clusters: IPX and null modem games (IPX/NullModem-over-RollbackNet)
 
 A game that plays over IPX or a null modem runs one copy per player on every computer, all identical: copy c plays
